@@ -2,20 +2,16 @@ import { initialBoard } from "@/domain/initialBoard";
 import type { Board } from "@/domain/model/board";
 import type { Move } from "@/domain/model/move";
 import type { HandKind, Player } from "@/domain/model/piece";
-import {
-    applyMove,
-    createEmptyHands,
-    replayMoves,
-    toggleSide,
-} from "@/domain/service/moveService";
 import { isCheckmate } from "@/domain/service/checkmate";
+import { applyMove, createEmptyHands, replayMoves, toggleSide } from "@/domain/service/moveService";
+import { isRepetition } from "@/domain/service/repetition";
 import { produce } from "immer";
 import { create } from "zustand";
 import { devtools, persist, subscribeWithSelector } from "zustand/middleware";
 
 interface GameResult {
     winner: Player | null; // 勝者（null は未決定）
-    reason: "checkmate" | "timeout" | "resign"; // 勝因（例：王手放置: checkmate、持ち時間切れ: timeout、投了: resign）
+    reason: "checkmate" | "timeout" | "resign" | "repetition"; // 勝因（例：王手放置: checkmate、持ち時間切れ: timeout、投了: resign）
 }
 
 interface GameState {
@@ -71,6 +67,11 @@ export const useGameStore = create<GameState>()(
                                 s.result = {
                                     winner: toggleSide(nextTurn),
                                     reason: "checkmate",
+                                };
+                            } else if (isRepetition(s.history)) {
+                                s.result = {
+                                    winner: null,
+                                    reason: "repetition",
                                 };
                             }
                         }),
