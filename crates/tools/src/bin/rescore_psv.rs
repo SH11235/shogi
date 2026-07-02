@@ -224,6 +224,14 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     onnx_gpu_id: i32,
 
+    /// ONNX推論セッション数（GPU 推論時のみ有効、CPU 推論では常に 1）。
+    /// 2 以上で複数セッション round-robin により H2D/D2H 転送と compute をオーバーラップ
+    /// させる（in-flight 多重化）。出力はバッチ順に再整列されるため、同一 TensorRT
+    /// エンジンキャッシュを使う限り出力はセッション数に依存せず bit 一致する。
+    /// VRAM 使用量はセッション数に応じて増える。
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=4))]
+    onnx_sessions: u64,
+
     /// TensorRT ExecutionProvider を使用（FP16推論、初回はエンジンコンパイルに時間がかかる）
     #[arg(long)]
     onnx_tensorrt: bool,
@@ -403,6 +411,7 @@ fn onnx_marker_decide(
         process_count,
         batch_size: cli.onnx_batch_size,
         gpu_id: cli.onnx_gpu_id,
+        sessions: cli.onnx_sessions as usize,
         use_tensorrt: cli.onnx_tensorrt,
         tensorrt_cache: cli.onnx_tensorrt_cache.as_deref(),
         score_clip: cli.score_clip,
@@ -2415,6 +2424,9 @@ struct OnnxPipelineConfig<'a> {
     process_count: u64,
     batch_size: usize,
     gpu_id: i32,
+    /// GPU 推論セッション数（`--onnx-sessions`）。2 以上で in-flight 多重化。
+    /// 出力はバッチ順に再整列されセッション数に依存しないため fingerprint には含めない。
+    sessions: usize,
     use_tensorrt: bool,
     tensorrt_cache: Option<&'a std::path::Path>,
     score_clip: i16,
@@ -3065,6 +3077,7 @@ where
         process_count,
         batch_size,
         gpu_id,
+        sessions,
         use_tensorrt,
         tensorrt_cache,
         score_clip,
@@ -3088,6 +3101,8 @@ where
     use ort::session::Session;
     use ort::value::TensorRef;
     use rshogi_core::movegen::{MoveList, generate_legal};
+    // ONNX パイプライン専用のため fn 内 use（top-level だと non-ONNX ビルドで unused-import）。
+    use std::collections::BTreeMap;
     use tools::dlshogi_features::{MAX_MOVE_LABEL_NUM, make_move_label};
 
     /// 合法手のロジットを softmax 正規化して `out` に書き込む
@@ -3151,105 +3166,141 @@ where
     // ONNX Runtime セッション初期化
     eprintln!("Loading {model_name} ONNX model: {}", onnx_path.display());
 
-    let builder = Session::builder()
-        .map_err(onnx_ort_err)?
-        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::All)
-        .map_err(|e| anyhow::anyhow!("ORT builder error: {e}"))?
-        .with_intra_threads(1)
-        .map_err(|e| anyhow::anyhow!("ORT builder error: {e}"))?;
+    // セッションを 1 本構築する。`--onnx-sessions` ≥ 2 のとき複数回呼ばれるため、
+    // EP 情報などのログと可用性チェックは verbose（1 本目）のみで行う。
+    // ORT profiling も 1 本目のセッションにのみ適用する。
+    let build_session = |verbose: bool| -> Result<Session> {
+        let builder = Session::builder()
+            .map_err(onnx_ort_err)?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::All)
+            .map_err(|e| anyhow::anyhow!("ORT builder error: {e}"))?
+            .with_intra_threads(1)
+            .map_err(|e| anyhow::anyhow!("ORT builder error: {e}"))?;
 
-    let mut builder = if let Some(path) = profile_path {
-        eprintln!("ORT profiling enabled: {}", path.display());
-        builder
-            .with_profiling(path)
-            .map_err(|e| anyhow::anyhow!("ORT profiling error: {e}"))?
-    } else {
-        builder
-    };
+        let mut builder = match (verbose, profile_path) {
+            (true, Some(path)) => {
+                eprintln!("ORT profiling enabled: {}", path.display());
+                builder
+                    .with_profiling(path)
+                    .map_err(|e| anyhow::anyhow!("ORT profiling error: {e}"))?
+            }
+            _ => builder,
+        };
 
-    let mut session = if gpu_id >= 0 {
-        if use_tensorrt {
-            eprintln!("Using TensorRT (FP16) on GPU {gpu_id}");
+        let session = if gpu_id >= 0 {
+            if use_tensorrt {
+                if verbose {
+                    eprintln!("Using TensorRT (FP16) on GPU {gpu_id}");
+                }
 
-            let trt_ep = ort::execution_providers::TensorRTExecutionProvider::default()
-                .with_device_id(gpu_id)
-                .with_fp16(true)
-                .with_engine_cache(tensorrt_cache.is_some());
-            let trt_ep = if let Some(cache_path) = tensorrt_cache {
-                let cache_str = cache_path.to_str().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "TensorRT cache path contains non-UTF-8 characters: {}",
-                        cache_path.display()
-                    )
-                })?;
-                eprintln!("TensorRT engine cache: {}", cache_path.display());
-                trt_ep.with_engine_cache_path(cache_str)
+                let trt_ep = ort::execution_providers::TensorRTExecutionProvider::default()
+                    .with_device_id(gpu_id)
+                    .with_fp16(true)
+                    .with_engine_cache(tensorrt_cache.is_some());
+                let trt_ep = if let Some(cache_path) = tensorrt_cache {
+                    let cache_str = cache_path.to_str().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "TensorRT cache path contains non-UTF-8 characters: {}",
+                            cache_path.display()
+                        )
+                    })?;
+                    if verbose {
+                        eprintln!("TensorRT engine cache: {}", cache_path.display());
+                    }
+                    trt_ep.with_engine_cache_path(cache_str)
+                } else {
+                    if verbose {
+                        eprintln!(
+                            "TensorRT engine cache: disabled (use --onnx-tensorrt-cache to enable)"
+                        );
+                    }
+                    trt_ep
+                };
+
+                if verbose {
+                    match trt_ep.is_available() {
+                        Ok(true) => eprintln!("TensorRT execution provider: available"),
+                        Ok(false) => {
+                            anyhow::bail!(
+                                "TensorRTExecutionProvider is NOT available.\n\
+                                 Ensure TensorRT (libnvinfer.so.10) is in LD_LIBRARY_PATH.\n\
+                                 To use CUDA EP instead, omit --onnx-tensorrt."
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("WARNING: Failed to check TensorRT EP availability: {e}");
+                        }
+                    }
+                }
+
+                // TensorRT EP + CUDA EP をフォールバックとして登録
+                let cuda_ep = ort::execution_providers::CUDAExecutionProvider::default()
+                    .with_device_id(gpu_id)
+                    .build()
+                    .error_on_failure();
+                let trt_ep = trt_ep.build().error_on_failure();
+
+                builder
+                    .with_execution_providers([trt_ep, cuda_ep])
+                    .map_err(|e| anyhow::anyhow!("TensorRT/CUDA EP registration failed: {e}"))?
+                    .commit_from_file(onnx_path)
+                    .map_err(onnx_ort_err)?
             } else {
-                eprintln!("TensorRT engine cache: disabled (use --onnx-tensorrt-cache to enable)");
-                trt_ep
-            };
+                if verbose {
+                    eprintln!("Using CUDA GPU {gpu_id}");
+                }
 
-            match trt_ep.is_available() {
-                Ok(true) => eprintln!("TensorRT execution provider: available"),
-                Ok(false) => {
-                    anyhow::bail!(
-                        "TensorRTExecutionProvider is NOT available.\n\
-                         Ensure TensorRT (libnvinfer.so.10) is in LD_LIBRARY_PATH.\n\
-                         To use CUDA EP instead, omit --onnx-tensorrt."
-                    );
+                let cuda_ep = ort::execution_providers::CUDAExecutionProvider::default()
+                    .with_device_id(gpu_id);
+                if verbose {
+                    match cuda_ep.is_available() {
+                        Ok(true) => eprintln!("CUDA execution provider: available"),
+                        Ok(false) => {
+                            anyhow::bail!(
+                                "CUDAExecutionProvider is NOT available in the loaded ONNX Runtime library.\n\
+                                 The library may be a CPU-only build.\n\
+                                 Check ORT_DYLIB_PATH points to a GPU-enabled onnxruntime.\n\
+                                 To use CPU inference instead, omit --onnx-gpu-id."
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("WARNING: Failed to check CUDA EP availability: {e}");
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("WARNING: Failed to check TensorRT EP availability: {e}");
-                }
+
+                let ep = cuda_ep.build().error_on_failure();
+                builder
+                    .with_execution_providers([ep])
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "CUDA EP registration failed (is onnxruntime-gpu installed?): {e}"
+                        )
+                    })?
+                    .commit_from_file(onnx_path)
+                    .map_err(onnx_ort_err)?
             }
-
-            // TensorRT EP + CUDA EP をフォールバックとして登録
-            let cuda_ep = ort::execution_providers::CUDAExecutionProvider::default()
-                .with_device_id(gpu_id)
-                .build()
-                .error_on_failure();
-            let trt_ep = trt_ep.build().error_on_failure();
-
-            builder
-                .with_execution_providers([trt_ep, cuda_ep])
-                .map_err(|e| anyhow::anyhow!("TensorRT/CUDA EP registration failed: {e}"))?
-                .commit_from_file(onnx_path)
-                .map_err(onnx_ort_err)?
         } else {
-            eprintln!("Using CUDA GPU {gpu_id}");
-
-            let cuda_ep =
-                ort::execution_providers::CUDAExecutionProvider::default().with_device_id(gpu_id);
-            match cuda_ep.is_available() {
-                Ok(true) => eprintln!("CUDA execution provider: available"),
-                Ok(false) => {
-                    anyhow::bail!(
-                        "CUDAExecutionProvider is NOT available in the loaded ONNX Runtime library.\n\
-                         The library may be a CPU-only build.\n\
-                         Check ORT_DYLIB_PATH points to a GPU-enabled onnxruntime.\n\
-                         To use CPU inference instead, omit --onnx-gpu-id."
-                    );
-                }
-                Err(e) => {
-                    eprintln!("WARNING: Failed to check CUDA EP availability: {e}");
-                }
+            if verbose {
+                eprintln!("Using CPU");
             }
-
-            let ep = cuda_ep.build().error_on_failure();
-            builder
-                .with_execution_providers([ep])
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "CUDA EP registration failed (is onnxruntime-gpu installed?): {e}"
-                    )
-                })?
-                .commit_from_file(onnx_path)
-                .map_err(onnx_ort_err)?
-        }
-    } else {
-        eprintln!("Using CPU");
-        builder.commit_from_file(onnx_path).map_err(onnx_ort_err)?
+            builder.commit_from_file(onnx_path).map_err(onnx_ort_err)?
+        };
+        Ok(session)
     };
+
+    // GPU 推論時のみ複数セッションを許可する（CPU 推論は intra-op を奪い合うだけなので常に 1）。
+    // 2 本目以降は同じ TensorRT engine cache を読むだけなので構築は軽い。
+    let num_sessions = if gpu_id >= 0 { sessions.max(1) } else { 1 };
+    let mut gpu_sessions: Vec<Session> = Vec::with_capacity(num_sessions);
+    for i in 0..num_sessions {
+        gpu_sessions.push(build_session(i == 0)?);
+    }
+    if num_sessions > 1 {
+        eprintln!(
+            "ONNX sessions: {num_sessions} (in-flight multiplexing; outputs re-ordered by batch)"
+        );
+    }
 
     eprintln!("{model_name} ONNX model loaded. Batch size: {batch_size}");
 
@@ -3280,11 +3331,11 @@ where
         .append(true)
         .open(output_path)
         .with_context(|| format!("Failed to open {}", output_path.display()))?;
-    let mut writer = BufWriter::new(out_file);
+    let writer = BufWriter::new(out_file);
 
     // expand 出力 writer（expand 有効時のみ）。main 側で truncate(0) 済みなので
     // append open で常に先頭から書く。
-    let mut expand_writer: Option<BufWriter<File>> = if let Some(e) = expand {
+    let expand_writer: Option<BufWriter<File>> = if let Some(e) = expand {
         let f =
             File::options().create(true).append(true).open(e.output_path).with_context(|| {
                 format!("Failed to open expand output {}", e.output_path.display())
@@ -3297,7 +3348,7 @@ where
     // leaf-REPLACEMENT 出力 writer（replacement 有効時のみ）。expand と同様 main 側で
     // truncate(0) 済みなので append open で常に先頭から書く。leaf-LABEL 出力（writer）と
     // 同一ループで 1:1 lockstep に書くため、レコード数は両者で一致する。
-    let mut replacement_writer: Option<BufWriter<File>> = if let Some(rp) = replacement_output {
+    let replacement_writer: Option<BufWriter<File>> = if let Some(rp) = replacement_output {
         let f =
             File::options().create(true).append(true).open(rp).with_context(|| {
                 format!("Failed to open leaf-replacement output {}", rp.display())
@@ -3331,9 +3382,6 @@ where
     let mut clipped_count: u64 = 0;
     let mut total_processed: u64 = 0;
     let mut total_expanded: u64 = 0;
-    // expand 用 softmax バッファ（バッチ・局面間で再利用）
-    let mut logits_buf: Vec<f32> = Vec::with_capacity(600);
-    let mut probs_buf: Vec<f32> = Vec::with_capacity(600);
 
     // 入力特徴 host バッファを CUDA pinned (page-locked) 化するための allocator。
     // pinned 化で pageable→pinned ステージング (CPU 介在) が消え、真の async H2D になる。
@@ -3345,7 +3393,7 @@ where
             AllocatorType::Device,
             MemoryType::CPUInput,
         )
-        .and_then(|info| ort::memory::Allocator::new(&session, info))
+        .and_then(|info| ort::memory::Allocator::new(&gpu_sessions[0], info))
         .map(|allocator| PinnedPool {
             allocator,
             ptrs: Vec::new(),
@@ -3355,9 +3403,11 @@ where
         None
     };
 
-    // フェーズ別 wall time 計測（RESCORE_PHASE_TIMING=1 のとき末尾で出力）。read/build は
-    // producer、run/write は consumer の別スレッドで計測するため、オーバーラップ分は
-    // 各フェーズの合算が wall を超える。供給コストと GPU コストの絶対値切り分けに使う。
+    // フェーズ別 wall time 計測（RESCORE_PHASE_TIMING=1 のとき末尾で出力）。read は reader、
+    // build は producer、run と write の後処理分は各 GPU worker、write のファイル書き出し分
+    // は writer と、それぞれ別スレッドで計測して合算するため、オーバーラップ分は各フェーズ
+    // の合算が wall を超える（`--onnx-sessions` ≥ 2 では run の合算だけでも wall を超えうる）。
+    // 供給コストと GPU コストの絶対値切り分けに使う。
     let phase_timing = std::env::var_os("RESCORE_PHASE_TIMING").is_some();
     let (mut t_run, mut t_write) = (0u128, 0u128);
 
@@ -3377,24 +3427,29 @@ where
 
     let want_leaf_sfens = replacement_output.is_some();
 
-    // 供給（read+build）と GPU 推論（session.run）を別スレッドにして直列実行をオーバーラップ。
-    // 王手 probe を build へ移したこととあわせ、GPU が CPU 前処理を待つアイドルを潰す。
-    // - producer: ストリーム読み込み（直列 I/O）+ rayon 並列特徴量構築
-    // - consumer（主スレッド）: ORT セッションで推論し結果を書き出し
-    // 決定性: from_bytes/unpack を直列段階に残しバッチ構成を不変に保つため、出力はオーバーラップ
-    // 前の直列ループ実装と bit 一致。slot は free/ready の 2 本のチャネルで循環し、同時生存は
-    // PIPELINE_SLOTS 個。
-    const PIPELINE_SLOTS: usize = 2;
+    // 供給（read/build）・GPU 推論・書き出しを別スレッドに分けて直列実行をオーバーラップ。
+    // - reader: ストリーム読み込み + レコードデコード（直列。バッチ構成をここで確定）
+    // - producer: rayon 並列特徴量構築
+    // - GPU worker × num_sessions: 各自の ORT セッションで推論し後処理（score 変換 /
+    //   シリアライズ / expand）まで行う。num_sessions ≥ 2 なら別セッション＝別 CUDA
+    //   ストリームで in-flight 多重化され、H2D/D2H 転送と compute が重なる
+    // - writer（主スレッド）: バッチ index（seq）で再整列してファイルへ書き出し
+    // 決定性: バッチ構成は reader の直列段階で不変に確定し、どのセッションで推論しても
+    // 同一エンジンなら結果は同一、書き出しは seq 順に再整列するため、出力はスレッド数・
+    // セッション数・パイプライン化に依存せず旧・直列ループ実装と bit 一致する。
+    // slot は free/ready の 2 本のチャネルで循環し、同時生存は pipeline_slots 個
+    // （ピークメモリは入力件数に非依存）。
+    let pipeline_slots = 2 * num_sessions;
 
-    // 入力特徴バッファ (f1/f2) を PIPELINE_SLOTS 個ぶん確保。pinned_pool があれば pinned で
+    // 入力特徴バッファ (f1/f2) を pipeline_slots 個ぶん確保。pinned_pool があれば pinned で
     // 全スロットを一括確保し、1 件でも失敗したら pool を捨てて全スロットを pageable Vec で
     // 作り直す (all-or-nothing。pinned/pageable 混在を避ける)。pinned_pool への &mut 借用は
     // ここで完結させ、thread::scope には確保済みバッファ (HostBuf) のみ move する
     // (pinned_pool は scope 後の drop で free)。
-    let mut slot_bufs: Vec<(HostBuf, HostBuf)> = Vec::with_capacity(PIPELINE_SLOTS);
+    let mut slot_bufs: Vec<(HostBuf, HostBuf)> = Vec::with_capacity(pipeline_slots);
     let pinned_ok = if let Some(pool) = pinned_pool.as_mut() {
         let mut ok = true;
-        for _ in 0..PIPELINE_SLOTS {
+        for _ in 0..pipeline_slots {
             // 個別に評価してから match (同一 pool への &mut 借用を逐次化する)。f1 が Err でも
             // f2 の確保は走るが、その PinnedBuf は `_` アームで即 drop される。ptr は確保成功時に
             // pool.ptrs へ登録済みなので PinnedPool::drop で漏れなく free される (リークなし)。
@@ -3423,7 +3478,7 @@ where
         // 先に slot_bufs を空にしてから pinned_pool を drop する (登録 ptr を 1 回ずつ free)。
         slot_bufs.clear();
         drop(pinned_pool.take());
-        for _ in 0..PIPELINE_SLOTS {
+        for _ in 0..pipeline_slots {
             slot_bufs.push((
                 HostBuf::Paged(vec![0.0f32; batch_size * f1_size]),
                 HostBuf::Paged(vec![0.0f32; batch_size * f2_size]),
@@ -3431,26 +3486,332 @@ where
         }
     }
 
-    // 出力 host バッファのメモリ種別 (バッチサイズ非依存なのでループ外で 1 回だけ作成)。
-    // pinned 化の可否は入力 pinned (pinned_ok) に従う: 入力を pinned 化できた GPU 経路では出力も
-    // CUDA pinned (page-locked) にして run_binding 内の D2H を真の async D2H にする。それ以外
-    // (CPU 推論 / 入力 pinned 確保失敗) は CPU pageable。pinned 化はメモリ場所のみの差で出力は
-    // bit 一致。出力 pinned の実確保は run_binding 内で行われ、失敗時は fallback せずエラーになる。
-    let output_mem = if pinned_ok {
-        MemoryInfo::new(
-            AllocationDevice::CUDA_PINNED,
-            gpu_id,
-            AllocatorType::Device,
-            MemoryType::CPUOutput,
-        )
-    } else {
-        MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::CPUOutput)
+    // GPU worker → writer。推論+後処理済みバッチ。書き出しバイト列まで worker 側で
+    // 構築し、writer は seq 順に再整列して write するだけにする（後処理を GPU
+    // クリティカルパスから外し、別セッションの推論と重ねる）。
+    struct DoneBatch {
+        slot: PreparedBatch,
+        rescore_bytes: Vec<u8>,
+        replacement_bytes: Vec<u8>,
+        expand_bytes: Vec<u8>,
+        skipped: u64,
+        clipped: u64,
+        expanded: u64,
     }
-    .map_err(onnx_ort_err)?;
+    let (done_tx, done_rx) = mpsc::channel::<(u64, Result<DoneBatch>)>();
 
+    // ---- GPU worker × num_sessions: 推論 + 後処理 ----
+    // TensorRT engine cache が未生成の初回実行に複数セッションが同時へエンジン構築・
+    // キャッシュ書き込みで競合しないよう、2 本目以降の worker は 1 本目の最初のバッチ
+    // 完了（= エンジン確定・cache 書き込み済み）を待ってから受信を始める。これにより
+    // cold cache でも全セッションが同一エンジンをロードし、出力の bit 一致が保たれる。
+    let (gate_tx, gate_rx) = mpsc::channel::<()>();
+    let gate_rx = Arc::new(Mutex::new(gate_rx));
+    let mut gate_tx = Some(gate_tx);
+    let want_replacement = replacement_output.is_some();
+    // worker 本体。worker 0 は主スレッドで直接実行する（writer 分離後の主スレッドを
+    // 遊ばせず、総スレッド数を最小に保つ）。2 本目以降のセッションのみスレッドを spawn する。
+    // gate の送り手は worker 0 のみが持つ。worker 0 が 1 バッチも処理せず終了した
+    // 場合も drop によって待機側の recv が解除される。
+    let run_gpu_worker = |worker_idx: usize,
+                          session: &mut Session,
+                          done_tx: mpsc::Sender<(u64, Result<DoneBatch>)>,
+                          mut gate_tx: Option<mpsc::Sender<()>>,
+                          gate_rx: &Mutex<mpsc::Receiver<()>>,
+                          ready_rx: &Mutex<mpsc::Receiver<(u64, PreparedBatch)>>|
+     -> (u128, u128) {
+        let (mut t_run, mut t_write) = (0u128, 0u128);
+        // expand 用 softmax バッファ（worker 内でバッチ間再利用）
+        let mut logits_buf: Vec<f32> = Vec::with_capacity(600);
+        let mut probs_buf: Vec<f32> = Vec::with_capacity(600);
+        // 出力 host バッファのメモリ種別（バッチサイズ非依存なのでループ外で 1 回だけ
+        // 作成。`MemoryInfo` は Send/Sync でないため worker スレッド内で作る）。
+        // pinned 化の可否は入力 pinned (pinned_ok) に従う: 入力を pinned 化できた GPU
+        // 経路では出力も CUDA pinned (page-locked) にして run_binding 内の D2H を真の
+        // async D2H にする。それ以外 (CPU 推論 / 入力 pinned 確保失敗) は CPU pageable。
+        // pinned 化はメモリ場所のみの差で出力は bit 一致。出力 pinned の実確保は
+        // run_binding 内で行われ、失敗時は fallback せずエラーになる。
+        let output_mem = if pinned_ok {
+            MemoryInfo::new(
+                AllocationDevice::CUDA_PINNED,
+                gpu_id,
+                AllocatorType::Device,
+                MemoryType::CPUOutput,
+            )
+        } else {
+            MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::CPUOutput)
+        };
+        let output_mem = match output_mem.map_err(onnx_ort_err) {
+            Ok(m) => m,
+            Err(e) => {
+                // seq 値は使われない（writer は Err を再整列より先に伝播する）。
+                let _ = done_tx.send((u64::MAX, Err(e)));
+                return (t_run, t_write);
+            }
+        };
+        let output_mem = &output_mem;
+        if worker_idx != 0 {
+            // worker 0 の初バッチ完了通知（または worker 0 終了による切断）を待つ。
+            let _ = gate_rx.lock().expect("gate_rx mutex poisoned").recv();
+        }
+        loop {
+            // recv を Mutex 内で待つ: ロック保持者だけが次のバッチを取り、他 worker は
+            // ロック待ちで並ぶ（取り合いの順序は出力に影響しない）。
+            let msg = ready_rx.lock().expect("ready_rx mutex poisoned").recv();
+            let (seq, batch) = match msg {
+                Ok(x) => x,
+                Err(_) => break, // producer 終了・供給済みバッチも処理済み
+            };
+            if batch.actual_batch == 0 {
+                // EOF / 中断 sentinel はそのまま writer へ中継（最終 seq なので writer
+                // は全バッチ書き出し後に必ず最後に処理する）。
+                let _ = done_tx.send((
+                    seq,
+                    Ok(DoneBatch {
+                        slot: batch,
+                        rescore_bytes: Vec::new(),
+                        replacement_bytes: Vec::new(),
+                        expand_bytes: Vec::new(),
+                        skipped: 0,
+                        clipped: 0,
+                        expanded: 0,
+                    }),
+                ));
+                break;
+            }
+            let actual_batch = batch.actual_batch;
+            // ort エラーは Result のまま writer へ送って伝播させる（ここで ? を使うと
+            // writer が seq 待ちのままデッドロックするため）。
+            let result = (|| -> Result<DoneBatch> {
+                let mut phase_t = Instant::now();
+                // IoBinding で推論（Python の run_with_iobinding に対応）
+                // session.run() より ORT 内部のメモリ管理が効率的
+                //
+                // 最適化検証で得られた知見:
+                // - create_binding() のループ外化（再利用）は逆効果（4.6〜36% 悪化）。
+                //   rebind 時に ORT 内部で前回バインドのクリーンアップコストが発生する
+                //   ため、毎回新規作成の方が速い。
+                // - output_policy のバインド省略も逆効果（10% 悪化）。
+                //   ORT が未バインド出力の処理にオーバーヘッドを生じる。
+                // - 旧実装は pageable な Vec から H2D していたため cudaMemcpyAsync が
+                //   実質同期 (CPU staging 介在) となり全体の ~96% を占めていた (nsys)。
+                //   入力 host バッファを pinned (page-locked) 化することでこの staging を
+                //   消し、真の async H2D にしている (HostBuf / PinnedPool 参照)。
+                let shape1: [usize; 4] = [actual_batch, input1_channels, 9, 9];
+                let input1 = TensorRef::<f32>::from_array_view((
+                    shape1,
+                    &batch.f1.as_slice()[..actual_batch * f1_size],
+                ))
+                .map_err(onnx_ort_err)?;
+
+                let shape2: [usize; 4] = [actual_batch, input2_channels, 9, 9];
+                let input2 = TensorRef::<f32>::from_array_view((
+                    shape2,
+                    &batch.f2.as_slice()[..actual_batch * f2_size],
+                ))
+                .map_err(onnx_ort_err)?;
+
+                let mut binding = session.create_binding().map_err(onnx_ort_err)?;
+                binding.bind_input("input1", &input1).map_err(onnx_ort_err)?;
+                binding.bind_input("input2", &input2).map_err(onnx_ort_err)?;
+                // output_policy: スコアリングには不使用だが、省略すると ORT 内部処理で
+                // オーバーヘッドが増加するため全出力をバインドする
+                binding
+                    .bind_output_to_device("output_policy", output_mem)
+                    .map_err(onnx_ort_err)?;
+                binding
+                    .bind_output_to_device("output_value", output_mem)
+                    .map_err(onnx_ort_err)?;
+
+                let outputs = session.run_binding(&binding).map_err(onnx_ort_err)?;
+
+                let (_, values) =
+                    outputs["output_value"].try_extract_tensor::<f32>().map_err(onnx_ort_err)?;
+                if phase_timing {
+                    t_run += phase_t.elapsed().as_nanos();
+                    phase_t = Instant::now();
+                }
+
+                // rescore 後処理（テンソルから直接読み取り、書き出しバイト列を構築）。
+                // skip_in_check が真かつ親が王手の場合は書き出しを抑制（推論結果は破棄）。
+                let mut skipped = 0u64;
+                let mut clipped_n = 0u64;
+                let mut rescore_bytes = Vec::with_capacity(actual_batch * PackedSfenValue::SIZE);
+                let mut replacement_bytes = if want_replacement {
+                    Vec::with_capacity(actual_batch * PackedSfenValue::SIZE)
+                } else {
+                    Vec::new()
+                };
+                for (i, (psv, _parts)) in batch.records.iter().enumerate() {
+                    if skip_in_check && batch.in_checks[i] {
+                        skipped += 1;
+                        continue;
+                    }
+                    let winrate = values[i];
+                    let clamped = winrate.clamp(0.001, 0.999);
+                    let logit = (clamped / (1.0 - clamped)).ln();
+                    // qsearch-leaf-label モードで葉の STM が root と異なる場合、推論値は
+                    // 葉の手番視点なので root 視点へ符号反転する。
+                    let leaf_score = logit * eval_scale;
+                    let signed_score = if batch.stm_flags[i] {
+                        -leaf_score
+                    } else {
+                        leaf_score
+                    };
+                    let raw_score = signed_score as i32;
+                    let clipped = raw_score.abs() > score_clip as i32;
+                    let new_score = raw_score.clamp(-(score_clip as i32), score_clip as i32) as i16;
+                    if clipped {
+                        clipped_n += 1;
+                    }
+                    // leaf-LABEL arm: 出力 sfen は常に root の `psv.sfen`（局面は置換
+                    // しない）。葉評価はラベルのみに反映（符号反転は signed_score に
+                    // 適用済み）。
+                    let new_psv = PackedSfenValue {
+                        sfen: psv.sfen,
+                        score: new_score,
+                        move16: 0,
+                        game_ply: psv.game_ply,
+                        game_result: psv.game_result,
+                        padding: 0,
+                    };
+                    rescore_bytes.extend_from_slice(&new_psv.to_bytes());
+
+                    // leaf-REPLACEMENT arm（有効時のみ、leaf-LABEL と 1:1 lockstep）。
+                    // `--apply-qsearch-leaf` → DL rescore の 2 工程と bit 一致させる:
+                    // - sfen は葉局面の packed sfen
+                    // - score は葉評価（符号反転なし＝葉手番視点）に clip 適用
+                    // - game_result は STM 反転時のみ符号反転
+                    if want_replacement {
+                        let leaf_raw = leaf_score as i32;
+                        let leaf_clipped_score =
+                            leaf_raw.clamp(-(score_clip as i32), score_clip as i32) as i16;
+                        let leaf_game_result = if batch.stm_flags[i] {
+                            -psv.game_result
+                        } else {
+                            psv.game_result
+                        };
+                        let replacement_psv = PackedSfenValue {
+                            sfen: batch.leaf_sfens[i],
+                            score: leaf_clipped_score,
+                            move16: 0,
+                            game_ply: psv.game_ply,
+                            game_result: leaf_game_result,
+                            padding: 0,
+                        };
+                        replacement_bytes.extend_from_slice(&replacement_psv.to_bytes());
+                    }
+                }
+
+                // expand 機能（policy ベースの子局面生成）
+                let mut expanded = 0u64;
+                let mut expand_bytes = Vec::new();
+                if let Some(expand_cfg) = expand {
+                    let (policy_shape, policy_data) = outputs["output_policy"]
+                        .try_extract_tensor::<f32>()
+                        .map_err(onnx_ort_err)?;
+                    let expected_len = actual_batch * MAX_MOVE_LABEL_NUM;
+                    if policy_data.len() != expected_len {
+                        anyhow::bail!(
+                            "Policy output shape mismatch: expected [{actual_batch}, \
+                                     {MAX_MOVE_LABEL_NUM}] ({expected_len} elements), got shape \
+                                     {:?} ({} elements). Is the ONNX model a compatible policy \
+                                     network?",
+                            policy_shape,
+                            policy_data.len()
+                        );
+                    }
+
+                    for (i, (psv, parts)) in batch.records.iter().enumerate() {
+                        if expand_cfg.skip_parent_in_check && batch.in_checks[i] {
+                            continue;
+                        }
+
+                        let mut pos = Position::new();
+                        if pos
+                            .set_from_parts(&parts.board, &parts.hands, parts.side_to_move)
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        let color = pos.side_to_move();
+
+                        let mut list = MoveList::new();
+                        generate_legal(&pos, &mut list);
+                        if list.is_empty() {
+                            continue;
+                        }
+
+                        let policy_row =
+                            &policy_data[i * MAX_MOVE_LABEL_NUM..(i + 1) * MAX_MOVE_LABEL_NUM];
+
+                        logits_buf.clear();
+                        for mv in list.iter() {
+                            let label = make_move_label(*mv, color);
+                            logits_buf.push(policy_row[label]);
+                        }
+                        probs_buf.resize(logits_buf.len(), 0.0);
+                        softmax_normalize(&logits_buf, &mut probs_buf);
+
+                        for (j, mv) in list.iter().enumerate() {
+                            if probs_buf[j] > expand_cfg.threshold {
+                                let gives_check = pos.gives_check(*mv);
+                                pos.do_move(*mv, gives_check);
+
+                                let child_in_check = pos.in_check();
+                                if !(expand_cfg.skip_child_in_check && child_in_check) {
+                                    let packed = pack_position(&pos);
+                                    let child = PackedSfenValue {
+                                        sfen: packed,
+                                        score: 0,
+                                        move16: 0,
+                                        game_ply: psv.game_ply.saturating_add(1),
+                                        game_result: 0,
+                                        padding: 0,
+                                    };
+                                    expand_bytes.extend_from_slice(&child.to_bytes());
+                                    expanded += 1;
+                                }
+
+                                pos.undo_move(*mv);
+                            }
+                        }
+                    }
+                }
+
+                if phase_timing {
+                    t_write += phase_t.elapsed().as_nanos();
+                }
+                Ok(DoneBatch {
+                    slot: batch,
+                    rescore_bytes,
+                    replacement_bytes,
+                    expand_bytes,
+                    skipped,
+                    clipped: clipped_n,
+                    expanded,
+                })
+            })();
+            let failed = result.is_err();
+            if done_tx.send((seq, result)).is_err() || failed {
+                break;
+            }
+            // 初バッチ完了（= TRT engine 確定）。待機中の他 worker を全て解放する。
+            if let Some(gate) = gate_tx.take() {
+                for _ in 1..num_sessions {
+                    let _ = gate.send(());
+                }
+            }
+        }
+        (t_run, t_write)
+    };
     let (t_read, t_build) = thread::scope(|scope| -> Result<(u128, u128)> {
         let (free_tx, free_rx) = mpsc::channel::<PreparedBatch>();
-        let (ready_tx, ready_rx) = mpsc::channel::<PreparedBatch>();
+        // producer→GPU worker。バッチ通番 seq を添えて送り、writer が seq で再整列する。
+        // Receiver は複数 worker で分け合う（Mutex 越しに recv した worker がそのバッチを
+        // 担当する。担当順は任意でよく、出力順は writer の再整列が保証する）。
+        let (ready_tx, ready_rx) = mpsc::channel::<(u64, PreparedBatch)>();
+        let ready_rx = Arc::new(Mutex::new(ready_rx));
         for (f1, f2) in slot_bufs {
             free_tx
                 .send(PreparedBatch {
@@ -3470,26 +3831,49 @@ where
                 .expect("initial slot send must succeed");
         }
 
-        // ---- producer: ストリーム読み込み + 並列特徴量構築 ----
-        let producer = scope.spawn(move || -> Result<(u128, u128)> {
+        // reader→producer 間で受け渡す 1 バッチ分の読み込み+デコード済みレコード。
+        // バッファは chunk_free/chunk_ready の 2 本のチャネルで循環し、同時生存は
+        // reader_chunks 個（ピークメモリは入力件数に非依存）。build 中も reader が
+        // 先読みできるよう slot 数より 1 つ多くする。
+        struct RecordChunk {
+            records: Vec<(PackedSfenValue, UnpackedSfen)>,
+            errors: u64,
+        }
+        let reader_chunks = pipeline_slots + 1;
+        let (chunk_free_tx, chunk_free_rx) = mpsc::channel::<RecordChunk>();
+        let (chunk_ready_tx, chunk_ready_rx) = mpsc::channel::<RecordChunk>();
+        for _ in 0..reader_chunks {
+            chunk_free_tx
+                .send(RecordChunk {
+                    records: Vec::with_capacity(batch_size),
+                    errors: 0,
+                })
+                .expect("initial chunk send must succeed");
+        }
+
+        // ---- reader: ストリーム読み込み + レコードデコード（直列） ----
+        // 旧実装は producer が read→build を直列に行っていたが、read+decode を専用
+        // スレッドへ分離して特徴量構築とオーバーラップさせる。1 バッチ分のレコード列は
+        // 旧実装と同一の直列ロジックで確定するため、バッチ構成は不変（= 出力 bit 一致）。
+        let reader_handle = scope.spawn(move || -> Result<u128> {
             let mut reader = reader;
             let mut remaining = remaining;
             let mut buffer = [0u8; PackedSfenValue::SIZE];
-            let (mut t_read, mut t_build) = (0u128, 0u128);
+            let mut t_read = 0u128;
             loop {
-                // 空き slot を取得。consumer が終了して free 側が切れたら producer も終了。
-                let mut slot = match free_rx.recv() {
-                    Ok(s) => s,
-                    Err(_) => return Ok((t_read, t_build)),
+                // 空きチャンクを取得。producer が終了して free 側が切れたら reader も終了。
+                let mut chunk = match chunk_free_rx.recv() {
+                    Ok(c) => c,
+                    Err(_) => return Ok(t_read),
                 };
                 let phase_t = Instant::now();
                 // バッチ分のレコードをストリーム読み込み。
                 // `--skip-in-check` 指定時もこの段階で親局面はドロップしない。推論は常に実行し
                 // 王手フラグだけを記録して、rescore 書き出しと expand 書き出しの王手スキップを
                 // 個別判定する（expand のポリシー推論を --skip-in-check と独立に動かすため）。
-                slot.records.clear();
-                let mut errs: u64 = 0;
-                while slot.records.len() < batch_size && remaining > 0 {
+                chunk.records.clear();
+                chunk.errors = 0;
+                while chunk.records.len() < batch_size && remaining > 0 {
                     if INTERRUPTED.load(Ordering::SeqCst) {
                         remaining = 0;
                         break;
@@ -3506,29 +3890,60 @@ where
                     let psv = match PackedSfenValue::from_bytes(&buffer) {
                         Some(p) => p,
                         None => {
-                            errs += 1;
+                            chunk.errors += 1;
                             continue;
                         }
                     };
                     let parts = match unpack_sfen_to_parts(&psv.sfen) {
                         Ok(p) => p,
                         Err(_) => {
-                            errs += 1;
+                            chunk.errors += 1;
                             continue;
                         }
                     };
-                    slot.records.push((psv, parts));
+                    chunk.records.push((psv, parts));
                 }
-                let actual_batch = slot.records.len();
                 if phase_timing {
                     t_read += phase_t.elapsed().as_nanos();
                 }
+                // 空チャンクは EOF / 中断 sentinel として producer へ伝えて reader 終了。
+                let eof = chunk.records.is_empty();
+                if chunk_ready_tx.send(chunk).is_err() || eof {
+                    return Ok(t_read);
+                }
+            }
+        });
+
+        // ---- producer: rayon 並列特徴量構築 ----
+        let producer = scope.spawn(move || -> u128 {
+            let mut t_build = 0u128;
+            let mut seq = 0u64;
+            loop {
+                // 空き slot を取得。writer が終了して free 側が切れたら producer も終了。
+                let mut slot = match free_rx.recv() {
+                    Ok(s) => s,
+                    Err(_) => return t_build,
+                };
+                // reader からデコード済みレコードを受け取る。reader が read エラーで途中
+                // 終了した場合はチャネルが切れるのでここで producer も終了する（エラー自体
+                // は reader の join 結果として伝播する）。
+                let mut chunk = match chunk_ready_rx.recv() {
+                    Ok(c) => c,
+                    Err(_) => return t_build,
+                };
+                std::mem::swap(&mut slot.records, &mut chunk.records);
+                let errs = chunk.errors;
+                // チャンクバッファを reader へ返却（reader が終了済みでも無視）。swap で
+                // 入った古い records は次回 reader 側で clear されて再利用される。
+                let _ = chunk_free_tx.send(chunk);
+                let actual_batch = slot.records.len();
                 if actual_batch == 0 {
-                    // EOF / 中断: actual_batch=0 を sentinel として送り producer 終了。
+                    // reader からの EOF / 中断 sentinel を GPU worker へ中継して終了。
+                    // sentinel は最終 seq を持つため、writer は再整列後に必ず最後に処理する。
                     slot.actual_batch = 0;
                     slot.errors = errs;
-                    let _ = ready_tx.send(slot);
-                    return Ok((t_read, t_build));
+                    let _ = ready_tx.send((seq, slot));
+                    return t_build;
                 }
 
                 let phase_t = Instant::now();
@@ -3647,224 +4062,150 @@ where
                 if phase_timing {
                     t_build += phase_t.elapsed().as_nanos();
                 }
-                // ready へ送る。consumer 側が終了して受け口が切れたら producer も終了。
-                if ready_tx.send(slot).is_err() {
-                    return Ok((t_read, t_build));
+                // ready へ送る。worker 側が全て終了して受け口が切れたら producer も終了。
+                if ready_tx.send((seq, slot)).is_err() {
+                    return t_build;
                 }
+                seq += 1;
             }
         });
 
-        // ---- consumer（主スレッド）: GPU 推論 + 書き出し ----
-        while let Ok(batch) = ready_rx.recv() {
-            if batch.actual_batch == 0 {
-                // producer からの EOF / 中断 sentinel。
-                error_count += batch.errors;
-                break;
-            }
-            let actual_batch = batch.actual_batch;
-            error_count += batch.errors;
-            let mut phase_t = Instant::now();
-            {
-                // IoBinding で推論（Python の run_with_iobinding に対応）
-                // session.run() より ORT 内部のメモリ管理が効率的
-                //
-                // 最適化検証で得られた知見:
-                // - create_binding() のループ外化（再利用）は逆効果（4.6〜36% 悪化）。
-                //   rebind 時に ORT 内部で前回バインドのクリーンアップコストが発生するため、
-                //   毎回新規作成の方が速い。
-                // - output_policy のバインド省略も逆効果（10% 悪化）。
-                //   ORT が未バインド出力の処理にオーバーヘッドを生じる。
-                // - 旧実装は pageable な Vec から H2D していたため cudaMemcpyAsync が実質同期
-                //   (CPU staging 介在) となり全体の ~96% を占めていた (nsys)。入力 host バッファを
-                //   pinned (page-locked) 化することでこの staging を消し、真の async H2D にしている
-                //   (HostBuf / PinnedPool 参照)。
-                let shape1: [usize; 4] = [actual_batch, input1_channels, 9, 9];
-                let input1 = TensorRef::<f32>::from_array_view((
-                    shape1,
-                    &batch.f1.as_slice()[..actual_batch * f1_size],
-                ))
-                .map_err(onnx_ort_err)?;
-
-                let shape2: [usize; 4] = [actual_batch, input2_channels, 9, 9];
-                let input2 = TensorRef::<f32>::from_array_view((
-                    shape2,
-                    &batch.f2.as_slice()[..actual_batch * f2_size],
-                ))
-                .map_err(onnx_ort_err)?;
-
-                let mut binding = session.create_binding().map_err(onnx_ort_err)?;
-                binding.bind_input("input1", &input1).map_err(onnx_ort_err)?;
-                binding.bind_input("input2", &input2).map_err(onnx_ort_err)?;
-                // output_policy: スコアリングには不使用だが、省略すると ORT 内部処理で
-                // オーバーヘッドが増加するため全出力をバインドする
-                binding
-                    .bind_output_to_device("output_policy", &output_mem)
-                    .map_err(onnx_ort_err)?;
-                binding
-                    .bind_output_to_device("output_value", &output_mem)
-                    .map_err(onnx_ort_err)?;
-
-                let outputs = session.run_binding(&binding).map_err(onnx_ort_err)?;
-
-                let (_, values) =
-                    outputs["output_value"].try_extract_tensor::<f32>().map_err(onnx_ort_err)?;
-                if phase_timing {
-                    t_run += phase_t.elapsed().as_nanos();
-                    phase_t = Instant::now();
-                }
-
-                // rescore 書き出し（テンソルから直接読み取り、to_vec() コピーを排除）
-                // skip_in_check が真かつ親が王手の場合は書き出しを抑制（推論結果は破棄）。
-                for (i, (psv, _parts)) in batch.records.iter().enumerate() {
-                    if skip_in_check && batch.in_checks[i] {
-                        skipped_count += 1;
-                        continue;
-                    }
-                    let winrate = values[i];
-                    let clamped = winrate.clamp(0.001, 0.999);
-                    let logit = (clamped / (1.0 - clamped)).ln();
-                    // qsearch-leaf-label モードで葉の STM が root と異なる場合、推論値は葉の
-                    // 手番視点なので root 視点へ符号反転する。
-                    let leaf_score = logit * eval_scale;
-                    let signed_score = if batch.stm_flags[i] {
-                        -leaf_score
-                    } else {
-                        leaf_score
-                    };
-                    let raw_score = signed_score as i32;
-                    let clipped = raw_score.abs() > score_clip as i32;
-                    let new_score = raw_score.clamp(-(score_clip as i32), score_clip as i32) as i16;
-                    if clipped {
-                        clipped_count += 1;
-                    }
-                    // leaf-LABEL arm: 出力 sfen は常に root の `psv.sfen`（局面は置換しない）。
-                    // 葉評価はラベルのみに反映（符号反転は signed_score に適用済み）。
-                    let new_psv = PackedSfenValue {
-                        sfen: psv.sfen,
-                        score: new_score,
-                        move16: 0,
-                        game_ply: psv.game_ply,
-                        game_result: psv.game_result,
-                        padding: 0,
-                    };
-                    writer.write_all(&new_psv.to_bytes())?;
-
-                    // leaf-REPLACEMENT arm（有効時のみ、leaf-LABEL と 1:1 lockstep）。
-                    // `--apply-qsearch-leaf` → DL rescore の 2 工程と bit 一致させる:
-                    // - sfen は葉局面の packed sfen
-                    // - score は葉評価（符号反転なし＝葉手番視点）に clip 適用
-                    // - game_result は STM 反転時のみ符号反転
-                    if let Some(rw) = replacement_writer.as_mut() {
-                        let leaf_raw = leaf_score as i32;
-                        let leaf_clipped_score =
-                            leaf_raw.clamp(-(score_clip as i32), score_clip as i32) as i16;
-                        let leaf_game_result = if batch.stm_flags[i] {
-                            -psv.game_result
-                        } else {
-                            psv.game_result
-                        };
-                        let replacement_psv = PackedSfenValue {
-                            sfen: batch.leaf_sfens[i],
-                            score: leaf_clipped_score,
-                            move16: 0,
-                            game_ply: psv.game_ply,
-                            game_result: leaf_game_result,
-                            padding: 0,
-                        };
-                        rw.write_all(&replacement_psv.to_bytes())?;
-                    }
-                }
-
-                // expand 機能（policy ベースの子局面生成）
-                if let (Some(expand_cfg), Some(ew)) = (expand, expand_writer.as_mut()) {
-                    let (policy_shape, policy_data) = outputs["output_policy"]
-                        .try_extract_tensor::<f32>()
-                        .map_err(onnx_ort_err)?;
-                    let expected_len = actual_batch * MAX_MOVE_LABEL_NUM;
-                    if policy_data.len() != expected_len {
-                        anyhow::bail!(
-                            "Policy output shape mismatch: expected [{actual_batch}, \
-                             {MAX_MOVE_LABEL_NUM}] ({expected_len} elements), got shape {:?} \
-                             ({} elements). Is the ONNX model a compatible policy network?",
-                            policy_shape,
-                            policy_data.len()
-                        );
-                    }
-
-                    for (i, (psv, parts)) in batch.records.iter().enumerate() {
-                        if expand_cfg.skip_parent_in_check && batch.in_checks[i] {
-                            continue;
-                        }
-
-                        let mut pos = Position::new();
-                        if pos
-                            .set_from_parts(&parts.board, &parts.hands, parts.side_to_move)
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        let color = pos.side_to_move();
-
-                        let mut list = MoveList::new();
-                        generate_legal(&pos, &mut list);
-                        if list.is_empty() {
-                            continue;
-                        }
-
-                        let policy_row =
-                            &policy_data[i * MAX_MOVE_LABEL_NUM..(i + 1) * MAX_MOVE_LABEL_NUM];
-
-                        logits_buf.clear();
-                        for mv in list.iter() {
-                            let label = make_move_label(*mv, color);
-                            logits_buf.push(policy_row[label]);
-                        }
-                        probs_buf.resize(logits_buf.len(), 0.0);
-                        softmax_normalize(&logits_buf, &mut probs_buf);
-
-                        for (j, mv) in list.iter().enumerate() {
-                            if probs_buf[j] > expand_cfg.threshold {
-                                let gives_check = pos.gives_check(*mv);
-                                pos.do_move(*mv, gives_check);
-
-                                let child_in_check = pos.in_check();
-                                if !(expand_cfg.skip_child_in_check && child_in_check) {
-                                    let packed = pack_position(&pos);
-                                    let child = PackedSfenValue {
-                                        sfen: packed,
-                                        score: 0,
-                                        move16: 0,
-                                        game_ply: psv.game_ply.saturating_add(1),
-                                        game_result: 0,
-                                        padding: 0,
-                                    };
-                                    ew.write_all(&child.to_bytes())?;
-                                    total_expanded += 1;
-                                }
-
-                                pos.undo_move(*mv);
-                            }
-                        }
-                    }
-                }
-
-                if phase_timing {
-                    t_write += phase_t.elapsed().as_nanos();
-                }
-            }
-
-            total_processed += actual_batch as u64;
-            progress.inc(actual_batch as u64);
-            // slot を再利用に戻す。producer が既に終了していて受け口が切れていても無視。
-            let _ = free_tx.send(batch);
+        // 2 本目以降のセッション用 worker スレッドを spawn（worker 0 は後で主スレッドで実行）。
+        let mut worker_handles = Vec::with_capacity(num_sessions - 1);
+        let mut sessions_iter = gpu_sessions.iter_mut();
+        let session0 = sessions_iter.next().expect("num_sessions >= 1");
+        for (i, session) in sessions_iter.enumerate() {
+            let done_tx = done_tx.clone();
+            let ready_rx = Arc::clone(&ready_rx);
+            let gate_rx = Arc::clone(&gate_rx);
+            let worker = &run_gpu_worker;
+            worker_handles.push(
+                scope.spawn(move || worker(i + 1, session, done_tx, None, &gate_rx, &ready_rx)),
+            );
         }
 
-        // consumer 終了。free_tx を drop して producer の free_rx.recv() を解除し join。
-        // producer の read エラーはここで `?` 相当で伝播する（join 結果が Err）。
-        // consumer が途中の `?` で早期 return した場合も、scope クロージャの unwind で
-        // free_tx が drop され producer の recv が解除されるためデッドロックしない。
-        drop(free_tx);
-        producer.join().expect("producer thread panicked")
+        // ---- writer: seq 再整列 + 書き出し ----
+        // 主スレッドは worker 0 として GPU submit を担うため、書き出しは専用スレッドに移す。
+        struct WriterStats {
+            skipped: u64,
+            clipped: u64,
+            expanded: u64,
+            processed: u64,
+            errors: u64,
+            t_write: u128,
+        }
+        let writer_handle = scope.spawn(move || -> Result<WriterStats> {
+            let mut writer = writer;
+            let mut expand_writer = expand_writer;
+            let mut replacement_writer = replacement_writer;
+            let mut stats = WriterStats {
+                skipped: 0,
+                clipped: 0,
+                expanded: 0,
+                processed: 0,
+                errors: 0,
+                t_write: 0,
+            };
+            let mut pending: BTreeMap<u64, DoneBatch> = BTreeMap::new();
+            let mut next_seq: u64 = 0;
+            'writer_loop: loop {
+                // 全 worker が終了して done が閉じたらループを抜ける（正常系は sentinel 処理の
+                // break で抜ける。こちらの経路は reader エラー等で sentinel が届かない場合）。
+                let (seq, done) = match done_rx.recv() {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                // worker の推論エラーは seq 順を待たず即時伝播する。writer の早期 return で
+                // free_tx が drop され、producer→reader→worker が連鎖的に終了する。
+                let done = done?;
+                pending.insert(seq, done);
+                // 揃った分だけ seq 順に書き出す。pending は同時生存 slot 数で抑えられる。
+                while let Some(done) = pending.remove(&next_seq) {
+                    next_seq += 1;
+                    stats.errors += done.slot.errors;
+                    if done.slot.actual_batch == 0 {
+                        break 'writer_loop; // EOF / 中断 sentinel（最終 seq）
+                    }
+                    let phase_t = Instant::now();
+                    writer.write_all(&done.rescore_bytes)?;
+                    if let Some(rw) = replacement_writer.as_mut() {
+                        rw.write_all(&done.replacement_bytes)?;
+                    }
+                    if let Some(ew) = expand_writer.as_mut() {
+                        ew.write_all(&done.expand_bytes)?;
+                    }
+                    if phase_timing {
+                        stats.t_write += phase_t.elapsed().as_nanos();
+                    }
+                    stats.skipped += done.skipped;
+                    stats.clipped += done.clipped;
+                    stats.expanded += done.expanded;
+                    stats.processed += done.slot.actual_batch as u64;
+                    progress.inc(done.slot.actual_batch as u64);
+                    // slot を再利用に戻す。producer が既に終了していて受け口が切れていても無視。
+                    let _ = free_tx.send(done.slot);
+                }
+            }
+
+            // 出力ファイル本体を flush + sync して、マーカー書き出し前にクラッシュしても
+            // 書き出し済みバイト列が確実にディスクに着地している状態を作る。
+            // sync_all() は内部の File に対して実行（BufWriter::flush + into_inner で取り出し）。
+            writer.flush()?;
+            let rescore_inner = writer
+                .into_inner()
+                .map_err(|e| anyhow::anyhow!("rescore writer into_inner error: {}", e.error()))?;
+            rescore_inner.sync_all()?;
+            drop(rescore_inner);
+
+            if let Some(mut ew) = expand_writer.take() {
+                ew.flush()?;
+                let inner = ew.into_inner().map_err(|e| {
+                    anyhow::anyhow!("expand writer into_inner error: {}", e.error())
+                })?;
+                inner.sync_all()?;
+            }
+
+            if let Some(mut rw) = replacement_writer.take() {
+                rw.flush()?;
+                let inner = rw.into_inner().map_err(|e| {
+                    anyhow::anyhow!("replacement writer into_inner error: {}", e.error())
+                })?;
+                inner.sync_all()?;
+            }
+
+            Ok(stats)
+        });
+
+        // ---- worker 0（主スレッド）: GPU 推論 + 後処理 ----
+        // done_tx の元 Sender は worker 0 に move して終了時に drop させる（spawn した
+        // worker が全て終了した時点で done が閉じ、writer も必ず終了できる）。
+        {
+            let gate_tx0 = gate_tx.take();
+            let (r, w) = run_gpu_worker(0, session0, done_tx, gate_tx0, &gate_rx, &ready_rx);
+            t_run += r;
+            t_write += w;
+        }
+
+        // 全スレッドを join する。spawn した worker は producer 終了（ready 閉鎖）で、reader
+        // は producer 終了（chunk_free 閉鎖）で、producer は sentinel 送信後または writer 終了
+        // （free 閉鎖）で終了する。writer は sentinel 処理後または done 閉鎖後に flush まで
+        // 済ませて終了する。reader の read エラー・worker の推論エラー・writer の書き出し
+        // エラーはここで伝播する（join 結果が Err）。
+        for handle in worker_handles {
+            let (r, w) = handle.join().expect("gpu worker thread panicked");
+            t_run += r;
+            t_write += w;
+        }
+        let t_build = producer.join().expect("producer thread panicked");
+        let t_read = reader_handle.join().expect("reader thread panicked")?;
+        let stats = writer_handle.join().expect("writer thread panicked")?;
+        skipped_count += stats.skipped;
+        clipped_count += stats.clipped;
+        total_expanded += stats.expanded;
+        total_processed += stats.processed;
+        error_count += stats.errors;
+        t_write += stats.t_write;
+        Ok((t_read, t_build))
     })?;
 
     if phase_timing {
@@ -3886,38 +4227,15 @@ where
     }
 
     if profile_path.is_some() {
-        match session.end_profiling() {
+        // profiling は 1 本目のセッションにのみ適用している（build_session 参照）。
+        match gpu_sessions[0].end_profiling() {
             Ok(path) => eprintln!("ORT profile saved: {path}"),
             Err(e) => eprintln!("ORT profile error: {e}"),
         }
     }
 
-    // 出力ファイル本体を flush + sync して、マーカー書き出し前にクラッシュしても
-    // 書き出し済みバイト列が確実にディスクに着地している状態を作る。
-    // sync_all() は内部の File に対して実行（BufWriter::flush + into_inner で取り出し）。
-    writer.flush()?;
-    let rescore_inner = writer
-        .into_inner()
-        .map_err(|e| anyhow::anyhow!("rescore writer into_inner error: {}", e.error()))?;
-    rescore_inner.sync_all()?;
-    drop(rescore_inner);
-
-    if let Some(mut ew) = expand_writer.take() {
-        ew.flush()?;
-        let inner = ew
-            .into_inner()
-            .map_err(|e| anyhow::anyhow!("expand writer into_inner error: {}", e.error()))?;
-        inner.sync_all()?;
-    }
-
-    if let Some(mut rw) = replacement_writer.take() {
-        rw.flush()?;
-        let inner = rw
-            .into_inner()
-            .map_err(|e| anyhow::anyhow!("replacement writer into_inner error: {}", e.error()))?;
-        inner.sync_all()?;
-    }
-
+    // 出力ファイル本体の flush + sync は writer スレッドが終了時に実施済み
+    //（マーカー書き出し前にクラッシュしても書き出し済みバイト列がディスクに着地している）。
     progress.finish_with_message("Done");
 
     // 統計情報
@@ -4019,6 +4337,7 @@ fn process_file_with_onnx(
         process_count,
         batch_size: cli.onnx_batch_size,
         gpu_id: cli.onnx_gpu_id,
+        sessions: cli.onnx_sessions as usize,
         use_tensorrt: cli.onnx_tensorrt,
         tensorrt_cache: cli.onnx_tensorrt_cache.as_deref(),
         score_clip: cli.score_clip,
@@ -4079,6 +4398,7 @@ fn process_file_with_dlshogi_onnx(
         process_count,
         batch_size: cli.onnx_batch_size,
         gpu_id: cli.onnx_gpu_id,
+        sessions: cli.onnx_sessions as usize,
         use_tensorrt: cli.onnx_tensorrt,
         tensorrt_cache: cli.onnx_tensorrt_cache.as_deref(),
         score_clip: cli.score_clip,
