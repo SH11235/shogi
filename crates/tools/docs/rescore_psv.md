@@ -162,6 +162,7 @@ cargo run --release -p tools --bin rescore_psv -- \
 | `--dlshogi-onnx-model` | — | dlshogi ONNX モデルパス（`dlshogi-onnx` feature 時） |
 | `--onnx-batch-size` | 256 | 推論バッチサイズ |
 | `--onnx-gpu-id` | 0 | GPU ID（`-1` で CPU 推論） |
+| `--onnx-sessions` | 2 | GPU 推論セッション数（1〜4、CPU 推論では常に 1）。2 以上で推論を複数セッションに多重化し H2D/D2H 転送と compute をオーバーラップ。出力はバッチ順に再整列されるため同一エンジンなら bit 一致（後述） |
 | `--onnx-tensorrt` | false | TensorRT EP を使用（FP16 推論） |
 | `--onnx-tensorrt-cache` | — | TensorRT エンジンキャッシュの保存先 |
 | `--onnx-eval-scale` | 600.0 | 勝率→cp 変換スケール（有限値・正値必須） |
@@ -349,14 +350,26 @@ ONNX モードでは以下を起動時 / ファイルごとに検証し、デー
 
 ### ONNX モードの供給パイプライン
 
-ONNX 直推論モード（`--dlshogi-onnx-model` / `--onnx-model`）では、CPU 側の前処理
-（PSV デコード + 特徴量テンソル構築）を producer スレッド、GPU 推論（`session.run`）を
-consumer（主スレッド）に分け、両者をオーバーラップして実行する。GPU が次バッチの
-CPU 前処理を待ってアイドルする区間を潰し、GPU を連続的に飽和させる。バッファは固定
-枚数の slot プールで再利用するため、ピークメモリは入力件数に依存しない。
+ONNX 直推論モード（`--dlshogi-onnx-model` / `--onnx-model`）では、処理を
+reader（PSV 読み込み + デコード、直列）→ producer（rayon 並列特徴量構築）→
+GPU worker × `--onnx-sessions`（推論 + score 変換等の後処理）→ writer（バッチ順への
+再整列 + ファイル書き出し）の各スレッドに分け、全段をオーバーラップして実行する。
+GPU が次バッチの CPU 前処理を待ってアイドルする区間を潰し、GPU を連続的に飽和させる。
+バッファは固定枚数の slot プールで再利用するため、ピークメモリは入力件数に依存しない。
 
-決定性: PSV のデコードを直列段階に残してバッチ構成を不変に保つため、出力は逐次実装と
-bit 一致する。
+`--onnx-sessions` ≥ 2 では ORT セッション（= CUDA ストリーム）を複数持ち、バッチを
+round-robin で振り分けて in-flight を多重化する。単一セッションでは H2D →
+compute → D2H が GPU 上で完全直列になる（`run_binding` が同期のため）のに対し、
+複数セッションでは別バッチの転送と compute が重なり、転送分の GPU アイドルを回収できる。
+VRAM（エンジン/コンテキスト）はセッション数に応じて増える。GPU が電力上限に達している
+環境では 3 以上に増やしても伸びない（実測では 2 が最適）。
+
+決定性: バッチ構成は reader の直列段階で確定し、どのセッションで推論しても同一エンジン
+なら結果は同一、書き出しは writer がバッチ通番で再整列するため、出力はセッション数・
+スレッド数に依存せず逐次実装と bit 一致する。TensorRT 使用時は同一エンジンキャッシュの
+利用が前提（エンジンを再ビルドすると fp16 の最下位ビットが変わりうるのは従来どおり）。
+cold cache 初回実行では 2 本目以降のセッションが 1 本目の初回バッチ完了（= エンジン確定・
+キャッシュ書き込み）を待ってから開始するため、全セッションが同一エンジンを使う。
 
 入力特徴と出力（推論結果）の host バッファは、GPU 推論時（`--onnx-gpu-id >= 0`）に確保できれば
 **CUDA pinned (page-locked) メモリ**を使う（`IoBinding` の入出力先を `AllocationDevice::CUDA_PINNED`
@@ -567,6 +580,10 @@ AobaZero ONNX model loaded. Batch size: 1024
   pageable→pinned ステージング（CPU 介在で実質同期化）を解消する（「ONNX モードの供給
   パイプライン」参照）。pinned 化で転送は真の async になり推論と overlap されるため、転送は
   支配項ではなく、入力 FP16 化による転送量半減の効果も小さい
+- 単一セッションでは `run_binding` が同期実行のため、GPU 上では H2D → compute → D2H が
+  バッチ内で完全直列になる。`--onnx-sessions`（デフォルト 2）で推論を複数セッションに
+  多重化すると、別バッチの転送と compute が重なりこのアイドルを回収できる（「ONNX モード
+  の供給パイプライン」参照。出力はバッチ順に再整列され bit 一致）
 - `--threads` による特徴量構築の並列化は GPU 推論とオーバーラップされる。供給（read+build）が
   GPU 推論より速ければ全体時間への影響は小さい（軽量モデル・高速 GPU で前処理が供給律速に
   なる場合のみ寄与する）
