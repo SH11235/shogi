@@ -110,8 +110,9 @@ impl SortMode {
 const SFEN_SCAN_CHUNK: usize = 32;
 
 /// SFEN 局面検索（逐次スキャン）の進行状態。イベントループが 1 tick ごとに
-/// `SFEN_SCAN_CHUNK` 対局ずつ `load_game` して照合し、途中経過を描画する。保持するのは
-/// 一致した対局の index だけで、局面は 1 対局ぶんずつ読んでは捨てるためメモリは入力に依存しない。
+/// `SFEN_SCAN_CHUNK` 対局ずつ `load_game` して照合し、途中経過を描画する。局面は 1 対局
+/// ぶんずつ読んでは捨てるので、追加で保持するのは一致した対局の index（`matches`）だけ
+/// ＝メモリは一致件数に比例し、対局あたりの局面数には非依存。
 struct SfenScan {
     /// 正規化済み（手数フィールドを除いた盤面・手番・持駒）の検索対象 SFEN。
     target: String,
@@ -1647,18 +1648,29 @@ mod tests {
 
     #[test]
     fn cancel_sfen_scan_keeps_prior_filter() {
+        // 別フィルタで部分集合に絞った状態から SFEN スキャンを途中中断し、filtered と
+        // base_filtered がどちらもスキャン前（＝別フィルタの結果）のままであることを確認する。
         let n = SFEN_SCAN_CHUNK * 2;
-        let source = fake_source(vec![vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()]; n]);
+        let mut games = vec![vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()]; n];
+        for i in [1usize, 40, 63] {
+            games[i] = vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string(); 3]; // len:3 で絞れる部分集合。
+        }
+        let source = fake_source(games);
         let index = source.build_index().expect("build_index");
         let mut app = App::new(Box::new(source), index);
-        let before = app.filtered.clone();
+        app.filter_input = "len:3".to_string();
+        app.apply_filter();
+        let filtered_before = app.filtered.clone();
+        let base_before = app.base_filtered.clone();
+        assert_eq!(base_before, vec![1, 40, 63], "事前フィルタで部分集合になっている");
 
         app.start_sfen_scan(HIRATE_SFEN);
         app.advance_sfen_scan(); // 1 チャンクだけ進め、未完了のまま中断する。
         assert!(app.scan.is_some(), "まだ走査途中");
         app.cancel_sfen_scan();
         assert!(app.scan.is_none());
-        assert_eq!(app.filtered, before, "中断時は絞り込みが実行前のまま");
+        assert_eq!(app.filtered, filtered_before, "中断で filtered はスキャン前のまま");
+        assert_eq!(app.base_filtered, base_before, "中断で base_filtered もスキャン前のまま");
     }
 
     #[test]
