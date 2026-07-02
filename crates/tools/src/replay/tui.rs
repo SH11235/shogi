@@ -124,7 +124,11 @@ struct SfenScan {
 struct App {
     source: Box<dyn GameSource>,
     index: GameIndex,
-    /// `index.entries` のうち、現在のフィルタに一致するものの index 列。
+    /// 現在の絞り込み結果（`index.entries` への index 列、ソート前・発見順）。メタ情報
+    /// フィルタは `entry_matches` から、SFEN 局面検索は逐次スキャンの一致集合から作る。
+    /// 並べ替えはこれを再ソートするので、SFEN スキャン結果も並べ替えで失われない。
+    base_filtered: Vec<usize>,
+    /// `base_filtered` を現在の並び順で表示用に並べたもの。
     filtered: Vec<usize>,
     selected: usize,
     mode: Mode,
@@ -139,11 +143,12 @@ struct App {
 
 impl App {
     fn new(source: Box<dyn GameSource>, index: GameIndex) -> Self {
-        let filtered: Vec<usize> = (0..index.entries.len()).collect();
+        let all: Vec<usize> = (0..index.entries.len()).collect();
         let mut app = Self {
             source,
             index,
-            filtered,
+            base_filtered: all.clone(),
+            filtered: all,
             selected: 0,
             mode: Mode::Browse,
             filter_input: String::new(),
@@ -179,9 +184,16 @@ impl App {
     fn apply_filter(&mut self) {
         let query = self.filter_input.to_lowercase();
         let filter = parse_filter(&query);
-        let mut filtered: Vec<usize> = (0..self.index.entries.len())
+        self.base_filtered = (0..self.index.entries.len())
             .filter(|&i| entry_matches(&self.index, &self.index.entries[i], filter))
             .collect();
+        self.resort();
+    }
+
+    /// `base_filtered` を現在の並び順で `filtered` に反映し、先頭対局を読み込む。絞り込み
+    /// 集合はそのままに並び順だけ変えるので、SFEN スキャン結果も並べ替えで維持される。
+    fn resort(&mut self) {
+        let mut filtered = self.base_filtered.clone();
         sort_filtered(&mut filtered, &self.index.entries, self.sort_mode);
         self.filtered = filtered;
         self.selected = 0;
@@ -190,7 +202,7 @@ impl App {
 
     fn cycle_sort_mode(&mut self) {
         self.sort_mode = self.sort_mode.next();
-        self.apply_filter();
+        self.resort();
     }
 
     fn next_game(&mut self) {
@@ -250,9 +262,10 @@ impl App {
                 }
                 KeyCode::Enter => {
                     // `sfen:` だけは即時フィルタではなく Enter で逐次スキャンを起動する。
-                    // SFEN は大文字＝先手・小文字＝後手で意味が変わるため、小文字化する
-                    // `apply_filter` 経路ではなく生の `filter_input` から取り出す。
-                    if let Some(sfen) = self.filter_input.strip_prefix("sfen:") {
+                    // 値（SFEN 本体）は大文字＝先手・小文字＝後手で意味が変わるため、小文字化する
+                    // `apply_filter` 経路ではなく生の `filter_input` から取り出す（プレフィクス
+                    // 判定は他フィルタと揃えて大小無視）。
+                    if let Some(sfen) = sfen_query_from_input(&self.filter_input) {
                         let sfen = sfen.to_string();
                         self.start_sfen_scan(&sfen);
                     }
@@ -285,13 +298,15 @@ impl App {
         true
     }
 
-    /// `sfen:` の値から逐次スキャンを開始する（Enter 契機）。空クエリは無視する。
+    /// `sfen:` の値から逐次スキャンを開始する（Enter 契機）。フィールド数が SFEN として
+    /// 不正な入力（3〜4 フィールド以外・空クエリ）は走査せず、その旨をステータスに出す。
     fn start_sfen_scan(&mut self, sfen: &str) {
-        let target = normalize_sfen(sfen);
-        if target.is_empty() {
-            self.status = "SFEN 局面検索: クエリが空です".to_string();
+        let Some(target) = parse_sfen_query(sfen) else {
+            self.status =
+                "SFEN 局面検索: SFEN が不正です（盤面 手番 持駒 [手数] の 3〜4 フィールド）"
+                    .to_string();
             return;
-        }
+        };
         self.scan = Some(SfenScan {
             target,
             next: 0,
@@ -324,15 +339,21 @@ impl App {
         }
     }
 
-    /// スキャン完了：一致した対局だけを現在の並び順で `filtered` に反映する。
+    /// スキャン完了：一致した対局だけを絞り込み集合にして現在の並び順で反映する。以後の
+    /// 並べ替え（`s`）は `base_filtered` を再ソートするので、この結果は失われない。
     fn finish_sfen_scan(&mut self, scan: SfenScan) {
         let count = scan.matches.len();
-        let mut filtered = scan.matches;
-        sort_filtered(&mut filtered, &self.index.entries, self.sort_mode);
-        self.filtered = filtered;
-        self.selected = 0;
-        self.load_selected();
-        self.status = format!("SFEN 局面検索: {count} 件一致");
+        self.base_filtered = scan.matches;
+        self.status.clear();
+        self.resort();
+        // `resort`→`load_selected` が先頭対局の読み込みエラーを status に残した場合は
+        // 上書きせず、件数を前置きして両方見えるようにする。
+        let headline = format!("SFEN 局面検索: {count} 件一致");
+        self.status = if self.status.is_empty() {
+            headline
+        } else {
+            format!("{headline}（{}）", self.status)
+        };
     }
 
     /// 走査中のスキャンを中断する（`filtered` は開始前のまま）。
@@ -504,6 +525,33 @@ fn entry_matches(index: &GameIndex, entry: &GameIndexEntry, filter: Filter<'_>) 
 /// 大文字＝先手駒・小文字＝後手駒で意味が変わるので、`/` フィルタと違い小文字化はしない。
 fn normalize_sfen(s: &str) -> String {
     s.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+}
+
+/// ユーザー入力の SFEN クエリを検証し、比較キー（`normalize_sfen` と同じ 3 フィールド）を返す。
+/// 受け付けるのは「盤面 手番 持駒」の 3 フィールド、または末尾に手数を足した 4 フィールド
+/// （手数は数値、比較では無視）のみ。それ以外（フィールド不足・余剰・手数が非数値）は `None`
+/// を返し、呼び出し側で走査せずエラー表示する（無駄な全走査と余剰フィールドの誤ヒットを防ぐ）。
+fn parse_sfen_query(s: &str) -> Option<String> {
+    let fields: Vec<&str> = s.split_whitespace().collect();
+    match fields.as_slice() {
+        [board, side, hands] => Some(format!("{board} {side} {hands}")),
+        [board, side, hands, moveno] if moveno.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(format!("{board} {side} {hands}"))
+        }
+        _ => None,
+    }
+}
+
+/// `filter_input` が（プレフィクスのみ大小無視で）`sfen:` なら、値部分（原文＝大小保持）を返す。
+/// 即時フィルタは小文字化後に `sfen` を認識するので、Enter 経路とステータス表示もプレフィクス
+/// だけは同様に大小無視にして揃える（`SFEN:` で即時表示は絞られないのに Enter が無反応になる
+/// 不一致を防ぐ）。値の SFEN 本体は大小に意味があるので原文のまま返す。
+fn sfen_query_from_input(input: &str) -> Option<&str> {
+    let prefix = "sfen:";
+    match input.get(..prefix.len()) {
+        Some(head) if head.eq_ignore_ascii_case(prefix) => input.get(prefix.len()..),
+        _ => None,
+    }
 }
 
 /// 対局中のいずれかの着手前局面が `target`（正規化済み SFEN）と一致するか。
@@ -911,7 +959,7 @@ fn draw_status_bar(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
         return;
     }
     let text = match &app.mode {
-        Mode::Filter if app.filter_input.starts_with("sfen:") => format!(
+        Mode::Filter if sfen_query_from_input(&app.filter_input).is_some() => format!(
             "SFEN 局面検索: {}_   （Enter で全 {} 対局を走査 / 手数は無視）",
             app.filter_input,
             app.index.entries.len()
@@ -1463,6 +1511,15 @@ mod tests {
     struct FakeSource {
         /// 各対局の着手前 SFEN 列。
         games: Vec<Vec<String>>,
+        /// `load_game` が `Err` を返す対局 ordinal（照合対象から除外する分岐の検証用）。
+        error_ordinals: Vec<usize>,
+    }
+
+    fn fake_source(games: Vec<Vec<String>>) -> FakeSource {
+        FakeSource {
+            games,
+            error_ordinals: Vec::new(),
+        }
     }
 
     impl GameSource for FakeSource {
@@ -1494,6 +1551,9 @@ mod tests {
             let GameSourceRef::Psv { ordinal, .. } = entry.source else {
                 unreachable!("FakeSource yields only Psv refs");
             };
+            if self.error_ordinals.contains(&(ordinal as usize)) {
+                anyhow::bail!("synthetic load error for game {ordinal}");
+            }
             let moves = self.games[ordinal as usize].iter().map(|s| move_with_sfen(s)).collect();
             Ok(GameRecord {
                 moves,
@@ -1502,44 +1562,158 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sfen_scan_filters_to_games_containing_position() {
-        // game 0/2 は探索局面を含む（2 は手数だけ違う）。game 1 は含まない。
-        let source = FakeSource {
-            games: vec![
-                vec![
-                    "9/9/9/9/9/9/9/9/9 b - 1".to_string(),
-                    HIRATE_SFEN.to_string(),
-                ],
-                vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()],
-                vec![
-                    "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 40".to_string(),
-                ],
-            ],
-        };
-        let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
-
-        app.start_sfen_scan(HIRATE_SFEN);
+    /// スキャンが有限回で完了するまで進める。
+    fn drain_scan(app: &mut App) {
         let mut guard = 0;
         while app.scan.is_some() {
             app.advance_sfen_scan();
             guard += 1;
-            assert!(guard < 100, "スキャンが有限回で終わる");
+            assert!(guard < 1000, "スキャンが有限回で終わる");
         }
+    }
+
+    #[test]
+    fn parse_sfen_query_validates_field_count() {
+        assert_eq!(parse_sfen_query("9/9/9 b -"), Some("9/9/9 b -".to_string()));
+        assert_eq!(parse_sfen_query("9/9/9 b - 1"), Some("9/9/9 b -".to_string()));
+        // 手数だけ違っても同じ比較キーになる。
+        assert_eq!(parse_sfen_query("9/9/9 b - 1"), parse_sfen_query("9/9/9 b - 42"));
+        // フィールド不足・余剰・手数が非数値・空は None（走査しない）。
+        assert_eq!(parse_sfen_query("9/9/9 b"), None);
+        assert_eq!(parse_sfen_query("9/9/9"), None);
+        assert_eq!(parse_sfen_query("9/9/9 b - 1 garbage"), None);
+        assert_eq!(parse_sfen_query("9/9/9 b - x"), None);
+        assert_eq!(parse_sfen_query(""), None);
+    }
+
+    #[test]
+    fn sfen_query_prefix_is_case_insensitive_but_value_is_preserved() {
+        assert_eq!(sfen_query_from_input("sfen:9/9/9 b - 1"), Some("9/9/9 b - 1"));
+        // プレフィクスは大小無視、値（大文字＝先手駒）は原文のまま。
+        assert_eq!(sfen_query_from_input("SFEN:LNSG b - 1"), Some("LNSG b - 1"));
+        assert_eq!(sfen_query_from_input("Sfen:x"), Some("x"));
+        assert_eq!(sfen_query_from_input("pair:4"), None);
+        assert_eq!(sfen_query_from_input("sfe"), None);
+        // マルチバイト先頭でも panic しない。
+        assert_eq!(sfen_query_from_input("日本語"), None);
+    }
+
+    #[test]
+    fn sfen_scan_filters_to_games_containing_position() {
+        // game 0/2 は探索局面を含む（2 は手数だけ違う）。game 1 は含まない。
+        let source = fake_source(vec![
+            vec![
+                "9/9/9/9/9/9/9/9/9 b - 1".to_string(),
+                HIRATE_SFEN.to_string(),
+            ],
+            vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()],
+            vec!["lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 40".to_string()],
+        ]);
+        let index = source.build_index().expect("build_index");
+        let mut app = App::new(Box::new(source), index);
+
+        app.start_sfen_scan(HIRATE_SFEN);
+        drain_scan(&mut app);
         assert_eq!(app.filtered, vec![0, 2], "探索局面を含む対局だけに絞られる");
         assert!(app.status.contains("2 件"), "一致件数を表示: {}", app.status);
     }
 
     #[test]
-    fn empty_sfen_query_does_not_start_scan() {
+    fn sfen_scan_spans_multiple_chunks() {
+        // SFEN_SCAN_CHUNK を超える対局数で、tick 跨ぎの take/書き戻しと一致蓄積を検証する。
+        let n = SFEN_SCAN_CHUNK * 2 + 5;
+        let mut games = vec![vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()]; n];
+        games[5] = vec![HIRATE_SFEN.to_string()];
+        games[SFEN_SCAN_CHUNK + 3] =
+            vec!["lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 7".to_string()];
+        let source = fake_source(games);
+        let index = source.build_index().expect("build_index");
+        let mut app = App::new(Box::new(source), index);
+
+        app.start_sfen_scan(HIRATE_SFEN);
+        let mut ticks = 0;
+        while app.scan.is_some() {
+            app.advance_sfen_scan();
+            ticks += 1;
+            assert!(ticks < 1000, "有限回で終わる");
+        }
+        assert!(ticks >= 2, "複数 tick に跨る (実測 {ticks})");
+        assert_eq!(
+            app.filtered,
+            vec![5, SFEN_SCAN_CHUNK + 3],
+            "chunk 跨ぎでも一致を取りこぼさない"
+        );
+    }
+
+    #[test]
+    fn cancel_sfen_scan_keeps_prior_filter() {
+        let n = SFEN_SCAN_CHUNK * 2;
+        let source = fake_source(vec![vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()]; n]);
+        let index = source.build_index().expect("build_index");
+        let mut app = App::new(Box::new(source), index);
+        let before = app.filtered.clone();
+
+        app.start_sfen_scan(HIRATE_SFEN);
+        app.advance_sfen_scan(); // 1 チャンクだけ進め、未完了のまま中断する。
+        assert!(app.scan.is_some(), "まだ走査途中");
+        app.cancel_sfen_scan();
+        assert!(app.scan.is_none());
+        assert_eq!(app.filtered, before, "中断時は絞り込みが実行前のまま");
+    }
+
+    #[test]
+    fn sfen_scan_skips_games_that_fail_to_load() {
+        // game 1 は探索局面を含むが load_game が Err → 照合対象から除外。game 2 は含み load 成功。
         let source = FakeSource {
-            games: vec![vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()]],
+            games: vec![
+                vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()],
+                vec![HIRATE_SFEN.to_string()],
+                vec![HIRATE_SFEN.to_string()],
+            ],
+            error_ordinals: vec![1],
         };
         let index = source.build_index().expect("build_index");
         let mut app = App::new(Box::new(source), index);
-        app.start_sfen_scan("   ");
+        app.start_sfen_scan(HIRATE_SFEN);
+        drain_scan(&mut app);
+        assert_eq!(app.filtered, vec![2], "load 失敗の対局は一致に含めない");
+    }
+
+    #[test]
+    fn sort_after_sfen_scan_preserves_matches() {
+        // スキャン後に `s`（並べ替え）を押しても絞り込み結果が全件に戻らないこと（回帰）。
+        let source = fake_source(vec![
+            vec![
+                "9/9/9/9/9/9/9/9/9 b - 1".to_string(),
+                HIRATE_SFEN.to_string(),
+            ],
+            vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()],
+            vec!["lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 40".to_string()],
+        ]);
+        let index = source.build_index().expect("build_index");
+        let mut app = App::new(Box::new(source), index);
+        // Enter 経由と同じく filter_input を残したままスキャン（`s` の再フィルタ源）。
+        app.filter_input = format!("sfen:{HIRATE_SFEN}");
+        app.start_sfen_scan(HIRATE_SFEN);
+        drain_scan(&mut app);
+        assert_eq!(app.filtered, vec![0, 2]);
+
+        app.cycle_sort_mode();
+        let mut got = app.filtered.clone();
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 2], "並べ替えでスキャン結果が維持される（全件に戻らない）");
+    }
+
+    #[test]
+    fn invalid_sfen_query_does_not_start_scan() {
+        let source = fake_source(vec![vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()]]);
+        let index = source.build_index().expect("build_index");
+        let mut app = App::new(Box::new(source), index);
+        app.start_sfen_scan("   "); // 空
         assert!(app.scan.is_none(), "空クエリではスキャンを開始しない");
+        assert!(app.status.contains("不正"), "不正入力はエラー表示: {}", app.status);
+        app.start_sfen_scan("9/9/9 b"); // フィールド不足
+        assert!(app.scan.is_none(), "フィールド不足ではスキャンを開始しない");
     }
 
     #[test]
