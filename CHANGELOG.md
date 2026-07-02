@@ -7,26 +7,107 @@ marker として `vX.Y.Z` を打つ。crates.io 上の `rshogi-core` は別系�
 運用しており、library API の互換性は core のバージョンで判断する
 (`crates/rshogi-core/Cargo.toml`)。
 
-## Unreleased
+## v1.2.0 — 2026-07-03
 
-### ビルド (feature / edition 命名の de-abbreviate)
+v1.1.0 後の機能追加 + パフォーマンス改善リリース。教師データ品質パイプライン
+(prep_hcpe / rescore_hcpe / teacher_labeler / yardstick_label・score) と棋譜レビュー用
+TUI (kifu_player) が新規追加の中心。パフォーマンス面は rescore_psv / psv_to_hcpe3 の
+教師データツール群で複数の高速化 (最大 ~30x) を実施。
 
-- Cargo feature / preset edition 名から省略形 `ls-` / `ext` を排し、自己説明的な
-  名前へ移行した。互換 alias は残さないため、旧名を直接指定する build invocation は
-  新名へ更新が必要:
-  - `ls-arch` → `layerstack-arch`
-  - `ls-size-<dims>` → `layerstacks-<dims>` (例: `ls-size-1536x16x32` → `layerstacks-1536x16x32`)
-  - `ls-ext-psqt` / `ls-ext-threat` → `nnue-psqt` / `nnue-threat`
-  - 旧 alias `layerstack-only` 廃止 (`layerstack-arch` を使う)
-  - `edition-ls-…` → `edition-layerstacks-…`
-- 軸分離 (architecture / size / ext) の設計は不変。NNUE 標準語 (HalfKA / HalfKP /
-  HM / FT / PSQT) は読みやすさのため維持。
+### パフォーマンス改善
 
-### NNUE
+- **rescore_psv: ONNX 推論の複数セッション in-flight 多重化** (`--onnx-sessions`, #845):
+  単一セッションでは H2D→compute→D2H が完全直列になり GPU アイドルが生じていた
+  (nsys 実測: kernel/memcpy overlap 0ms, GPU idle 22%)。別 CUDA ストリームに multiplex
+  する複数セッション供給に再構成。
+  実測値: 208-213k pos/s → 237-242k pos/s (**+15%**)。GPU util 95% → 100%、消費電力
+  548W → 575W (TGP 上限)。出力は sessions 数に依存せず bit 一致。
+  (実測: RTX 5090 (native), TRT fp16, cached engine, 10M 局面 / commit bad207c2)
 
-- LayerStack `1024x16x32` (FT_OUT=1024, L1=16, L2=32) size variant を追加。
-  preset `edition-layerstacks-halfka_hm_merged-1024x16x32-none`。L1=16 系で既存
-  const generic を流用するため inference kernel の追加なし。
+- **rescore_psv: 入力/出力 host バッファの CUDA pinned 化** (#812 相当 / 703cb185, 6bb066e5):
+  pageable バッファでは `cudaMemcpyAsync` が pageable→pinned staging で実質同期化し、
+  nsys で全処理の ~96% を占めていた。pinned 化で真の async 転送に変更。
+  実測値 (2M records, batch1024, min-of-3): TensorRT FP16 132k → 167k pos/s (**+26%**) /
+  CUDA EP FP32 45k → 54k pos/s (**+21%**)。出力バッファも同様に pinned 化 (#837)。
+  (実測: RTX 5090 (WSL2) / commit 6bb066e5, 703cb185)
+
+- **rescore_psv: ONNX producer の set_from_parts 化**（String 往復除去, #838）/
+  **内部 NNUE 評価の parts 直接構築**（#815）: `unpack_sfen→String→set_sfen` の局面復元を
+  `unpack_sfen_to_parts→set_from_parts` 直接構築に置換し per-record の文字列確保を排除。
+  静的 NNUE 評価や producer 側の read/build 処理を大きく高速化した（出力は bit 一致を維持）。
+  (commit 927863fb, 15d4273e)
+
+- **psv_to_hcpe3: PSV→hcp 直接展開**（+ evalfix bake, #814）: convert ホットパスの
+  `unpack_sfen→String→set_sfen→pack_position_hcp` 往復を排除し
+  `unpack_sfen_to_parts→pack_hcp_from_parts` で直接 hcp 化。文字列往復除去により変換処理を
+  大幅に高速化した（出力は bit 一致を維持）。(commit c58c59b5)
+
+- **rescore_psv: dlshogi-ONNX 供給の GPU 推論パイプライン化**: CPU 前処理と GPU 推論を
+  producer/consumer に分離しオーバーラップさせ、GPU アイドル区間を解消。
+  実測値 (DL_suisho15b, BS=1024, 500k records): 60.6s → 52.2s (**-14%, pos/s +16%**)。
+  GPU util 91.9% → 97.3%、boost clock 1695→1929 MHz を維持。
+  (実測: RTX 3080 Ti / commit 74b7bd82)
+
+- **threat 評価: find_usable_accumulator の遡及深さを runtime has_threat で可変化**:
+  threat モデルと非 threat モデルとで最適な遡及深さが異なる非対称性を確認し、
+  compile-time feature でなく runtime 分岐に変更。両モデルそれぞれで最適な深さを選択できる
+  ようになった（accumulator 値は不変、bit-identical を確認）。
+
+- **extract_bench_positions: streaming reservoir sampling 化**（メモリ入力非依存, #770）:
+  全局面を Vec に蓄積してから層化サンプルする load-all 設計を Algorithm R の reservoir
+  sampling に変更。ピークメモリ使用量を入力サイズに依存しない形に削減した（出力件数・
+  sign_validation は旧設計と完全一致、同一 seed での決定性も維持）。
+
+### 新機能
+
+- **kifu_player: PSV / tournament JSONL 共通の棋譜プレイヤー TUI** (#839, #841, #842, #843):
+  棋譜を盤面付きで再生・レビューする TUI を新規追加。その後 CSA 入力対応と派生指標での
+  ソート・検索 (Tier1+2)、盤面/指し手表示のブラッシュアップを追加 PR で拡張。
+
+- **教師データ品質パイプライン一式**: hcpe3 教師形式（各手に MultiPV soft policy, gensfen
+  側 5a3ae197）、prep_hcpe（hcpe 教師の汚染除去・重複除去・shuffle・分割, b0f818ac）、
+  共有ラベリングコア teacher_labeler + rescore_hcpe（intra-chunk resume 対応込み, ba27b160
+  他）、ラベル品質「物差し」ハーネス yardstick_label/score（ONNX labeler モード・
+  --capture-depths depth sweep・--spsa-params 対応込み, 37dcf9e7 他）、ベンチ局面
+  ground truth ラベラー label_bench_positions / DL水匠リスコアラ label_bench_dl（#769,
+  #772, #773）を新規追加。教師データの生成・清浄化・評価を一通りツール化。
+
+- **NNUE: Threat 特徴量の拡張**: Threat cross-side profile (id10) 追加 + arch_str dims
+  照合で load 堅牢化（cc032cdf）、threat profile step-attacker (slider attacker 除外,
+  id3/33408) を engine に追加（7b8c5b34）。対応する preset edition
+  (`edition-layerstacks-halfka_hm_merged-1024x16x32-threat`, #822) も追加。
+
+- **NNUE: LayerStack size variant 追加**: `1024x16x32`（FT_OUT=1024, L1=16, L2=32,
+  既存 const generic 流用のため inference kernel 追加なし）、`768x8x32`（#775, #776）
+  の 2 size variant を追加。
+
+- **ビルド: feature / edition 命名の de-abbreviate**: Cargo feature / preset edition 名
+  から省略形 `ls-` / `ext` を排し自己説明的な名前へ移行（互換 alias なし、破壊的リネーム）。
+  `ls-arch`→`layerstack-arch`、`ls-size-<dims>`→`layerstacks-<dims>`、
+  `ls-ext-psqt`/`ls-ext-threat`→`nnue-psqt`/`nnue-threat`、
+  `edition-ls-…`→`edition-layerstacks-…`。旧名を直接指定する build invocation は要更新。
+
+- **tournament: per-engine `--engine-nodes`** を追加（zero-node 棄却・meta 記録込み）。
+
+- **csa-client**: `--target` preset 接続先をカスタムドメインに変更、
+  `analyze_selfplay` 互換 JSONL 出力を既定 ON 化 (#768)。
+
+### その他 (fix / refactor / docs / ci)
+
+- fix(csa-server): cold-start 復元後の turn alarm 誤発火・viewer キャッシュ 500 エラーを修正
+  (#780, #798, 013b0d39)。
+- fix(search): SE 探索爆発による fixed-depth 非終了バグを修正、rtime+depth の打ち切り予算
+  除外。
+- fix(nnue): AVX-512 ビルドで OUTPUT_DIM=8 の AffineTransform が誤 eval を返す不具合を修正
+  (0c18dee9)。
+- fix(tools): psv_to_hcpe3 の成り手 move16 変換バグ、hcpe3 policy 負け詰み符号バグ (#817)、
+  floodgate URL/index 形式 rot 対応など多数の tools 側バグ修正。
+- fix(deps): RUSTSEC-2026-0190 (anyhow), RUSTSEC-2026-0185 (quinn-proto) 対応。
+- refactor(nnue): AffineTransform 重みレイアウト判定の一元化、LayerStack enum 整理。
+- ci: GitHub Actions の commit SHA pin 化、NNUE wasm/SIMD (Intel SDE) runtime 検証 job 追加。
+- build(tools): reqwest を rustls-tls 化し openssl-sys 依存を除去。
+- docs: skills (教師データ一括変換・再評価、selfplay、edition-build)、csa-server/client
+  運用ガイド、usi-perf-measure のハマりどころ追記など多数の doc 整備。
 
 ## v1.1.0 — 2026-06-02
 
