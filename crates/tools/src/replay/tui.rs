@@ -75,16 +75,22 @@ enum SortMode {
     Discovery,
     /// エラー→黒勝ち→白勝ち→引き分け→不明の順にグルーピング。
     Outcome,
-    /// JSONL のペアファイル（`file_idx`）単位でグルーピング。PSV は全件 1 グループ。
-    EnginePair,
+    /// 対局長（手数）の降順。
+    Length,
+    /// 決着の大きさ（`|final_cp|`）の降順。評価値の無い対局は末尾。
+    Decisiveness,
+    /// 評価値の振れ幅（`max_swing_cp`）の降順。評価値の無い対局は末尾。
+    Swing,
 }
 
 impl SortMode {
     fn next(self) -> Self {
         match self {
             SortMode::Discovery => SortMode::Outcome,
-            SortMode::Outcome => SortMode::EnginePair,
-            SortMode::EnginePair => SortMode::Discovery,
+            SortMode::Outcome => SortMode::Length,
+            SortMode::Length => SortMode::Decisiveness,
+            SortMode::Decisiveness => SortMode::Swing,
+            SortMode::Swing => SortMode::Discovery,
         }
     }
 
@@ -92,7 +98,9 @@ impl SortMode {
         match self {
             SortMode::Discovery => "発見順",
             SortMode::Outcome => "勝敗別",
-            SortMode::EnginePair => "エンジンペア別",
+            SortMode::Length => "対局長",
+            SortMode::Decisiveness => "決着の大きさ",
+            SortMode::Swing => "評価値振れ幅",
         }
     }
 }
@@ -265,7 +273,9 @@ fn outcome_keyword(entry: &GameIndexEntry) -> &'static str {
 fn jsonl_game_id(entry: &GameIndexEntry) -> Option<u32> {
     match entry.source {
         GameSourceRef::Jsonl { game_id, .. } => Some(game_id),
-        GameSourceRef::Psv { .. } => None,
+        // CSA は 1 ファイル = 1 対局で `game_id` を持たない（番号検索は ordinal ベースで
+        // 別途扱う）。
+        GameSourceRef::Psv { .. } | GameSourceRef::Csa { .. } => None,
     }
 }
 
@@ -273,8 +283,10 @@ fn jsonl_game_id(entry: &GameIndexEntry) -> Option<u32> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Filter<'a> {
     Empty,
-    /// `pair:4` 等の `field:value` 構文。指定フィールドの完全一致のみを見る。
+    /// `pair:4` 等の `field:value` 構文。指定フィールドの完全一致・比較・別名判定を見る。
     Field(FieldKind, &'a str),
+    /// `reversal`/`decisive` 等、値を取らない述語。
+    Keyword(KeywordKind),
     /// prefix 無しで数字のみのクエリ。ラベル部分一致を無効化し、数値フィールドの
     /// 完全一致のみを見る（`vol4B_raw` のようにラベルに数字を含むデータで
     /// `pair_index=4` のつもりの `"4"` がラベルにも部分一致してしまう問題への対応）。
@@ -291,6 +303,20 @@ enum FieldKind {
     Id,
     Outcome,
     Label,
+    /// `winner:sente|gote`（`black|white` も可）。勝者側で絞り込む。
+    Winner,
+    /// `len:>N|<N|N`。手数で絞り込む。
+    Len,
+    /// `swing:>N|<N|N`。評価値振れ幅（`max_swing_cp`）で絞り込む。
+    Swing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeywordKind {
+    /// 両者が優勢になった局面がある（形勢逆転棋譜）。
+    Reversal,
+    /// 勝敗が付いた（引き分け・エラー・不明でない）。
+    Decisive,
 }
 
 /// 検索クエリを解析する。`query` は呼び出し側で既に小文字化済みの前提。
@@ -306,16 +332,35 @@ fn parse_filter(query: &str) -> Filter<'_> {
             "id" => Some(FieldKind::Id),
             "outcome" => Some(FieldKind::Outcome),
             "label" => Some(FieldKind::Label),
+            "winner" => Some(FieldKind::Winner),
+            "len" => Some(FieldKind::Len),
+            "swing" => Some(FieldKind::Swing),
             _ => None,
         };
         if let Some(field) = field {
             return Filter::Field(field, value);
         }
     }
+    match query {
+        "reversal" => return Filter::Keyword(KeywordKind::Reversal),
+        "decisive" => return Filter::Keyword(KeywordKind::Decisive),
+        _ => {}
+    }
     if query.bytes().all(|b| b.is_ascii_digit()) {
         return Filter::NumericExact(query);
     }
     Filter::Text(query)
+}
+
+/// `>N` / `<N` / `N` の比較指定に `actual` が一致するか。パースできない指定は不一致。
+fn matches_numeric_cmp(actual: u32, spec: &str) -> bool {
+    if let Some(n) = spec.strip_prefix('>') {
+        n.parse::<u32>().is_ok_and(|n| actual > n)
+    } else if let Some(n) = spec.strip_prefix('<') {
+        n.parse::<u32>().is_ok_and(|n| actual < n)
+    } else {
+        spec.parse::<u32>().is_ok_and(|n| actual == n)
+    }
 }
 
 fn entry_matches(index: &GameIndex, entry: &GameIndexEntry, filter: Filter<'_>) -> bool {
@@ -330,6 +375,19 @@ fn entry_matches(index: &GameIndex, entry: &GameIndexEntry, filter: Filter<'_>) 
         Filter::Field(FieldKind::Outcome, v) => outcome_keyword(entry).contains(v),
         Filter::Field(FieldKind::Label, v) => {
             display_label(index, entry).to_lowercase().contains(v)
+        }
+        Filter::Field(FieldKind::Winner, v) => match entry.outcome {
+            Some(GameOutcomeView::Win(Color::Black)) => v == "sente" || v == "black",
+            Some(GameOutcomeView::Win(Color::White)) => v == "gote" || v == "white",
+            _ => false,
+        },
+        Filter::Field(FieldKind::Len, v) => matches_numeric_cmp(entry.ply_count, v),
+        Filter::Field(FieldKind::Swing, v) => {
+            entry.metrics.max_swing_cp.is_some_and(|s| matches_numeric_cmp(s, v))
+        }
+        Filter::Keyword(KeywordKind::Reversal) => entry.metrics.had_reversal(REVERSAL_THRESHOLD_CP),
+        Filter::Keyword(KeywordKind::Decisive) => {
+            !entry.error && matches!(entry.outcome, Some(GameOutcomeView::Win(_)))
         }
         Filter::NumericExact(v) => [
             entry.pair_index,
@@ -362,12 +420,20 @@ fn outcome_sort_key(entry: &GameIndexEntry) -> u8 {
 /// `filtered`（`index.entries` への index 列）を `mode` に従って安定ソートする。
 /// 安定ソートなので、同一キー内の相対順は呼び出し前の順序（発見順）を維持する。
 fn sort_filtered(filtered: &mut [usize], entries: &[GameIndexEntry], mode: SortMode) {
+    use std::cmp::Reverse;
+    // 指標ソートは降順。評価値の無い対局（None）は末尾へ寄せる（`is_none` を第 1 キーに）。
     match mode {
         SortMode::Discovery => {}
         SortMode::Outcome => filtered.sort_by_key(|&i| outcome_sort_key(&entries[i])),
-        SortMode::EnginePair => {
-            filtered.sort_by_key(|&i| entries[i].file_idx().unwrap_or(usize::MAX))
-        }
+        SortMode::Length => filtered.sort_by_key(|&i| Reverse(entries[i].ply_count)),
+        SortMode::Decisiveness => filtered.sort_by_key(|&i| {
+            let m = entries[i].metrics.final_cp;
+            (m.is_none(), Reverse(m.map(|c| c.unsigned_abs()).unwrap_or(0)))
+        }),
+        SortMode::Swing => filtered.sort_by_key(|&i| {
+            let m = entries[i].metrics.max_swing_cp;
+            (m.is_none(), Reverse(m.unwrap_or(0)))
+        }),
     }
 }
 
@@ -580,6 +646,9 @@ const GRAPH_CP_CLAMP: f64 = 3000.0;
 /// 「評価値が大きく動いた手」とみなす |Δcp| の閾値。歩2枚分の評価値変動を目安にした固定値。
 const EVAL_SWING_THRESHOLD_CP: f64 = 200.0;
 
+/// `reversal` 検索の閾値。両者がこの cp 以上優勢になった局面があれば形勢逆転とみなす。
+const REVERSAL_THRESHOLD_CP: i32 = 300;
+
 /// 手番相対の生スコアから、先手固定 POV の打点値を導出する。
 /// プラス = 先手優勢、マイナス = 後手優勢（design doc「評価値グラフ」節参照）。
 /// `score_cp`/`score_mate` が両方とも無い手は `None`（打点をスキップする）。
@@ -602,10 +671,8 @@ fn black_pov_cp(mv: &MoveView) -> Option<f64> {
     Some(black_pov.clamp(-GRAPH_CP_CLAMP, GRAPH_CP_CLAMP))
 }
 
-/// `game.moves` と同じ長さ・同じ並びの打点列（評価値が無い手は `None`）。
-/// 「手」のインデックスで隣接判定するために、評価値の有無でフィルタした
-/// flat なリストにはしない（フィルタ後に隣接させると、評価値が欠けた手を
-/// 挟んだ前後の手が直線で繋がってしまい、欠損が無かったように見えてしまう）。
+/// `game.moves` と同じ長さ・同じ並びの打点列（評価値が無い手は `None`）。評価値付きの手の
+/// 元インデックスを保つため flat にしない（`evaluated_points` が index 付きで使う）。
 fn eval_points(game: &GameRecord) -> Vec<Option<(f64, f64, Color)>> {
     game.moves
         .iter()
@@ -651,8 +718,7 @@ fn draw_eval_graph(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
         frame.render_widget(Paragraph::new("(対局を選択してください)").block(block), area);
         return;
     };
-    let aligned = eval_points(game);
-    let plotted: Vec<(f64, f64, Color)> = aligned.iter().filter_map(|p| *p).collect();
+    let plotted: Vec<(f64, f64, Color)> = eval_points(game).into_iter().flatten().collect();
     if plotted.len() < 2 {
         frame.render_widget(Paragraph::new("(表示できる評価値がありません)").block(block), area);
         return;
@@ -679,12 +745,13 @@ fn draw_eval_graph(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
                 y2: 0.0,
                 color: RColor::DarkGray,
             });
-            // 着手側で色分けした線分（着手後の評価値を、その着手側の色で結ぶ）。
-            // 評価値の無い手を挟む区間は線を引かない（隣接する「手」同士のみ結ぶ）。
-            for pair in aligned.windows(2) {
-                let (Some((x1, y1, _)), Some((x2, y2, side2))) = (pair[0], pair[1]) else {
-                    continue;
-                };
+            // 評価値付きの手を出現順に結ぶ（着手後の評価値を、その着手側の色で）。CSA のように
+            // 片側エンジンしか評価値を書かない棋譜では評価値が 1 手おきになり、「手インデックスで
+            // 隣接」を結ぶと隣り合う評価値付きの手が無く線が 1 本も引けないため、評価値付きの手の
+            // 並びで隣接を結ぶ（X 軸は ply なので欠けた手の区間はそのぶん横に広い線分になる）。
+            for pair in plotted.windows(2) {
+                let (x1, y1, _) = pair[0];
+                let (x2, y2, side2) = pair[1];
                 let color = if side2 == Color::Black {
                     RColor::Yellow
                 } else {
@@ -713,7 +780,11 @@ fn draw_eval_graph(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
 
 fn draw_status_bar(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let text = match &app.mode {
-        Mode::Filter => format!("検索: {}_", app.filter_input),
+        Mode::Filter => format!(
+            "検索 [id: pair: outcome: winner:sente|gote len:>N swing:>N reversal label:]: {}_   （一致 {}件）",
+            app.filter_input,
+            app.filtered.len()
+        ),
         Mode::Help => "何かキーを押すとヘルプを閉じます".to_string(),
         Mode::Browse => {
             // 通常時はヘルプを行頭に固定する（手を動かしても位置がずれないよう、可変長の
@@ -745,17 +816,24 @@ fn draw_help_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Line::from("n        次の評価値急変手へジャンプ"),
         Line::from("N        前の評価値急変手へジャンプ"),
         Line::from(format!(
-            "s        対局リストの並べ替えを切り替え（{}/{}/{}）",
+            "s        対局リストの並べ替えを切り替え（{}/{}/{}/{}/{}）",
             SortMode::Discovery.label(),
             SortMode::Outcome.label(),
-            SortMode::EnginePair.label()
+            SortMode::Length.label(),
+            SortMode::Decisiveness.label(),
+            SortMode::Swing.label()
         )),
         Line::from("/        検索・フィルタ入力（Enter/Esc で終了、Esc はクリアも兼ねる）"),
         Line::from("?        このヘルプの表示・終了"),
         Line::from("q / Esc  終了（ヘルプ表示中は閉じるだけ）"),
         Line::from(""),
         Line::from("検索構文: pair:<n> slot:<n> startpos:<n> id:<n> outcome:<kw> label:<text>"),
-        Line::from("prefix 無しで数字のみを入力すると、上記フィールドの完全一致のみで絞り込みます"),
+        Line::from(
+            "          winner:sente|gote  len:>N|<N|N  swing:>N  reversal  decisive|draw|error",
+        ),
+        Line::from(
+            "prefix 無しで数字のみを入力すると、id/pair/slot/startpos の完全一致で絞り込みます",
+        ),
     ];
     let para = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("キーバインド一覧"));
@@ -789,34 +867,34 @@ fn current_move(app: &App) -> Option<&MoveView> {
     app.current_game.as_ref().and_then(|g| g.moves.get(app.current_move))
 }
 
-/// 指し手行に並べる注釈（評価値・探索情報）。engine ラベルは対局ラベルと重複して
-/// 冗長なので出さない。注釈が無い手は空文字を返す（行に何も足さない）。
+/// 指し手行に並べる注釈（評価値・探索情報）。注釈が無い手は空文字を返す（行に何も足さない）。
+/// engine 名や think limit は対局ラベルと重複・誤解を招くため `MoveAnnotation` に持たせない。
 fn annotation_inline(mv: &MoveView) -> String {
     let a = &mv.annotation;
     let mut parts = Vec::new();
+    // 評価値・詰みは手番相対（USI）で格納しているので、グラフと同じ先手基準（＋先手良し／
+    // －後手良し）へ変換して表示する。手番相対のままだと手番交代のたびに符号が反転して読みにくい。
+    let to_black_pov = |v: i32| if mv.side == Color::White { -v } else { v };
     if let Some(v) = a.score_mate {
-        parts.push(format!("詰み{v:+}"));
+        parts.push(format!("詰み{:+}", to_black_pov(v)));
     } else if let Some(v) = a.score_cp {
-        parts.push(format!("評価値{v:+}"));
+        parts.push(format!("評価値{:+}", to_black_pov(v)));
     }
     if let Some(v) = a.depth {
-        parts.push(format!("depth{v}"));
+        parts.push(format!("depth={v}"));
     }
     if let Some(v) = a.seldepth {
-        parts.push(format!("seldepth{v}"));
+        parts.push(format!("seldepth={v}"));
     }
     if let Some(v) = a.nodes {
-        parts.push(format!("nodes{v}"));
+        parts.push(format!("nodes={v}"));
     }
     if let Some(v) = a.nps {
-        parts.push(format!("nps{v}"));
+        parts.push(format!("nps={v}"));
     }
     if let Some(v) = a.elapsed_ms {
         parts.push(format!("経過{v}ms"));
     }
-    // think_limit_ms（制限）は出さない：depth 制限の対局では書き込み側が既定値を入れる
-    // ため実際の制御（例: depth 15）と乖離して誤解を招く。実消費は 経過 が、時間切れは
-    // TIMEOUT が表す。
     if a.timed_out == Some(true) {
         parts.push("TIMEOUT".to_string());
     }
@@ -1031,7 +1109,7 @@ fn hand_text(pos: &Position, color: Color) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::MoveAnnotation;
+    use super::super::model::{EvalMetrics, MoveAnnotation};
     use super::*;
 
     fn mv(side: Color, score_cp: Option<i32>, score_mate: Option<i32>) -> MoveView {
@@ -1080,6 +1158,7 @@ mod tests {
             pair_index,
             pair_slot,
             startpos_idx,
+            metrics: Default::default(),
         }
     }
 
@@ -1118,9 +1197,9 @@ mod tests {
 
     #[test]
     fn eval_points_preserves_gap_position_for_missing_eval() {
-        // 中央の手だけ評価値が無い対局。draw_eval_graph 側はこの None を
-        // 「前後の手を直線で繋がない」境界として使うため、None の位置が
-        // 元の手の並びと一致していることをここで固定する。
+        // 中央の手だけ評価値が無い対局。eval_points は評価値付きの手の元インデックスを
+        // 保つため None を潰さず、位置が元の手の並びと一致することを固定する
+        // （`evaluated_points` / 評価値急変ジャンプがこの index を使う）。
         let game = GameRecord {
             moves: vec![
                 mv(Color::Black, Some(10), None),
@@ -1134,6 +1213,30 @@ mod tests {
         assert!(points[0].is_some());
         assert!(points[1].is_none(), "評価値の無い手は None のまま保持される");
         assert!(points[2].is_some());
+    }
+
+    #[test]
+    fn eval_graph_connects_one_sided_evals() {
+        // CSA のように片側エンジンしか評価値を書かない棋譜（1 手おきに評価値）。手インデックス
+        // 隣接では隣り合う評価値付きの手が無く線が 1 本も引けないので、draw_eval_graph は
+        // 評価値付きの手を出現順に結ぶ（flat 化した打点列で隣接を取る）。
+        let game = GameRecord {
+            moves: vec![
+                mv_with_ply(1, Color::Black, Some(30), None),
+                mv_with_ply(2, Color::White, None, None),
+                mv_with_ply(3, Color::Black, Some(50), None),
+                mv_with_ply(4, Color::White, None, None),
+                mv_with_ply(5, Color::Black, Some(-20), None),
+            ],
+            leading_gap_is_drop: false,
+        };
+        let plotted: Vec<_> = eval_points(&game).into_iter().flatten().collect();
+        assert_eq!(plotted.len(), 3, "評価値付きの 3 手が打点される（flat 隣接で 2 本の線）");
+        let adjacent_move_pairs = eval_points(&game)
+            .windows(2)
+            .filter(|w| w[0].is_some() && w[1].is_some())
+            .count();
+        assert_eq!(adjacent_move_pairs, 0, "手インデックス隣接では線が引けない（この修正の動機）");
     }
 
     // --- 検索フィルタ (parse_filter / entry_matches) ---
@@ -1217,8 +1320,36 @@ mod tests {
     #[test]
     fn sort_mode_cycles_through_all_variants() {
         assert_eq!(SortMode::Discovery.next(), SortMode::Outcome);
-        assert_eq!(SortMode::Outcome.next(), SortMode::EnginePair);
-        assert_eq!(SortMode::EnginePair.next(), SortMode::Discovery);
+        assert_eq!(SortMode::Outcome.next(), SortMode::Length);
+        assert_eq!(SortMode::Length.next(), SortMode::Decisiveness);
+        assert_eq!(SortMode::Decisiveness.next(), SortMode::Swing);
+        assert_eq!(SortMode::Swing.next(), SortMode::Discovery);
+    }
+
+    fn metric_entry(
+        ply_count: u32,
+        final_cp: Option<i32>,
+        max_swing_cp: Option<u32>,
+    ) -> GameIndexEntry {
+        GameIndexEntry {
+            source: GameSourceRef::Psv {
+                start_record: 0,
+                end_record: 0,
+                ordinal: 0,
+            },
+            outcome: None,
+            error: false,
+            ply_count,
+            pair_index: None,
+            pair_slot: None,
+            startpos_idx: None,
+            metrics: EvalMetrics {
+                final_cp,
+                min_cp: final_cp,
+                max_cp: final_cp,
+                max_swing_cp,
+            },
+        }
     }
 
     #[test]
@@ -1236,16 +1367,62 @@ mod tests {
     }
 
     #[test]
-    fn sort_filtered_by_engine_pair_groups_by_file_idx() {
+    fn sort_filtered_metric_sorts_are_descending_with_none_last() {
         let entries = vec![
-            jsonl_entry(1, None, None, None, None, false, 1),
-            jsonl_entry(2, None, None, None, None, false, 0),
-            jsonl_entry(3, None, None, None, None, false, 1),
-            jsonl_entry(4, None, None, None, None, false, 0),
+            metric_entry(30, Some(50), Some(100)),   // idx 0
+            metric_entry(200, Some(-800), Some(50)), // idx 1
+            metric_entry(100, None, None),           // idx 2: 指標なし
+            metric_entry(80, Some(300), Some(900)),  // idx 3
         ];
-        let mut filtered: Vec<usize> = (0..entries.len()).collect();
-        sort_filtered(&mut filtered, &entries, SortMode::EnginePair);
-        assert_eq!(filtered, vec![1, 3, 0, 2]);
+        let key = |mode| {
+            let mut f: Vec<usize> = (0..entries.len()).collect();
+            sort_filtered(&mut f, &entries, mode);
+            f
+        };
+        // 対局長 降順。
+        assert_eq!(key(SortMode::Length), vec![1, 2, 3, 0]);
+        // |final_cp| 降順、None(idx2) 末尾。|−800| > |300| > |50|。
+        assert_eq!(key(SortMode::Decisiveness), vec![1, 3, 0, 2]);
+        // max_swing_cp 降順、None(idx2) 末尾。900 > 100 > 50。
+        assert_eq!(key(SortMode::Swing), vec![3, 0, 1, 2]);
+    }
+
+    #[test]
+    fn entry_matches_tier2_predicates() {
+        let idx = GameIndex::default();
+        let b_win =
+            jsonl_entry(1, None, None, None, Some(GameOutcomeView::Win(Color::Black)), false, 0);
+        let w_win =
+            jsonl_entry(2, None, None, None, Some(GameOutcomeView::Win(Color::White)), false, 0);
+        let draw = jsonl_entry(3, None, None, None, Some(GameOutcomeView::Draw), false, 0);
+        assert!(entry_matches(&idx, &b_win, parse_filter("winner:sente")));
+        assert!(!entry_matches(&idx, &b_win, parse_filter("winner:gote")));
+        assert!(entry_matches(&idx, &w_win, parse_filter("winner:gote")));
+        // black/white は sente/gote の別名。
+        assert!(entry_matches(&idx, &b_win, parse_filter("winner:black")));
+        assert!(entry_matches(&idx, &w_win, parse_filter("winner:white")));
+        assert!(entry_matches(&idx, &b_win, parse_filter("decisive")));
+        assert!(!entry_matches(&idx, &draw, parse_filter("decisive")));
+
+        let long = metric_entry(150, None, None);
+        assert!(entry_matches(&idx, &long, parse_filter("len:>100")));
+        assert!(!entry_matches(&idx, &long, parse_filter("len:<100")));
+        assert!(entry_matches(&idx, &metric_entry(30, None, None), parse_filter("len:30")));
+
+        let swingy = metric_entry(10, Some(0), Some(500));
+        assert!(entry_matches(&idx, &swingy, parse_filter("swing:>300")));
+        assert!(!entry_matches(&idx, &swingy, parse_filter("swing:>600")));
+
+        let mut rev = metric_entry(10, Some(100), Some(50));
+        rev.metrics.min_cp = Some(-400);
+        rev.metrics.max_cp = Some(400);
+        assert!(entry_matches(&idx, &rev, parse_filter("reversal")));
+        // min=max=100（両者優勢局面なし）は逆転ではない。
+        assert!(!entry_matches(
+            &idx,
+            &metric_entry(10, Some(100), Some(50)),
+            parse_filter("reversal")
+        ));
     }
 
     #[test]
@@ -1380,21 +1557,35 @@ mod tests {
     }
 
     #[test]
-    fn annotation_inline_omits_engine_and_is_empty_without_data() {
+    fn annotation_inline_uses_key_value_and_is_empty_without_data() {
         let mut m = mv_with_ply(1, Color::Black, None, None);
         assert_eq!(annotation_inline(&m), "", "注釈が無ければ空文字（行に何も足さない）");
         m.annotation = MoveAnnotation {
             score_cp: Some(-77),
             depth: Some(15),
-            engine_label: Some("vol4B_nnued15_30m".to_string()),
+            seldepth: Some(20),
             ..Default::default()
         };
         let s = annotation_inline(&m);
-        assert!(s.contains("評価値-77") && s.contains("depth15"), "評価値と探索情報を出す: {s}");
         assert!(
-            !s.contains("engine") && !s.contains("vol4B"),
-            "engine は冗長なので出さない: {s}"
+            s.contains("評価値-77") && s.contains("depth=15") && s.contains("seldepth=20"),
+            "評価値と探索情報を key=value で出す: {s}"
         );
+    }
+
+    #[test]
+    fn annotation_inline_shows_black_pov_score() {
+        // 手番相対で格納した score を、パネルでは先手基準へ変換して表示する（グラフと符号統一）。
+        // 先手手はそのまま。
+        let b = mv_with_ply(1, Color::Black, Some(80), None);
+        assert!(annotation_inline(&b).contains("評価値+80"), "{}", annotation_inline(&b));
+        // 後手手（後手にとって +80）は先手基準で -80。
+        let mut w = mv_with_ply(2, Color::White, Some(80), None);
+        assert!(annotation_inline(&w).contains("評価値-80"), "{}", annotation_inline(&w));
+        // 詰みも先手基準（後手詰みは -）。
+        w.annotation.score_cp = None;
+        w.annotation.score_mate = Some(3);
+        assert!(annotation_inline(&w).contains("詰み-3"), "{}", annotation_inline(&w));
     }
 
     #[test]

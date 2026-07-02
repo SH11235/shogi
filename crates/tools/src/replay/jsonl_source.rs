@@ -19,8 +19,8 @@ use crate::kif::format_move_label;
 use crate::selfplay::EvalLog;
 
 use super::model::{
-    GameIndex, GameIndexEntry, GameOutcomeView, GameRecord, GameSource, GameSourceRef,
-    MoveAnnotation, MoveView, PairFileMeta,
+    EvalAccumulator, GameIndex, GameIndexEntry, GameOutcomeView, GameRecord, GameSource,
+    GameSourceRef, MoveAnnotation, MoveView, PairFileMeta,
 };
 
 pub struct JsonlSource {
@@ -149,11 +149,7 @@ struct MoveLine {
     #[serde(default)]
     elapsed_ms: Option<u64>,
     #[serde(default)]
-    think_limit_ms: Option<u64>,
-    #[serde(default)]
     timed_out: Option<bool>,
-    #[serde(default)]
-    engine: Option<String>,
     #[serde(default)]
     eval: Option<EvalLog>,
 }
@@ -225,6 +221,8 @@ fn index_one_file(
 
     let mut open: HashMap<u32, u64> = HashMap::new();
     let mut closed: HashSet<u32> = HashSet::new();
+    // game_id ごとの評価値指標。move 行は interleave しうるので game_id で束ねる。
+    let mut evals: HashMap<u32, EvalAccumulator> = HashMap::new();
 
     while let Some((line_start, line_len)) = read_line(&mut reader, &mut offset, &mut line_buf)? {
         let value: Value = serde_json::from_slice(&line_buf).with_context(|| {
@@ -243,6 +241,9 @@ fn index_one_file(
                     );
                 }
                 open.entry(game_id).or_insert(line_start);
+                if let Some(cp) = move_black_pov_cp(&value) {
+                    evals.entry(game_id).or_default().push(cp);
+                }
             }
             Some("result") => {
                 let result: ResultLine = serde_json::from_value(value).with_context(|| {
@@ -272,6 +273,7 @@ fn index_one_file(
                     pair_index: result.pair_index,
                     pair_slot: result.pair_slot,
                     startpos_idx: result.startpos_idx,
+                    metrics: evals.remove(&result.game_id).unwrap_or_default().finish(),
                 });
                 closed.insert(result.game_id);
             }
@@ -311,6 +313,19 @@ fn parse_outcome(s: &str) -> Option<GameOutcomeView> {
     }
 }
 
+/// move 行 JSON から評価値を先手視点 cp で取り出す（評価値が無い・範囲外・手番が
+/// `"b"`/`"w"` として読めない場合は `None` でスキップ）。`eval.score_cp` は手番相対（USI）
+/// なので後手番なら符号を反転する。索引時に sfen を parse せず済ませるため、盤面ではなく
+/// `side_to_move` フィールドを使う。
+fn move_black_pov_cp(value: &Value) -> Option<i32> {
+    let cp = i32::try_from(value.get("eval")?.get("score_cp")?.as_i64()?).ok()?;
+    match value.get("side_to_move")?.as_str()? {
+        "b" => Some(cp),
+        "w" => cp.checked_neg(),
+        _ => None,
+    }
+}
+
 fn build_move_view(line: &MoveLine) -> Result<MoveView> {
     let mut pos = Position::new();
     pos.set_sfen(&line.sfen_before)
@@ -340,9 +355,7 @@ fn build_move_view(line: &MoveLine) -> Result<MoveView> {
         nodes: line.eval.as_ref().and_then(|e| e.nodes),
         nps: line.eval.as_ref().and_then(|e| e.nps),
         elapsed_ms: line.elapsed_ms,
-        think_limit_ms: line.think_limit_ms,
         timed_out: line.timed_out,
-        engine_label: line.engine.clone(),
     };
 
     Ok(MoveView {
@@ -404,6 +417,27 @@ mod tests {
         format!(
             r#"{{"type":"result","game_id":{game_id},"outcome":"{outcome}","reason":"r","plies":{plies},"error":{error}}}"#
         )
+    }
+
+    #[test]
+    fn move_black_pov_cp_requires_valid_side_and_range() {
+        use serde_json::json;
+        assert_eq!(
+            move_black_pov_cp(&json!({"side_to_move": "b", "eval": {"score_cp": 120}})),
+            Some(120)
+        );
+        // 後手番は符号反転。
+        assert_eq!(
+            move_black_pov_cp(&json!({"side_to_move": "w", "eval": {"score_cp": 80}})),
+            Some(-80)
+        );
+        // 手番欠落・不明値・評価値なしは先手扱いにせず None でスキップ。
+        assert_eq!(move_black_pov_cp(&json!({"eval": {"score_cp": 120}})), None);
+        assert_eq!(
+            move_black_pov_cp(&json!({"side_to_move": "x", "eval": {"score_cp": 120}})),
+            None
+        );
+        assert_eq!(move_black_pov_cp(&json!({"side_to_move": "b"})), None);
     }
 
     #[test]

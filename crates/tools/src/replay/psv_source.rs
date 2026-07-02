@@ -16,8 +16,8 @@ use crate::kif::format_move_label;
 use crate::packed_sfen::{PackedSfenValue, move16_to_move, unpack_sfen};
 
 use super::model::{
-    GameIndex, GameIndexEntry, GameOutcomeView, GameRecord, GameSource, GameSourceRef,
-    MoveAnnotation, MoveView,
+    EvalAccumulator, EvalMetrics, GameIndex, GameIndexEntry, GameOutcomeView, GameRecord,
+    GameSource, GameSourceRef, MoveAnnotation, MoveView, move_is_legal,
 };
 
 /// 1対局あたりの平均レコード数がこれを下回ったら、連続した自己対局ストリーム
@@ -49,6 +49,8 @@ impl GameSource for PsvSource {
         // 直近に読んだレコードの (game_result, side_to_move)。境界を検出した瞬間、
         // これは「閉じる対局」の最終レコードの値になっている。
         let mut last_result: Option<(i8, Color)> = None;
+        // 現在の対局の評価値指標。score は手番相対なので先手視点へ変換して流す。
+        let mut acc = EvalAccumulator::default();
 
         loop {
             match reader.read_exact(&mut buf) {
@@ -66,11 +68,19 @@ impl GameSource for PsvSource {
                     record_idx,
                     last_result,
                     entries.len() as u32,
+                    std::mem::take(&mut acc).finish(),
                 ));
                 current_start = record_idx;
             }
+            let side = side_to_move_from_packed(&psv.sfen);
+            let black_pov = if side == Color::Black {
+                psv.score as i32
+            } else {
+                -(psv.score as i32)
+            };
+            acc.push(black_pov);
             prev_ply = Some(psv.game_ply);
-            last_result = Some((psv.game_result, side_to_move_from_packed(&psv.sfen)));
+            last_result = Some((psv.game_result, side));
             record_idx += 1;
         }
 
@@ -80,6 +90,7 @@ impl GameSource for PsvSource {
                 record_idx,
                 last_result,
                 entries.len() as u32,
+                acc.finish(),
             ));
         }
 
@@ -139,8 +150,14 @@ impl GameSource for PsvSource {
                 (Move::NONE, format!("{:>4} (終局局面)", psv.game_ply))
             } else {
                 let mv = move16_to_move(psv.move16);
-                let label = format_move_label(psv.game_ply as u32, &pos, mv);
-                (mv, label)
+                // 破損 move16 は合法手生成に一致しない → 通常手にせず生表示にフォールバック。
+                // `format_move_label`（空マス発で `piece_type()` panic）や `render_board` の
+                // `do_move`（成り不正で `promote().unwrap()` panic）が合法手前提のため。
+                if move_is_legal(&pos, mv) {
+                    (mv, format_move_label(psv.game_ply as u32, &pos, mv))
+                } else {
+                    (Move::NONE, format!("{:>4} (不正な指し手)", psv.game_ply))
+                }
             };
 
             moves.push(MoveView {
@@ -179,6 +196,7 @@ fn finish_entry(
     end_record: u64,
     last_result: Option<(i8, Color)>,
     ordinal: u32,
+    metrics: EvalMetrics,
 ) -> GameIndexEntry {
     let outcome = match last_result {
         Some((1, side)) => Some(GameOutcomeView::Win(side)),
@@ -198,6 +216,7 @@ fn finish_entry(
         pair_index: None,
         pair_slot: None,
         startpos_idx: None,
+        metrics,
     }
 }
 
