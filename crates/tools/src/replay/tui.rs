@@ -1,6 +1,7 @@
 //! ratatui ベースの棋譜プレイヤー画面・イベントループ。
 
 use std::io::{self};
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -105,6 +106,21 @@ impl SortMode {
     }
 }
 
+/// SFEN 局面検索の 1 tick で走査する対局数。描画と走査のバランスを取る目安値。
+const SFEN_SCAN_CHUNK: usize = 32;
+
+/// SFEN 局面検索（逐次スキャン）の進行状態。イベントループが 1 tick ごとに
+/// `SFEN_SCAN_CHUNK` 対局ずつ `load_game` して照合し、途中経過を描画する。保持するのは
+/// 一致した対局の index だけで、局面は 1 対局ぶんずつ読んでは捨てるためメモリは入力に依存しない。
+struct SfenScan {
+    /// 正規化済み（手数フィールドを除いた盤面・手番・持駒）の検索対象 SFEN。
+    target: String,
+    /// 次に走査する `index.entries` のインデックス。
+    next: usize,
+    /// これまでに一致した `index.entries` のインデックス列。
+    matches: Vec<usize>,
+}
+
 struct App {
     source: Box<dyn GameSource>,
     index: GameIndex,
@@ -117,6 +133,8 @@ struct App {
     current_game: Option<GameRecord>,
     current_move: usize,
     status: String,
+    /// 実行中の SFEN 局面検索（逐次スキャン）。`None` なら通常操作。
+    scan: Option<SfenScan>,
 }
 
 impl App {
@@ -133,6 +151,7 @@ impl App {
             current_game: None,
             current_move: 0,
             status: String::new(),
+            scan: None,
         };
         app.load_selected();
         app
@@ -229,7 +248,16 @@ impl App {
                     self.apply_filter();
                     self.mode = Mode::Browse;
                 }
-                KeyCode::Enter => self.mode = Mode::Browse,
+                KeyCode::Enter => {
+                    // `sfen:` だけは即時フィルタではなく Enter で逐次スキャンを起動する。
+                    // SFEN は大文字＝先手・小文字＝後手で意味が変わるため、小文字化する
+                    // `apply_filter` 経路ではなく生の `filter_input` から取り出す。
+                    if let Some(sfen) = self.filter_input.strip_prefix("sfen:") {
+                        let sfen = sfen.to_string();
+                        self.start_sfen_scan(&sfen);
+                    }
+                    self.mode = Mode::Browse;
+                }
                 KeyCode::Backspace => {
                     self.filter_input.pop();
                     self.apply_filter();
@@ -255,6 +283,63 @@ impl App {
             },
         }
         true
+    }
+
+    /// `sfen:` の値から逐次スキャンを開始する（Enter 契機）。空クエリは無視する。
+    fn start_sfen_scan(&mut self, sfen: &str) {
+        let target = normalize_sfen(sfen);
+        if target.is_empty() {
+            self.status = "SFEN 局面検索: クエリが空です".to_string();
+            return;
+        }
+        self.scan = Some(SfenScan {
+            target,
+            next: 0,
+            matches: Vec::new(),
+        });
+    }
+
+    /// スキャンを `SFEN_SCAN_CHUNK` 対局ぶん進める。全件走査し終えたら結果を反映する。
+    /// `load_game` に失敗した対局は照合対象から除外する（スキャンは止めない）。
+    fn advance_sfen_scan(&mut self) {
+        // `self.source`/`self.index` をループ内で借用するため scan を一旦取り出す。
+        let Some(mut scan) = self.scan.take() else {
+            return;
+        };
+        let total = self.index.entries.len();
+        let end = (scan.next + SFEN_SCAN_CHUNK).min(total);
+        for i in scan.next..end {
+            let entry = &self.index.entries[i];
+            if let Ok(game) = self.source.load_game(&self.index, entry)
+                && game_contains_sfen(&game, &scan.target)
+            {
+                scan.matches.push(i);
+            }
+        }
+        scan.next = end;
+        if scan.next >= total {
+            self.finish_sfen_scan(scan);
+        } else {
+            self.scan = Some(scan);
+        }
+    }
+
+    /// スキャン完了：一致した対局だけを現在の並び順で `filtered` に反映する。
+    fn finish_sfen_scan(&mut self, scan: SfenScan) {
+        let count = scan.matches.len();
+        let mut filtered = scan.matches;
+        sort_filtered(&mut filtered, &self.index.entries, self.sort_mode);
+        self.filtered = filtered;
+        self.selected = 0;
+        self.load_selected();
+        self.status = format!("SFEN 局面検索: {count} 件一致");
+    }
+
+    /// 走査中のスキャンを中断する（`filtered` は開始前のまま）。
+    fn cancel_sfen_scan(&mut self) {
+        if self.scan.take().is_some() {
+            self.status = "SFEN 局面検索を中断しました".to_string();
+        }
     }
 }
 
@@ -293,6 +378,9 @@ enum Filter<'a> {
     NumericExact(&'a str),
     /// それ以外の自由文字列。従来どおりラベル部分一致 OR outcome キーワード部分一致。
     Text(&'a str),
+    /// `sfen:<SFEN>`。局面本体（各手の着手前 SFEN）が要るため即時フィルタでは絞り込まず
+    /// （`entry_matches` で常に一致扱い）、Enter で全対局を逐次スキャンして反映する。
+    Sfen(&'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +413,10 @@ fn parse_filter(query: &str) -> Filter<'_> {
         return Filter::Empty;
     }
     if let Some((prefix, value)) = query.split_once(':') {
+        // SFEN は局面本体が要るので即時フィルタ経路に乗せず、Enter で逐次スキャンして扱う。
+        if prefix == "sfen" {
+            return Filter::Sfen(value);
+        }
         let field = match prefix {
             "pair" => Some(FieldKind::Pair),
             "slot" => Some(FieldKind::Slot),
@@ -402,7 +494,21 @@ fn entry_matches(index: &GameIndex, entry: &GameIndexEntry, filter: Filter<'_>) 
             display_label(index, entry).to_lowercase().contains(v)
                 || outcome_keyword(entry).contains(v)
         }
+        // 局面本体は索引に無いので即時フィルタでは絞らない（Enter で逐次スキャン）。
+        Filter::Sfen(_) => true,
     }
+}
+
+/// SFEN 局面検索の比較キー。末尾の手数フィールド（4 個目）を落とし、「盤面・手番・持駒」の
+/// 3 フィールドで比較する。同一局面でも手数カウンタは対局中の位置で変わるため無視する。
+/// 大文字＝先手駒・小文字＝後手駒で意味が変わるので、`/` フィルタと違い小文字化はしない。
+fn normalize_sfen(s: &str) -> String {
+    s.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+}
+
+/// 対局中のいずれかの着手前局面が `target`（正規化済み SFEN）と一致するか。
+fn game_contains_sfen(game: &GameRecord, target: &str) -> bool {
+    game.moves.iter().any(|mv| normalize_sfen(&mv.sfen_before) == target)
 }
 
 fn outcome_sort_key(entry: &GameIndexEntry) -> u8 {
@@ -443,7 +549,20 @@ fn run_event_loop(
 ) -> Result<()> {
     loop {
         terminal.draw(|frame| draw(frame, app))?;
-        if let Event::Key(key) = event::read()?
+        if app.scan.is_some() {
+            // 逐次スキャン中はブロックせず、キー入力があれば中断だけ受け付け、無ければ
+            // 1 tick ぶん走査を進める。draw を挟むので進捗がステータスバーに反映される。
+            if event::poll(Duration::ZERO)? {
+                if let Event::Key(key) = event::read()?
+                    && key.kind == KeyEventKind::Press
+                    && matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                {
+                    app.cancel_sfen_scan();
+                }
+            } else {
+                app.advance_sfen_scan();
+            }
+        } else if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
             && !app.handle_key(key.code)
         {
@@ -779,9 +898,26 @@ fn draw_eval_graph(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
 }
 
 fn draw_status_bar(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    // 逐次スキャン中は他のどのモード表示よりも進捗を優先する。
+    if let Some(scan) = &app.scan {
+        let text = format!(
+            "SFEN 局面検索中 {}/{}（一致 {} 件）  Esc/q:中断",
+            scan.next,
+            app.index.entries.len(),
+            scan.matches.len()
+        );
+        let para = Paragraph::new(text).block(Block::default().borders(Borders::ALL));
+        frame.render_widget(para, area);
+        return;
+    }
     let text = match &app.mode {
+        Mode::Filter if app.filter_input.starts_with("sfen:") => format!(
+            "SFEN 局面検索: {}_   （Enter で全 {} 対局を走査 / 手数は無視）",
+            app.filter_input,
+            app.index.entries.len()
+        ),
         Mode::Filter => format!(
-            "検索 [id: pair: outcome: winner:sente|gote len:>N swing:>N reversal label:]: {}_   （一致 {}件）",
+            "検索 [id: pair: outcome: winner:sente|gote len:>N swing:>N reversal sfen: label:]: {}_   （一致 {}件）",
             app.filter_input,
             app.filtered.len()
         ),
@@ -830,6 +966,9 @@ fn draw_help_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Line::from("検索構文: pair:<n> slot:<n> startpos:<n> id:<n> outcome:<kw> label:<text>"),
         Line::from(
             "          winner:sente|gote  len:>N|<N|N  swing:>N  reversal  decisive|draw|error",
+        ),
+        Line::from(
+            "          sfen:<SFEN>  局面本体を全対局走査（Enter で実行 / Esc・q で中断 / 手数は無視）",
         ),
         Line::from(
             "prefix 無しで数字のみを入力すると、id/pair/slot/startpos の完全一致で絞り込みます",
@@ -1266,6 +1405,141 @@ mod tests {
     #[test]
     fn parse_filter_text_fallback_for_non_numeric_query() {
         assert_eq!(parse_filter("vol4b_raw"), Filter::Text("vol4b_raw"));
+    }
+
+    // --- SFEN 局面検索 ---
+
+    const HIRATE_SFEN: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
+
+    fn move_with_sfen(sfen: &str) -> MoveView {
+        MoveView {
+            ply: 1,
+            side: Color::Black,
+            sfen_before: sfen.to_string(),
+            mv: Move::NONE,
+            kif_label: String::new(),
+            annotation: MoveAnnotation::default(),
+        }
+    }
+
+    #[test]
+    fn normalize_sfen_strips_move_number_and_preserves_case() {
+        let base = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b -";
+        // 手数だけ違う同一局面は正規化後に一致する。
+        assert_eq!(normalize_sfen(&format!("{base} 1")), normalize_sfen(&format!("{base} 77")));
+        // 手数フィールドを落とし、大文字（先手駒）を保持する。
+        assert_eq!(normalize_sfen(&format!("{base} 1")), base);
+        assert!(normalize_sfen(&format!("{base} 1")).contains("PPPPPPPPP"));
+    }
+
+    #[test]
+    fn game_contains_sfen_matches_ignoring_move_number() {
+        let game = GameRecord {
+            moves: vec![
+                move_with_sfen("9/9/9/9/9/9/9/9/9 b - 5"),
+                move_with_sfen(HIRATE_SFEN),
+            ],
+            leading_gap_is_drop: false,
+        };
+        // 手数が違っても盤面・手番・持駒が一致すればヒットする。
+        assert!(game_contains_sfen(&game, &normalize_sfen("9/9/9/9/9/9/9/9/9 b - 1")));
+        // 手番が違えばヒットしない。
+        assert!(!game_contains_sfen(&game, &normalize_sfen("9/9/9/9/9/9/9/9/9 w - 1")));
+    }
+
+    #[test]
+    fn parse_filter_recognizes_sfen_prefix() {
+        assert_eq!(parse_filter("sfen:9/9/9 b - 1"), Filter::Sfen("9/9/9 b - 1"));
+    }
+
+    #[test]
+    fn entry_matches_sfen_is_always_true_for_immediate_filter() {
+        // 即時フィルタでは絞らない（実際の判定は Enter 契機の逐次スキャン）。
+        let index = empty_index();
+        let entry = jsonl_entry(1, None, None, None, None, false, 0);
+        assert!(entry_matches(&index, &entry, Filter::Sfen("anything")));
+    }
+
+    struct FakeSource {
+        /// 各対局の着手前 SFEN 列。
+        games: Vec<Vec<String>>,
+    }
+
+    impl GameSource for FakeSource {
+        fn build_index(&self) -> Result<GameIndex> {
+            let entries = (0..self.games.len())
+                .map(|i| GameIndexEntry {
+                    source: GameSourceRef::Psv {
+                        start_record: 0,
+                        end_record: 0,
+                        ordinal: i as u32,
+                    },
+                    outcome: None,
+                    error: false,
+                    ply_count: self.games[i].len() as u32,
+                    pair_index: None,
+                    pair_slot: None,
+                    startpos_idx: None,
+                    metrics: Default::default(),
+                })
+                .collect();
+            Ok(GameIndex {
+                entries,
+                pair_files: Vec::new(),
+                warnings: Vec::new(),
+            })
+        }
+
+        fn load_game(&self, _index: &GameIndex, entry: &GameIndexEntry) -> Result<GameRecord> {
+            let GameSourceRef::Psv { ordinal, .. } = entry.source else {
+                unreachable!("FakeSource yields only Psv refs");
+            };
+            let moves = self.games[ordinal as usize].iter().map(|s| move_with_sfen(s)).collect();
+            Ok(GameRecord {
+                moves,
+                leading_gap_is_drop: false,
+            })
+        }
+    }
+
+    #[test]
+    fn sfen_scan_filters_to_games_containing_position() {
+        // game 0/2 は探索局面を含む（2 は手数だけ違う）。game 1 は含まない。
+        let source = FakeSource {
+            games: vec![
+                vec![
+                    "9/9/9/9/9/9/9/9/9 b - 1".to_string(),
+                    HIRATE_SFEN.to_string(),
+                ],
+                vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()],
+                vec![
+                    "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 40".to_string(),
+                ],
+            ],
+        };
+        let index = source.build_index().expect("build_index");
+        let mut app = App::new(Box::new(source), index);
+
+        app.start_sfen_scan(HIRATE_SFEN);
+        let mut guard = 0;
+        while app.scan.is_some() {
+            app.advance_sfen_scan();
+            guard += 1;
+            assert!(guard < 100, "スキャンが有限回で終わる");
+        }
+        assert_eq!(app.filtered, vec![0, 2], "探索局面を含む対局だけに絞られる");
+        assert!(app.status.contains("2 件"), "一致件数を表示: {}", app.status);
+    }
+
+    #[test]
+    fn empty_sfen_query_does_not_start_scan() {
+        let source = FakeSource {
+            games: vec![vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()]],
+        };
+        let index = source.build_index().expect("build_index");
+        let mut app = App::new(Box::new(source), index);
+        app.start_sfen_scan("   ");
+        assert!(app.scan.is_none(), "空クエリではスキャンを開始しない");
     }
 
     #[test]
