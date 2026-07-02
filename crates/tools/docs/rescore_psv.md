@@ -73,6 +73,26 @@ $env:ORT_DYLIB_PATH = "C:\path\to\onnxruntime-win-x64-gpu-1.24.2\lib\onnxruntime
 $env:PATH = "C:\path\to\TensorRT\lib;C:\path\to\onnxruntime-win-x64-gpu-1.24.2\lib;C:\path\to\cudnn\bin;" + $env:PATH
 ```
 
+### 5. Windows ネイティブ環境の補足
+
+Windows で使う場合は、上記 1〜3 を **Windows 版・同一バージョン**で揃える（下記は Windows 版の直リンク。
+1〜3 の wget は Linux 版なので注意）:
+
+- **ONNX Runtime**: `onnxruntime-win-x64-gpu-1.24.2.zip`（**CUDA 12 ビルド**を使う。`onnxruntime-win-x64-gpu_cuda13-*.zip` ではない）
+  - https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-gpu-1.24.2.zip
+- **cuDNN 9**: https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.8.0.87_cuda12-archive.zip
+- **TensorRT 10.11**: https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.11.0/zip/TensorRT-10.11.0.33.Windows.win10.cuda-12.9.zip
+
+補足:
+
+- **RTX 5090 / Blackwell (sm_120)** でそのまま動作する（ORT 1.24.2 + TensorRT 10.11 + CUDA 12.9 + cuDNN 9.8）。
+  `--onnx-tensorrt` 使用時に **`--onnx-tensorrt-cache <ディレクトリ>` を付けて実行すると、TensorRT が初回に
+  その GPU 向け FP16 エンジンをビルドして `<ディレクトリ>` に保存し、2 回目以降は再利用してビルドを
+  省略する**（生成物例: `<ディレクトリ>/TensorrtExecutionProvider_..._fp16_sm120.engine`）。エンジンは
+  GPU アーキ固有なので、GPU を変えたら再ビルドされる。
+- **外部データ形式の ONNX**: `model_*.single.onnx` 本体が小さく（〜150KB）別に `.onnx.data`（数十 MB）を
+  伴うモデルは、**両ファイルを同一ディレクトリに置く**（ORT が本体からの相対パスで外部ウェイトを読む）。
+
 ## 使い方
 
 ### ビルド
