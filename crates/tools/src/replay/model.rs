@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use rshogi_core::movegen::{MoveList, generate_legal_all};
+use rshogi_core::position::Position;
 use rshogi_core::types::{Color, Move};
 
 /// 索引フェーズで構築する、対局1件分のメタ情報（局面・指し手は含まない）。
@@ -21,6 +23,84 @@ pub struct GameIndexEntry {
     pub pair_index: Option<u32>,
     pub pair_slot: Option<u32>,
     pub startpos_idx: Option<u32>,
+    /// 索引時に収穫する評価値ベースの派生指標（すべて**先手視点** cp）。ソート・検索用で、
+    /// 評価値が 1 つも無い対局は `None`。手番相対 score を持つ PSV/JSONL は先手視点へ変換
+    /// してから、元々先手視点の CSA はそのまま `EvalAccumulator` に流す。
+    pub metrics: EvalMetrics,
+}
+
+/// 対局の評価値の要約（先手視点 cp）。`EvalAccumulator` で 1 パス収穫する。ソート・検索の
+/// 目安用のヒューリスティックで、詰みの扱いは出典依存（JSONL は `score_mate` を無視、PSV/CSA
+/// は生の score/コメント値をそのまま算入）。ビューアは一度に 1 出典しか開かないため出典間の
+/// 厳密比較は前提にしない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvalMetrics {
+    /// 最後の評価値付きの手の cp（決着の大きさ = `|final_cp|`）。
+    pub final_cp: Option<i32>,
+    pub min_cp: Option<i32>,
+    pub max_cp: Option<i32>,
+    /// 連続する評価値付きの手の間の `|Δcp|` の最大（評価値の振れ幅）。
+    pub max_swing_cp: Option<u32>,
+}
+
+impl EvalMetrics {
+    /// 「形勢逆転」判定：両者が `threshold` cp 以上優勢になった局面があるか
+    /// （`min_cp ≤ -threshold` かつ `max_cp ≥ +threshold`）。
+    pub fn had_reversal(&self, threshold: i32) -> bool {
+        matches!((self.min_cp, self.max_cp), (Some(lo), Some(hi)) if lo <= -threshold && hi >= threshold)
+    }
+}
+
+/// 先手視点 cp を手順で流し込んで `EvalMetrics` を 1 パスで組み立てる。
+#[derive(Default)]
+pub struct EvalAccumulator {
+    metrics: EvalMetrics,
+    prev_cp: Option<i32>,
+}
+
+impl EvalAccumulator {
+    /// 先手視点 cp を 1 手ぶん流す（評価値の無い手は呼ばない）。
+    pub fn push(&mut self, black_pov_cp: i32) {
+        self.metrics.final_cp = Some(black_pov_cp);
+        self.metrics.min_cp =
+            Some(self.metrics.min_cp.map_or(black_pov_cp, |m| m.min(black_pov_cp)));
+        self.metrics.max_cp =
+            Some(self.metrics.max_cp.map_or(black_pov_cp, |m| m.max(black_pov_cp)));
+        if let Some(prev) = self.prev_cp {
+            // 外部棋譜の異常値でも panic しないよう差分は i64 で取り u32 に飽和させる
+            // （`i32::MAX - i32::MIN` は i32 に収まらない）。
+            let swing =
+                i64::from(black_pov_cp).abs_diff(i64::from(prev)).min(u64::from(u32::MAX)) as u32;
+            self.metrics.max_swing_cp =
+                Some(self.metrics.max_swing_cp.map_or(swing, |s| s.max(swing)));
+        }
+        self.prev_cp = Some(black_pov_cp);
+    }
+
+    pub fn finish(self) -> EvalMetrics {
+        self.metrics
+    }
+}
+
+/// `pos` の合法手集合に `mv` が from/to/成り/打ちの意味で含まれるか。合法手生成は `pos`
+/// からのみ手を作るので、CSA/PSV 由来の非合法手（空マス発・駒種不整合・成り不正）を渡しても
+/// panic せず判定できる。`Move` は上位ビットに移動後の駒を持ち `from_usi`/`move16_to_move`
+/// はそれを埋めないため `==` ではなく意味で一致を見る。
+pub fn move_is_legal(pos: &Position, mv: Move) -> bool {
+    let mut list = MoveList::new();
+    generate_legal_all(pos, &mut list);
+    list.iter().any(|&g| moves_match(g, mv))
+}
+
+fn moves_match(a: Move, b: Move) -> bool {
+    if a.is_drop() != b.is_drop() {
+        return false;
+    }
+    if a.is_drop() {
+        a.to() == b.to() && a.drop_piece_type() == b.drop_piece_type()
+    } else {
+        a.from() == b.from() && a.to() == b.to() && a.is_promote() == b.is_promote()
+    }
 }
 
 /// 対局の出典と、その対局を再生するために必要な位置情報。
@@ -81,18 +161,6 @@ impl GameIndex {
     }
 }
 
-impl GameIndexEntry {
-    /// `GameSourceRef::Jsonl` / `Csa` のとき `Some`。`GameIndex::pair_file` を引くキー。
-    pub fn file_idx(&self) -> Option<usize> {
-        match self.source {
-            GameSourceRef::Jsonl { file_idx, .. } | GameSourceRef::Csa { file_idx, .. } => {
-                Some(file_idx)
-            }
-            GameSourceRef::Psv { .. } => None,
-        }
-    }
-}
-
 /// 1局を開いたときに遅延構築する、再生用の完全な手順。
 #[derive(Debug, Clone)]
 pub struct GameRecord {
@@ -129,9 +197,7 @@ pub struct MoveAnnotation {
     pub nodes: Option<u64>,
     pub nps: Option<u64>,
     pub elapsed_ms: Option<u64>,
-    pub think_limit_ms: Option<u64>,
     pub timed_out: Option<bool>,
-    pub engine_label: Option<String>,
 }
 
 /// PSV / JSONL の違いを吸収する共通インターフェース。

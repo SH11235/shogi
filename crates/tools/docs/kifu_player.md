@@ -74,9 +74,10 @@ cargo run -p tools --release --features kifu-player --bin kifu_player -- \
   最終手の移動先（駒）と移動元（空マス）を背景色（緑）＋太字でハイライトする。手番・持駒・
   王手表示も指了後の局面を反映する（「王手」＝最終手が王手だったこと）。ただし pass 手・
   タイムアウト手は実際には指されていないため、指了前の局面のまま表示する。
-- 右: 指し手一覧。棋譜風ラベルに各手の注釈を淡色で並べる（評価値・depth・seldepth・
-  nodes・nps・経過。engine 名は対局ラベルと重複し、think_limit_ms は depth 制限の対局で
-  既定値が出て誤解を招くため、いずれも省略）。パネル幅に収まらなければ末尾は切れる。
+- 右: 指し手一覧。棋譜風ラベルに各手の注釈を淡色で並べる（評価値・`depth=`・`seldepth=`・
+  `nodes=`・`nps=`・経過を `key=value` 形式で。engine 名は対局ラベルと重複し、think limit は
+  depth 制限の対局で既定値が出て誤解を招くため、いずれも注釈に出さない）。パネル幅に
+  収まらなければ末尾は切れる。
   現在の手をハイライト。手数は絶対手数で表示する（JSONL は対局内 1 始まりの `ply` ではなく
   `sfen_before` の SFEN 手数カウンタを採用するので、定跡途中開始の対局は 24 手目等から
   正しく始まる）。PSV の `skip_initial_ply` で先頭手が落ちた場合はその手の前に
@@ -99,6 +100,8 @@ cargo run -p tools --release --features kifu-player --bin kifu_player -- \
 `field:value` の prefix 構文でフィールドを指定して絞り込める（完全一致・部分一致は
 フィールドごとに異なる。下表参照）:
 
+検索入力中は入力欄に主なフィールドのヒントと現在の一致件数を表示する。
+
 | 構文 | 絞り込み対象 | 一致方式 |
 |------|------|------|
 | `pair:<n>` | `pair_index`（JSONL のみ） | 完全一致 |
@@ -107,6 +110,15 @@ cargo run -p tools --release --features kifu-player --bin kifu_player -- \
 | `id:<n>` | `game_id`（JSONL のみ、ペアファイル内ローカル） | 完全一致 |
 | `outcome:<kw>` | `black_win`/`white_win`/`draw`/`error` | 部分一致 |
 | `label:<text>` | 対局ラベル | 部分一致 |
+| `winner:sente\|gote` | 勝者側（`black`/`white` も可） | 完全一致 |
+| `len:>N` / `len:<N` / `len:N` | 手数（`ply_count`） | 比較 |
+| `swing:>N` / `swing:<N` / `swing:N` | 評価値振れ幅（`max_swing_cp`） | 比較 |
+| `reversal` | 両者が 300cp 以上優勢になった局面あり（形勢逆転） | 述語 |
+| `decisive` | 勝敗が付いた（引き分け・エラー・不明でない） | 述語 |
+
+`winner`/`len`/`swing`/`reversal`/`decisive` は索引時に収穫した派生指標（先手視点 cp の
+`final_cp`/`min_cp`/`max_cp`/`max_swing_cp` と手数）で判定するので、PSV/JSONL/CSA いずれの
+出典でも機能する。評価値の無い対局は `swing:`/`reversal` にヒットしない。
 
 `id:<n>` は `pair:`/`slot:`/`startpos:` と AND combine できないため、複数の
 エンジンペアに同じ `game_id` の対局がある場合はそれら全部にヒットする
@@ -114,7 +126,7 @@ cargo run -p tools --release --features kifu-player --bin kifu_player -- \
 対局を一意に指定したい場合は対局ラベルまたは `pair:`/`slot:`/`startpos:` の
 組み合わせで対局リストを絞り込んでから `j`/`k` で辿るのが確実）。
 
-prefix を付けずに**数字のみ**を入力した場合は、上記の数値フィールド（`pair_index`/
+prefix を付けずに**数字のみ**を入力した場合は、数値フィールド（`pair_index`/
 `pair_slot`/`startpos_idx`/`game_id`）の完全一致のみを見る（対局ラベルの部分一致は
 見ない）。エンジンラベルに数字を含むデータ（例: `vol4B_raw`）で `pair_index=4` の
 つもりで `4` と打つと、prefix 無しの数字クエリでは `pair_index` 等の完全一致だけに
@@ -124,11 +136,13 @@ prefix を付けずに**数字のみ**を入力した場合は、上記の数値
 ## 対局リストの並べ替え（`s`）
 
 `s` を押すたびに次の順序へ循環する（フィルタ後のリストに適用、同じキー内の
-相対順は発見順を維持する安定ソート）:
+相対順は発見順を維持する安定ソート）。指標ソートは降順で、評価値の無い対局は末尾へ寄せる:
 
 1. 発見順（デフォルト。ファイル列挙順→完了順）
 2. 勝敗別（エラー→黒勝ち→白勝ち→引き分け→不明）
-3. エンジンペア別（JSONL のペアファイル単位。PSV は常に1グループ）
+3. 対局長（手数の降順）
+4. 決着の大きさ（`|final_cp|` の降順）
+5. 評価値振れ幅（`max_swing_cp` の降順）
 
 ## 評価値急変ジャンプ（`n` / `N`）
 

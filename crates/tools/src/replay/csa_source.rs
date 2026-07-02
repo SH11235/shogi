@@ -12,7 +12,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use rshogi_core::movegen::{MoveList, generate_legal_all};
 use rshogi_core::position::Position;
 use rshogi_core::types::{Color, Move};
 use rshogi_csa::{Color as CsaColor, ParsedMove, SpecialMove, csa_move_to_usi, parse_csa_full};
@@ -20,8 +19,8 @@ use rshogi_csa::{Color as CsaColor, ParsedMove, SpecialMove, csa_move_to_usi, pa
 use crate::kif::format_move_label;
 
 use super::model::{
-    GameIndex, GameIndexEntry, GameOutcomeView, GameRecord, GameSource, GameSourceRef,
-    MoveAnnotation, MoveView, PairFileMeta,
+    EvalAccumulator, GameIndex, GameIndexEntry, GameOutcomeView, GameRecord, GameSource,
+    GameSourceRef, MoveAnnotation, MoveView, PairFileMeta, move_is_legal,
 };
 
 pub struct CsaSource {
@@ -106,6 +105,12 @@ impl GameSource for CsaSource {
                 parsed.iter().filter(|m| matches!(m, ParsedMove::Normal(_))).count() as u32;
             let outcome = derive_outcome(init.side_to_move, normal_count, &parsed);
 
+            // 評価値コメントは元々先手視点なので、そのまま指標へ流す。
+            let mut acc = EvalAccumulator::default();
+            for cp in parse_eval_comments(&text).into_iter().flatten() {
+                acc.push(cp);
+            }
+
             let file_idx = pair_files.len();
             let ordinal = entries.len() as u32;
             entries.push(GameIndexEntry {
@@ -116,6 +121,7 @@ impl GameSource for CsaSource {
                 pair_index: None,
                 pair_slot: None,
                 startpos_idx: None,
+                metrics: acc.finish(),
             });
             pair_files.push(PairFileMeta {
                 path: path.clone(),
@@ -235,30 +241,6 @@ fn opposite(c: CsaColor) -> CsaColor {
     match c {
         CsaColor::Black => CsaColor::White,
         CsaColor::White => CsaColor::Black,
-    }
-}
-
-/// `pos` の合法手集合に `mv` が含まれるか。`is_legal_with_pass` 等は pseudo-legal 手を
-/// 前提に内部で移動元の駒を読むため、CSA 由来の非合法手（空マス発・駒種不整合・成り不正）
-/// を渡すと panic しうる。合法手生成は `pos` からのみ手を作るので、任意の `mv` に対して
-/// panic せず判定できる。`Move` は上位ビットに移動後の駒を持ち `from_usi` はそれを埋めない
-/// ため、`==` ではなく from/to/成り/打ちの意味で一致を見る（JSONL/PSV も駒無し move を
-/// 格納しており、比較を意味ベースに揃える）。
-fn move_is_legal(pos: &Position, mv: Move) -> bool {
-    let mut list = MoveList::new();
-    generate_legal_all(pos, &mut list);
-    list.iter().any(|&g| moves_match(g, mv))
-}
-
-/// 移動後の駒ビットを無視し、from/to/成り/打ちの意味で 2 手が同一かを見る。
-fn moves_match(a: Move, b: Move) -> bool {
-    if a.is_drop() != b.is_drop() {
-        return false;
-    }
-    if a.is_drop() {
-        a.to() == b.to() && a.drop_piece_type() == b.drop_piece_type()
-    } else {
-        a.from() == b.from() && a.to() == b.to() && a.is_promote() == b.is_promote()
     }
 }
 
