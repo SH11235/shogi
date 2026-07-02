@@ -872,10 +872,13 @@ fn current_move(app: &App) -> Option<&MoveView> {
 fn annotation_inline(mv: &MoveView) -> String {
     let a = &mv.annotation;
     let mut parts = Vec::new();
+    // 評価値・詰みは手番相対（USI）で格納しているので、グラフと同じ先手基準（＋先手良し／
+    // －後手良し）へ変換して表示する。手番相対のままだと手番交代のたびに符号が反転して読みにくい。
+    let to_black_pov = |v: i32| if mv.side == Color::White { -v } else { v };
     if let Some(v) = a.score_mate {
-        parts.push(format!("詰み{v:+}"));
+        parts.push(format!("詰み{:+}", to_black_pov(v)));
     } else if let Some(v) = a.score_cp {
-        parts.push(format!("評価値{v:+}"));
+        parts.push(format!("評価値{:+}", to_black_pov(v)));
     }
     if let Some(v) = a.depth {
         parts.push(format!("depth={v}"));
@@ -1568,6 +1571,21 @@ mod tests {
             s.contains("評価値-77") && s.contains("depth=15") && s.contains("seldepth=20"),
             "評価値と探索情報を key=value で出す: {s}"
         );
+    }
+
+    #[test]
+    fn annotation_inline_shows_black_pov_score() {
+        // 手番相対で格納した score を、パネルでは先手基準へ変換して表示する（グラフと符号統一）。
+        // 先手手はそのまま。
+        let b = mv_with_ply(1, Color::Black, Some(80), None);
+        assert!(annotation_inline(&b).contains("評価値+80"), "{}", annotation_inline(&b));
+        // 後手手（後手にとって +80）は先手基準で -80。
+        let mut w = mv_with_ply(2, Color::White, Some(80), None);
+        assert!(annotation_inline(&w).contains("評価値-80"), "{}", annotation_inline(&w));
+        // 詰みも先手基準（後手詰みは -）。
+        w.annotation.score_cp = None;
+        w.annotation.score_mate = Some(3);
+        assert!(annotation_inline(&w).contains("詰み-3"), "{}", annotation_inline(&w));
     }
 
     #[test]
