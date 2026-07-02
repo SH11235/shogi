@@ -671,10 +671,8 @@ fn black_pov_cp(mv: &MoveView) -> Option<f64> {
     Some(black_pov.clamp(-GRAPH_CP_CLAMP, GRAPH_CP_CLAMP))
 }
 
-/// `game.moves` と同じ長さ・同じ並びの打点列（評価値が無い手は `None`）。
-/// 「手」のインデックスで隣接判定するために、評価値の有無でフィルタした
-/// flat なリストにはしない（フィルタ後に隣接させると、評価値が欠けた手を
-/// 挟んだ前後の手が直線で繋がってしまい、欠損が無かったように見えてしまう）。
+/// `game.moves` と同じ長さ・同じ並びの打点列（評価値が無い手は `None`）。評価値付きの手の
+/// 元インデックスを保つため flat にしない（`evaluated_points` が index 付きで使う）。
 fn eval_points(game: &GameRecord) -> Vec<Option<(f64, f64, Color)>> {
     game.moves
         .iter()
@@ -720,8 +718,7 @@ fn draw_eval_graph(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
         frame.render_widget(Paragraph::new("(対局を選択してください)").block(block), area);
         return;
     };
-    let aligned = eval_points(game);
-    let plotted: Vec<(f64, f64, Color)> = aligned.iter().filter_map(|p| *p).collect();
+    let plotted: Vec<(f64, f64, Color)> = eval_points(game).into_iter().flatten().collect();
     if plotted.len() < 2 {
         frame.render_widget(Paragraph::new("(表示できる評価値がありません)").block(block), area);
         return;
@@ -748,12 +745,13 @@ fn draw_eval_graph(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
                 y2: 0.0,
                 color: RColor::DarkGray,
             });
-            // 着手側で色分けした線分（着手後の評価値を、その着手側の色で結ぶ）。
-            // 評価値の無い手を挟む区間は線を引かない（隣接する「手」同士のみ結ぶ）。
-            for pair in aligned.windows(2) {
-                let (Some((x1, y1, _)), Some((x2, y2, side2))) = (pair[0], pair[1]) else {
-                    continue;
-                };
+            // 評価値付きの手を出現順に結ぶ（着手後の評価値を、その着手側の色で）。CSA のように
+            // 片側エンジンしか評価値を書かない棋譜では評価値が 1 手おきになり、「手インデックスで
+            // 隣接」を結ぶと隣り合う評価値付きの手が無く線が 1 本も引けないため、評価値付きの手の
+            // 並びで隣接を結ぶ（X 軸は ply なので欠けた手の区間はそのぶん横に広い線分になる）。
+            for pair in plotted.windows(2) {
+                let (x1, y1, _) = pair[0];
+                let (x2, y2, side2) = pair[1];
                 let color = if side2 == Color::Black {
                     RColor::Yellow
                 } else {
@@ -1196,9 +1194,9 @@ mod tests {
 
     #[test]
     fn eval_points_preserves_gap_position_for_missing_eval() {
-        // 中央の手だけ評価値が無い対局。draw_eval_graph 側はこの None を
-        // 「前後の手を直線で繋がない」境界として使うため、None の位置が
-        // 元の手の並びと一致していることをここで固定する。
+        // 中央の手だけ評価値が無い対局。eval_points は評価値付きの手の元インデックスを
+        // 保つため None を潰さず、位置が元の手の並びと一致することを固定する
+        // （`evaluated_points` / 評価値急変ジャンプがこの index を使う）。
         let game = GameRecord {
             moves: vec![
                 mv(Color::Black, Some(10), None),
@@ -1212,6 +1210,30 @@ mod tests {
         assert!(points[0].is_some());
         assert!(points[1].is_none(), "評価値の無い手は None のまま保持される");
         assert!(points[2].is_some());
+    }
+
+    #[test]
+    fn eval_graph_connects_one_sided_evals() {
+        // CSA のように片側エンジンしか評価値を書かない棋譜（1 手おきに評価値）。手インデックス
+        // 隣接では隣り合う評価値付きの手が無く線が 1 本も引けないので、draw_eval_graph は
+        // 評価値付きの手を出現順に結ぶ（flat 化した打点列で隣接を取る）。
+        let game = GameRecord {
+            moves: vec![
+                mv_with_ply(1, Color::Black, Some(30), None),
+                mv_with_ply(2, Color::White, None, None),
+                mv_with_ply(3, Color::Black, Some(50), None),
+                mv_with_ply(4, Color::White, None, None),
+                mv_with_ply(5, Color::Black, Some(-20), None),
+            ],
+            leading_gap_is_drop: false,
+        };
+        let plotted: Vec<_> = eval_points(&game).into_iter().flatten().collect();
+        assert_eq!(plotted.len(), 3, "評価値付きの 3 手が打点される（flat 隣接で 2 本の線）");
+        let adjacent_move_pairs = eval_points(&game)
+            .windows(2)
+            .filter(|w| w[0].is_some() && w[1].is_some())
+            .count();
+        assert_eq!(adjacent_move_pairs, 0, "手インデックス隣接では線が引けない（この修正の動機）");
     }
 
     // --- 検索フィルタ (parse_filter / entry_matches) ---
