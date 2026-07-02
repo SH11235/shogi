@@ -117,12 +117,14 @@ cargo build --release -p tools --bin rescore_psv
 
 ONNX/TRT の `rescore_psv` は、軽量モデル＋高速 GPU だと **1 プロセスは前処理(read+build)供給律速**で
 GPU が遊ぶ。**入力を分割して複数プロセス並走**させると独立 CUDA ストリーム＋独立前処理で GPU 余力を
-埋め、実効スループットがほぼ線形にスケールする（**コード不要**）。実測: RTX 5090 で 30m resnet10/TRT fp16、
-**2 プロセス並走 ≈ 2.1x**（単体 ≈39.6k → 合算 ≈84k pos/s）。
+埋め、実効スループットがスケールする（**コード不要**）。実測: RTX 5090 / 30m resnet10 / TRT fp16 /
+Ryzen 9 9950X3D(16C32T)、`--threads=16÷N`: 1→42.8k / 2→85.7k / 4→119k / **6→143k(3.34x)** / 8→144k。
+**~6 プロセスでプラトー**（8 本は 6 本と同値）。
 
+- **プラトーの律速は VRAM でなく CPU**（producer 特徴量構築が物理コアを使い切る）。「VRAM の限り N 本」は誤りで、
+  **物理コア数依存の数本（実測 ~6）が最適**。各プロセスは `--threads ≈ 物理コア数÷N`。
 - 各プロセスの **`--output-dir` は必ず分ける**（同一だと `.done` で片方が全スキップ）。
 - 入力分割: 別 shard / `--limit`+オフセット別スライス等。`--onnx-tensorrt-cache` は共有可（engine 再利用）。
-- `nvidia-smi` の util を見て並走数を調整（GPU 飽和で頭打ち。VRAM も上限）。
 - 詳細は `crates/tools/docs/rescore_psv.md`「スループット最適化: 同一 GPU で複数プロセス並走」。
 
 ## 出力検証（必須）
