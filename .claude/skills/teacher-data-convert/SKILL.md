@@ -113,20 +113,6 @@ cargo build --release -p tools --bin rescore_psv
 - 中断（Ctrl-C / SIGINT）時: `psv_to_hcpe3` は `.partial` を削除（壊れた最終出力を残さない）。
   `rescore_psv` は出力ファイルが中途残存し、再実行時に `.done` マーカー／既存出力レコード数で skip/resume される。
 
-### GPU 経路(ONNX)を最速化: 同一 GPU で複数プロセス並走
-
-ONNX/TRT の `rescore_psv` は、軽量モデル＋高速 GPU だと **1 プロセスは前処理(read+build)供給律速**で
-GPU が遊ぶ。**入力を分割して複数プロセス並走**させると独立 CUDA ストリーム＋独立前処理で GPU 余力を
-埋め、実効スループットがスケールする（**コード不要**）。参考実測（環境依存。resnet10 57ch / TRT fp16 /
-16C32T CPU、`--threads = 物理コア数 ÷ N`）: 1→1.0x / 2→2.0x / 4→2.8x / **6→3.34x** / 8→3.36x。
-**~6 プロセスでプラトー**（8 本は 6 本と同値。実効値は CPU コア数・モデル・同時負荷で変動）。
-
-- **プラトーの律速は VRAM でなく CPU**（producer 特徴量構築が物理コアを使い切る）。「VRAM の限り N 本」は誤りで、
-  **物理コア数依存の数本（実測 ~6）が最適**。各プロセスは `--threads ≈ 物理コア数÷N`。
-- 各プロセスの **`--output-dir` は必ず分ける**（同一だと `.done` で片方が全スキップ）。
-- 入力分割: 別 shard / `--limit`+オフセット別スライス等。`--onnx-tensorrt-cache` は共有可（engine 再利用）。
-- 詳細は `crates/tools/docs/rescore_psv.md`「スループット最適化: 同一 GPU で複数プロセス並走」。
-
 ## 出力検証（必須）
 
 大量変換・再評価は**出力の bit 一致を必ず確認**する:
