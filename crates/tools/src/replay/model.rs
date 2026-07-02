@@ -42,6 +42,9 @@ pub enum GameSourceRef {
         start_offset: u64,
         end_offset: u64,
     },
+    /// CSA ファイル横断インデックスの中での位置。CSA は 1 ファイル = 1 対局なので
+    /// `file_idx` が対局を一意に定め、`ordinal` は表示用の通し番号（0-indexed）。
+    Csa { file_idx: usize, ordinal: u32 },
 }
 
 /// 対局の勝者（手番に依存しない固定 POV で表現する）。
@@ -51,8 +54,9 @@ pub enum GameOutcomeView {
     Draw,
 }
 
-/// JSONL ペアファイル単位のメタ情報。対局ごとに複製しない
-/// （`GameIndexEntry::file_idx` からこちらを引く）。
+/// 対局ファイル単位のメタ情報（JSONL のペアファイル / CSA の単一ファイル）。対局ごと
+/// に複製しない（`GameIndexEntry::file_idx` からこちらを引く）。`black_label`/`white_label`
+/// は JSONL はエンジンラベル、CSA は `N+`/`N-` のプレイヤー名。
 #[derive(Debug, Clone)]
 pub struct PairFileMeta {
     pub path: PathBuf,
@@ -78,10 +82,12 @@ impl GameIndex {
 }
 
 impl GameIndexEntry {
-    /// `GameSourceRef::Jsonl` のときのみ `Some`。`GameIndex::pair_file` を引くキー。
+    /// `GameSourceRef::Jsonl` / `Csa` のとき `Some`。`GameIndex::pair_file` を引くキー。
     pub fn file_idx(&self) -> Option<usize> {
         match self.source {
-            GameSourceRef::Jsonl { file_idx, .. } => Some(file_idx),
+            GameSourceRef::Jsonl { file_idx, .. } | GameSourceRef::Csa { file_idx, .. } => {
+                Some(file_idx)
+            }
             GameSourceRef::Psv { .. } => None,
         }
     }
@@ -149,6 +155,12 @@ pub fn display_label(index: &GameIndex, entry: &GameIndexEntry) -> String {
         } => match index.pair_file(file_idx) {
             Some(meta) => format!("{}-vs-{} #{:03}", meta.black_label, meta.white_label, game_id),
             None => format!("?-vs-? #{:03}", game_id),
+        },
+        GameSourceRef::Csa { file_idx, ordinal } => match index.pair_file(file_idx) {
+            Some(meta) => {
+                format!("{}-vs-{} #{:03}", meta.black_label, meta.white_label, ordinal + 1)
+            }
+            None => format!("?-vs-? #{:03}", ordinal + 1),
         },
     }
 }

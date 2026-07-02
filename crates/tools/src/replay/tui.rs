@@ -265,7 +265,9 @@ fn outcome_keyword(entry: &GameIndexEntry) -> &'static str {
 fn jsonl_game_id(entry: &GameIndexEntry) -> Option<u32> {
     match entry.source {
         GameSourceRef::Jsonl { game_id, .. } => Some(game_id),
-        GameSourceRef::Psv { .. } => None,
+        // CSA は 1 ファイル = 1 対局で `game_id` を持たない（番号検索は ordinal ベースで
+        // 別途扱う）。
+        GameSourceRef::Psv { .. } | GameSourceRef::Csa { .. } => None,
     }
 }
 

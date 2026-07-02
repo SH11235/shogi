@@ -1,11 +1,11 @@
-# kifu_player — PSV / tournament JSONL 棋譜プレイヤー TUI
+# kifu_player — PSV / tournament JSONL / CSA 棋譜プレイヤー TUI
 
-PSV (PackedSfenValue) ファイルと `tournament` の出力 JSONL を、同じ TUI で
-1手ずつ再生・閲覧するツール。`tournament` の out-dir は数千局規模になりうるため、
-横断した対局リストをインクリメンタルにフィルタして特定の対局へすぐ辿り着けるように
-してある。
+PSV (PackedSfenValue) ファイル、`tournament` の出力 JSONL、CSA 棋譜（`csa_client`
+出力）を、同じ TUI で 1手ずつ再生・閲覧するツール。out-dir / CSA ディレクトリは
+数千局規模になりうるため、横断した対局リストをインクリメンタルにフィルタして
+特定の対局へすぐ辿り着けるようにしてある。
 
-読み取り専用のビューアであり、PSV のシャッフル・分割・統合や JSONL の編集は行わない。
+読み取り専用のビューアであり、PSV のシャッフル・分割・統合や JSONL/CSA の編集は行わない。
 
 ## ビルド
 
@@ -41,6 +41,29 @@ cargo run -p tools --release --features kifu-player --bin kifu_player -- \
 out-dir 配下の `*-vs-*.jsonl`（`tournament` が出力するペアファイル）を横断して
 1つの対局リストにまとめる。`control_history.jsonl` 等、対局データを含まない
 付随ファイルは自動的に除外される。
+
+### CSA を開く
+
+```bash
+# 単一ファイル
+cargo run -p tools --release --features kifu-player --bin kifu_player -- \
+  --csa runs/csa_match/p2g4/20260618_020153_ftfn400_vs_hkp400.csa
+
+# ディレクトリ（配下の *.csa をサブディレクトリまで再帰して横断）
+cargo run -p tools --release --features kifu-player --bin kifu_player -- \
+  --csa runs/csa_match
+```
+
+`--csa` には rshogi `csa_client` が出力する CSA 棋譜（1 ファイル = 1 対局）を渡す。
+ディレクトリを指定すると `YYYY/MM/DD/*.csa` のようなネストも再帰して集め、パス順に
+並べる（floodgate のログ構成を想定）。対局ラベルは `N+`/`N-` のプレイヤー名を使う。
+
+- **勝敗**は終局手（`%TORYO`/`%KACHI` 等）とそこでの手番から導出する（`%TORYO` は
+  勝ち・負けどちらの記録にも書かれるため、終端で手番だった側を敗者とみなす）。
+  終局手が無い（中断・未完）ファイルは「勝敗不明」として扱う。
+- **評価値**は floodgate 形式コメント `'* <score> [pv...]` から拾う（best-effort）。
+  コメントを書いていない対局・手は評価値なし（評価値グラフに打点しない）。両対局者の
+  片方しか評価値を書いていない場合はその側の手だけが打点される。
 
 ## 画面構成
 
