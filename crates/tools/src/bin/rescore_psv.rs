@@ -50,7 +50,6 @@ use glob::glob;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 use rayon::prelude::*;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -3102,6 +3101,8 @@ where
     use ort::session::Session;
     use ort::value::TensorRef;
     use rshogi_core::movegen::{MoveList, generate_legal};
+    // ONNX パイプライン専用のため fn 内 use（top-level だと non-ONNX ビルドで unused-import）。
+    use std::collections::BTreeMap;
     use tools::dlshogi_features::{MAX_MOVE_LABEL_NUM, make_move_label};
 
     /// 合法手のロジットを softmax 正規化して `out` に書き込む
