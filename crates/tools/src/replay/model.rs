@@ -77,30 +77,20 @@ impl EvalAccumulator {
         self.prev_cp = Some(black_pov_cp);
     }
 
+    /// 収穫した `EvalMetrics` を取り出す（`push` で流し込んだ結果を確定する）。
     pub fn finish(self) -> EvalMetrics {
         self.metrics
     }
 }
 
-/// `pos` の合法手集合に `mv` が from/to/成り/打ちの意味で含まれるか。合法手生成は `pos`
-/// からのみ手を作るので、CSA/PSV 由来の非合法手（空マス発・駒種不整合・成り不正）を渡しても
-/// panic せず判定できる。`Move` は上位ビットに移動後の駒を持ち `from_usi`/`move16_to_move`
-/// はそれを埋めないため `==` ではなく意味で一致を見る。
+/// `pos` の合法手集合に `mv` が含まれるか。合法手生成は `pos` からのみ手を作るので、CSA/PSV
+/// 由来の非合法手（空マス発・成り不正）を渡しても panic せず判定できる。`Move::raw()` は下位
+/// 16bit（from/to/成り/打ち）で、`from_usi`/`move16_to_move` が埋めない上位ビット（移動後の駒）
+/// を含まないため、`==` ではなく `raw()` 一致で意味比較する。
 pub fn move_is_legal(pos: &Position, mv: Move) -> bool {
     let mut list = MoveList::new();
     generate_legal_all(pos, &mut list);
-    list.iter().any(|&g| moves_match(g, mv))
-}
-
-fn moves_match(a: Move, b: Move) -> bool {
-    if a.is_drop() != b.is_drop() {
-        return false;
-    }
-    if a.is_drop() {
-        a.to() == b.to() && a.drop_piece_type() == b.drop_piece_type()
-    } else {
-        a.from() == b.from() && a.to() == b.to() && a.is_promote() == b.is_promote()
-    }
+    list.iter().any(|&g| g.raw() == mv.raw())
 }
 
 /// 対局の出典と、その対局を再生するために必要な位置情報。

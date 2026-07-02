@@ -9,12 +9,15 @@
 //! rshogi csa_client が先手視点に正規化して書くため、手番相対へ戻して格納する）。
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rshogi_core::position::Position;
 use rshogi_core::types::{Color, Move};
-use rshogi_csa::{Color as CsaColor, ParsedMove, SpecialMove, csa_move_to_usi, parse_csa_full};
+use rshogi_csa::{
+    Color as CsaColor, ParsedMove, SpecialMove, csa_move_to_usi, parse_csa_full, usi_move_to_csa,
+};
+use walkdir::WalkDir;
 
 use crate::kif::format_move_label;
 
@@ -23,12 +26,17 @@ use super::model::{
     GameSourceRef, MoveAnnotation, MoveView, PairFileMeta, move_is_legal,
 };
 
+/// CSA 棋譜（rshogi csa_client 出力形式）の `GameSource` 実装。
+///
+/// `--csa <dir|file>` に渡すパスを受け取り、`build_index`/`load_game` を提供する。
+/// ディレクトリを渡すと配下の `*.csa` を再帰収集して 1 つの対局リストとして扱う。
 pub struct CsaSource {
     /// ディレクトリ（配下の `*.csa` を横断）または単一 `.csa` ファイル。
     input: PathBuf,
 }
 
 impl CsaSource {
+    /// `input` はディレクトリ（配下の `*.csa` を再帰横断）または単一 `.csa` ファイル。
     pub fn new(input: impl Into<PathBuf>) -> Self {
         Self {
             input: input.into(),
@@ -38,37 +46,27 @@ impl CsaSource {
     /// 入力がディレクトリなら配下の `*.csa` を（サブディレクトリも再帰して）パス順で、
     /// 単一ファイルならそれ 1 つを返す。floodgate は `YYYY/MM/DD/*.csa` のように日付
     /// ディレクトリへネストするため再帰する。実行のたびに `file_idx` を安定させるよう
-    /// 全体を収集してからソートする。
+    /// 全体を収集してからソートする。`follow_links(false)` で symlink は辿らない（ループ回避）。
     fn collect_paths(&self) -> Result<Vec<PathBuf>> {
         let md = fs::metadata(&self.input)
             .with_context(|| format!("failed to stat {}", self.input.display()))?;
         if md.is_dir() {
-            let mut paths = Vec::new();
-            collect_csa_recursive(&self.input, &mut paths)?;
+            let mut paths: Vec<PathBuf> = WalkDir::new(&self.input)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_type().is_file()
+                        && e.path().extension().and_then(|x| x.to_str()) == Some("csa")
+                })
+                .map(|e| e.into_path())
+                .collect();
             paths.sort();
             Ok(paths)
         } else {
             Ok(vec![self.input.clone()])
         }
     }
-}
-
-/// `dir` 以下を再帰して `*.csa` を `out` に集める。`file_type()` は symlink を辿らない
-/// ため、symlink ディレクトリには入らず（ループ回避）symlink の csa も拾わない。
-fn collect_csa_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in
-        fs::read_dir(dir).with_context(|| format!("failed to read directory {}", dir.display()))?
-    {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        let path = entry.path();
-        if ft.is_dir() {
-            collect_csa_recursive(&path, out)?;
-        } else if ft.is_file() && path.extension().and_then(|x| x.to_str()) == Some("csa") {
-            out.push(path);
-        }
-    }
-    Ok(())
 }
 
 impl GameSource for CsaSource {
@@ -177,20 +175,26 @@ impl GameSource for CsaSource {
             };
 
             let usi = csa_move_to_usi(&cm.mv, &pos).ok();
-            // 次手の局面へ進めつつ、この手が CSA 局面に合法適用できたかを確かめる。
-            // 適用に失敗したらそれ以降は復元できないので、この手を最後に打ち切る。
+            // csa_move_to_usi は駒種を落とす（成り判定にしか使わない）ため、usi→CSA 逆変換が
+            // 元の CSA 手に戻るかで駒種の整合も確かめる。駒種を偽った破損手（例: 歩の位置から
+            // の `+7776GI`）は apply_csa_move が誤った駒を盤へ置き以降の局面が壊れるため、
+            // 通常手にせず盤面追跡もそこで打ち切る。
+            let csa_consistent = usi
+                .as_deref()
+                .and_then(|u| usi_move_to_csa(u, &pos).ok())
+                .is_some_and(|back| back == cm.mv);
             let applied = pos.apply_csa_move(&cm.mv).is_ok();
 
-            // 通常手として `mv` を持たせるのは「sfen_before が core 側で復元でき、その局面の
-            // 合法手集合に `mv` が含まれる」ときだけ。`render_board` の `do_move`（`promote()
-            // .unwrap()` 等）も `format_move_label`（空マス発で `piece_type()` が panic）も
+            // 通常手として `mv` を持たせるのは「駒種まで整合し、sfen_before が core 側で復元でき、
+            // その局面の合法手集合に `mv` が含まれる」ときだけ。`render_board` の `do_move`
+            // （`promote().unwrap()` 等）も `format_move_label`（空マス発で `piece_type()` panic）も
             // 合法手を前提にしており、`apply_csa_move` は駒種・成りの妥当性まで検証しないため、
-            // 合法手生成との一致で確実にゲートする。満たさない手は `Move::NONE` ＋ 生 CSA
-            // ラベルにフォールバックし、盤面は指了前局面のまま表示させる。
+            // 合法手生成と CSA 逆変換の一致で確実にゲートする。満たさない手は `Move::NONE` ＋
+            // 生 CSA ラベルへフォールバックする。
             let legal_mv = usi
                 .as_deref()
                 .and_then(Move::from_usi)
-                .filter(|&mv| core_ok && move_is_legal(&core, mv));
+                .filter(|&mv| csa_consistent && core_ok && move_is_legal(&core, mv));
             let (mv, kif_label) = match legal_mv {
                 Some(mv) => (mv, format_move_label(abs_ply, &core, mv)),
                 None => (Move::NONE, format!("{:>4} {}", abs_ply, cm.mv)),
@@ -217,7 +221,9 @@ impl GameSource for CsaSource {
                 },
             });
 
-            if !applied {
+            // 通常手として信頼できない手（駒種不整合・非合法・適用失敗）が出たら、盤面追跡は
+            // これ以上信頼できないので打ち切る。
+            if legal_mv.is_none() || !applied {
                 break;
             }
             normal_idx += 1;
@@ -303,6 +309,7 @@ fn is_csa_move_line(s: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::path::Path;
 
     fn write_csa(dir: &Path, name: &str, text: &str) -> PathBuf {
         let path = dir.join(name);
@@ -395,6 +402,20 @@ mod tests {
         assert_eq!(game.moves.len(), 2);
         assert!(game.moves[0].mv.is_normal(), "初手は通常手");
         assert!(!game.moves[1].mv.is_normal(), "不正手は Move::NONE にフォールバック");
+    }
+
+    #[test]
+    fn piece_type_mismatch_falls_back_to_none_and_truncates() {
+        // 初期局面の 77 は歩だが、駒種を偽って `+7776GI`（銀）と書いた破損手。usi 変換は駒種を
+        // 落として 7g7f になるが、逆変換で `+7776FU` に戻り不一致 → 通常手にせず打ち切る。
+        let text = "V2.2\nN+S\nN-G\nPI\n+7776GI\nT1\n%TORYO\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csa(dir.path(), "a.csa", text);
+        let source = CsaSource::new(dir.path());
+        let index = source.build_index().expect("build_index");
+        let game = source.load_game(&index, &index.entries[0]).expect("load_game");
+        assert_eq!(game.moves.len(), 1);
+        assert!(!game.moves[0].mv.is_normal(), "駒種を偽った手は Move::NONE にフォールバック");
     }
 
     #[test]

@@ -783,7 +783,7 @@ fn draw_eval_graph(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
 fn draw_status_bar(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let text = match &app.mode {
         Mode::Filter => format!(
-            "検索 [id: pair: outcome: winner:gote len:>N swing:>N reversal label:]: {}_   （一致 {}件）",
+            "検索 [id: pair: outcome: winner:sente|gote len:>N swing:>N reversal label:]: {}_   （一致 {}件）",
             app.filter_input,
             app.filtered.len()
         ),
