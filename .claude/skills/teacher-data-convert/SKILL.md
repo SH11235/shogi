@@ -113,6 +113,18 @@ cargo build --release -p tools --bin rescore_psv
 - 中断（Ctrl-C / SIGINT）時: `psv_to_hcpe3` は `.partial` を削除（壊れた最終出力を残さない）。
   `rescore_psv` は出力ファイルが中途残存し、再実行時に `.done` マーカー／既存出力レコード数で skip/resume される。
 
+### GPU 経路(ONNX)を最速化: 同一 GPU で複数プロセス並走
+
+ONNX/TRT の `rescore_psv` は、軽量モデル＋高速 GPU だと **1 プロセスは前処理(read+build)供給律速**で
+GPU が遊ぶ。**入力を分割して複数プロセス並走**させると独立 CUDA ストリーム＋独立前処理で GPU 余力を
+埋め、実効スループットがほぼ線形にスケールする（**コード不要**）。実測: RTX 5090 で 30m resnet10/TRT fp16、
+**2 プロセス並走 ≈ 2.1x**（単体 ≈39.6k → 合算 ≈84k pos/s）。
+
+- 各プロセスの **`--output-dir` は必ず分ける**（同一だと `.done` で片方が全スキップ）。
+- 入力分割: 別 shard / `--limit`+オフセット別スライス等。`--onnx-tensorrt-cache` は共有可（engine 再利用）。
+- `nvidia-smi` の util を見て並走数を調整（GPU 飽和で頭打ち。VRAM も上限）。
+- 詳細は `crates/tools/docs/rescore_psv.md`「スループット最適化: 同一 GPU で複数プロセス並走」。
+
 ## 出力検証（必須）
 
 大量変換・再評価は**出力の bit 一致を必ず確認**する:
