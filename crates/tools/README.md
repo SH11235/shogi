@@ -17,7 +17,7 @@
 
 | ツール | 説明 |
 |--------|------|
-| `kifu_player` | PSV / tournament JSONL / CSA を同じ TUI で再生・評価値グラフ付きで閲覧（`kifu-player` feature、[詳細](docs/kifu_player.md)） |
+| `kifu_player` | PSV / tournament JSONL / CSA を同じ TUI で再生・閲覧（`kifu-player` feature、評価値グラフ・検索/絞り込み（SFEN 局面検索含む）付き。[詳細](docs/kifu_player.md)） |
 
 ### 学習データ処理
 
@@ -80,7 +80,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 各ツールの詳細は `docs/` を参照：
 
 - [tournament](docs/tournament.md) - 並列トーナメント・SPRT 検定
-- [kifu_player](docs/kifu_player.md) - PSV / tournament JSONL / CSA 共通の棋譜プレイヤー TUI（評価値グラフ付き）
+- [kifu_player](docs/kifu_player.md) - PSV / tournament JSONL / CSA 共通の棋譜プレイヤー TUI（評価値グラフ・検索/絞り込み（SFEN 局面検索含む）付き）
 - [gensfen](docs/gensfen.md) - 教師局面生成ツールの詳細
 - [benchmark](docs/benchmark.md) - ベンチマークツールの詳細
 - [pack_tools](docs/pack_tools.md) - 学習データ処理ツール群
