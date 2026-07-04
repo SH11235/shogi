@@ -1329,8 +1329,12 @@ struct Clock {
 impl Clock {
     fn from_summary(summary: &GameSummary) -> Self {
         Self {
-            black_time_ms: summary.black_time.total_time_ms + summary.black_time.increment_ms,
-            white_time_ms: summary.white_time.total_time_ms + summary.white_time.increment_ms,
+            // #858: btime/wtime は「増分を加える前の真の残時間」= total_time_ms を採る。
+            // 以前は init に increment を足し込んでいたため、go で別途送る binc/winc と
+            // 合わせてエンジンが増分を二重計上した残時間で思考していた。consume 側で
+            // 各手 post-increment (`slot - consumed + inc`) するので、ここは pre-increment。
+            black_time_ms: summary.black_time.total_time_ms,
+            white_time_ms: summary.white_time.total_time_ms,
             black_byoyomi_ms: summary.black_time.byoyomi_ms,
             white_byoyomi_ms: summary.white_time.byoyomi_ms,
             black_increment_ms: summary.black_time.increment_ms,
@@ -1362,6 +1366,13 @@ impl Clock {
         let btime = self.black_time_ms.max(0);
         let wtime = self.white_time_ms.max(0);
         if self.black_increment_ms > 0 || self.white_increment_ms > 0 {
+            // #858: fischer でも byoyomi 分岐と同趣旨で、エンジンへ報告する自分の持ち時間
+            // から通信マージンを差し引く。手番側 (side_to_move) の btime/wtime のみ減算し、
+            // 相手側は情報用途なので触らない。think_limit_ms 側と同じ実効予算にする。
+            let (btime, wtime) = match side_to_move {
+                Color::Black => ((btime - margin_msec as i64).max(0), wtime),
+                Color::White => (btime, (wtime - margin_msec as i64).max(0)),
+            };
             format!(
                 "btime {} wtime {} binc {} winc {}",
                 btime, wtime, self.black_increment_ms, self.white_increment_ms
@@ -1384,7 +1395,9 @@ impl Clock {
             Color::White => (self.white_time_ms, self.white_byoyomi_ms, self.white_increment_ms),
         };
         if increment_ms > 0 {
-            total_ms.max(0) as u64 + increment_ms.max(0) as u64
+            // #858: fischer でも margin をエンジンへの実効思考予算から差し引く
+            // (byoyomi 分岐と同趣旨)。total(pre-increment) + inc から margin を引く。
+            (total_ms.max(0) + increment_ms.max(0) - margin_msec as i64).max(0) as u64
         } else if byoyomi_ms > 0 {
             (byoyomi_ms - margin_msec as i64).max(0) as u64
         } else if total_ms > 0 {
@@ -1973,5 +1986,111 @@ mod tests {
         // self は白 (5_000ms), opp は黒 (10_000ms)
         assert_eq!(pub_state.remaining_time_sec_self, Some(5));
         assert_eq!(pub_state.remaining_time_sec_opp, Some(10));
+    }
+
+    // ---- #858: fischer の btime 二重計上 + margin 未適用の修正 ----
+
+    fn fischer_summary(total_ms: i64, inc_ms: i64) -> GameSummary {
+        use rshogi_csa::{Color, initial_position};
+        let time = crate::protocol::TimeConfig {
+            total_time_ms: total_ms,
+            byoyomi_ms: 0,
+            increment_ms: inc_ms,
+        };
+        GameSummary {
+            game_id: "g".to_owned(),
+            my_color: Color::Black,
+            sente_name: "b".to_owned(),
+            gote_name: "w".to_owned(),
+            position: initial_position(),
+            initial_moves: Vec::new(),
+            black_time: time.clone(),
+            white_time: time,
+            reconnect_token: None,
+        }
+    }
+
+    fn byoyomi_summary(total_ms: i64, byoyomi_ms: i64) -> GameSummary {
+        use rshogi_csa::{Color, initial_position};
+        let time = crate::protocol::TimeConfig {
+            total_time_ms: total_ms,
+            byoyomi_ms,
+            increment_ms: 0,
+        };
+        GameSummary {
+            game_id: "g".to_owned(),
+            my_color: Color::Black,
+            sente_name: "b".to_owned(),
+            gote_name: "w".to_owned(),
+            position: initial_position(),
+            initial_moves: Vec::new(),
+            black_time: time.clone(),
+            white_time: time,
+            reconnect_token: None,
+        }
+    }
+
+    #[test]
+    fn clock_from_summary_btime_excludes_increment() {
+        // #858: btime/wtime は total_time_ms (pre-increment) で、増分を足し込まない。
+        let clock = Clock::from_summary(&fischer_summary(60_000, 5_000));
+        assert_eq!(clock.black_time_ms, 60_000);
+        assert_eq!(clock.white_time_ms, 60_000);
+        // increment 自体は保持する (go の binc/winc で送るため)。
+        assert_eq!(clock.black_increment_ms, 5_000);
+        assert_eq!(clock.white_increment_ms, 5_000);
+    }
+
+    #[test]
+    fn clock_fischer_go_args_report_pre_increment_time_minus_margin() {
+        use rshogi_csa::Color;
+        // #858: fischer の go は btime=total-margin(手番側のみ) / binc=inc。
+        // 旧実装は btime=total+inc(=65000) を送り、binc と合わせて二重計上していた。
+        let clock = Clock::from_summary(&fischer_summary(60_000, 5_000));
+        // 先手番: 自分 (black) の btime から margin(1500) を引く。wtime は据え置き。
+        assert_eq!(
+            clock.build_go_args(1_500, Color::Black),
+            "btime 58500 wtime 60000 binc 5000 winc 5000"
+        );
+        // 後手番: 自分 (white) の wtime から margin を引く。
+        assert_eq!(
+            clock.build_go_args(1_500, Color::White),
+            "btime 60000 wtime 58500 binc 5000 winc 5000"
+        );
+    }
+
+    #[test]
+    fn clock_fischer_think_limit_applies_margin() {
+        use rshogi_csa::Color;
+        // #858: think_limit = total(pre-increment) + inc - margin = 60000 + 5000 - 1500。
+        // 旧実装は btime に inc 込みで total_ms=65000 → 65000 + 5000 = 70000 だった。
+        let clock = Clock::from_summary(&fischer_summary(60_000, 5_000));
+        assert_eq!(clock.think_limit_ms(1_500, Color::Black), 63_500);
+    }
+
+    #[test]
+    fn clock_fischer_margin_larger_than_budget_clamps_to_zero() {
+        use rshogi_csa::Color;
+        // margin が予算より大きいときは go/think_limit とも 0 にクランプ (負値を送らない)。
+        let clock = Clock::from_summary(&fischer_summary(1_000, 500));
+        assert_eq!(clock.think_limit_ms(5_000, Color::Black), 0);
+        assert_eq!(
+            clock.build_go_args(5_000, Color::Black),
+            "btime 0 wtime 1000 binc 500 winc 500"
+        );
+    }
+
+    #[test]
+    fn clock_byoyomi_branch_unchanged_by_858() {
+        use rshogi_csa::Color;
+        // #858 の変更は fischer(inc>0) 限定。byoyomi(inc=0) は従来どおり
+        // btime=total / go byoyomi=byoyomi-margin / think_limit=byoyomi-margin。
+        let clock = Clock::from_summary(&byoyomi_summary(60_000, 10_000));
+        assert_eq!(clock.black_time_ms, 60_000);
+        assert_eq!(
+            clock.build_go_args(1_500, Color::Black),
+            "btime 60000 wtime 60000 byoyomi 8500"
+        );
+        assert_eq!(clock.think_limit_ms(1_500, Color::Black), 8_500);
     }
 }
