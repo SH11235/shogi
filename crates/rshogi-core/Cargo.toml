@@ -100,6 +100,7 @@ layerstacks-768x16x32  = []
 layerstacks-768x8x32   = []
 layerstacks-512x16x32  = []
 layerstacks-1024x16x32 = []
+layerstacks-3072x16x32 = []
 
 # LayerStack 拡張 slot (psqt / threat)
 # - nnue-psqt:   AccumulatorLayerStacks に psqt_accumulation を含める。PSQT モデル読み込み可。
@@ -133,8 +134,9 @@ mode-specific  = []
 # NNUE progress8kpabs バケットの差分更新最適化
 # - 有効時: StackEntry に progress_sum/computed_progress フィールド追加、
 #   ensure_progress_bucket で DirtyPiece 差分から O(1) 更新
-# - L0=1536 系で性能向上、L0=768/512 で退行する trade-off
-# - 適用条件: build.rs で mode-specific + layerstacks-1536x16x32 / layerstacks-1536x32x32 を強制
+# - L0=1536 系 / L0=3072 で性能向上、L0=768/512 で退行する trade-off
+# - 適用条件: build.rs で mode-specific + layerstacks-1536x16x32 / layerstacks-1536x32x32 /
+#   layerstacks-3072x16x32 を強制
 #   (mode-* が未指定の互換 build では check 緩和、user 責任で組合せ可)
 nnue-progress-diff = []
 
@@ -148,7 +150,7 @@ edition-universal = [
   "mode-universal",
   "layerstack-arch", "halfkx-arch",
   "ft-halfkp", "ft-halfka_split", "ft-halfka_merged", "ft-halfka_hm_split", "ft-halfka_hm_merged",
-  "layerstacks-1536x16x32", "layerstacks-1536x32x32", "layerstacks-768x16x32", "layerstacks-768x8x32", "layerstacks-512x16x32", "layerstacks-1024x16x32",
+  "layerstacks-1536x16x32", "layerstacks-1536x32x32", "layerstacks-768x16x32", "layerstacks-768x8x32", "layerstacks-512x16x32", "layerstacks-1024x16x32", "layerstacks-3072x16x32",
   "nnue-psqt", "nnue-threat",
   "halfkx-activation-crelu", "halfkx-activation-screlu", "halfkx-activation-pairwise",
 ]
@@ -166,7 +168,7 @@ edition-layerstacks             = ["edition-layerstacks-any-any-any"]
 edition-layerstacks-any-any-any = [
   "mode-family", "layerstack-arch",
   "ft-halfkp", "ft-halfka_split", "ft-halfka_merged", "ft-halfka_hm_split", "ft-halfka_hm_merged",
-  "layerstacks-1536x16x32", "layerstacks-1536x32x32", "layerstacks-768x16x32", "layerstacks-768x8x32", "layerstacks-512x16x32", "layerstacks-1024x16x32",
+  "layerstacks-1536x16x32", "layerstacks-1536x32x32", "layerstacks-768x16x32", "layerstacks-768x8x32", "layerstacks-512x16x32", "layerstacks-1024x16x32", "layerstacks-3072x16x32",
   "nnue-psqt", "nnue-threat",
 ]
 
@@ -212,7 +214,7 @@ edition-layerstacks-halfka_hm_merged-1536x32x32-none = [
   "nnue-progress-diff",
 ]
 
-# LayerStack specific (1024x16x32 / 768x16x32 / 768x8x32 / 512x16x32、none のみ)。L0≠1536 系は progress-diff 不可。
+# LayerStack specific (1024x16x32 / 768x16x32 / 768x8x32 / 512x16x32、none のみ)。L0=1024/768/512 系は progress-diff 不可。
 edition-layerstacks-halfka_hm_merged-1024x16x32-none = [
   "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1024x16x32",
 ]
@@ -242,6 +244,12 @@ edition-layerstacks-halfka_hm_merged-768x8x32-none = [
 ]
 edition-layerstacks-halfka_hm_merged-512x16x32-none = [
   "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-512x16x32",
+]
+# LayerStack specific (3072x16x32、none のみ)。FT_OUT=3072 の大型 FT。
+# L0=3072 も progress-diff の NPS 改善を実測で確認済みのため 1536 系と同様に同梱する。
+edition-layerstacks-halfka_hm_merged-3072x16x32-none = [
+  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-3072x16x32",
+  "nnue-progress-diff",
 ]
 
 # LS specific preset (halfka_hm_merged 以外の 4 FT、1536x16x32-none で代表整備)。

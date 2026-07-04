@@ -43,6 +43,7 @@ layerstacks-768x16x32  = ["rshogi-core/layerstacks-768x16x32"]
 layerstacks-768x8x32   = ["rshogi-core/layerstacks-768x8x32"]
 layerstacks-512x16x32  = ["rshogi-core/layerstacks-512x16x32"]
 layerstacks-1024x16x32 = ["rshogi-core/layerstacks-1024x16x32"]
+layerstacks-3072x16x32 = ["rshogi-core/layerstacks-3072x16x32"]
 # LS 拡張 slot
 nnue-psqt   = ["rshogi-core/nnue-psqt"]
 nnue-threat = ["rshogi-core/nnue-threat"]

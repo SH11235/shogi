@@ -183,6 +183,18 @@ fn progress_diff_with_1536x32x32_ok() {
 }
 
 #[test]
+fn progress_diff_with_3072_ok() {
+    let has = lookup(&[
+        "mode-specific",
+        "layerstack-arch",
+        "layerstacks-3072x16x32",
+        "ft-halfka_hm_merged",
+        "nnue-progress-diff",
+    ]);
+    assert!(validate_feature_combination(&has).is_ok());
+}
+
+#[test]
 fn progress_diff_in_family_rejected() {
     let has = lookup(&[
         "mode-family",
