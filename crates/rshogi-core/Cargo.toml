@@ -100,6 +100,7 @@ layerstacks-768x16x32  = []
 layerstacks-768x8x32   = []
 layerstacks-512x16x32  = []
 layerstacks-1024x16x32 = []
+layerstacks-3072x16x32 = []
 
 # LayerStack 拡張 slot (psqt / threat)
 # - nnue-psqt:   AccumulatorLayerStacks に psqt_accumulation を含める。PSQT モデル読み込み可。
@@ -148,7 +149,7 @@ edition-universal = [
   "mode-universal",
   "layerstack-arch", "halfkx-arch",
   "ft-halfkp", "ft-halfka_split", "ft-halfka_merged", "ft-halfka_hm_split", "ft-halfka_hm_merged",
-  "layerstacks-1536x16x32", "layerstacks-1536x32x32", "layerstacks-768x16x32", "layerstacks-768x8x32", "layerstacks-512x16x32", "layerstacks-1024x16x32",
+  "layerstacks-1536x16x32", "layerstacks-1536x32x32", "layerstacks-768x16x32", "layerstacks-768x8x32", "layerstacks-512x16x32", "layerstacks-1024x16x32", "layerstacks-3072x16x32",
   "nnue-psqt", "nnue-threat",
   "halfkx-activation-crelu", "halfkx-activation-screlu", "halfkx-activation-pairwise",
 ]
@@ -166,7 +167,7 @@ edition-layerstacks             = ["edition-layerstacks-any-any-any"]
 edition-layerstacks-any-any-any = [
   "mode-family", "layerstack-arch",
   "ft-halfkp", "ft-halfka_split", "ft-halfka_merged", "ft-halfka_hm_split", "ft-halfka_hm_merged",
-  "layerstacks-1536x16x32", "layerstacks-1536x32x32", "layerstacks-768x16x32", "layerstacks-768x8x32", "layerstacks-512x16x32", "layerstacks-1024x16x32",
+  "layerstacks-1536x16x32", "layerstacks-1536x32x32", "layerstacks-768x16x32", "layerstacks-768x8x32", "layerstacks-512x16x32", "layerstacks-1024x16x32", "layerstacks-3072x16x32",
   "nnue-psqt", "nnue-threat",
 ]
 
@@ -242,6 +243,13 @@ edition-layerstacks-halfka_hm_merged-768x8x32-none = [
 ]
 edition-layerstacks-halfka_hm_merged-512x16x32-none = [
   "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-512x16x32",
+]
+# LayerStack specific (3072x16x32、none のみ)。FT_OUT=3072 の大型 FT。
+# nnue-progress-diff は現状 1536 系のみ許可 (checks.rs)。L0=3072 は「L0 大 → full
+# progress 再計算が高コスト → diff 有利」の trade-off 上 1536 と同側と推測されるが、
+# 未測定のため speculative な組合せは作らず none のみ整備する (「測定なし最適化は禁止」)。
+edition-layerstacks-halfka_hm_merged-3072x16x32-none = [
+  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-3072x16x32",
 ]
 
 # LS specific preset (halfka_hm_merged 以外の 4 FT、1536x16x32-none で代表整備)。

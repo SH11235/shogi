@@ -43,6 +43,7 @@ fn validate_feature_combination(
         "layerstacks-768x8x32",
         "layerstacks-512x16x32",
         "layerstacks-1024x16x32",
+        "layerstacks-3072x16x32",
     ];
     let layerstacks_count = layerstacks_features
         .iter()
@@ -93,6 +94,9 @@ fn validate_feature_combination(
 
     // nnue-progress-diff は L0=1536 系で性能向上、L0=768/512 で退行する trade-off。
     // 退行構成での誤指定を弾く。
+    // NOTE: L0=3072 は「L0 大 → full progress 再計算が高コスト → diff 有利」の trade-off 上
+    // 1536 と同側 (有利) と推測されるが、未測定のため許可リストには入れない
+    // (「測定なし最適化は禁止」)。実測で改善を確認したら 3072 を下記 valid 条件に追加する。
     if has_feature("nnue-progress-diff") {
         let valid = mode_specific
             && (has_feature("layerstacks-1536x16x32")

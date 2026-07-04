@@ -528,7 +528,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
             // - `w_ptr`: `AlignedBox<i8>` のポインタ。`_mm_loadu_si128`
             //   （非アラインロード）を使っているためアライメント要件は無い
             // - プリフェッチは hint のみで safety に影響しない
-            // - ループ `L1 / 16` は const generics 由来。`L1 ∈ {512, 768, 1536}`
+            // - ループ `L1 / 16` は const generics 由来。`L1 ∈ {512, 768, 1024, 1536, 3072}`
             //   は全て 16 の倍数なので末端要素が取り残されない
             unsafe {
                 use std::arch::x86_64::*;
@@ -585,7 +585,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
             //   アラインが保証され `_mm256_load/store_si256` の要件を満たす
             // - `w_ptr`: `AlignedBox<i8>` だが `_mm_loadu_si128` 非アラインロード
             //   を使うためアライメント要件は無い
-            // - `L1 ∈ {512, 768, 1536}` はすべて 16 の倍数
+            // - `L1 ∈ {512, 768, 1024, 1536, 3072}` はすべて 16 の倍数
             unsafe {
                 use std::arch::x86_64::*;
 

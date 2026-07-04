@@ -1292,13 +1292,16 @@ pub(crate) fn update_and_evaluate_layer_stacks_cached(
             LayerStacksAccStack::L512x16x32(s) => ensure_progress_bucket(pos, s, num_buckets),
             #[cfg(feature = "layerstacks-1024x16x32")]
             LayerStacksAccStack::L1024x16x32(s) => ensure_progress_bucket(pos, s, num_buckets),
+            #[cfg(feature = "layerstacks-3072x16x32")]
+            LayerStacksAccStack::L3072x16x32(s) => ensure_progress_bucket(pos, s, num_buckets),
             #[cfg(not(any(
                 feature = "layerstacks-1536x16x32",
                 feature = "layerstacks-1536x32x32",
                 feature = "layerstacks-768x16x32",
                 feature = "layerstacks-768x8x32",
                 feature = "layerstacks-512x16x32",
-                feature = "layerstacks-1024x16x32"
+                feature = "layerstacks-1024x16x32",
+                feature = "layerstacks-3072x16x32"
             )))]
             _ => unreachable!("no LayerStacks variant enabled"),
         };

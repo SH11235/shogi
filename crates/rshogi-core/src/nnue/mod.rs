@@ -122,6 +122,8 @@ pub use network_layer_stacks::NetworkLayerStacks1024x16x32;
 pub use network_layer_stacks::NetworkLayerStacks1536x16x32;
 #[cfg(all(feature = "layerstacks-1536x32x32", feature = "ft-halfka_hm_merged"))]
 pub use network_layer_stacks::NetworkLayerStacks1536x32x32;
+#[cfg(all(feature = "layerstacks-3072x16x32", feature = "ft-halfka_hm_merged"))]
+pub use network_layer_stacks::NetworkLayerStacks3072x16x32;
 pub use network_layer_stacks::{LayerStacksNetwork, LsNetByFt, NetworkLayerStacks};
 // `#[macro_export]` で crate root に出る ls_dispatch_ft_size! を nnue:: パスからも参照可能にする。
 pub use crate::ls_dispatch_ft_size;
