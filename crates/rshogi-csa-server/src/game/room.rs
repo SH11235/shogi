@@ -316,25 +316,15 @@ impl GameRoom {
         self.finish(result)
     }
 
-    /// cold-start 復元直後に、現在手番の経過計測起点を現在時刻へ張り直す。
-    ///
-    /// replay は局面と時計消費を再現するが `turn_started_at_ms` には最後の手の
-    /// 歴史的時刻が残る。張り直さないと復元後の最初の手で `apply_move` の
-    /// `now_ms - turn_started_at_ms` が evict 滞留ぶん過大になり即 `TimeUp` する。
-    /// `Playing` 以外は起点を持たない（`AgreeWaiting` 復元では `None` のまま）ため no-op。
-    pub fn reset_turn_started_at(&mut self, now_ms: u64) {
-        if matches!(self.status, GameStatus::Playing) {
-            self.turn_started_at_ms = Some(now_ms);
-        }
-    }
-
     /// 現在手番が `now_ms` 時点で残している持ち時間 (ms)。`0` は時間切れ。
     /// `Playing` 以外は `None`。
     ///
-    /// turn alarm 発火時に「evict 滞留での早発火か、実際の時間切れか」を区別する
-    /// ために使う。`reset_turn_started_at` で cold-start 復元時に起点が `now` へ
-    /// 張り直されるため、evict 早発火では満額の残時間が返り、warm な真の時間切れ
-    /// （alarm は `turn_budget + margin + safety` 後に発火）では `0` が返る。
+    /// turn alarm 発火時に「まだ残時間があるか、実際の時間切れか」を区別する
+    /// ために使う。計時起点 `turn_started_at_ms` は「直前の指し手の at_ms（初手前は
+    /// play_started_at_ms）」で統一されており、cold-start 復元後も張り直さない
+    /// (<https://github.com/SH11235/rshogi/issues/852>)。休眠を跨いだ長考が予算を
+    /// 超えていれば `0`（= 時間切れ）が返り、alarm 側は force_time_up する。実時間が
+    /// まだ予算内なら残時間が正で返り、alarm は残時間ぶん貼り直す。
     pub fn current_turn_remaining_ms(&self, now_ms: u64) -> Option<u64> {
         if !matches!(self.status, GameStatus::Playing) {
             return None;
@@ -753,20 +743,6 @@ mod tests {
     }
 
     #[test]
-    fn reset_turn_started_at_sets_now_when_playing_and_noop_before_start() {
-        // START 前 (AgreeWaiting) は起点を作らない。
-        let mut room = make_room();
-        room.reset_turn_started_at(12_345);
-        assert!(matches!(room.status(), GameStatus::AgreeWaiting));
-        assert_eq!(room.turn_started_at_ms, None);
-
-        // START 後 (Playing) は計測起点を渡した now へ張り直す。
-        agree_both(&mut room);
-        room.reset_turn_started_at(67_890);
-        assert_eq!(room.turn_started_at_ms, Some(67_890));
-    }
-
-    #[test]
     fn current_turn_remaining_ms_is_none_before_start() {
         let room = make_room();
         assert_eq!(room.current_turn_remaining_ms(0), None);
@@ -778,11 +754,11 @@ mod tests {
         agree_both(&mut room); // now=0 で START → 現手番の計測起点も 0、満額 budget
         let budget = room.clock_turn_budget_ms(room.current_turn()).max(0) as u64;
         assert!(budget > 0);
-        // 経過 0 → 残 == budget（evict 早発火: 復元で起点が now に張り直された状況に相当）
+        // 経過 0 → 残 == budget（起点は手番開始時刻のまま。まだ実時間を消費していない）
         assert_eq!(room.current_turn_remaining_ms(0), Some(budget));
         // 経過 < budget → 残 = budget - elapsed
         assert_eq!(room.current_turn_remaining_ms(budget / 2), Some(budget - budget / 2));
-        // budget 到達/超過 → 0（warm な真の時間切れ: alarm は budget+margin+safety 後に発火）
+        // budget 到達/超過 → 0（実時間が予算を超えた時間切れ。alarm は force_time_up する）
         assert_eq!(room.current_turn_remaining_ms(budget), Some(0));
         assert_eq!(room.current_turn_remaining_ms(budget + 5_000), Some(0));
     }

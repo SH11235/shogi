@@ -597,18 +597,23 @@ mod tests {
     }
 
     /// hibernation evict を跨いだ cold start で replay 直後の `turn_started_at_ms`
-    /// は最後の手の歴史的時刻のまま残る。張り直さずに次の手を指すと、復元時刻と
-    /// の差（evict 滞留ぶん = 数十分）がそのまま elapsed になり即 `TimeUp` する。
-    /// この対照テストはバグ条件が実際に成立することを固定する。
+    /// は最後の手の at_ms のまま残る (#852 の計時統一)。DO 側は起点を「今」へ
+    /// 張り直さないため、休眠滞留を跨いで実時間が予算を超えていれば、live 側の次の
+    /// 手でも replay 同様に `TimeUp` する。live と replay が同じ規則で課金される
+    /// (= 乖離しない) ことを固定する対照テスト
+    /// (<https://github.com/SH11235/rshogi/issues/852>)。
     #[test]
-    fn cold_start_without_reset_spuriously_times_out() {
+    fn cold_start_charges_real_elapsed_and_times_out_when_over_budget() {
         let mut cfg = baseline_config();
         cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
         let moves = vec![move_row(1, "black", "+7776FU,T3", 3_000)];
         let ReplaySummary::Restored { mut core } = replay_core_room(&cfg, &moves) else {
             panic!("expected Restored");
         };
-        // 黒の手の 30 分後に白が指す（白番の長考中に DO が evict された状況）。
+        // 黒の手 (at_ms = PLAY_STARTED + 3s) の 30 分後に白が指す（白番の長考中に DO
+        // が evict され、復帰後に着手した状況）。本体 60s + 秒読み 10s の予算を実時間が
+        // 大きく超えるため、live 側 (handle_line) でも TimeUp(White) になる。これが
+        // 従来 replay 側だけが TimeUp し live と乖離していた幽霊 TimeUp を解消する。
         let resumed_at_ms = PLAY_STARTED_AT_MS + 30 * 60_000;
         let result = core
             .handle_line(Color::White, &CsaLine::new("-3334FU,T1"), resumed_at_ms + 1_000)
@@ -620,32 +625,68 @@ mod tests {
                     loser: Color::White
                 })
             ),
-            "張り直し無しでは復元滞留ぶんで即 TimeUp するはず: {:?}",
+            "実時間が予算超過なら live 側でも TimeUp するはず: {:?}",
             result.outcome
         );
     }
 
-    /// `reset_turn_started_at(now)` を復元直後に呼べば、計測起点が現在時刻に
-    /// 張り直され、復元後の最初の手が evict 滞留ぶんで誤 `TimeUp` しない。
+    /// 「大きな at_ms ギャップ (長考) を含む手列」でも各手の実消費が予算内なら、
+    /// replay は `MoveReplayFailed` にならず `Restored` する (#852 root fix の対照)。
+    /// 本番で発症した fischer-60-5F を模し、40 秒級の長考を 2 手繋いでも 60s バンク +
+    /// 5s increment の予算内なので TimeUp しない
+    /// (<https://github.com/SH11235/rshogi/issues/852>)。
     #[test]
-    fn cold_start_reset_turn_started_at_avoids_spurious_time_up() {
+    fn cold_start_replay_with_large_but_within_budget_fischer_gaps_restores() {
+        let mut cfg = baseline_config();
+        cfg.clock = ClockSpec::Fischer {
+            total_time_sec: 60,
+            increment_sec: 5,
+        };
+        cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
+        // 黒 40s 長考 → 白 40s 長考。いずれも 60s バンク + 5s increment の予算内。
+        let moves = vec![
+            move_row(1, "black", "+7776FU,T40", 40_000),
+            move_row(2, "white", "-3334FU,T40", 80_000),
+        ];
+        let ReplaySummary::Restored { core } = replay_core_room(&cfg, &moves) else {
+            panic!("予算内の長考なら Restored のはず (MoveReplayFailed になってはいけない)");
+        };
+        assert_eq!(core.moves_played(), 2);
+        // 予算内なので両者とも残時間が正 (TimeUp していない)。
+        assert!(core.clock_remaining_main_ms(Color::Black) > 0);
+        assert!(core.clock_remaining_main_ms(Color::White) > 0);
+    }
+
+    /// cold-start 復元後の alarm 判定を固定する (#852)。計時起点を張り直さないので、
+    /// 実時間が予算を超えた `now` では `current_turn_remaining_ms` が `0` を返し、
+    /// alarm は `force_time_up` を発火する。予算内の `now` では残時間が正で、alarm は
+    /// 残時間ぶん貼り直す (<https://github.com/SH11235/rshogi/issues/852>)。
+    #[test]
+    fn cold_start_alarm_decides_time_up_from_real_remaining() {
         let mut cfg = baseline_config();
         cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
         let moves = vec![move_row(1, "black", "+7776FU,T3", 3_000)];
         let ReplaySummary::Restored { mut core } = replay_core_room(&cfg, &moves) else {
             panic!("expected Restored");
         };
-        let resumed_at_ms = PLAY_STARTED_AT_MS + 30 * 60_000;
-        core.reset_turn_started_at(resumed_at_ms);
-        let result = core
-            .handle_line(Color::White, &CsaLine::new("-3334FU,T1"), resumed_at_ms + 1_000)
-            .expect("post-restore move must not spuriously time out");
-        match result.outcome {
-            HandleOutcome::MoveAccepted { next_turn, .. } => {
-                assert_eq!(next_turn, Color::Black);
-            }
-            other => panic!("expected MoveAccepted, got {other:?}"),
-        }
+        // 次手番は白。計時起点は黒の手の at_ms (= PLAY_STARTED + 3s) のまま。
+        let turn_start = PLAY_STARTED_AT_MS + 3_000;
+        let budget = core.clock_turn_budget_ms(Color::White).max(0) as u64;
+        assert!(budget > 0);
+        // 予算内の now → 残時間が正 → alarm は reschedule する。
+        let within = turn_start + budget / 2;
+        assert_eq!(core.current_turn_remaining_ms(within), Some(budget - budget / 2));
+        // 予算超過の now (30 分後) → 残 0 → alarm は force_time_up する。
+        let over = turn_start + 30 * 60_000;
+        assert_eq!(core.current_turn_remaining_ms(over), Some(0));
+        // 実際に force_time_up が GameEnded(TimeUp{White}) を返すこと。
+        let result = core.force_time_up(core.current_turn());
+        assert!(matches!(
+            result.outcome,
+            HandleOutcome::GameEnded(GameResult::TimeUp {
+                loser: Color::White
+            })
+        ));
     }
 
     /// `MoveRow::at_ms` が 0 未満や `play_started_at_ms` より小さい異常値でも、
