@@ -968,7 +968,7 @@ mod tests {
         //     でカバーされているが、`GameRoom` 層での挙動もここで固定する。
         let mut room = room_with(0, 5, 10);
         agree_both(&mut room);
-        // margin=0 なので elapsed_ms がそのまま consume に渡る。
+        // elapsed_ms は margin の値に関わらず常にそのまま consume に渡る (#857)。
         let r = room.handle_line(Color::Black, &line("+7776FU"), 5_000).unwrap();
         assert!(matches!(
             r.outcome,

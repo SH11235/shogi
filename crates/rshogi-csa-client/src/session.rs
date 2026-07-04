@@ -329,8 +329,7 @@ where
 
     let mut clock = Clock::from_summary(&summary);
     if let Some(state) = &resume_state {
-        clock.black_time_ms = state.black_remaining_ms.max(0);
-        clock.white_time_ms = state.white_remaining_ms.max(0);
+        clock.apply_resume_remaining(state.black_remaining_ms, state.white_remaining_ms);
     }
 
     let mut s = SessionState {
@@ -1342,6 +1341,20 @@ impl Clock {
         }
     }
 
+    /// 再接続 (`BEGIN Reconnect_State`) の `Black/White_Time_Remaining_Ms` を
+    /// 台帳へ反映する。
+    ///
+    /// サーバーが送る値は `remaining_main_ms` = fischer では slot そのもの
+    /// (次手の増分込み post-increment)。#858 で台帳 btime/wtime は pre-increment
+    /// (増分を足す前の残時間) 規約になったため、各色の増分を差し引いてから
+    /// 書き込む。そのまま代入すると再接続後は台帳が恒久的に +inc 膨張し、
+    /// エンジンへの報告予算がサーバー予算を超えて TimeUp を招く。
+    /// byoyomi / sudden-death は increment=0 なので従来どおり素通しになる。
+    fn apply_resume_remaining(&mut self, black_remaining_ms: i64, white_remaining_ms: i64) {
+        self.black_time_ms = (black_remaining_ms.max(0) - self.black_increment_ms).max(0);
+        self.white_time_ms = (white_remaining_ms.max(0) - self.white_increment_ms).max(0);
+    }
+
     fn increment_ms(&self, color: Color) -> i64 {
         match color {
             Color::Black => self.black_increment_ms,
@@ -2092,5 +2105,44 @@ mod tests {
             "btime 60000 wtime 60000 byoyomi 8500"
         );
         assert_eq!(clock.think_limit_ms(1_500, Color::Black), 8_500);
+    }
+
+    #[test]
+    fn clock_resume_fischer_subtracts_increment_from_server_remaining() {
+        use rshogi_csa::Color;
+        // fischer 再接続: サーバーの Black/White_Time_Remaining_Ms は slot
+        // (次手の増分込み post-increment)。台帳は pre-increment 規約なので、
+        // 各色の増分を差し引いた値になること。差し引かず素通しすると台帳が
+        // +inc 膨張し、以後の全手でエンジン報告予算がサーバー予算を超える。
+        let mut clock = Clock::from_summary(&fischer_summary(60_000, 5_000));
+        clock.apply_resume_remaining(30_000, 25_000);
+        assert_eq!(clock.black_time_ms, 25_000);
+        assert_eq!(clock.white_time_ms, 20_000);
+        // エンジン報告予算 = 台帳 + inc - margin = server slot - margin を維持。
+        assert_eq!(clock.think_limit_ms(1_500, Color::Black), 28_500);
+        assert_eq!(
+            clock.build_go_args(1_500, Color::Black),
+            "btime 23500 wtime 20000 binc 5000 winc 5000"
+        );
+    }
+
+    #[test]
+    fn clock_resume_fischer_clamps_when_remaining_below_increment() {
+        // サーバー slot は生存中 (consume 後) は常に >= inc だが、負値・inc 未満の
+        // 入力でも台帳が負にならないこと (防御的 clamp)。
+        let mut clock = Clock::from_summary(&fischer_summary(60_000, 5_000));
+        clock.apply_resume_remaining(3_000, -1_000);
+        assert_eq!(clock.black_time_ms, 0);
+        assert_eq!(clock.white_time_ms, 0);
+    }
+
+    #[test]
+    fn clock_resume_byoyomi_passes_server_remaining_through() {
+        // byoyomi (inc=0): remaining_main_ms は本体残時間そのもので、従来どおり
+        // 素通しになる (#858 前後で挙動不変)。
+        let mut clock = Clock::from_summary(&byoyomi_summary(60_000, 10_000));
+        clock.apply_resume_remaining(30_000, 25_000);
+        assert_eq!(clock.black_time_ms, 30_000);
+        assert_eq!(clock.white_time_ms, 25_000);
     }
 }
