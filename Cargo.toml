@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/rshogi-book",
     "crates/rshogi-core",
     "crates/rshogi-csa",
     "crates/rshogi-csa-client",
