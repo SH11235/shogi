@@ -80,6 +80,7 @@ CSA プロトコル一般仕様や本家 Floodgate 運用は §2 の外部参照
 | `START:<game_id>` | 両者 AGREE 後の対局開始通知 | `crates/rshogi-csa-server/src/game/room.rs::GameRoom::handle_agree` |
 | `REJECT:<game_id>` | どちらかが REJECT した | TCP `server.rs::drive_game_inner` の AGREE 結果が false の経路 (`server.rs::wait_both_agree` の戻り値で分岐) |
 | `<token>,T<sec>` | 1 手分の broadcast (各 client / 観戦者へ送出)。`T<sec>` 値はサーバー側 `room.rs` で計算した経過秒 | `room.rs::GameRoom::handle_move` (broadcast 行作成)、TCP `server.rs::parse_move_broadcast` (受信側ヘルパ) |
+| `'<comment>` | **観戦者専用**の付随行。直前の `<token>,T<sec>` に付いた Floodgate 評価値コメント (`* <eval> <pv...>` 等) を、対局者を除く観戦者だけへ 1 行配信する (`BroadcastTarget::Spectators`)。対局者へ送らないのはエンジン解析が相手に漏れないようにするため。指し手行と同一 ply で送られ、既存 viewer client は `'` 始まり行を無視する互換性がある。指し手にコメントが無ければ本行は出ない | `room.rs::GameRoom::apply_move` (comment 付き手のとき追加)、Workers `game_room.rs::dispatch_broadcasts`→`send_to_spectators` / TCP `server.rs::dispatch` (いずれも Spectators 経路) |
 
 ## 5. x1 拡張コマンド一覧
 
@@ -113,7 +114,7 @@ CSA 標準を超えた `%%` 系拡張コマンド。受理条件は frontend で
 | `%%WHO` | ログイン中プレイヤ一覧。`##[WHO] <name> <status>` を name 昇順、終端 `##[WHO] END` | ✅ | ❌ | `info.rs::who_lines` |
 | `%%LIST` | アクティブ対局一覧。`##[LIST] <game_id> <black> <white> <game_name> <started_at>` + END | ✅ | ❌ | `info.rs::list_lines` |
 | `%%SHOW <game_id>` | 1 対局のサマリ。未登録は `##[SHOW] NOT_FOUND <game_id>` 後 END | ✅ | ❌ | `info.rs::show_lines` |
-| `%%MONITOR2ON <game_id>` | 観戦購読 (broadcast 受信開始)。応答 `##[MONITOR2] BEGIN <id>` / 不在 `##[MONITOR2] NOT_FOUND <game_id>` / 多重 `##[MONITOR2] BUSY <game_id>`。`<id>` は **TCP では要求された `<game_id>`**、**Workers では `monitor_id` (active_game_id があればそれ、無ければ `room_id`)** が入る | ✅ | ✅ (spectator 経路) | TCP `server.rs` の `ClientCommand::Monitor2On` arm / Workers `game_room.rs::GameRoom::handle_spectator_line` の `Monitor2On` arm |
+| `%%MONITOR2ON <game_id>` | 観戦購読 (broadcast 受信開始)。応答 `##[MONITOR2] BEGIN <id>` / 不在 `##[MONITOR2] NOT_FOUND <game_id>` / 多重 `##[MONITOR2] BUSY <game_id>`。`<id>` は **TCP では要求された `<game_id>`**、**Workers では `monitor_id` (active_game_id があればそれ、無ければ `room_id`)** が入る。**Workers の snapshot 本文** (`BEGIN`〜`END` 間) は Game_Summary ブロックに続けて各手を `<token>,T<sec>` (`T<sec>` は `at_ms` 差分から再計算) で流し、コメント付きの手は直後に `'<comment>` 行を 1 行足す (ライブ broadcast の観戦者専用コメント行と同一形式)。終局済 DO では末尾に結果コード行 (`#RESIGN` 等) が付く | ✅ | ✅ (spectator 経路) | TCP `server.rs` の `ClientCommand::Monitor2On` arm / Workers `game_room.rs::GameRoom::handle_spectator_line` の `Monitor2On` arm、snapshot 本文は `spectator_snapshot.rs::build_spectator_snapshot` |
 | `%%MONITOR2OFF <game_id>` | 観戦購読解除。応答 `##[MONITOR2OFF] <id>` + END (`<id>` は §MONITOR2ON と同じ規則。TCP は `<game_id>`、Workers は `monitor_id`)。Workers では未登録 `<game_id>` を渡された場合 `##[MONITOR2OFF] NOT_FOUND <requested>` + END で返す経路がある | ✅ | ✅ (spectator 経路) | TCP `server.rs` の `Monitor2Off` arm / Workers `game_room.rs::GameRoom::handle_spectator_line` の `Monitor2Off` arm |
 | `%%CHAT <message>` | room へ chat 配信。応答 `##[CHAT] OK <game_id>` / 未観戦時 `##[CHAT] NOT_MONITORING` (broadcast 形式は `##[CHAT] <handle>: <message>`) | ✅ | ✅ (player + spectator) | TCP `server.rs` の `Chat` arm / Workers `game_room.rs` の `Chat` arm (player + spectator 経路) |
 | `%%VERSION` | 実装名 + バージョン 1 行。`##[VERSION] rshogi-csa-server <CARGO_PKG_VERSION>`。**他の x1 応答と異なり END 終端行なし** (§6 の例外) | ✅ | ❌ | `info.rs::version_lines` |

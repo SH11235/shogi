@@ -127,11 +127,19 @@ pub enum WsAttachment {
         ///
         /// 設計上は in-memory のみ扱いだが、DO の WebSocket Hibernation 経由で
         /// 異なる handler 呼び出し間で参照する必要があるため attachment 経由で
-        /// 永続化する (= `serialize_attachment` に乗る)。Hibernation 後に「snapshot
-        /// 送信中」状態が復帰してしまうのを防ぐため、`#[serde(default)]` で
-        /// `false` を既定値として復元する規則 (= 万一 hibernation 中に snapshot
-        /// 送信処理が中断したら、復帰後の DO は queue を空 / フラグ false で
-        /// 開始する)。
+        /// 永続化する (= `serialize_attachment` に乗る)。
+        ///
+        /// `#[serde(default)]` は **field が欠落した旧 schema** (snapshot 3 field
+        /// 導入前) の attachment を deserialize したときに `false` で復元する
+        /// ための既定値である。`true` で serialize 済みの値を復元時に `false` へ
+        /// 戻す効果は **無い** (serde default は field 不在時にのみ適用され、
+        /// `true`→`true` で round-trip する。`spectator_snapshot_state_round_trips_via_serde`
+        /// が固定)。したがって snapshot 送信がエラーで中断してこの flag が `true`
+        /// のまま永続化されると、以降の broadcast が `send_to_spectators` の per-ws
+        /// pending queue に積まれ続け、観戦者が無音フリーズする。中断時は送信経路側
+        /// が明示的に `false` へ戻す責務を持つ (`GameRoom::send_spectator_snapshot`
+        /// のエラー経路が [`WsAttachment::reset_spectator_snapshot`] で flag を落とし
+        /// queue を空にしたうえで ws を close する)。
         #[serde(default)]
         snapshot_in_progress: bool,
         /// snapshot に含めた最終 ply (1 始まり、初手前なら 0)。
@@ -206,6 +214,26 @@ impl WsAttachment {
             snapshot_in_progress: false,
             last_ply_in_snapshot: 0,
             pending_queue: Vec::new(),
+        }
+    }
+
+    /// Spectator の snapshot 送信状態を初期状態 (flag=false / queue 空) に戻す。
+    ///
+    /// snapshot 送信経路がエラーで中断すると、`snapshot_in_progress = true` の
+    /// まま attachment が残り、`send_to_spectators` が以降の broadcast を per-ws
+    /// pending queue に積み続けて観戦者が無音フリーズする。エラー経路でこの
+    /// helper を通して flag を落とし queue を空にする。`last_ply_in_snapshot` は
+    /// flag=false では参照されないため `0` に戻す。Spectator 以外の variant は
+    /// 変更せず元の値を返す。
+    pub fn reset_spectator_snapshot(self) -> Self {
+        match self {
+            Self::Spectator { room_id, .. } => Self::Spectator {
+                room_id,
+                snapshot_in_progress: false,
+                last_ply_in_snapshot: 0,
+                pending_queue: Vec::new(),
+            },
+            other => other,
         }
     }
 }
@@ -380,6 +408,37 @@ mod tests {
         let s = serde_json::to_string(&att).unwrap();
         let restored: WsAttachment = serde_json::from_str(&s).unwrap();
         assert_eq!(att, restored);
+    }
+
+    #[test]
+    fn reset_spectator_snapshot_clears_flag_and_queue() {
+        // snapshot 送信中 (flag=true, queue 非空) の attachment を reset すると
+        // flag=false / last_ply=0 / queue 空になる。room_id は保持する。
+        let att = WsAttachment::Spectator {
+            room_id: "room-xyz".to_owned(),
+            snapshot_in_progress: true,
+            last_ply_in_snapshot: 7,
+            pending_queue: vec![
+                ("+5756FU,T2".to_owned(), Some(8)),
+                ("##[CHAT] alice: hi".to_owned(), None),
+            ],
+        };
+        assert_eq!(
+            att.reset_spectator_snapshot(),
+            WsAttachment::Spectator {
+                room_id: "room-xyz".to_owned(),
+                snapshot_in_progress: false,
+                last_ply_in_snapshot: 0,
+                pending_queue: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn reset_spectator_snapshot_is_noop_for_non_spectator() {
+        // Player / Pending は snapshot 状態を持たないので変更されない。
+        let player = WsAttachment::player(Role::Black, "alice", "g");
+        assert_eq!(player.clone().reset_spectator_snapshot(), player);
     }
 
     #[test]

@@ -93,7 +93,8 @@ use crate::spectator_control::{
     MonitorDecision, resolve_monitor_target, resolve_monitor_target_with_finished,
 };
 use crate::spectator_snapshot::{
-    SpectatorClocks, SpectatorSnapshotInput, build_spectator_snapshot,
+    SpectatorClocks, SpectatorSnapshotInput, build_spectator_snapshot, is_move_broadcast,
+    move_elapsed_secs, parse_move_row_line,
 };
 use crate::ws_route::{WsRoute, parse_ws_route};
 use crate::x1_paths::{
@@ -1060,7 +1061,26 @@ impl GameRoom {
                 self.reschedule_turn_alarm(&result.outcome).await?;
                 self.dispatch_broadcasts(&result.broadcasts).await?;
             }
-            HandleOutcome::GameEnded(_) | HandleOutcome::Continue => {
+            HandleOutcome::GameEnded(_) => {
+                // 千日手 / 連続王手千日手 / 最大手数で「盤面を進めた最終手」がある
+                // 終局では、その手を broadcast だけでなく moves テーブルにも永続化
+                // する。core `apply_move` は本手を `do_move` してから `GameEnded` を
+                // 返し、`<token>,T<sec>` の move broadcast を積む (room.rs:509-513)
+                // ため、この行が append されないと R2 棋譜 export と late-joiner
+                // snapshot から終局手が欠落する。判定は move broadcast
+                // (`'+'/'-'` 始まり + ply=Some) の有無で行い、%TORYO / %KACHI /
+                // TimeUp / 反則負け等の盤面を進めない終局では該当 entry が無く
+                // append されない。append は MoveAccepted 経路と同じく raw client
+                // 行を保存し、broadcast より前に行う (append→dispatch→alarm cleanup
+                // の順を保ち、alarm cleanup を dispatch より前へ出さない = 1033-1047
+                // の broadcast→alarm cleanup 順序の根拠を崩さない)。
+                if result.broadcasts.iter().any(is_move_broadcast) {
+                    self.append_move(color, line, now).await?;
+                }
+                self.dispatch_broadcasts(&result.broadcasts).await?;
+                self.reschedule_turn_alarm(&result.outcome).await?;
+            }
+            HandleOutcome::Continue => {
                 self.dispatch_broadcasts(&result.broadcasts).await?;
                 self.reschedule_turn_alarm(&result.outcome).await?;
             }
@@ -1149,6 +1169,14 @@ impl GameRoom {
     /// 例外経路: `cfg` が無いケース (= LOGIN 前の DO に観戦者だけが入ってきた
     /// case)。snapshot は組まずに END を返してそのまま通常 broadcast 経路に
     /// 載せる (player から手が指されるまで配信は無いので queue 不要)。
+    ///
+    /// エラー経路: flag を `true` にセットした後の失敗 (`ensure_core_loaded` /
+    /// `load_moves` / `send_line` / attachment 更新) は必ずリセットして復旧する。
+    /// flag が `true` のまま抜けると `send_to_spectators` が以降の broadcast を
+    /// per-ws pending queue に積み続け、観戦者が queue overflow まで無音フリーズ
+    /// する。中断時は attachment を [`WsAttachment::reset_spectator_snapshot`] で
+    /// best-effort リセットし、client の reconnect ロジックで綺麗に復旧できるよう
+    /// ws を close (1011) してからエラーを伝播する。
     async fn send_spectator_snapshot(
         &self,
         ws: &WebSocket,
@@ -1158,6 +1186,7 @@ impl GameRoom {
         let Some(cfg) = cfg_opt else {
             // 対局未開始 (LOGIN 前) の DO に観戦者が入ったケース。snapshot は
             // 出さずそのまま終了する (Game_Summary に必要な game_id すら無いため)。
+            // flag はまだ立てていないのでリセット不要。
             return Ok(());
         };
 
@@ -1165,6 +1194,33 @@ impl GameRoom {
         // ここで初期化し、過去 invocation の残骸が混ざらないようにする。
         self.set_spectator_snapshot_state(ws, true, 0, Vec::new())?;
 
+        // ここから先の失敗は flag=true を残さない。中断したら reset + close する。
+        if let Err(e) = self.send_spectator_snapshot_body(ws, cfg, finished).await {
+            if let Ok(Some(att)) = ws.deserialize_attachment::<WsAttachment>() {
+                let reset = att.reset_spectator_snapshot();
+                let _ = ws.serialize_attachment(&reset);
+            }
+            let _ = ws.close(Some(1011), Some("snapshot failed".to_owned()));
+            crate::structured_log!(
+                event: "spectator_snapshot_failed",
+                component: "game_room",
+                game_id: cfg.game_id,
+                err: format!("{e:?}"),
+            );
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// `send_spectator_snapshot` の本体。`snapshot_in_progress = true` 前提で
+    /// snapshot 行を組んで送信し、queue を flush して flag を `false` に戻す。
+    /// いずれかの `?` で早期 return したときのリセット責務は呼び出し側が担う。
+    async fn send_spectator_snapshot_body(
+        &self,
+        ws: &WebSocket,
+        cfg: &PersistedConfig,
+        finished: &Option<FinishedState>,
+    ) -> Result<()> {
         // CoreRoom を確保し、clock / current_turn から `SpectatorClocks` を組む。
         // borrow scope は最小化し、await を伴う `load_moves` は borrow 外で呼ぶ。
         self.ensure_core_loaded().await?;
@@ -1177,7 +1233,8 @@ impl GameRoom {
             })
         };
         // CoreRoom が `replay_core_room` の InvalidSfen 等で復元できなかった場合
-        // (storage が破損した稀なケース)、安全側に snapshot を諦めて END だけ返す。
+        // (storage が破損した稀なケース)、安全側に snapshot を諦めて queue を
+        // flush する (flag も false へ戻る)。
         let Some(clocks) = clocks_opt else {
             self.flush_spectator_snapshot_queue(ws).await?;
             return Ok(());
@@ -1198,7 +1255,7 @@ impl GameRoom {
 
         // snapshot 完了。attachment の last_ply を更新し、queue を flush する。
         // queue 内の手は `ply > last_ply_in_snapshot` のみ送る (= snapshot に
-        // 含まれた手と重複しない broadcast のみ)。
+        // 含まれた手と重複しない broadcast のみ)。flush は flag を false へ戻す。
         self.set_spectator_snapshot_last_ply(ws, last_ply_in_snapshot)?;
         self.flush_spectator_snapshot_queue(ws).await?;
         Ok(())
@@ -2113,19 +2170,20 @@ impl GameRoom {
                 return ExportAttempt::Skipped;
             }
         };
-        // MoveRow は raw CSA 行（例: `+7776FU,T3`）を保持しているので、トークン部のみを
-        // 抽出して `KifuMove` に変換する。消費時間は at_ms 差分から秒に丸める。
+        // MoveRow は client が送ってきた raw CSA 行 (`+7776FU,T3` や Floodgate
+        // 形式 `+7776FU,'* 123 pv...`) を保持している。snapshot と同じ共有ヘルパ
+        // (`parse_move_row_line` / `move_elapsed_secs`) で token / コメントを抽出し、
+        // 消費時間は at_ms 差分から秒に丸めて `KifuMove` に変換する。Floodgate の
+        // 評価値 PV コメントは `KifuMove::comment` に載せて棋譜 `'` 行として残す。
+        let first_prev_ms = cfg.play_started_at_ms.unwrap_or(cfg.matched_at_ms);
+        let elapsed = move_elapsed_secs(&moves_rows, first_prev_ms);
         let mut kifu_moves: Vec<KifuMove> = Vec::with_capacity(moves_rows.len());
-        let mut prev_ts: u64 = cfg.play_started_at_ms.unwrap_or(cfg.matched_at_ms);
-        for m in &moves_rows {
-            let token_str = m.line.split(',').next().unwrap_or(&m.line);
-            let at_ms = m.at_ms.max(0) as u64;
-            let elapsed_ms = at_ms.saturating_sub(prev_ts);
-            prev_ts = at_ms;
+        for (m, sec) in moves_rows.iter().zip(elapsed) {
+            let (token_str, comment) = parse_move_row_line(&m.line);
             kifu_moves.push(KifuMove {
                 token: rshogi_csa_server::types::CsaMoveToken::new(token_str),
-                elapsed_sec: (elapsed_ms / 1000) as u32,
-                comment: None,
+                elapsed_sec: sec,
+                comment: comment.map(str::to_owned),
             });
         }
 

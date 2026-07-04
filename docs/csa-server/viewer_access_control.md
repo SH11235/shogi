@@ -163,7 +163,12 @@ stale window」「export retry pending」に起因する。
   `export_kifu_to_r2()` → `KEY_FINISHED` set → `live-games-index/` delete の順で
   動く。途中で DO が落ちる、または R2 delete が transient error で失敗すると、
   終局済対局の live entry が一時的に残る (orphan)。orphan は cron sweep
-  (https://github.com/SH11235/rshogi/issues/629) が best-effort で掃除する
+  (https://github.com/SH11235/rshogi/issues/629) が best-effort で掃除する。
+  通常の sweep は primary meta (`kifu-by-id/<id>.meta.json`) の存在を消去条件に
+  するため、**meta を書かない** `force_finalize_unrecoverable` 経路 (復元不能で
+  `#ABNORMAL` 強制終局) の inline delete が retry を尽くして失敗すると、meta が
+  永遠に現れず通常 sweep でも回収できない幽霊 entry が残りうる。これは §7.4 の
+  hard-TTL backstop で最終的に回収する
 - **export retry pending**: meta PUT / by-id PUT が失敗して
   `KEY_EXPORT_PENDING` outbox に積まれている場合
   (https://github.com/SH11235/rshogi/issues/623)、live は delete 済でも単局
@@ -190,6 +195,16 @@ stale window」「export retry pending」に起因する。
   (15 分間隔) の各発火で sweep する (0 分は backfill も併走)。R2 list deadline
   (25s) や page 上限 (100 page) に達すると 1 cron 内で完了しない場合がある
   (次 cron で継続)
+- **hard-TTL backstop**: 通常 sweep が消せない幽霊 entry
+  (meta 不在のまま残った `force_finalize_unrecoverable` 由来の orphan 等) を
+  回収する最終防衛線。live entry の `started_at_ms` が `LIVE_ENTRY_HARD_TTL_MS`
+  (**72 時間**) より古ければ、meta の有無に関わらず削除する。72h はどんな正規
+  対局の持ち時間よりも遥かに長いため、進行中対局を誤って消す現実的リスクは無い。
+  仮に誤削除しても実害は「`/api/v1/games/live` 一覧から隠れる」だけで、対局
+  そのもの (DO / WS / 終局処理) には一切影響しない。hard-TTL 削除は必ず
+  `event=live_orphan_sweep_hard_ttl_deleted` の error レベル structured_log を
+  残し、`SweepStats.hard_ttl_deleted` で件数を計上する (恒常的に非 0 なら
+  finalize 経路の live-index delete が慢性的に失敗している疑い)
 - **list の網羅性**: 保証しない (1 page 上限あり、`next_cursor` で連結)
 
 ### 7.5 viewer 運用目標 (informative, 計測値ではない)

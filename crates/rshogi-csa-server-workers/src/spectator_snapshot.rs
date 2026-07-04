@@ -8,8 +8,10 @@
 //!
 //! 1. 観戦者向け `BEGIN Game_Summary` ブロック（`Black/White_Time_Remaining_Ms:`
 //!    末尾拡張行を含む、player 経路の `Your_Turn:` / `Reconnect_Token:` は含まない）
-//! 2. これまでの move 行 (1 行 1 手): `<token>,T<elapsed_sec>` 形式
-//!    （broadcast の通常形式と一致）
+//! 2. これまでの move 行 (1 手あたり 1〜2 行): まず `<token>,T<elapsed_sec>`
+//!    （broadcast の通常形式と一致。`elapsed_sec` は `at_ms` 差分から再計算する）、
+//!    続いてコメントが付いていれば `'<comment>` 行（Floodgate 評価値 PV。ライブ
+//!    broadcast の観戦者専用コメント行と同一形式）
 //! 3. （終局済 DO の場合のみ）終局結果コード行 (`#RESIGN` / `#TIME_UP` 等)
 //!
 //! `BEGIN Position` / `END Position` は Game_Summary の `position_section` 内部に
@@ -105,12 +107,24 @@ pub fn build_spectator_snapshot(input: SpectatorSnapshotInput<'_>) -> Vec<String
         lines.push(raw_line.to_owned());
     }
 
-    // 既存の指し手 (broadcast move 行と完全に同一書式)。`MoveRow::line` は
-    // `+7776FU,T3` のような raw CSA 行をそのまま保持しているため、改行除去
-    // だけ済ませて push する。
-    for m in input.moves {
-        let trimmed = m.line.trim_end_matches(['\r', '\n']);
-        lines.push(trimmed.to_owned());
+    // 既存の指し手を broadcast と同一 wire 形式に正規化して push する。
+    // `MoveRow::line` は client が送ってきた raw 行 (`+7776FU,T3` や Floodgate
+    // 形式 `+7776FU,'* 123 +7776FU...`) をそのまま保持しているため、
+    // - token 部を取り出し、消費時間は broadcast 同様 `at_ms` 差分から再計算した
+    //   `<token>,T<sec>` を出す (raw 行の `T` 値や `,T` 欠落に依存しない)
+    // - コメントが付いていれば直後に `'<comment>` 行を 1 行足す (Floodgate
+    //   評価値 PV。ライブ broadcast の観戦者専用コメント行と同じ形式で、観戦
+    //   client は `'` 始まり行を無視する互換性がある)
+    // export (`export_kifu_to_r2`) と同じ行 parse (`parse_move_row_line`) /
+    // elapsed 計算 (`move_elapsed_secs`) を共有する。
+    let first_prev_ms = input.config.play_started_at_ms.unwrap_or(input.config.matched_at_ms);
+    let elapsed = move_elapsed_secs(input.moves, first_prev_ms);
+    for (m, sec) in input.moves.iter().zip(elapsed) {
+        let (token, comment) = parse_move_row_line(&m.line);
+        lines.push(format!("{token},T{sec}"));
+        if let Some(c) = comment {
+            lines.push(format!("'{c}"));
+        }
     }
 
     // 終局済 DO の場合は最終結果コード行を追加。終局時に CoreRoom 側で broadcast
@@ -122,6 +136,57 @@ pub fn build_spectator_snapshot(input: SpectatorSnapshotInput<'_>) -> Vec<String
     }
 
     lines
+}
+
+/// `MoveRow::line` の raw CSA 行を `(token, comment)` に分解する共有ヘルパ。
+///
+/// `MoveRow::line` は client が送ってきた行をそのまま保持しており、次の形が
+/// あり得る:
+/// - `+7776FU` （コメント無し・時間フィールド無し）
+/// - `+7776FU,T3` （時間フィールド付き）
+/// - `+7776FU,'* 123 +7776FU -3334FU` （Floodgate 形式のコメント付き）
+/// - `+7776FU,T3'コメント` （時間 + コメント）
+///
+/// `token` は最初の `,` より前 (`command.rs::parse_move` と同じ token 抽出)。
+/// `comment` は最初の `'` より後 (存在すれば。`'` プレフィックスは含めない)。
+/// snapshot (`build_spectator_snapshot`) と export (`export_kifu_to_r2`) で
+/// この 1 箇所を共有し、wire 形式の食い違いを防ぐ。
+pub(crate) fn parse_move_row_line(line: &str) -> (&str, Option<&str>) {
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    let token = trimmed.split(',').next().unwrap_or(trimmed);
+    let comment = trimmed.split_once('\'').map(|(_, c)| c);
+    (token, comment)
+}
+
+/// `moves` を先頭から走査し、各手の消費時間 (秒、切り捨て) を `at_ms` 差分から
+/// 算出する共有ヘルパ。
+///
+/// `first_prev_ms` は初手の計時起点 (= `play_started_at_ms`、無ければ
+/// `matched_at_ms`)。以降は 1 手前の `at_ms` を起点にする。負値 `at_ms` は
+/// `0` に丸め、起点より小さい `at_ms` は `saturating_sub` で `0` 秒にする。
+/// snapshot と export で同一の経過秒を出すためのロジック集約。
+pub(crate) fn move_elapsed_secs(moves: &[MoveRow], first_prev_ms: u64) -> Vec<u32> {
+    let mut prev_ts = first_prev_ms;
+    moves
+        .iter()
+        .map(|m| {
+            let at_ms = m.at_ms.max(0) as u64;
+            let elapsed_ms = at_ms.saturating_sub(prev_ts);
+            prev_ts = at_ms;
+            (elapsed_ms / 1000) as u32
+        })
+        .collect()
+}
+
+/// broadcast entry が「盤面を進めた指し手行」かを判定する共有ヘルパ。
+///
+/// 指し手 broadcast は `+`/`-` で始まり `ply.is_some()`。終局理由行 (`%TORYO`
+/// 等) や勝敗コード行 (`#RESIGN` 等)、観戦者専用コメント行 (`'...`) はいずれも
+/// これに該当しない。workers の `finalize`（`GameEnded` 経路）が「盤面を進めた
+/// 終局手を moves テーブルへ永続化すべきか」を判定するのに使う
+/// (https://github.com/SH11235/rshogi/issues/853 系: 終局手の棋譜欠落防止)。
+pub(crate) fn is_move_broadcast(entry: &rshogi_csa_server::BroadcastEntry) -> bool {
+    entry.ply.is_some() && entry.line.as_str().starts_with(['+', '-'])
 }
 
 #[cfg(test)]
@@ -151,12 +216,13 @@ mod tests {
         }
     }
 
-    fn move_row(ply: i64, color: &str, line: &str) -> MoveRow {
+    /// `at_ms` を明示して MoveRow を作る (経過秒の正規化テスト用)。
+    fn move_row_at(ply: i64, color: &str, line: &str, at_ms: i64) -> MoveRow {
         MoveRow {
             ply,
             color: color.to_owned(),
             line: line.to_owned(),
-            at_ms: 1_000_000 + ply * 1_000,
+            at_ms,
         }
     }
 
@@ -213,14 +279,17 @@ mod tests {
         );
     }
 
-    /// シナリオ 2: 数手後 (= moves 3 件、進行中)。
+    /// シナリオ 2: 数手後 (= moves 3 件、進行中)。raw 行は token のみでも、
+    /// 出力は `at_ms` 差分から計算した `<token>,T<sec>` に正規化される。
     #[test]
     fn snapshot_after_three_moves_appends_move_lines_in_order() {
         let cfg = baseline_config();
+        // raw 行は bare token (T フィールド無し)。play_started_at_ms=1_000_000
+        // を起点に、各 at_ms 差分から T が算出される。
         let moves = vec![
-            move_row(1, "black", "+7776FU,T3"),
-            move_row(2, "white", "-3334FU,T2"),
-            move_row(3, "black", "+8833UM,T4"),
+            move_row_at(1, "black", "+7776FU", 1_003_000), // 3s
+            move_row_at(2, "white", "-3334FU", 1_005_000), // 2s
+            move_row_at(3, "black", "+8833UM", 1_009_000), // 4s
         ];
         let cl = clocks(597_000, 598_000, Color::White);
         let lines = build_spectator_snapshot(SpectatorSnapshotInput {
@@ -230,7 +299,7 @@ mod tests {
             finalized: None,
         });
 
-        // 全 move 行が順序通り含まれる。
+        // 正規化後の move 行が順序通り含まれる。
         let move_indices: Vec<usize> = ["+7776FU,T3", "-3334FU,T2", "+8833UM,T4"]
             .iter()
             .map(|m| {
@@ -251,54 +320,54 @@ mod tests {
         assert!(!lines.iter().any(|l| l.starts_with('#')));
     }
 
-    /// シナリオ 3: 終局直後 (= moves に %TORYO が含まれる + finalized も Some)。
-    /// 一見すると move 行重複 (`%TORYO`) と result code (`#RESIGN`) の二重記録に
-    /// 見えるが、クライアントは onEnd を `#RESIGN` 等で確定する仕様で、`%TORYO`
-    /// は通常の move stream と同じ位置で再生されるだけ (UI 側は idempotent)。
+    /// シナリオ 3: 経過秒の正規化 + Floodgate コメント行の展開。raw 行の `T` 値は
+    /// 無視して `at_ms` 差分から再計算し、コメントは token 行の直後に `'` 始まりで
+    /// 1 行足す (ライブ broadcast の観戦者専用コメント行と同一 wire 形式)。
     #[test]
-    fn snapshot_after_toryo_with_finalized_appends_result_code_line() {
+    fn snapshot_normalizes_time_and_emits_comment_lines() {
         let cfg = baseline_config();
         let moves = vec![
-            move_row(1, "black", "+7776FU,T3"),
-            move_row(2, "white", "-3334FU,T2"),
-            move_row(3, "black", "%TORYO,T1"),
+            // raw の `,T99` は無視され、at_ms 差分の 3s に正規化される。
+            move_row_at(1, "black", "+7776FU,T99", 1_003_000),
+            // Floodgate 形式: token 行 + `'` コメント行の 2 行に展開される。
+            move_row_at(2, "white", "-3334FU,'* -50 -3334FU +2726FU", 1_006_000),
         ];
-        let cl = clocks(596_000, 598_000, Color::Black);
-        let finished = FinishedState {
-            result_code: "#RESIGN".to_owned(),
-            ended_at_ms: 1_010_000,
-            exported_at_ms: Some(1_010_500),
-        };
+        let cl = clocks(597_000, 597_000, Color::Black);
         let lines = build_spectator_snapshot(SpectatorSnapshotInput {
             config: &cfg,
             moves: &moves,
             clocks: &cl,
-            finalized: Some(&finished),
+            finalized: None,
         });
 
-        // `%TORYO` 行と `#RESIGN` 行が両方入り、`#RESIGN` は最終位置。
-        let toryo_idx = lines
+        // raw の T99 は出ず、at_ms 差分の T3 に正規化される。
+        assert!(
+            lines.iter().any(|l| l == "+7776FU,T3"),
+            "missing normalized +7776FU,T3: {lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("T99")), "raw T99 must not leak: {lines:?}");
+        // コメントは token 行の直後に `'` 始まりで 1 行。
+        let mv_idx = lines
             .iter()
-            .position(|l| l == "%TORYO,T1")
-            .unwrap_or_else(|| panic!("missing %TORYO,T1: {lines:?}"));
-        let resign_idx = lines
+            .position(|l| l == "-3334FU,T3")
+            .unwrap_or_else(|| panic!("missing -3334FU,T3: {lines:?}"));
+        let cmt_idx = lines
             .iter()
-            .position(|l| l == "#RESIGN")
-            .unwrap_or_else(|| panic!("missing #RESIGN: {lines:?}"));
-        assert!(toryo_idx < resign_idx);
-        assert_eq!(resign_idx, lines.len() - 1, "result code must be last: {lines:?}");
+            .position(|l| l == "'* -50 -3334FU +2726FU")
+            .unwrap_or_else(|| panic!("missing comment line: {lines:?}"));
+        assert_eq!(cmt_idx, mv_idx + 1, "comment must follow its move line: {lines:?}");
     }
 
     /// シナリオ 4: 終局済 DO 接続経路 (moves 全部 + finalized で snapshot を 1 回送る)。
-    /// シナリオ 3 と入力は似るが、観戦者が「new connection した時点で既に finished」
-    /// だったケース。snapshot は 1 回送って close する経路 (DO 側) なので、本関数の
-    /// 戻り値としてはシナリオ 3 と同じ「全 moves + 結果コード」になる。
+    /// 観戦者が「new connection した時点で既に finished」だったケース。snapshot は
+    /// 1 回送って close する経路 (DO 側) で、戻り値は「全 moves (正規化済) + 結果
+    /// コード」になる。
     #[test]
     fn snapshot_for_finished_do_emits_full_history_with_result_code() {
         let cfg = baseline_config();
         let moves = vec![
-            move_row(1, "black", "+7776FU,T3"),
-            move_row(2, "white", "-3334FU,T2"),
+            move_row_at(1, "black", "+7776FU,T3", 1_002_000), // 2s
+            move_row_at(2, "white", "-3334FU,T2", 1_005_000), // 3s
         ];
         let cl = clocks(594_000, 597_000, Color::Black);
         let finished = FinishedState {
@@ -315,14 +384,9 @@ mod tests {
 
         // `#TIME_UP` で終端する。
         assert_eq!(lines.last().map(String::as_str), Some("#TIME_UP"));
-        // 全 moves が含まれる (順序保証は他テストで確認済みのため、ここでは含有のみ)。
-        for m in &moves {
-            assert!(
-                lines.iter().any(|l| l == &m.line),
-                "missing move line {:?}: {lines:?}",
-                m.line
-            );
-        }
+        // 正規化後の token 行 (raw の T 値ではなく at_ms 差分の T) が全て含まれる。
+        assert!(lines.iter().any(|l| l == "+7776FU,T2"), "missing +7776FU,T2: {lines:?}");
+        assert!(lines.iter().any(|l| l == "-3334FU,T3"), "missing -3334FU,T3: {lines:?}");
     }
 
     /// `Game_ID:` / `Name+:` / `Name-:` は config 由来で snapshot に乗る。
@@ -339,5 +403,71 @@ mod tests {
         assert!(lines.iter().any(|l| l == "Game_ID:room-1-test"));
         assert!(lines.iter().any(|l| l == "Name+:alice"));
         assert!(lines.iter().any(|l| l == "Name-:bob"));
+    }
+
+    #[test]
+    fn parse_move_row_line_extracts_token_and_optional_comment() {
+        // bare token: comment 無し。
+        assert_eq!(parse_move_row_line("+7776FU"), ("+7776FU", None));
+        // T フィールドのみ: comment 無し。
+        assert_eq!(parse_move_row_line("+7776FU,T3"), ("+7776FU", None));
+        // Floodgate 形式 (`,'`): comment はプレフィックス `'` を除いた本体。
+        assert_eq!(
+            parse_move_row_line("+7776FU,'* 123 +7776FU -3334FU"),
+            ("+7776FU", Some("* 123 +7776FU -3334FU"))
+        );
+        // T + comment: token は最初の `,` まで、comment は最初の `'` 以降。
+        assert_eq!(parse_move_row_line("+7776FU,T3'note"), ("+7776FU", Some("note")));
+        // 末尾改行は除去する。
+        assert_eq!(parse_move_row_line("+7776FU,T3\r\n"), ("+7776FU", None));
+    }
+
+    #[test]
+    fn move_elapsed_secs_computes_from_at_ms_deltas() {
+        let moves = vec![
+            move_row_at(1, "black", "+7776FU", 1_003_000), // prev 1_000_000 → 3s
+            move_row_at(2, "white", "-3334FU", 1_005_500), // prev 1_003_000 → 2s (切り捨て)
+            move_row_at(3, "black", "+8833UM", 1_005_000), // prev 1_005_500 → 0s (逆行は 0)
+        ];
+        assert_eq!(move_elapsed_secs(&moves, 1_000_000), vec![3, 2, 0]);
+        // 空入力は空 Vec。
+        assert_eq!(move_elapsed_secs(&[], 1_000_000), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn is_move_broadcast_only_matches_board_advancing_moves() {
+        use rshogi_csa_server::types::CsaLine;
+        use rshogi_csa_server::{BroadcastEntry, BroadcastTarget};
+
+        let mv = BroadcastEntry {
+            target: BroadcastTarget::All,
+            line: CsaLine::new("+7776FU,T3"),
+            ply: Some(1),
+        };
+        assert!(is_move_broadcast(&mv));
+
+        // 観戦者専用コメント行 (`'...`) は move ではない。
+        let comment = BroadcastEntry {
+            target: BroadcastTarget::Spectators,
+            line: CsaLine::new("'* 123 +7776FU"),
+            ply: Some(1),
+        };
+        assert!(!is_move_broadcast(&comment));
+
+        // 終局理由行 / 勝敗コード行 (ply=None) は move ではない。
+        let toryo = BroadcastEntry {
+            target: BroadcastTarget::All,
+            line: CsaLine::new("#RESIGN"),
+            ply: None,
+        };
+        assert!(!is_move_broadcast(&toryo));
+
+        // '+'/'-' 始まりでも ply=None なら move ではない (防御的)。
+        let no_ply = BroadcastEntry {
+            target: BroadcastTarget::All,
+            line: CsaLine::new("+7776FU,T3"),
+            ply: None,
+        };
+        assert!(!is_move_broadcast(&no_ply));
     }
 }

@@ -50,7 +50,10 @@ pub enum BroadcastTarget {
     White,
     /// 両対局者に送る（観戦者は含めない）。
     Players,
-    /// 観戦者だけに送る（観戦機能未実装の本構成でも経路だけ用意しておく）。
+    /// 観戦者だけに送る（対局者には送らない）。終局理由の観戦者向けメッセージ
+    /// や、指し手に付随する Floodgate 評価値コメント `'<comment>` の配信に使う。
+    /// 評価値コメントを対局者へ送らないのは、エンジン解析が相手に漏れないように
+    /// するため。
     Spectators,
     /// 両対局者 + 同一ルームの全観戦者に送る（引き分け・無勝負時の同報）。
     All,
@@ -283,7 +286,9 @@ impl GameRoom {
                 self.verify_game_id(game_id.as_ref())?;
                 self.handle_reject(from)
             }
-            ClientCommand::Move { token, .. } => self.handle_move(from, &token, now_ms),
+            ClientCommand::Move { token, comment } => {
+                self.handle_move(from, &token, comment.as_deref(), now_ms)
+            }
             ClientCommand::Toryo => self.handle_toryo(from),
             ClientCommand::Kachi => self.handle_kachi(from),
             ClientCommand::Chudan => self.handle_chudan(from),
@@ -435,6 +440,7 @@ impl GameRoom {
         &mut self,
         from: Color,
         token: &CsaMoveToken,
+        comment: Option<&str>,
         now_ms: u64,
     ) -> Result<HandleResult, ServerError> {
         if !matches!(self.status, GameStatus::Playing) {
@@ -452,7 +458,7 @@ impl GameRoom {
         }
 
         match self.validator.validate_move(&self.pos, token) {
-            Ok(mv) => self.apply_move(from, token, mv, now_ms),
+            Ok(mv) => self.apply_move(from, token, comment, mv, now_ms),
             Err(violation) => {
                 // 構文・手番不一致は protocol error（状態変更なし）。
                 // それ以外の合法性違反は反則負けとして終局。
@@ -482,6 +488,7 @@ impl GameRoom {
         &mut self,
         from: Color,
         token: &CsaMoveToken,
+        comment: Option<&str>,
         mv: rshogi_core::types::Move,
         now_ms: u64,
     ) -> Result<HandleResult, ServerError> {
@@ -511,6 +518,21 @@ impl GameRoom {
             line: CsaLine::new(format!("{},T{}", token.as_str(), elapsed_sec)),
             ply: Some(self.moves_played),
         }];
+
+        // 4.5 指し手にコメント (Floodgate 評価値 PV 等) が付いていれば、観戦者
+        //     だけに `'<comment>` 行を追加配信する。対局者へは送らない
+        //     (エンジン解析が相手に漏れないようにするため)。ply は本手と同一に
+        //     して、観戦者 snapshot の pending-queue dedup
+        //     (`ply > last_ply_in_snapshot`) が本手行と揃うようにする。終局手
+        //     (千日手 / 連続王手千日手 / 最大手数) でも本手 broadcast は残るので、
+        //     ここで push しておけば終局経路でもコメントが配信される。
+        if let Some(c) = comment {
+            broadcasts.push(BroadcastEntry {
+                target: BroadcastTarget::Spectators,
+                line: CsaLine::new(format!("'{c}")),
+                ply: Some(self.moves_played),
+            });
+        }
 
         // 5. 千日手・連続王手千日手判定。
         match self.validator.classify_repetition(&self.pos) {
@@ -779,6 +801,40 @@ mod tests {
         assert_eq!(r.broadcasts.len(), 1);
         assert_eq!(r.broadcasts[0].target, BroadcastTarget::All);
         assert_eq!(r.broadcasts[0].line.as_str(), "+7776FU,T3");
+    }
+
+    #[test]
+    fn move_with_comment_broadcasts_spectator_only_comment_line() {
+        let mut room = make_room();
+        agree_both(&mut room);
+        // Floodgate 形式の評価値コメント付き指し手。
+        let r = room
+            .handle_line(Color::Black, &line("+7776FU,'* 123 +7776FU -3334FU"), 3_000)
+            .unwrap();
+        assert!(matches!(r.outcome, HandleOutcome::MoveAccepted { .. }));
+        // 本手 broadcast (全員宛) + 観戦者専用コメント broadcast の 2 件。
+        assert_eq!(r.broadcasts.len(), 2);
+        let mv = &r.broadcasts[0];
+        assert_eq!(mv.target, BroadcastTarget::All);
+        assert_eq!(mv.line.as_str(), "+7776FU,T3");
+        assert_eq!(mv.ply, Some(1));
+        let cmt = &r.broadcasts[1];
+        // 観戦者だけに送る (対局者には漏らさない)。
+        assert_eq!(cmt.target, BroadcastTarget::Spectators);
+        assert_eq!(cmt.line.as_str(), "'* 123 +7776FU -3334FU");
+        // ply は本手と同一 (snapshot pending-queue dedup を本手行と揃えるため)。
+        assert_eq!(cmt.ply, Some(1));
+    }
+
+    #[test]
+    fn move_without_comment_has_no_spectator_comment_broadcast() {
+        let mut room = make_room();
+        agree_both(&mut room);
+        let r = room.handle_line(Color::Black, &line("+7776FU,T3"), 3_000).unwrap();
+        assert!(matches!(r.outcome, HandleOutcome::MoveAccepted { .. }));
+        // コメントが無ければ本手 broadcast の 1 件のみ (余分な観戦者行を出さない)。
+        assert_eq!(r.broadcasts.len(), 1);
+        assert!(!r.broadcasts.iter().any(|b| b.line.as_str().starts_with('\'')));
     }
 
     #[test]
@@ -1211,6 +1267,17 @@ mod tests {
         }
         assert!(last.broadcasts.iter().any(|b| b.line.as_str() == "#SENNICHITE"));
         assert!(last.broadcasts.iter().any(|b| b.line.as_str() == "#DRAW"));
+        // 終局手 (盤面を進めた最終手) の move broadcast が HandleResult に残る
+        // ことを固定する。workers 側 `finalize` はこの entry を検出して moves
+        // テーブルへ永続化するため、消えると終局手が棋譜から欠落する
+        // (https://github.com/SH11235/rshogi/issues/853 系の欠損)。
+        assert!(
+            last.broadcasts
+                .iter()
+                .any(|b| { b.ply.is_some() && b.line.as_str().starts_with(['+', '-']) }),
+            "final move broadcast must be present: {:?}",
+            last.broadcasts
+        );
     }
 
     #[test]
