@@ -1753,13 +1753,35 @@ impl GameRoom {
         // 後追い掃除する契約。`play_started_at_ms` が None のまま終局した
         // (= AGREE 前 abnormal 等) ケースは live entry を put していないので
         // delete も skip する。
-        let live_delete_target = self
-            .config
-            .borrow()
-            .as_ref()
-            .and_then(|c| c.play_started_at_ms.map(|ts| (c.clone(), ts)));
-        if let Some((cfg_snapshot, started_at_ms)) = live_delete_target {
-            self.try_delete_live_games_index(&cfg_snapshot, started_at_ms).await;
+        //
+        // delete key は put と同じ `live_games_index_key(play_started_at_ms, game_id)`
+        // を使う契約 (https://github.com/SH11235/rshogi/issues/853)。in-memory
+        // `self.config` は GameEnded finalize 到達時点で常に Some のはず (core と
+        // lockstep で set される) だが、将来のリファクタや想定外の経路で None に
+        // なっても live entry を取り残さないよう、無ければ永続化済み `KEY_CONFIG`
+        // から読み直して delete key を組む。それでも config が取れない場合だけ、
+        // 無言スキップせず error ログで可視化する (本 issue で「tail に delete
+        // イベント・エラーが出ない」= 無言スキップが調査を難しくしたため)。
+        let in_mem_cfg = self.config.borrow().clone();
+        let cfg_for_delete: Option<PersistedConfig> = match in_mem_cfg {
+            Some(c) => Some(c),
+            None => self.state.storage().get(KEY_CONFIG).await.ok().flatten(),
+        };
+        match cfg_for_delete {
+            Some(cfg) => {
+                // `play_started_at_ms` が None なら live entry は未 put なので削除不要。
+                if let Some(started_at_ms) = cfg.play_started_at_ms {
+                    self.try_delete_live_games_index(&cfg, started_at_ms).await;
+                }
+            }
+            None => {
+                crate::structured_log!(
+                    event: "live_games_index_delete_skip",
+                    component: "game_room",
+                    level: "error",
+                    reason: "config_missing",
+                );
+            }
         }
 
         // moves テーブルを cleanup (https://github.com/SH11235/rshogi/issues/637)。
