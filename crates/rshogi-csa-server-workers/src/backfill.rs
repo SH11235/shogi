@@ -59,6 +59,23 @@ pub(crate) const SWEEP_DEADLINE_MS: u64 = 25_000;
 /// 避けるための break 条件。100 page = 100,000 件で十分な余白。
 pub(crate) const SWEEP_MAX_PAGES: u32 = 100;
 
+/// live entry の hard-TTL backstop (72 時間)。
+///
+/// 通常の sweep は「primary meta (`kifu-by-id/<id>.meta.json`) が存在する live
+/// entry」だけを消し、meta 未配置の entry は「進行中」または「終局時 meta PUT
+/// 失敗」の両義があるため保守的に残す (設計 v3 §3)。しかし
+/// `force_finalize_unrecoverable` 経路は R2 export / meta を書かずに終局させる
+/// ため、inline の live-index delete が retry を尽くして失敗すると、meta が
+/// 永遠に現れず通常 sweep でも回収できない幽霊 entry が残る (#853 系)。
+///
+/// これを回収するため、`started_at_ms` (= `play_started_at_ms`) が本 TTL より
+/// 古い live entry は meta の有無に関わらず削除する。72 時間はどんな持ち時間の
+/// 正規対局よりも遥かに長く、正当に進行中の対局が誤って消える現実的リスクは
+/// 無い。仮に消しても実害は「`/api/v1/games/live` 一覧から隠れる」だけで、
+/// 対局そのもの (DO / WS / 終局処理) には一切影響しない。誤削除の検知のため、
+/// hard-TTL 削除は必ず error レベルの structured_log を残す。
+pub(crate) const LIVE_ENTRY_HARD_TTL_MS: u64 = 72 * 60 * 60 * 1000;
+
 /// `run_games_index_backfill` の進捗統計。テスト容易性のため値型で返す。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct BackfillStats {
@@ -77,6 +94,11 @@ pub struct SweepStats {
     pub listed: u64,
     /// `kifu-by-id/<id>.meta.json` が存在する (= 終局済) ため delete した件数。
     pub deleted: u64,
+    /// meta 不在だが `LIVE_ENTRY_HARD_TTL_MS` を超過したため delete した件数
+    /// (hard-TTL backstop)。`deleted` とは別カウントにして、幽霊 entry の回収が
+    /// 発生した事実をログ / metric から検知できるようにする。恒常的に非 0 なら
+    /// finalize 経路の live-index delete が慢性的に失敗している疑い。
+    pub hard_ttl_deleted: u64,
     /// 走査した R2 list page 数 (https://github.com/SH11235/rshogi/issues/629)。pagination loop 化に伴って導入。
     /// 1 cron で複数 page を処理した状況をログから確認するための運用 metric。
     pub pages: u32,
@@ -97,19 +119,30 @@ pub(crate) struct MetaForIndexKey {
     pub ended_at_ms: u64,
 }
 
-/// `live-games-index/<inv>-<id>.json` の本文から `game_id` field のみ取り出す
-/// 最小 view。orphan sweep 判定に必要なのは `game_id` のみなので、それ以外の
-/// 形式 (clock 等) には依存しない。
+/// `live-games-index/<inv>-<id>.json` の本文から orphan sweep 判定に必要な field
+/// のみ取り出す最小 view。`game_id` (meta key 構築 + ログ用) と `started_at_ms`
+/// (hard-TTL backstop 用) だけを持ち、それ以外の形式 (clock 等) には依存しない。
 #[derive(Debug, Deserialize)]
-pub(crate) struct LiveEntryGameId {
+pub(crate) struct LiveEntryFields {
     pub game_id: String,
+    pub started_at_ms: u64,
+}
+
+/// hard-TTL backstop の削除判定 (純粋関数、host からテスト可能)。
+///
+/// `age_ms` = sweep 実行時刻 − live entry の `started_at_ms`。これが
+/// [`LIVE_ENTRY_HARD_TTL_MS`] 以上なら、primary meta が不在でも幽霊 entry と
+/// みなして削除対象にする (境界は「以上」= inclusive)。
+pub(crate) fn live_entry_hard_ttl_expired(age_ms: u64) -> bool {
+    age_ms >= LIVE_ENTRY_HARD_TTL_MS
 }
 
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use super::{
-        BackfillStats, KIFU_BY_ID_PREFIX, LiveEntryGameId, META_SUFFIX, MetaForIndexKey, PAGE_SIZE,
-        SWEEP_DEADLINE_MS, SWEEP_MAX_PAGES, SweepStats,
+        BackfillStats, KIFU_BY_ID_PREFIX, LIVE_ENTRY_HARD_TTL_MS, LiveEntryFields, META_SUFFIX,
+        MetaForIndexKey, PAGE_SIZE, SWEEP_DEADLINE_MS, SWEEP_MAX_PAGES, SweepStats,
+        live_entry_hard_ttl_expired,
     };
     use worker::{Date, Env, Result};
 
@@ -261,9 +294,18 @@ mod imp {
     /// 設計 v3 §3 に従い、判定キーは `kifu-by-id/<id>.csa` ではなく `.meta.json`。
     /// CSA 本体 put は失敗していても meta が書かれていれば終局確定 +
     /// finalize_if_ended 経路を通った証拠になる。逆もまた然りで、両方失敗した
-    /// orphan は本 sweep では消さない (= eventual に live 一覧に残るが、次回
-    /// cron で finalize 経路の副作用で meta が put された後に消える、または
-    /// 手動オペレーションで対処)。
+    /// orphan は本 sweep の **通常経路** では消さない (= eventual に live 一覧に
+    /// 残るが、次回 cron で finalize 経路の副作用で meta が put された後に消える、
+    /// または手動オペレーションで対処)。
+    ///
+    /// ただし meta を書かない `force_finalize_unrecoverable` 経路の inline
+    /// live-index delete が retry を尽くして失敗すると、meta が永遠に現れず通常
+    /// 経路では回収できない幽霊 entry が残る (#853 系)。これに対する最終防衛線と
+    /// して **hard-TTL backstop** を持つ: live entry の `started_at_ms` が
+    /// [`LIVE_ENTRY_HARD_TTL_MS`] (72h) より古ければ meta の有無に関わらず削除し、
+    /// error レベルログ + `SweepStats.hard_ttl_deleted` を計上する。正当に進行中の
+    /// 対局が誤って消えても実害は「live 一覧から隠れる」だけで対局自体には影響
+    /// しない ([`live_entry_hard_ttl_expired`] / `docs/csa-server/viewer_access_control.md` §7.4)。
     ///
     /// https://github.com/SH11235/rshogi/issues/629 で pagination loop 化した。R2 list の `truncated` が `true`
     /// の間は cursor を辿って次 page を処理し、以下のいずれかの条件で打ち切る:
@@ -327,11 +369,14 @@ mod imp {
                 let live_key = obj.key();
                 stats.listed = stats.listed.saturating_add(1);
 
-                // live entry 本文から game_id を取り出す。key 文字列パースより
-                // 本文の `game_id` field を信頼するほうが、key 形式の将来変更
-                // に対して頑健。
-                let game_id = match read_live_entry_game_id(&bucket, &live_key).await {
-                    Some(id) => id,
+                // live entry 本文から game_id / started_at_ms を取り出す。key 文字列
+                // パースより本文 field を信頼するほうが、key 形式の将来変更に
+                // 対して頑健。
+                let LiveEntryFields {
+                    game_id,
+                    started_at_ms: entry_started_at_ms,
+                } = match read_live_entry_fields(&bucket, &live_key).await {
+                    Some(f) => f,
                     None => {
                         if Date::now().as_millis().saturating_sub(started_at_ms)
                             >= SWEEP_DEADLINE_MS
@@ -364,9 +409,19 @@ mod imp {
                         continue;
                     }
                 };
-                if head_result.is_none() {
-                    // meta が無い = まだ進行中 (or 終局時 meta put 失敗)。前者は
-                    // 正常状態、後者は本 sweep の対象外 (設計 v3 §3 の意図的な保守)。
+
+                // hard-TTL backstop: meta 不在でも `started_at_ms` が
+                // `LIVE_ENTRY_HARD_TTL_MS` より古ければ削除する。TTL 判定の「now」
+                // 基準には sweep 開始時刻 (`started_at_ms` 変数、最大 25s の stale)
+                // を流用する (72h に対して無視できる)。`force_finalize_unrecoverable`
+                // 経路の live-index delete が retry を尽くして失敗した幽霊 entry を
+                // 回収するための最終防衛線 (#853 系)。
+                let age_ms = started_at_ms.saturating_sub(entry_started_at_ms);
+                let hard_ttl_expired = live_entry_hard_ttl_expired(age_ms);
+                if head_result.is_none() && !hard_ttl_expired {
+                    // meta が無い & TTL 内 = まだ進行中 (or 終局時 meta put 失敗)。
+                    // 前者は正常状態、後者は本 sweep の対象外 (設計 v3 §3 の意図的
+                    // な保守)。
                     if Date::now().as_millis().saturating_sub(started_at_ms) >= SWEEP_DEADLINE_MS {
                         stats.deadline_reached = true;
                         break 'outer;
@@ -388,7 +443,24 @@ mod imp {
                     }
                     continue;
                 }
-                stats.deleted = stats.deleted.saturating_add(1);
+                if head_result.is_none() {
+                    // hard-TTL backstop 経路で幽霊 entry を回収した。誤削除の検知
+                    // と finalize 経路の慢性失敗の検知のため、必ず error レベルで
+                    // 残す (通常 orphan delete とは別カウント)。
+                    stats.hard_ttl_deleted = stats.hard_ttl_deleted.saturating_add(1);
+                    crate::structured_log!(
+                        event: "live_orphan_sweep_hard_ttl_deleted",
+                        component: "backfill",
+                        level: "error",
+                        game_id: game_id,
+                        live_key: live_key,
+                        started_at_ms: entry_started_at_ms,
+                        age_ms: age_ms,
+                        ttl_ms: LIVE_ENTRY_HARD_TTL_MS,
+                    );
+                } else {
+                    stats.deleted = stats.deleted.saturating_add(1);
+                }
 
                 if Date::now().as_millis().saturating_sub(started_at_ms) >= SWEEP_DEADLINE_MS {
                     stats.deadline_reached = true;
@@ -421,6 +493,7 @@ mod imp {
             component: "backfill",
             listed: stats.listed,
             deleted: stats.deleted,
+            hard_ttl_deleted: stats.hard_ttl_deleted,
             pages: stats.pages,
             deadline_reached: stats.deadline_reached,
             elapsed_ms: elapsed_ms,
@@ -428,11 +501,12 @@ mod imp {
         Ok(stats)
     }
 
-    /// `live-games-index/<key>` の本文を読んで `game_id` field を返す。
+    /// `live-games-index/<key>` の本文を読んで orphan sweep 判定に必要な field
+    /// (`game_id` / `started_at_ms`) を返す。
     ///
     /// 失敗はすべて構造化ログで記録した上で `None` を返し、呼び出し側で entry
     /// を skip させる (sweep 全体を停止しない)。
-    async fn read_live_entry_game_id(bucket: &worker::Bucket, key: &str) -> Option<String> {
+    async fn read_live_entry_fields(bucket: &worker::Bucket, key: &str) -> Option<LiveEntryFields> {
         let fetched = match bucket.get(key).execute().await {
             Ok(o) => o,
             Err(e) => {
@@ -459,8 +533,8 @@ mod imp {
                 return None;
             }
         };
-        match serde_json::from_slice::<LiveEntryGameId>(&bytes) {
-            Ok(v) => Some(v.game_id),
+        match serde_json::from_slice::<LiveEntryFields>(&bytes) {
+            Ok(v) => Some(v),
             Err(e) => {
                 crate::structured_log!(
                     event: "live_orphan_sweep_parse_failed",
@@ -514,9 +588,9 @@ mod tests {
     }
 
     #[test]
-    fn live_entry_game_id_deserializes_from_live_entry_wire() {
+    fn live_entry_fields_deserializes_from_live_entry_wire() {
         // `LiveGamesIndexEntry` の wire (`live_games_index::tests::live_entry_serializes_with_expected_fields`
-        // と整合) から `game_id` のみ抽出できる。
+        // と整合) から `game_id` / `started_at_ms` を抽出できる。
         let json = r#"{
             "game_id": "g1",
             "started_at_ms": 1777391025209,
@@ -525,8 +599,32 @@ mod tests {
             "clock": {"kind": "fischer", "total_sec": 300, "increment_sec": 5},
             "source": "kifu"
         }"#;
-        let parsed: LiveEntryGameId = serde_json::from_str(json).unwrap();
+        let parsed: LiveEntryFields = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.game_id, "g1");
+        assert_eq!(parsed.started_at_ms, 1_777_391_025_209);
+    }
+
+    #[test]
+    fn live_entry_fields_rejects_missing_started_at_ms() {
+        // `started_at_ms` 欠落は parse error → sweep 経路で skip (hard-TTL 判定
+        // 材料が無いため保守的に触らない)。
+        let json = r#"{"game_id": "g1"}"#;
+        assert!(serde_json::from_str::<LiveEntryFields>(json).is_err());
+    }
+
+    #[test]
+    fn live_entry_hard_ttl_expired_boundary() {
+        // TTL 未満は保持、ちょうど TTL 以上で削除対象 (inclusive 境界)。
+        assert!(!live_entry_hard_ttl_expired(0));
+        assert!(!live_entry_hard_ttl_expired(LIVE_ENTRY_HARD_TTL_MS - 1));
+        assert!(live_entry_hard_ttl_expired(LIVE_ENTRY_HARD_TTL_MS));
+        assert!(live_entry_hard_ttl_expired(LIVE_ENTRY_HARD_TTL_MS + 1));
+    }
+
+    #[test]
+    fn live_entry_hard_ttl_is_72_hours() {
+        // 定数の値をリグレッションで固定する (72h = 259_200_000ms)。
+        assert_eq!(LIVE_ENTRY_HARD_TTL_MS, 259_200_000);
     }
 
     #[test]
@@ -550,6 +648,7 @@ mod tests {
             SweepStats {
                 listed: 0,
                 deleted: 0,
+                hard_ttl_deleted: 0,
                 pages: 0,
                 deadline_reached: false,
             }
