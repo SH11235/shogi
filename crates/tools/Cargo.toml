@@ -83,6 +83,10 @@ log.workspace = true
 # Local dependencies
 rshogi-core = { path = "../rshogi-core" }
 rshogi-csa = { path = "../rshogi-csa" }
+# 定跡リーダ(book_from_csa の roundtrip テストで生成 .db を読み戻すのに使う)。
+# edition(NNUE)軸には触れないため default-features=false とし、rshogi-core の feature は
+# 本 crate 側の指定に委ねる(rshogi-usi と同じ方針)。
+rshogi-book = { path = "../rshogi-book", default-features = false }
 
 # Additional dependencies
 sysinfo = "0.37"
