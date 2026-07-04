@@ -215,26 +215,29 @@ fn find_candidates(
     Some(candidates)
 }
 
-/// 候補列から採用手の添字を選ぶ(採択回数に比例した 1 パスのオンライン重み付き抽選)。
+/// 候補列から採用手の添字を選ぶ。`consider_move_count=false` は等確率、
+/// `true` は採択回数比例の 1 パス・オンライン重み付き抽選。
 fn select_index(
     candidates: &[Candidate],
     consider_move_count: bool,
     rng: &mut dyn BookRng,
 ) -> usize {
     let n = candidates.len();
-    // まず等確率で 1 つ選ぶ。
-    let mut idx = rng.rand_below(n as u64) as usize;
+    if !consider_move_count {
+        return rng.rand_below(n as u64) as usize;
+    }
 
-    if consider_move_count {
-        let sum: u64 = candidates.iter().map(|c| c.move_count).sum();
-        let mut cumulative: u64 = 0;
-        for (i, c) in candidates.iter().enumerate() {
-            // 全手 count=0 なら等確率にフォールバック(各手を 1 とみなす)。
-            let weight = if sum == 0 { 1 } else { c.move_count };
-            cumulative += weight;
-            if cumulative != 0 && rng.rand_below(cumulative) < weight {
-                idx = i;
-            }
+    // 候補は count 降順ソート済みなので先頭の weight は必ず 1 以上
+    // (全手 count=0 のときは各手を 1 とみなす等確率フォールバック)。
+    // よって cumulative は常に正で、i=0 で必ず idx=0 が採用される。
+    let sum: u64 = candidates.iter().map(|c| c.move_count).sum();
+    let mut idx = 0;
+    let mut cumulative: u64 = 0;
+    for (i, c) in candidates.iter().enumerate() {
+        let weight = if sum == 0 { 1 } else { c.move_count };
+        cumulative += weight;
+        if rng.rand_below(cumulative) < weight {
+            idx = i;
         }
     }
 
@@ -293,7 +296,7 @@ pub fn probe(
 
     // 5. BookDepthLimit(0 で無効): 筆頭手の depth 不足なら局面ごと不採用。
     if options.depth_limit != 0 && candidates[0].depth < options.depth_limit {
-        info("BookDepthLimit is lower than the depth of this node.");
+        info("Top move depth is below BookDepthLimit.");
         return None;
     }
 
@@ -544,10 +547,9 @@ mod tests {
             ..Default::default()
         };
         // 並びは count 降順: [7g7f(70), 2g2f(20), 6g6f(10)]。
-        // select: base=rand_below(3); 次に各手で rand_below(cumulative)。
-        // cumulative: 70, 90, 100。系列 [_, 0, _, _] → i=0 で採用(0<70)、i=1 で 89<20?false、
-        // i=2 で 99<10?false → 7g7f。
-        let mut rng = SeqRng::new(vec![0, 0, 89, 99]);
+        // select: 各手で rand_below(cumulative)。cumulative: 70, 90, 100。
+        // 系列 → i=0 で採用(0<70)、i=1 で 89<20?false、i=2 で 99<10?false → 7g7f。
+        let mut rng = SeqRng::new(vec![0, 89, 99]);
         let result = probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).unwrap();
         assert_eq!(result.best_move.to_usi(), "7g7f");
     }
@@ -565,9 +567,9 @@ mod tests {
             ..Default::default()
         };
         // sum=0 なので weight=1、cumulative=1,2,3。系列で i=1 を選ばせる:
-        // base=1、i=0: rand_below(1)=0<1 → idx=0; i=1: rand_below(2)=0<1 → idx=1;
+        // i=0: rand_below(1)=0<1 → idx=0; i=1: rand_below(2)=0<1 → idx=1;
         // i=2: rand_below(3)=2<1?false → idx=1。
-        let mut rng = SeqRng::new(vec![1, 0, 0, 2]);
+        let mut rng = SeqRng::new(vec![0, 0, 2]);
         let result = probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).unwrap();
         assert_eq!(result.best_move.to_usi(), "2g2f");
     }

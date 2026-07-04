@@ -73,14 +73,16 @@ pub(crate) fn normalize_key(sfen: &str, ignore_ply: bool) -> String {
 
 impl Book {
     /// ファイルパスから定跡を読み込む(NNUE ローダの `init_nnue` 相当の path 版 API)。
+    ///
+    /// バッファリングは `from_reader` 側で行う。
     pub fn from_path<P: AsRef<Path>>(path: P, ignore_ply: bool) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
-        Self::from_reader(BufReader::new(file), ignore_ply)
+        Self::from_reader(file, ignore_ply)
     }
 
     /// バイト列から定跡を読み込む(NNUE ローダの `init_nnue_from_bytes` 相当。wasm 互換)。
     pub fn from_bytes(bytes: &[u8], ignore_ply: bool) -> io::Result<Self> {
-        Self::from_reader(BufReader::new(Cursor::new(bytes)), ignore_ply)
+        Self::from_reader(Cursor::new(bytes), ignore_ply)
     }
 
     /// 任意の `Read` から定跡を読み込む。
