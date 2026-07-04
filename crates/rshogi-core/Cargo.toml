@@ -134,8 +134,9 @@ mode-specific  = []
 # NNUE progress8kpabs バケットの差分更新最適化
 # - 有効時: StackEntry に progress_sum/computed_progress フィールド追加、
 #   ensure_progress_bucket で DirtyPiece 差分から O(1) 更新
-# - L0=1536 系で性能向上、L0=768/512 で退行する trade-off
-# - 適用条件: build.rs で mode-specific + layerstacks-1536x16x32 / layerstacks-1536x32x32 を強制
+# - L0=1536 系 / L0=3072 で性能向上、L0=768/512 で退行する trade-off
+# - 適用条件: build.rs で mode-specific + layerstacks-1536x16x32 / layerstacks-1536x32x32 /
+#   layerstacks-3072x16x32 を強制
 #   (mode-* が未指定の互換 build では check 緩和、user 責任で組合せ可)
 nnue-progress-diff = []
 
@@ -213,7 +214,7 @@ edition-layerstacks-halfka_hm_merged-1536x32x32-none = [
   "nnue-progress-diff",
 ]
 
-# LayerStack specific (1024x16x32 / 768x16x32 / 768x8x32 / 512x16x32、none のみ)。L0≠1536 系は progress-diff 不可。
+# LayerStack specific (1024x16x32 / 768x16x32 / 768x8x32 / 512x16x32、none のみ)。L0=1024/768/512 系は progress-diff 不可。
 edition-layerstacks-halfka_hm_merged-1024x16x32-none = [
   "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1024x16x32",
 ]
@@ -245,11 +246,10 @@ edition-layerstacks-halfka_hm_merged-512x16x32-none = [
   "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-512x16x32",
 ]
 # LayerStack specific (3072x16x32、none のみ)。FT_OUT=3072 の大型 FT。
-# nnue-progress-diff は現状 1536 系のみ許可 (checks.rs)。L0=3072 は「L0 大 → full
-# progress 再計算が高コスト → diff 有利」の trade-off 上 1536 と同側と推測されるが、
-# 未測定のため speculative な組合せは作らず none のみ整備する (「測定なし最適化は禁止」)。
+# L0=3072 も progress-diff の NPS 改善を実測で確認済みのため 1536 系と同様に同梱する。
 edition-layerstacks-halfka_hm_merged-3072x16x32-none = [
   "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-3072x16x32",
+  "nnue-progress-diff",
 ]
 
 # LS specific preset (halfka_hm_merged 以外の 4 FT、1536x16x32-none で代表整備)。
