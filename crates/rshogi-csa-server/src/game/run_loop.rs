@@ -107,10 +107,13 @@ enum Event {
 /// 手番側の予算（本体 + byoyomi）+ 通信マージン + 通信猶予から
 /// `tokio::time::Instant` を計算する。
 ///
-/// `handle_move` 側は `consume(elapsed_ms - time_margin_ms)` で時計を進めるため、
-/// 物理時間が `turn_budget_ms + time_margin_ms` 以内に届く着手は合法。`run_loop` は
-/// この境界に `TIMEUP_GRACE_MS` を足した時刻まで `recv_line` を待機する
-/// （時間切れ確定と通信マージンの両立）。
+/// `handle_move` 側は `consume(raw elapsed)` で時計を進める（通信マージンを課金から
+/// 差し引かない、#857）。時間切れ判定は「秒切り捨て後の消費が予算を超えるか」で行われ、
+/// `turn_budget_ms` は切り捨て猶予 (`SECOND_GRAIN_MS - 1`) を含む。ここではさらに
+/// `time_margin_ms`（deadline 側の通信猶予）と `TIMEUP_GRACE_MS` を足した時刻まで
+/// `recv_line` を待機し、予算内の着手がネットワーク遅延で早発火の time-up を食らわない
+/// ようにする。物理経過が `turn_budget_ms` を超える着手は `consume` 側で実時間どおり
+/// 課金され time-up し得るが、その受信自体はここでは阻害しない。
 ///
 /// 旧実装は本体残時間のみを渡していたため、既定設定 `byoyomi=10` でも本体切れで
 /// 即 time-up していた。本版は
@@ -480,9 +483,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn run_does_not_time_out_within_communication_margin() {
-        // 通信マージン内に届いた手は時間切れ扱いしないこと。
-        // 残時間 1 秒 + マージン 5 秒。物理時間 4 秒経過後に着手 → 合法（消費は max(0, 4-5)=0 秒）。
+    async fn run_charges_real_elapsed_even_within_communication_margin() {
+        // #857: 通信マージンは deadline 側の猶予にのみ効かせ、課金からは差し引かない。
+        // 残時間 1 秒 + マージン 5 秒。物理経過 4 秒の着手は、deadline
+        // (turn_budget 1999ms + margin 5000ms + grace 250ms = 7249ms) 側では alarm が
+        // 発火せず handle_line まで届く (=救済) が、consume は実時間 4 秒を課金するため
+        // 1 秒予算を超過して time-up する。旧実装は margin を差し引いて consume(0 秒) と
+        // し、この着手を「消費ゼロ」で受理していた (課金割引バグ)。
         let config = GameRoomConfig {
             game_id: GameId::new("g"),
             black: PlayerName::new("a"),
@@ -513,10 +520,11 @@ mod tests {
             sente_tx.send(Ok(line("AGREE"))).unwrap();
             advance().await;
             gote_tx.send(Ok(line("AGREE"))).unwrap();
-            // Playing 開始時刻を 0 とすると、4 秒待機して着手 → 物理経過 4 秒 < 1+5=6 秒 = OK。
+            // Playing 開始を 0 として 4 秒待機後に着手。deadline は 7.249 秒なので手は
+            // handle_line まで届くが、実時間 4 秒課金で 1 秒予算を超過して time-up する。
             tokio::time::sleep(Duration::from_secs(4)).await;
             sente_tx.send(Ok(line("+7776FU"))).unwrap();
-            // 続いて gote が即時 %TORYO で対局終了。
+            // sente が既に time-up 済みなので、この %TORYO は届く前に対局が終わる。
             advance().await;
             gote_tx.send(Ok(line("%TORYO"))).unwrap();
         };
@@ -530,11 +538,11 @@ mod tests {
         let (_, result) = tokio::join!(driver, runner);
         let result = result.unwrap();
 
-        // sente の +7776FU は通信マージン内なので合法。最終的に gote の TORYO で sente が勝つ。
+        // sente の +7776FU は deadline 内で届くが、実時間 4 秒課金で 1 秒予算を超過 → time-up。
         assert!(matches!(
             result,
-            GameResult::Toryo {
-                winner: Color::Black
+            GameResult::TimeUp {
+                loser: Color::Black
             }
         ));
     }

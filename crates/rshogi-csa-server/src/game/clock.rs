@@ -34,7 +34,9 @@ pub enum ClockResult {
 pub trait TimeClock {
     /// 指定した対局者の残時間から `elapsed_ms` ミリ秒分を消費し、時間切れ判定を返す。
     ///
-    /// 呼び出し側が通信マージンを差し引いて渡すこと。
+    /// 呼び出し側は raw な実経過時間を渡す。通信マージンは deadline 側の猶予にのみ
+    /// 使い、課金 (本メソッド) からは差し引かない (#857)。秒/分単位への切り捨ては
+    /// 各実装 (`SecondsCountdownClock` / `FischerClock` / `StopWatchClock`) が行う。
     fn consume(&mut self, color: Color, elapsed_ms: u64) -> ClockResult;
 
     /// Game_Summary の `BEGIN Time` セクションを CSA 仕様の項目・順序・単位で出力する。

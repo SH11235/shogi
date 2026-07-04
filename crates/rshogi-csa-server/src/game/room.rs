@@ -118,7 +118,9 @@ pub struct GameRoomConfig {
     pub white: PlayerName,
     /// 最大手数（既定 256）。これに達したら `#MAX_MOVES`。
     pub max_moves: u32,
-    /// 通信マージン（ミリ秒）。`consume` 呼び出し前に減算される。
+    /// 通信マージン（ミリ秒）。deadline 側の猶予にのみ使う (#857)。
+    /// `compute_deadline` / turn alarm の予約で加算し、`consume`（課金）からは
+    /// 差し引かない。
     pub time_margin_ms: u64,
     /// `%KACHI` 判定に使う入玉ルール（既定は 24 点法 = `Point24`）。
     pub entering_king_rule: EnteringKingRule,
@@ -492,10 +494,14 @@ impl GameRoom {
         mv: rshogi_core::types::Move,
         now_ms: u64,
     ) -> Result<HandleResult, ServerError> {
-        // 1. 経過時間を計算し通信マージンを差し引いて時計を消費。
+        // 1. 経過時間を計算して時計を消費。通信マージン (`time_margin_ms`) は
+        //    deadline 側の猶予 (`compute_deadline` / turn alarm の予約) にのみ効かせ、
+        //    **課金 (`consume`) からは差し引かない**。margin を毎手の課金控除に使うと
+        //    fischer では実効予算が「total + (inc + margin)×手数」に膨張し、ライブ台帳
+        //    と終局棋譜の T が 1 秒/手ずれる (#857)。秒単位への切り捨ては clock 実装
+        //    (`SecondsCountdownClock` / `FischerClock`) 側で行われる。
         let started = self.turn_started_at_ms.unwrap_or(now_ms);
-        let raw_elapsed_ms = now_ms.saturating_sub(started);
-        let elapsed_ms = raw_elapsed_ms.saturating_sub(self.config.time_margin_ms);
+        let elapsed_ms = now_ms.saturating_sub(started);
         let clock_result = self.clock.consume(from, elapsed_ms);
 
         // 2. 時間切れなら盤面を進めず終局（手は受理しない）。
@@ -704,7 +710,7 @@ fn command_static_name(cmd: &ClientCommand) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::clock::SecondsCountdownClock;
+    use crate::game::clock::{FischerClock, SecondsCountdownClock};
 
     fn make_room() -> GameRoom {
         let config = GameRoomConfig {
@@ -905,7 +911,10 @@ mod tests {
     }
 
     #[test]
-    fn time_margin_is_subtracted_before_consume() {
+    fn time_margin_does_not_discount_consume() {
+        // #857: 通信マージンは deadline 猶予にのみ効かせ、課金 (consume) からは
+        // 差し引かない。margin=1500 でも経過 4000ms はそのまま consume(4000ms) され、
+        // 整数秒切り捨てで 4 秒課金される (旧実装は 2500ms→T2 に割り引いていた)。
         let config = GameRoomConfig {
             game_id: GameId::new("g"),
             black: PlayerName::new("a"),
@@ -918,9 +927,10 @@ mod tests {
         let clock = Box::new(SecondsCountdownClock::new(60, 0));
         let mut room = GameRoom::new(config, clock).expect("valid test config");
         agree_both(&mut room);
-        // 経過 4000ms, margin 1500ms → consume(2500ms)。整数秒切り捨てで 2 秒消費。
         let r = room.handle_line(Color::Black, &line("+7776FU"), 4_000).unwrap();
-        assert_eq!(r.broadcasts[0].line.as_str(), "+7776FU,T2");
+        assert_eq!(r.broadcasts[0].line.as_str(), "+7776FU,T4");
+        // 本体持ち時間も実時間ぶん (4 秒) 減っている (60 → 56 秒)。
+        assert_eq!(room.clock_remaining_main_ms(Color::Black), 56_000);
     }
 
     // ---- 通信マージン境界値テスト ----
@@ -940,13 +950,14 @@ mod tests {
     }
 
     #[test]
-    fn time_margin_larger_than_elapsed_clamps_to_zero_consume() {
-        // (a) time_margin_ms > elapsed_ms の場合、saturating_sub で consume 引数が 0
-        //     になり、手番は時間消費ゼロで受理される（margin が elapsed を完全吸収）。
+    fn time_margin_does_not_absorb_short_move_elapsed() {
+        // #857: margin > elapsed でも課金は割り引かない。margin=5000 でも経過 1000ms は
+        //     consume(1000ms) されて 1 秒課金される (旧実装は saturating_sub で 0 秒に
+        //     吸収し T0 にしていた)。margin は deadline 側の猶予にのみ残す。
         let mut room = room_with(5_000, 60, 0);
         agree_both(&mut room);
         let r = room.handle_line(Color::Black, &line("+7776FU"), 1_000).unwrap();
-        assert_eq!(r.broadcasts[0].line.as_str(), "+7776FU,T0");
+        assert_eq!(r.broadcasts[0].line.as_str(), "+7776FU,T1");
     }
 
     #[test]
@@ -1004,25 +1015,80 @@ mod tests {
     }
 
     #[test]
-    fn move_at_main_plus_margin_boundary_is_accepted() {
-        // (e) 本体 + margin の合算ちょうど: 本体 5 秒 + margin 1500ms のとき
-        //     elapsed 6500ms で着手 → consume(5000ms) → Black の本体を使い切って 0 に
-        //     落ちる（Continue 扱いで対局続行）。MoveAccepted.remaining_main_ms は
-        //     「次手番側 (White) の本体残り」なので、White 未消費の 5000ms が返る。
-        //     Black 側が実際に 0 まで落ちたことは broadcast の `,T5` で確認する。
+    fn delayed_move_within_margin_is_charged_real_time_and_times_up() {
+        // #857 test (b): 本体 5 秒 + margin 1500ms。物理経過 6500ms の遅延着手は、
+        //   deadline 側では救済される (turn_budget + margin が 6500ms を覆うので alarm は
+        //   発火しない) が、課金は実時間どおり: consume(6500ms) は 6 秒に切り捨てられ
+        //   5 秒予算を超過するため TimeUp になる。旧実装は margin を差し引いて
+        //   consume(5000ms) とし「本体ぴったり使い切り」で受理していた (課金割引バグ)。
         let mut room = room_with(1_500, 5, 0);
         agree_both(&mut room);
+        // deadline 猶予: turn_budget(本体5s + grain999ms) + margin1500ms は 6500ms を覆う。
+        let turn_budget_ms = room.clock_turn_budget_ms(Color::Black).max(0) as u64;
+        assert!(turn_budget_ms + room.time_margin_ms() >= 6_500);
+        // しかし課金は実時間 (6 秒) で、5 秒予算を超過するため時間切れ。
         let r = room.handle_line(Color::Black, &line("+7776FU"), 6_500).unwrap();
         assert!(matches!(
             r.outcome,
-            HandleOutcome::MoveAccepted {
-                next_turn: Color::White,
-                remaining_main_ms: 5_000,
-            }
+            HandleOutcome::GameEnded(GameResult::TimeUp {
+                loser: Color::Black
+            })
         ));
-        assert_eq!(r.broadcasts[0].line.as_str(), "+7776FU,T5");
-        // Black 側の本体持ち時間が 0 まで落ちていることを直接確認。
-        assert_eq!(room.clock_remaining_main_ms(Color::Black), 0);
+    }
+
+    #[test]
+    fn fischer_budget_invariant_no_margin_inflation() {
+        // #857 test (a): fischer(total=3, inc=1) + margin=1000。Black が毎手 (inc+1)=2 秒
+        //   使うと、実効予算 total + inc×手数 = 3 + 1×手数 を実時間どおり食い潰し、
+        //   4 手目で時間切れになる。旧実装は margin=1000 を毎手課金から割り引いて
+        //   consume(1000ms)=inc ちょうどにし、予算が減らず永久に時間切れしなかった
+        //   (fischer 予算膨張バグ)。ライブ T の合計が予算 total + inc×手数 を超えない
+        //   ことも確認する。
+        let config = GameRoomConfig {
+            game_id: GameId::new("g"),
+            black: PlayerName::new("a"),
+            white: PlayerName::new("b"),
+            max_moves: 256,
+            time_margin_ms: 1_000,
+            entering_king_rule: EnteringKingRule::Point24,
+            initial_sfen: None,
+        };
+        let clock = Box::new(FischerClock::new(3, 1));
+        let mut room = GameRoom::new(config, clock).expect("valid test config");
+        agree_both(&mut room);
+
+        // Black は 2 秒/手、White は 0 秒/手で交互に指す。turn_started は「直前の指し手の
+        // now_ms」なので、now を 2000 刻みで進めれば Black の各手の経過は 2000ms になる。
+        let black_moves = ["+7776FU", "+2726FU", "+2625FU"];
+        let white_moves = ["-3334FU", "-8384FU", "-8485FU"];
+        let mut black_t_total: u32 = 0;
+        for (i, (bm, wm)) in black_moves.iter().zip(white_moves.iter()).enumerate() {
+            let now = (i as u64 + 1) * 2_000;
+            let rb = room.handle_line(Color::Black, &line(bm), now).unwrap();
+            assert!(
+                matches!(rb.outcome, HandleOutcome::MoveAccepted { .. }),
+                "black move {i} should be accepted"
+            );
+            // ライブ T (broadcast) は実時間 2 秒。
+            assert_eq!(rb.broadcasts[0].line.as_str(), format!("{bm},T2"));
+            black_t_total += 2;
+            // White は同 now で即応 (経過 0 秒)。
+            let rw = room.handle_line(Color::White, &line(wm), now).unwrap();
+            assert!(matches!(rw.outcome, HandleOutcome::MoveAccepted { .. }));
+        }
+        // 4 手目の Black は予算超過で時間切れ。
+        let r = room.handle_line(Color::Black, &line("+2524FU"), 8_000).unwrap();
+        assert!(matches!(
+            r.outcome,
+            HandleOutcome::GameEnded(GameResult::TimeUp {
+                loser: Color::Black
+            })
+        ));
+        // 予算不変条件: 課金できた Black の T 合計 (6 秒) は total + inc×手数 = 3 + 1×3 = 6
+        // 以内に収まる (margin による水増しが無い)。
+        let total_sec = 3u32;
+        let inc_sec = 1u32;
+        assert!(black_t_total <= total_sec + inc_sec * black_moves.len() as u32);
     }
 
     #[test]
