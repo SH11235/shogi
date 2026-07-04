@@ -435,6 +435,66 @@ mod tests {
     }
 
     #[test]
+    fn live_broadcast_t_matches_export_elapsed_secs() {
+        // #857 test (c): ライブ配信 T (core `apply_move` の `<token>,T<sec>` broadcast) と、
+        //   終局 export / 観戦 snapshot の T (`move_elapsed_secs` が at_ms 差分から再計算)
+        //   が同一手で一致すること。通信マージンを課金から差し引かなくなったため、両者とも
+        //   「(到着 at_ms − 直前手 at_ms) を秒切り捨て」した同じ値になる (旧実装ではライブ側が
+        //   margin を引いて 1 秒/手ずれていた)。
+        use rshogi_core::types::EnteringKingRule;
+        use rshogi_csa_server::{CsaLine, FischerClock, GameRoom, GameRoomConfig, HandleOutcome};
+
+        let play_started_ms: u64 = 1_000_000;
+        let config = GameRoomConfig {
+            game_id: GameId::new("20140101120000"),
+            black: PlayerName::new("alice"),
+            white: PlayerName::new("bob"),
+            max_moves: 256,
+            // margin を課金へ持ち込まないことを確認するため 0 でなく 1000ms を設定する。
+            time_margin_ms: 1_000,
+            entering_king_rule: EnteringKingRule::Point24,
+            initial_sfen: None,
+        };
+        let clock = Box::new(FischerClock::new(60, 5));
+        let mut room = GameRoom::new(config, clock).expect("valid test config");
+        // AGREE を play_started_ms で成立させる (初手の計時起点 = play_started_ms)。
+        room.handle_line(Color::Black, &CsaLine::new("AGREE"), play_started_ms).unwrap();
+        room.handle_line(Color::White, &CsaLine::new("AGREE"), play_started_ms).unwrap();
+
+        // (color, token, at_ms) の着手列。秒境界の端数 (margin を跨ぐ差分) を含める。
+        let seq: [(Color, &str, u64); 4] = [
+            (Color::Black, "+7776FU", play_started_ms + 3_500), // 3500ms → T3
+            (Color::White, "-3334FU", play_started_ms + 8_000), // 4500ms → T4
+            (Color::Black, "+2726FU", play_started_ms + 10_000), // 2000ms → T2
+            (Color::White, "-8384FU", play_started_ms + 15_200), // 5200ms → T5
+        ];
+
+        let mut live_lines: Vec<String> = Vec::new();
+        let mut move_rows: Vec<MoveRow> = Vec::new();
+        for (i, (color, token, at_ms)) in seq.iter().enumerate() {
+            let r = room.handle_line(*color, &CsaLine::new(*token), *at_ms).unwrap();
+            assert!(matches!(r.outcome, HandleOutcome::MoveAccepted { .. }));
+            // broadcasts[0] が `<token>,T<sec>` (ライブ配信 T)。
+            live_lines.push(r.broadcasts[0].line.as_str().to_owned());
+            let color_str = if matches!(color, Color::Black) {
+                "+"
+            } else {
+                "-"
+            };
+            move_rows.push(move_row_at(i as i64 + 1, color_str, token, *at_ms as i64));
+        }
+
+        // export / snapshot 経路の T を at_ms 差分から再計算し、ライブ配信 T と一致を確認。
+        let export_secs = move_elapsed_secs(&move_rows, play_started_ms);
+        assert_eq!(export_secs.len(), live_lines.len());
+        for (i, (_, token, _)) in seq.iter().enumerate() {
+            assert_eq!(live_lines[i], format!("{token},T{}", export_secs[i]));
+        }
+        // 具体値も pin する。
+        assert_eq!(export_secs, vec![3, 4, 2, 5]);
+    }
+
+    #[test]
     fn is_move_broadcast_only_matches_board_advancing_moves() {
         use rshogi_csa_server::types::CsaLine;
         use rshogi_csa_server::{BroadcastEntry, BroadcastTarget};
