@@ -1,0 +1,604 @@
+//! 定跡 probe(root 局面 1 回、探索の外で実行)。
+//!
+//! 選択パイプラインは設計メモ(20260704_opening_book_design.md §3)の順序に従う:
+//!
+//! 1. `USI_OwnBook=false` なら不使用
+//! 2. `game_ply > BookMoves` なら不使用
+//! 3. find(ply 込みキー / IgnoreBookPly)。miss かつ FlippedBook なら反転局面で再検索し指し手反転
+//! 4. `to_move` + pseudo-legal + legal で合法性検証、非合法は info string 警告して除去
+//! 5. `BookDepthLimit`(0 で無効): 筆頭手 depth 不足なら局面ごと不採用
+//! 6. `BookEvalDiff` / `BookEvalBlackLimit` / `BookEvalWhiteLimit`: 下限未満を除去
+//! 7. `NarrowBook`: count 情報がある場合のみ出現率 10% 未満を除去
+//! 8. 選択: `ConsiderBookMoveCount` なら count 比例抽選(全 0 は等確率)、false は等確率
+//! 9. ponder 補完: book の ponder が none なら 1 手進めて再 find し筆頭候補を採用
+//! 10. bestmove(+ ponder)を返す
+
+use rshogi_core::position::Position;
+use rshogi_core::types::{Color, Move};
+
+use crate::flip;
+use crate::reader::Book;
+
+/// 定跡選択に用いる乱数源。テストで固定できるよう抽象化する。
+pub trait BookRng {
+    /// `[0, n)` の一様乱数を返す。`n == 0` の場合は 0 を返す。
+    fn rand_below(&mut self, n: u64) -> u64;
+}
+
+/// SplitMix64 ベースの既定乱数源(外部乱数 crate 非依存)。
+///
+/// 定跡手の抽選用途にのみ使うため、統計的品質は SplitMix64 で十分。
+#[derive(Debug, Clone)]
+pub struct DefaultBookRng {
+    state: u64,
+}
+
+impl DefaultBookRng {
+    /// システム時刻から種を採って生成する。
+    pub fn new() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        Self::from_seed(seed)
+    }
+
+    /// 種を明示して生成する(再現性が必要な場合・wasm など)。
+    pub fn from_seed(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+impl Default for DefaultBookRng {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BookRng for DefaultBookRng {
+    fn rand_below(&mut self, n: u64) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        self.next_u64() % n
+    }
+}
+
+/// 定跡 probe のオプション群(USI オプションのミラー)。
+///
+/// 既定値は設計メモ(20260704_opening_book_design.md §3)の規定に従う。
+#[derive(Debug, Clone)]
+pub struct BookOptions {
+    /// `USI_OwnBook`: 定跡使用の総合スイッチ。
+    pub own_book: bool,
+    /// `BookMoves`: この手数までしか定跡を使わない。
+    pub book_moves: i32,
+    /// `BookEvalDiff`: 筆頭手評価値からの許容差。
+    pub eval_diff: i32,
+    /// `BookEvalBlackLimit`: 先手番の評価値下限。
+    pub eval_black_limit: i32,
+    /// `BookEvalWhiteLimit`: 後手番の評価値下限。
+    pub eval_white_limit: i32,
+    /// `BookDepthLimit`: 筆頭手の必要 depth 下限(0 で無効)。
+    pub depth_limit: i32,
+    /// `NarrowBook`: 出現率 10% 未満の手を除外するか。
+    pub narrow_book: bool,
+    /// `ConsiderBookMoveCount`: 採択回数比例で抽選するか。
+    pub consider_move_count: bool,
+    /// `FlippedBook`: miss 時に先後反転局面で再検索するか。
+    pub flipped_book: bool,
+}
+
+impl Default for BookOptions {
+    fn default() -> Self {
+        Self {
+            own_book: true,
+            book_moves: 16,
+            eval_diff: 30,
+            eval_black_limit: 0,
+            eval_white_limit: -140,
+            depth_limit: 0,
+            narrow_book: false,
+            consider_move_count: false,
+            flipped_book: true,
+        }
+    }
+}
+
+/// probe 結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BookProbeResult {
+    /// 採用する指し手(合法性検証済み、32bit 化済み)。
+    pub best_move: Move,
+    /// 予想手(あれば)。
+    pub ponder_move: Option<Move>,
+}
+
+/// probe 内部で扱う合法性検証済みの候補手。
+struct Candidate {
+    /// この局面の座標系での合法手(32bit 化済み)。
+    mv: Move,
+    /// この局面の座標系での ponder(USI 文字列)。book に none なら `None`。
+    ponder_usi: Option<String>,
+    value: i32,
+    depth: i32,
+    move_count: u64,
+}
+
+/// find + flip + 合法性検証 + 並び替えまでを行い、筆頭手が先頭に来た候補列を返す。
+///
+/// 並びは move_count 降順 → value 降順(安定ソート)。
+fn find_candidates(
+    book: &Book,
+    position: &Position,
+    flipped_book: bool,
+    info: &mut dyn FnMut(&str),
+) -> Option<Vec<Candidate>> {
+    let sfen = position.to_sfen();
+
+    // 3. find(ply 込み) → miss なら flip 再検索。
+    let (entry, flipped) = if let Some(entry) = book.find_raw(&sfen) {
+        (entry, false)
+    } else if flipped_book {
+        let flipped_sfen = flip::flipped_key(&sfen)?;
+        (book.find_raw(&flipped_sfen)?, true)
+    } else {
+        return None;
+    };
+
+    // 4. 合法性検証。
+    let mut candidates: Vec<Candidate> = Vec::with_capacity(entry.moves.len());
+    for raw in &entry.moves {
+        let Some(move_usi) = &raw.move_usi else {
+            continue; // none/resign は指し手なし。
+        };
+        // flip ヒット時は指し手を元局面の座標系へ戻す。
+        let move_str = if flipped {
+            match flip::flip_usi_move(move_usi) {
+                Some(s) => s,
+                None => {
+                    info(&format!("Illegal Move In Book DB (unparsable flipped move): {move_usi}"));
+                    continue;
+                }
+            }
+        } else {
+            move_usi.clone()
+        };
+
+        let Some(decoded) = Move::from_usi(&move_str) else {
+            info(&format!("Illegal Move In Book DB (unparsable move): {move_str}"));
+            continue;
+        };
+        // to_move で 16bit → 32bit 化 + 手番/符号化検証。さらに pseudo-legal + legal で
+        // 完全合法性を確認する(探索の movegen を経ずに bestmove として直接返すため)。
+        let Some(mv) = position.to_move(decoded) else {
+            info(&format!("Illegal Move In Book DB: {move_str}"));
+            continue;
+        };
+        if mv == Move::NONE || !position.pseudo_legal(mv) || !position.is_legal(mv) {
+            info(&format!("Illegal Move In Book DB: {move_str}"));
+            continue;
+        }
+
+        let ponder_usi = raw.ponder_usi.as_ref().and_then(|p| {
+            if flipped {
+                flip::flip_usi_move(p)
+            } else {
+                Some(p.clone())
+            }
+        });
+
+        candidates.push(Candidate {
+            mv,
+            ponder_usi,
+            value: raw.value,
+            depth: raw.depth,
+            move_count: raw.move_count,
+        });
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // move_count 降順 → value 降順(安定ソートでファイル内順序を保つ)。
+    candidates.sort_by(|a, b| b.move_count.cmp(&a.move_count).then_with(|| b.value.cmp(&a.value)));
+
+    Some(candidates)
+}
+
+/// 候補列から採用手の添字を選ぶ(採択回数に比例した 1 パスのオンライン重み付き抽選)。
+fn select_index(
+    candidates: &[Candidate],
+    consider_move_count: bool,
+    rng: &mut dyn BookRng,
+) -> usize {
+    let n = candidates.len();
+    // まず等確率で 1 つ選ぶ。
+    let mut idx = rng.rand_below(n as u64) as usize;
+
+    if consider_move_count {
+        let sum: u64 = candidates.iter().map(|c| c.move_count).sum();
+        let mut cumulative: u64 = 0;
+        for (i, c) in candidates.iter().enumerate() {
+            // 全手 count=0 なら等確率にフォールバック(各手を 1 とみなす)。
+            let weight = if sum == 0 { 1 } else { c.move_count };
+            cumulative += weight;
+            if cumulative != 0 && rng.rand_below(cumulative) < weight {
+                idx = i;
+            }
+        }
+    }
+
+    idx
+}
+
+/// ponder を解決する。book に ponder があれば検証して採用、無ければ 1 手進めて筆頭手を拾う。
+fn resolve_ponder(
+    book: &Book,
+    position: &Position,
+    options: &BookOptions,
+    best_move: Move,
+    book_ponder: &Option<String>,
+) -> Option<Move> {
+    // best_move は find_candidates で完全合法性を検証済み。安全に 1 手進められる。
+    let gives_check = position.gives_check(best_move);
+    let mut child = position.clone();
+    child.do_move(best_move, gives_check);
+
+    if let Some(ponder_usi) = book_ponder {
+        // book 由来の ponder を子局面で検証。合法なら採用、非合法なら ponder なし。
+        let decoded = Move::from_usi(ponder_usi)?;
+        let mv = child.to_move(decoded)?;
+        if mv != Move::NONE && child.pseudo_legal(mv) && child.is_legal(mv) {
+            return Some(mv);
+        }
+        return None;
+    }
+
+    // ponder 補完: 子局面を再 find し筆頭候補を ponder に。
+    let child_candidates = find_candidates(book, &child, options.flipped_book, &mut |_| {})?;
+    child_candidates.first().map(|c| c.mv)
+}
+
+/// root 局面に対して定跡を probe する。ヒットしなければ `None`。
+///
+/// `info` には除外理由等の info string 本文(`"info string "` プレフィックスなし)が渡される。
+pub fn probe(
+    book: &Book,
+    position: &Position,
+    options: &BookOptions,
+    rng: &mut dyn BookRng,
+    mut info: impl FnMut(&str),
+) -> Option<BookProbeResult> {
+    // 1. 総合スイッチ。
+    if !options.own_book {
+        return None;
+    }
+    // 2. 手数制限。
+    if position.game_ply() > options.book_moves {
+        return None;
+    }
+
+    // 3-4. find + flip + 合法性検証 + 並び替え。
+    let mut candidates = find_candidates(book, position, options.flipped_book, &mut info)?;
+
+    // 5. BookDepthLimit(0 で無効): 筆頭手の depth 不足なら局面ごと不採用。
+    if options.depth_limit != 0 && candidates[0].depth < options.depth_limit {
+        info("BookDepthLimit is lower than the depth of this node.");
+        return None;
+    }
+
+    // 6. 評価値フィルタ。
+    {
+        let top_value = candidates[0].value;
+        let side_limit = if position.side_to_move() == Color::Black {
+            options.eval_black_limit
+        } else {
+            options.eval_white_limit
+        };
+        let value_limit = (top_value - options.eval_diff).max(side_limit);
+        let before = candidates.len();
+        candidates.retain(|c| c.value >= value_limit);
+        if candidates.len() != before {
+            info(&format!(
+                "BookEvalDiff = {} : {} moves to {} moves.",
+                options.eval_diff,
+                before,
+                candidates.len()
+            ));
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+    }
+
+    // 7. NarrowBook: count 情報がある場合のみ出現率 10% 未満を除去。
+    if options.narrow_book {
+        let total: u64 = candidates.iter().map(|c| c.move_count).sum();
+        if total > 0 {
+            let before = candidates.len();
+            let threshold = total as f64 * 0.1;
+            candidates.retain(|c| c.move_count as f64 >= threshold);
+            if candidates.len() != before {
+                info(&format!("NarrowBook : {} moves to {} moves.", before, candidates.len()));
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // 8. 選択。
+    let idx = select_index(&candidates, options.consider_move_count, rng);
+    let chosen = &candidates[idx];
+    let best_move = chosen.mv;
+    let book_ponder = chosen.ponder_usi.clone();
+
+    // 9. ponder 解決。
+    let ponder_move = resolve_ponder(book, position, options, best_move, &book_ponder);
+
+    Some(BookProbeResult {
+        best_move,
+        ponder_move,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HEADER: &str = "#YANEURAOU-DB2016 1.00";
+    const HIRATE: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
+
+    /// 決定的テスト用の乱数源(与えた列を順に返し、尽きたら 0)。
+    struct SeqRng {
+        values: Vec<u64>,
+        idx: usize,
+    }
+    impl SeqRng {
+        fn new(values: Vec<u64>) -> Self {
+            Self { values, idx: 0 }
+        }
+    }
+    impl BookRng for SeqRng {
+        fn rand_below(&mut self, n: u64) -> u64 {
+            if n == 0 {
+                return 0;
+            }
+            let v = self.values.get(self.idx).copied().unwrap_or(0);
+            self.idx += 1;
+            v % n
+        }
+    }
+
+    fn pos(sfen: &str) -> Position {
+        let mut p = Position::new();
+        p.set_sfen(sfen).unwrap();
+        p
+    }
+
+    fn no_info(_: &str) {}
+
+    #[test]
+    fn probe_hits_and_returns_bestmove() {
+        let data = format!("{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 30 16 100\n");
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let mut rng = SeqRng::new(vec![0]);
+        let result =
+            probe(&book, &pos(HIRATE), &BookOptions::default(), &mut rng, no_info).unwrap();
+        assert_eq!(result.best_move.to_usi(), "7g7f");
+        assert_eq!(result.ponder_move.map(|m| m.to_usi()).as_deref(), Some("3c3d"));
+    }
+
+    #[test]
+    fn probe_miss_returns_none() {
+        let data = format!("{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 30 16 100\n");
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        // 定跡に無い局面(2 手目 3c3d 後)。flip でもヒットしない。
+        let other = "lnsgkgsnl/1r5b1/pppppp1pp/6p2/9/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL b - 3";
+        let mut rng = SeqRng::new(vec![0]);
+        assert!(probe(&book, &pos(other), &BookOptions::default(), &mut rng, no_info).is_none());
+    }
+
+    #[test]
+    fn own_book_false_disables() {
+        let data = format!("{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 30 16 100\n");
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            own_book: false,
+            ..Default::default()
+        };
+        let mut rng = SeqRng::new(vec![0]);
+        assert!(probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).is_none());
+    }
+
+    #[test]
+    fn book_moves_limit_disables_after_ply() {
+        let data = format!("{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 30 16 100\n");
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            book_moves: 0,
+            ..Default::default()
+        };
+        let mut rng = SeqRng::new(vec![0]);
+        // game_ply=1 > book_moves=0 → 不使用。
+        assert!(probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).is_none());
+    }
+
+    #[test]
+    fn flipped_book_hits_on_one_sided_db() {
+        // 片側正規化定跡: 後手番局面 after_76 を flip した「先手番の正準局面」だけを登録する。
+        let after_76 = "lnsgkgsnl/1r5b1/ppppppppp/9/9/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL w - 2";
+        let flipped_sfen = flip::flipped_key(after_76).unwrap(); // 先手番(黒)の局面
+        // 黒視点フレームでの指し手 7g7f、ponder 8c8d を登録。
+        // probe 時に after_76 の座標系へ flip され、白の 3c3d、ponder は 2g2f になる。
+        let data = format!("{HEADER}\nsfen {flipped_sfen}\n7g7f 8c8d 20 16 50\n");
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+
+        let mut rng = SeqRng::new(vec![0]);
+        let result =
+            probe(&book, &pos(after_76), &BookOptions::default(), &mut rng, no_info).unwrap();
+        // flip で戻された指し手が after_76(白番)局面の合法手であること。
+        assert_eq!(result.best_move.to_usi(), "3c3d");
+        assert!(pos(after_76).is_legal(result.best_move));
+        // ponder も flip される(黒視点 8c8d → after_76 側では 2g2f)。
+        assert_eq!(result.ponder_move.map(|m| m.to_usi()).as_deref(), Some("2g2f"));
+    }
+
+    #[test]
+    fn depth_limit_rejects_whole_node() {
+        let data = format!("{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 30 5 100\n2g2f 8c8d 25 20 40\n");
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        // 筆頭手(count 降順で 7g7f, depth=5)が depth_limit=16 未満 → 局面ごと不採用。
+        let opts = BookOptions {
+            depth_limit: 16,
+            ..Default::default()
+        };
+        let mut rng = SeqRng::new(vec![0]);
+        assert!(probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).is_none());
+    }
+
+    #[test]
+    fn depth_limit_zero_is_disabled() {
+        let data = format!("{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 30 0 100\n");
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            depth_limit: 0,
+            ..Default::default()
+        };
+        let mut rng = SeqRng::new(vec![0]);
+        assert!(probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).is_some());
+    }
+
+    #[test]
+    fn eval_diff_filters_low_value_moves() {
+        // 筆頭手 value=100、2 番手 value=50。eval_diff=30 → 下限 70、50 は除去。
+        // count を等しくして value 順で並ぶようにする。
+        let data = format!("{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 100 16 10\n2g2f 8c8d 50 16 10\n");
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            eval_diff: 30,
+            eval_black_limit: -30000,
+            consider_move_count: false,
+            ..Default::default()
+        };
+        // 候補が 1 手に絞られるので抽選結果は常に 7g7f。
+        let mut rng = SeqRng::new(vec![0, 0, 0]);
+        let result = probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).unwrap();
+        assert_eq!(result.best_move.to_usi(), "7g7f");
+    }
+
+    #[test]
+    fn eval_black_limit_rejects_when_top_too_low() {
+        // 先手番で筆頭手 value=-50 が black_limit=0 を下回る → 全除去。
+        let data = format!("{HEADER}\nsfen {HIRATE}\n7g7f 3c3d -50 16 10\n");
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            eval_black_limit: 0,
+            ..Default::default()
+        };
+        let mut rng = SeqRng::new(vec![0]);
+        assert!(probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).is_none());
+    }
+
+    #[test]
+    fn narrow_book_removes_rare_moves() {
+        // count: 90 / 5 / 5 → 5% の 2 手を除去、残 1 手。
+        let data = format!(
+            "{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 0 0 90\n2g2f 8c8d 0 0 5\n2h6h none 0 0 5\n"
+        );
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            narrow_book: true,
+            eval_black_limit: -30000,
+            eval_diff: 30000,
+            ..Default::default()
+        };
+        let mut rng = SeqRng::new(vec![0]);
+        let result = probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).unwrap();
+        assert_eq!(result.best_move.to_usi(), "7g7f");
+    }
+
+    #[test]
+    fn weighted_selection_respects_counts() {
+        // 3 手: count 10 / 20 / 70。ConsiderBookMoveCount=true。
+        // SeqRng を制御して 3 番手(70)が選ばれる系列を作る。
+        let data = format!(
+            "{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 0 0 70\n2g2f 8c8d 0 0 20\n6g6f 4c4d 0 0 10\n"
+        );
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            consider_move_count: true,
+            eval_black_limit: -30000,
+            eval_diff: 30000,
+            ..Default::default()
+        };
+        // 並びは count 降順: [7g7f(70), 2g2f(20), 6g6f(10)]。
+        // select: base=rand_below(3); 次に各手で rand_below(cumulative)。
+        // cumulative: 70, 90, 100。系列 [_, 0, _, _] → i=0 で採用(0<70)、i=1 で 89<20?false、
+        // i=2 で 99<10?false → 7g7f。
+        let mut rng = SeqRng::new(vec![0, 0, 89, 99]);
+        let result = probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).unwrap();
+        assert_eq!(result.best_move.to_usi(), "7g7f");
+    }
+
+    #[test]
+    fn weighted_all_zero_counts_is_uniform() {
+        // 全手 count=0 → 各手 weight=1 の等確率抽選。base の乱数で決まる。
+        let data =
+            format!("{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 0 0 0\n2g2f 8c8d 0 0 0\n6g6f 4c4d 0 0 0\n");
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            consider_move_count: true,
+            eval_black_limit: -30000,
+            eval_diff: 30000,
+            ..Default::default()
+        };
+        // sum=0 なので weight=1、cumulative=1,2,3。系列で i=1 を選ばせる:
+        // base=1、i=0: rand_below(1)=0<1 → idx=0; i=1: rand_below(2)=0<1 → idx=1;
+        // i=2: rand_below(3)=2<1?false → idx=1。
+        let mut rng = SeqRng::new(vec![1, 0, 0, 2]);
+        let result = probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).unwrap();
+        assert_eq!(result.best_move.to_usi(), "2g2f");
+    }
+
+    #[test]
+    fn illegal_book_move_is_skipped_with_warning() {
+        // 1 手目に非合法手(自陣に無い駒の移動)を混ぜる。合法な 2g2f のみ残る。
+        let data = format!("{HEADER}\nsfen {HIRATE}\n5e5f 3c3d 0 0 100\n2g2f 8c8d 0 0 50\n");
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let mut warnings = Vec::new();
+        let mut rng = SeqRng::new(vec![0]);
+        let result = probe(&book, &pos(HIRATE), &BookOptions::default(), &mut rng, |m| {
+            warnings.push(m.to_string())
+        })
+        .unwrap();
+        assert_eq!(result.best_move.to_usi(), "2g2f");
+        assert!(warnings.iter().any(|w| w.contains("Illegal Move In Book DB")));
+    }
+
+    #[test]
+    fn ponder_completion_when_book_ponder_none() {
+        // 1 手目 ponder=none。子局面(7g7f 後)を find し筆頭手を ponder に補完。
+        let after_76 = "lnsgkgsnl/1r5b1/ppppppppp/9/9/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL w - 2";
+        let data = format!(
+            "{HEADER}\nsfen {HIRATE}\n7g7f none 0 0 100\nsfen {after_76}\n3c3d 2g2f 0 0 100\n"
+        );
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let mut rng = SeqRng::new(vec![0]);
+        let result =
+            probe(&book, &pos(HIRATE), &BookOptions::default(), &mut rng, no_info).unwrap();
+        assert_eq!(result.best_move.to_usi(), "7g7f");
+        assert_eq!(result.ponder_move.map(|m| m.to_usi()).as_deref(), Some("3c3d"));
+    }
+}

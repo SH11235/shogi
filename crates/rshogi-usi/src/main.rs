@@ -110,6 +110,21 @@ struct UsiEngine {
     pass_right_value_early: i32,
     /// パス権評価値（終盤）
     pass_right_value_late: i32,
+    // --- 定跡（opening book）関連 ---
+    /// probe パイプラインのオプション群（USI オプションのミラー）
+    book_options: rshogi_book::BookOptions,
+    /// BookFile（定跡ファイル名。`no_book` で無効）
+    book_file: String,
+    /// BookDir（定跡ファイルのディレクトリ）
+    book_dir: String,
+    /// IgnoreBookPly（末尾手数を無視して検索するか。定跡ロード時のキー正規化に使う）
+    ignore_book_ply: bool,
+    /// ロード済み定跡（isready 時にロード。BookFile=no_book なら None）
+    book: Option<rshogi_book::Book>,
+    /// ロード済み定跡の識別子 `(解決済みパス, ignore_book_ply)`。再ロード要否の判定に使う
+    book_loaded_sig: Option<(String, bool)>,
+    /// 定跡手抽選用の乱数源
+    book_rng: rshogi_book::DefaultBookRng,
 }
 
 impl UsiEngine {
@@ -150,6 +165,14 @@ impl UsiEngine {
             initial_pass_count: 2,
             pass_right_value_early: DEFAULT_PASS_RIGHT_VALUE_EARLY,
             pass_right_value_late: DEFAULT_PASS_RIGHT_VALUE_LATE,
+            book_options: rshogi_book::BookOptions::default(),
+            // BookFile 既定は no_book(定跡オフ)。既存 SPRT/tournament の挙動を変えない。
+            book_file: "no_book".to_string(),
+            book_dir: "book".to_string(),
+            ignore_book_ply: false,
+            book: None,
+            book_loaded_sig: None,
+            book_rng: rshogi_book::DefaultBookRng::new(),
         }
     }
 
@@ -268,6 +291,20 @@ impl UsiEngine {
             "option name PassRightValueLate type spin default {DEFAULT_PASS_RIGHT_VALUE_LATE} min 0 max 500"
         );
         println!("option name SPSAParamsFile type string default <auto>");
+        // 定跡（opening book）オプション。既定は BookFile=no_book(オフ)、
+        // BookDepthLimit=0(無効)（設計メモ 20260704_opening_book_design.md §3）。
+        println!("option name USI_OwnBook type check default true");
+        println!("option name BookFile type string default no_book");
+        println!("option name BookDir type string default book");
+        println!("option name BookMoves type spin default 16 min 0 max 10000");
+        println!("option name BookEvalDiff type spin default 30 min 0 max 30000");
+        println!("option name BookEvalBlackLimit type spin default 0 min -30000 max 30000");
+        println!("option name BookEvalWhiteLimit type spin default -140 min -30000 max 30000");
+        println!("option name BookDepthLimit type spin default 0 min 0 max 256");
+        println!("option name NarrowBook type check default false");
+        println!("option name ConsiderBookMoveCount type check default false");
+        println!("option name IgnoreBookPly type check default false");
+        println!("option name FlippedBook type check default true");
         for spec in SearchTuneParams::option_specs() {
             println!(
                 "option name {} type spin default {} min {} max {}",
@@ -347,7 +384,43 @@ impl UsiEngine {
         }
         self.maybe_load_spsa_params();
         self.maybe_report_large_pages();
+        self.maybe_load_book();
         println!("readyok");
+    }
+
+    /// 定跡ファイルのロード（isready 時に実施）。
+    ///
+    /// BookFile=no_book なら何もしない。ロード失敗は info string でエラー出力し、
+    /// 定跡なし（bookless）で継続する。同一パス・同一 IgnoreBookPly なら再ロードしない。
+    fn maybe_load_book(&mut self) {
+        if self.book_file == "no_book" || self.book_file.is_empty() {
+            self.book = None;
+            self.book_loaded_sig = None;
+            return;
+        }
+
+        // BookDir 配下に解決（BookFile が絶対パス/明示パスならそちらが優先される）。
+        let resolved = std::path::Path::new(&self.book_dir).join(&self.book_file);
+        let resolved_str = resolved.to_string_lossy().into_owned();
+        let sig = (resolved_str.clone(), self.ignore_book_ply);
+
+        // 既ロード & 設定不変なら再ロード不要。
+        if self.book.is_some() && self.book_loaded_sig.as_ref() == Some(&sig) {
+            return;
+        }
+
+        match rshogi_book::Book::from_path(&resolved, self.ignore_book_ply) {
+            Ok(book) => {
+                println!("info string book loaded: {resolved_str} ({} positions)", book.len());
+                self.book = Some(book);
+                self.book_loaded_sig = Some(sig);
+            }
+            Err(e) => {
+                println!("info string Error loading book file {resolved_str}: {e}");
+                self.book = None;
+                self.book_loaded_sig = None;
+            }
+        }
     }
 
     /// SPSA params ファイルの自動/明示読み込み。
@@ -859,6 +932,62 @@ impl UsiEngine {
                     eprintln!("info string PassRightValueLate: {}", self.pass_right_value_late);
                 }
             }
+            // --- 定跡（opening book）オプション ---
+            "USI_OwnBook" => {
+                self.book_options.own_book = value == "true" || value == "1";
+            }
+            "BookFile" => {
+                // 実ロードは isready 時。ここでは名前を保持するだけ。
+                self.book_file = if value.is_empty() {
+                    "no_book".to_string()
+                } else {
+                    value
+                };
+            }
+            "BookDir" => {
+                self.book_dir = if value.is_empty() {
+                    "book".to_string()
+                } else {
+                    value
+                };
+            }
+            "BookMoves" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    self.book_options.book_moves = v;
+                }
+            }
+            "BookEvalDiff" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    self.book_options.eval_diff = v;
+                }
+            }
+            "BookEvalBlackLimit" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    self.book_options.eval_black_limit = v;
+                }
+            }
+            "BookEvalWhiteLimit" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    self.book_options.eval_white_limit = v;
+                }
+            }
+            "BookDepthLimit" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    self.book_options.depth_limit = v;
+                }
+            }
+            "NarrowBook" => {
+                self.book_options.narrow_book = value == "true" || value == "1";
+            }
+            "ConsiderBookMoveCount" => {
+                self.book_options.consider_move_count = value == "true" || value == "1";
+            }
+            "IgnoreBookPly" => {
+                self.ignore_book_ply = value == "true" || value == "1";
+            }
+            "FlippedBook" => {
+                self.book_options.flipped_book = value == "true" || value == "1";
+            }
             _ => {
                 // 未知のオプションは無視
             }
@@ -1007,6 +1136,13 @@ impl UsiEngine {
         // 制限を解析
         let limits = self.parse_go_options(tokens);
 
+        // 定跡 probe（探索の外・root で 1 回）。
+        // go infinite / go mate / go ponder では probe しない（Phase 1 の単純化、設計メモ §3）。
+        // book hit 時は探索スレッドを起こさず bestmove を直接出力する。
+        if !limits.infinite && limits.mate == 0 && !limits.ponder && self.try_book_probe() {
+            return;
+        }
+
         // Stochastic_Ponder では 1 手戻した局面から先読みする（YaneuraOu 準拠）
         let mut pos = if self.stochastic_ponder && limits.ponder {
             self.stochastic_ponder_position().unwrap_or_else(|| self.position.clone())
@@ -1071,6 +1207,50 @@ impl UsiEngine {
                 })
                 .expect("failed to spawn search thread"),
         );
+    }
+
+    /// 現在局面を定跡で probe し、hit したら bestmove を直接出力して true を返す。
+    ///
+    /// USI_OwnBook=false / 定跡未ロード / miss の場合は何も出力せず false を返し、
+    /// 呼び出し側は通常探索へフォールバックする。
+    fn try_book_probe(&mut self) -> bool {
+        if !self.book_options.own_book {
+            return false;
+        }
+        let Some(book) = self.book.as_ref() else {
+            return false;
+        };
+
+        // probe 中の info string 本文を集めてから出力する（borrow 競合回避）。
+        let mut infos: Vec<String> = Vec::new();
+        let result = rshogi_book::probe(
+            book,
+            &self.position,
+            &self.book_options,
+            &mut self.book_rng,
+            |msg| infos.push(msg.to_string()),
+        );
+
+        for msg in &infos {
+            println!("info string {msg}");
+        }
+
+        match result {
+            Some(r) => {
+                let best_usi = r.best_move.to_usi();
+                match r.ponder_move {
+                    Some(ponder) => {
+                        println!("bestmove {best_usi} ponder {}", ponder.to_usi());
+                    }
+                    None => {
+                        println!("bestmove {best_usi}");
+                    }
+                }
+                std::io::stdout().flush().ok();
+                true
+            }
+            None => false,
+        }
     }
 
     /// goオプションを解析

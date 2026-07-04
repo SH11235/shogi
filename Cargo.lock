@@ -2435,6 +2435,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rshogi-book"
+version = "0.1.0"
+dependencies = [
+ "rshogi-core",
+]
+
+[[package]]
 name = "rshogi-core"
 version = "0.4.0"
 dependencies = [
@@ -2547,6 +2554,7 @@ dependencies = [
  "clap",
  "env_logger",
  "log",
+ "rshogi-book",
  "rshogi-core",
  "serde",
  "serde_json",

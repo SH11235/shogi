@@ -1,0 +1,22 @@
+[package]
+name = "rshogi-book"
+version = "0.1.0"
+edition = "2024"
+authors = ["SH11235"]
+description = "Opening book (YANEURAOU-DB2016 .db) reader and probe for rshogi"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/sh11235/rshogi"
+keywords = ["shogi", "usi", "opening-book", "japanese-chess", "engine"]
+categories = ["games", "game-engines"]
+
+[dependencies]
+# rshogi-core は Position / Move / Color のみ利用する。edition(NNUE)軸には触れないため
+# default-features=false とし、standalone ビルド用の既定 edition のみ本 crate の default で足す。
+# rshogi-usi は本 crate を default-features=false で依存し、preset edition specific build 時に
+# edition-universal が unify されるのを防ぐ(rshogi-usi/Cargo.toml と同じ方針)。
+rshogi-core = { version = "0.4", path = "../rshogi-core", default-features = false }
+
+[features]
+# standalone(`cargo test -p rshogi-book`)時に rshogi-core を既定 edition で解決するための default。
+# rshogi-usi 経由の依存では default-features=false で無効化され、core の edition は usi 側が決める。
+default = ["rshogi-core/edition-universal", "rshogi-core/search-no-pass-rules"]
