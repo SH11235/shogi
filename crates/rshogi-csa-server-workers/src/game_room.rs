@@ -510,12 +510,12 @@ impl DurableObject for GameRoom {
 
         self.ensure_core_loaded().await?;
 
-        // hibernation evict を跨ぐと、最後の手で予約した絶対 deadline alarm が evict
-        // 中に到来して発火し得る。cold-start 復元では ensure_core_loaded が
-        // turn_started_at を now へ張り直すため、まだ残時間があれば「実際の時間切れ
-        // ではなく evict 滞留での早発火」とみなし、force_time_up せず残時間で alarm を
-        // 張り直す。warm な真の時間切れでは alarm は turn_budget + margin + safety 後に
-        // 発火し、残時間は 0 になるのでこの分岐を通らない。
+        // 計時起点は「直前の指し手の at_ms（初手前は play_started_at_ms）」で統一され
+        // (https://github.com/SH11235/rshogi/issues/852)、cold-start 復元でも張り直さ
+        // ない。ここでは `now` 時点の真の残時間を再計算し、まだ残っていれば
+        // (turn alarm を貼り直す前の古い予約が早発火した等) 残時間ぶんで貼り直し、
+        // `0` なら実際の時間切れとして force_time_up する。休眠を跨いだ長考の time_up
+        // は、実ギャップで残時間が `0` になるためこの経路で正しく発火する。
         let now_ms = self.now_ms();
         let remaining_ms = {
             let borrow = self.core.borrow();
@@ -992,18 +992,28 @@ impl GameRoom {
             return Ok(());
         }
 
-        self.ensure_core_loaded().await?;
+        // `now` は ensure_core_loaded の**前**(= メッセージ到着時点)で採る。計時起点は
+        // 直前の指し手の at_ms なので、着手側に課金されるのは「到着時刻 - 起点」=
+        // 思考 + ネットワーク時間のみとなり、cold-start の復元 I/O(R2 リトライ +
+        // O(手数) の replay)は課金されない。後で採ると msec 級の短い時計では
+        // 復元 I/O だけで TimeUp し得る (https://github.com/SH11235/rshogi/issues/852)。
         let now = self.now_ms();
+        self.ensure_core_loaded().await?;
         let color = role.to_core();
 
         let result = {
             let mut borrow = self.core.borrow_mut();
             let Some(core) = borrow.as_mut() else {
+                // core 復元不能で安全網 (`force_finalize_unrecoverable`) が既に
+                // #ABNORMAL 強制終局済み (or 対局未成立)。無言破棄せず WS を閉じて
+                // 終局として応答する (https://github.com/SH11235/rshogi/issues/852)。
                 crate::structured_log!(
                     event: "handle_game_line_core_missing",
                     component: "game_room",
                     handle: handle,
                 );
+                let _ =
+                    ws.close(Some(1000), Some("game finished (unrecoverable state)".to_owned()));
                 return Ok(());
             };
             match core.handle_line(color, &csa, now) {
@@ -2535,49 +2545,131 @@ impl GameRoom {
                 // (`ReplaySummary` の variant 間サイズ差対策、persistence.rs 参照)。
                 *self.core.borrow_mut() = Some(*core);
                 *self.config.borrow_mut() = Some(cfg);
+
+                // live-games-index put が抜けたまま hibernation で isolate が落ちた
+                // ケースを救済する (https://github.com/SH11235/rshogi/issues/549 §5)。
+                self.retry_live_games_index_if_needed().await?;
+
+                // 計時起点は「直前の指し手の at_ms（初手前は play_started_at_ms）」で
+                // 統一し、live / replay / alarm すべてで同じ規則を使う
+                // (https://github.com/SH11235/rshogi/issues/852)。replay 完了時点で
+                // core の turn_started_at_ms は最終手の at_ms に一致している
+                // (`apply_move` が各手で now_ms=at_ms へ更新するため) ので、cold-start
+                // でも起点を「今」へ張り直さない。張り直すと休眠を跨いだ長考が毎回
+                // チャラになり、実ギャップ全額課金の replay 計時と乖離して幽霊 TimeUp
+                // → core 復元失敗で対局が凍結・live 永久残留する。休眠を跨いだ長考の
+                // 時間切れは `alarm` ハンドラが真の残時間 (`current_turn_remaining_ms`)
+                // で判定して force_time_up する。
             }
+            // 復元不能系 (InvalidSfen / UnknownColor / MoveReplayFailed)。root fix
+            // (計時統一) 後は幽霊 TimeUp 自体が起きないが、データ破損等での復元不能は
+            // 残るため、無言 no-op (= 着手の無言破棄 / live 永久残留) をやめ、対局を
+            // #ABNORMAL で強制終局させて live index からも確実に外す安全網
+            // (https://github.com/SH11235/rshogi/issues/852)。
             ReplaySummary::InvalidSfen { reason } => {
                 crate::structured_log!(
                     event: "replay_invalid_sfen",
                     component: "game_room",
+                    level: "error",
                     reason: reason,
                 );
+                self.force_finalize_unrecoverable(&cfg, "replay_invalid_sfen").await?;
             }
             ReplaySummary::UnknownColor { ply, color } => {
                 crate::structured_log!(
                     event: "replay_unknown_color",
                     component: "game_room",
+                    level: "error",
                     ply: ply,
                     color: color,
                 );
+                self.force_finalize_unrecoverable(&cfg, "replay_unknown_color").await?;
             }
             ReplaySummary::MoveReplayFailed { ply, line, reason } => {
                 crate::structured_log!(
                     event: "replay_move_failed",
                     component: "game_room",
+                    level: "error",
                     ply: ply,
                     line: line,
                     reason: reason,
                 );
+                self.force_finalize_unrecoverable(&cfg, "replay_move_failed").await?;
             }
         }
+        Ok(())
+    }
 
-        // live-games-index put が抜けたまま hibernation で isolate が落ちた
-        // ケースを救済する (https://github.com/SH11235/rshogi/issues/549 §5)。
-        self.retry_live_games_index_if_needed().await?;
+    /// cold-start replay が非 Restored (復元不能) だったとき、対局を `#ABNORMAL`
+    /// で強制終局させ、live-games-index から確実に外す安全網
+    /// (https://github.com/SH11235/rshogi/issues/852)。
+    ///
+    /// root fix (計時統一) 後は幽霊 TimeUp 自体が起きないが、永続化データの破損等で
+    /// replay できないケースは残る。従来はログのみで core=None のままだったため、
+    /// 着手が無言破棄され、観戦 snapshot は空、時間切れ alarm も no-op、finalize
+    /// 不発で live に永久残留していた。本メソッドは:
+    ///
+    /// 1. `KEY_FINISHED` を `#ABNORMAL`（勝敗不明の中断扱い、`GameResult::Abnormal`）
+    ///    で確定させ、以後の着手を終局済み扱いにする
+    /// 2. grace / alarm 系タグを片付ける
+    /// 3. live-games-index entry を削除する (play_started 済みで put 済みのケース)
+    /// 4. 復元できなかった moves を破棄する (再 replay しても同じ失敗になるため)
+    /// 5. error レベルの構造化ログを出す (root fix 後は稀な経路なので alert 対象)
+    /// 6. 両 WS を閉じて「終局として応答」する (無言破棄をやめる)
+    ///
+    /// R2 棋譜 export は局面を組めない (= replay できない) ため行わず、
+    /// `exported_at_ms: None` を残す。
+    async fn force_finalize_unrecoverable(
+        &self,
+        cfg: &PersistedConfig,
+        reason_event: &str,
+    ) -> Result<()> {
+        use rshogi_csa_server::game::result::GameResult;
+        use rshogi_csa_server::record::kifu::primary_result_code;
 
-        // replay 後の turn_started_at_ms は最後の手の歴史的時刻のまま。hibernation
-        // evict を跨いだ復元で最初の手が即 TimeUp になるのを防ぐため、計測起点を
-        // 現在時刻へ張り直す。上の retry I/O より後に行うのは、cold start が対局者の
-        // 着手で起きた場合、retry の R2 待ち時間がそのまま次手の elapsed に課金され、
-        // 短い byoyomi / msec 時計では復元 I/O だけで TimeUp になり得るため。
-        // ここに到達した時点で core が Some なのは直前の replay が Restored だった
-        // 場合のみ (warm path は早期 return 済み)。Playing 以外は setter 側で no-op。
-        // evict 中に予約済み絶対 deadline alarm が早発火するケースは `alarm` ハンドラ
-        // 側で `current_turn_remaining_ms` を再判定して reschedule することで救済する。
-        let now_ms = self.now_ms();
-        if let Some(core) = self.core.borrow_mut().as_mut() {
-            core.reset_turn_started_at(now_ms);
+        // 既に終局済みなら二重終局しない (race ガード)。
+        if self.load_finished().await?.is_some() {
+            return Ok(());
+        }
+
+        let ended_at_ms = self.now_ms();
+        let result_code = primary_result_code(&GameResult::Abnormal { winner: None });
+        let finished = FinishedState {
+            result_code: result_code.to_owned(),
+            ended_at_ms,
+            exported_at_ms: None,
+        };
+        // KEY_FINISHED を最優先で確定させ、以後の着手が終局済み扱いになるようにする。
+        self.state.storage().put(KEY_FINISHED, &finished).await?;
+
+        // grace / agree-timeout / turn alarm 系のタグを片付ける。
+        self.delete_grace_alarm_state().await?;
+
+        // live-games-index を削除する (play_started 済み = entry を put 済みの
+        // ケースのみ対象。未 put の場合は削除不要)。
+        if let Some(started_at_ms) = cfg.play_started_at_ms {
+            self.try_delete_live_games_index(cfg, started_at_ms).await;
+        }
+
+        // 復元できなかった moves は破棄する (KEY_FINISHED ガードで再 replay は
+        // 走らないが、storage を残す意味がないため cleanup する)。
+        self.clear_moves().await;
+
+        // core は生成できていない (= None) が、防御的に take しておく。
+        self.core.borrow_mut().take();
+
+        crate::structured_log!(
+            event: "unrecoverable_force_finalized",
+            component: "game_room",
+            level: "error",
+            game_id: cfg.game_id,
+            reason_event: reason_event,
+            result_code: result_code,
+        );
+
+        // 両 WS を穏やかに閉じる (無言破棄をやめ、終局として応答する)。
+        for ws in self.state.get_websockets() {
+            let _ = ws.close(Some(1000), Some("game finished (unrecoverable state)".to_owned()));
         }
         Ok(())
     }
