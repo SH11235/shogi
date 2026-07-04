@@ -204,7 +204,9 @@ pub struct ServerConfig {
     /// 登録されたときは strict mode となり、未登録の `game_name` で LOGIN した
     /// 接続は `LOGIN:incorrect unknown_game_name` で拒否される。
     pub clock_presets: HashMap<GameName, ClockSpec>,
-    /// 通信マージン (ミリ秒)。`GameRoom` の `consume` 前に差し引かれる。
+    /// 通信マージン (ミリ秒)。deadline 側の猶予にのみ使う (#857)。
+    /// `compute_timeup_deadline` で加算し、`GameRoom` の課金 (`consume`) からは
+    /// 差し引かれない。
     pub time_margin_ms: u64,
     /// 最大手数。
     pub max_moves: u32,

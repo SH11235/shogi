@@ -343,7 +343,7 @@ impl TimeClock for MillisecondsCountdownClock {
     }
 }
 
-/// Fischer 方式の時計（増分加算、**CSA client の会計規則に合わせた init+post hybrid**）。
+/// Fischer 方式の時計（増分加算、init+post hybrid）。
 ///
 /// - `total_time_seconds`: 初期の持ち時間（秒）。
 /// - `increment_seconds`: 1 手ごとに加算される増分（秒）。
@@ -351,17 +351,19 @@ impl TimeClock for MillisecondsCountdownClock {
 /// - 消費で残時間が負に落ちた時点で時間切れ。
 ///
 /// # セマンティクス
-/// 既存 CSA client (`crates/rshogi-csa-client/src/session.rs`) は以下の会計を採用:
 /// ```text
-/// init:          slot = total + increment     // pre-init-increment
+/// init:          slot = total + increment     // 初手予算 = total + inc
 /// consume(e):    slot = slot - e + increment  // post-move-increment
 /// ```
 ///
 /// FIDE 標準 (init=total / 各手 post-increment) とも、完全な pre-increment
-/// (init=total / 各手 pre-increment) とも異なる独特の計算だが、既存 client /
-/// 棋譜ツールとの interop を優先してサーバもこれに合わせる。初手に
-/// `total + increment` 秒の予算があり、以後各手ごとに (残 - elapsed + inc) で
-/// slot が更新される。
+/// (init=total / 各手 pre-increment) とも異なる独特の計算だが、slot は常に
+/// 「手番側が今の 1 手で使える本体予算」を表すと解釈すれば一貫している。
+/// CSA client (#858 以降) の台帳は pre-increment (init=total、consume 毎に
+/// `-e+inc`) で、常に `client 台帳 = server slot - inc` の対応が成立する
+/// (client はエンジンへ btime=台帳 / binc=inc を別送するため、margin 減算前の
+/// btime+binc は server slot と一致する。手番側の実報告は margin を差し引くので
+/// 実効予算 = server slot − margin)。
 ///
 /// - `turn_budget_ms` は「現在の slot (既に +increment 済み) + 秒 grain」を返す。
 #[derive(Debug, Clone)]
@@ -375,8 +377,8 @@ pub struct FischerClock {
 impl FischerClock {
     /// 新しい Fischer 時計を作る。引数単位は「秒」。
     ///
-    /// client と合わせるため初期 slot は `total + increment` (= 初手で使える
-    /// 予算)。以後 `consume` 毎に post-increment で `slot = slot - elapsed + inc`。
+    /// 初期 slot は `total + increment` (= 初手で使える予算)。以後 `consume`
+    /// 毎に post-increment で `slot = slot - elapsed + inc`。
     pub fn new(total_time_seconds: u32, increment_seconds: u32) -> Self {
         let initial = (total_time_seconds as i64 + increment_seconds as i64) * 1000;
         Self {
@@ -408,13 +410,13 @@ impl FischerClock {
 
 impl TimeClock for FischerClock {
     fn consume(&mut self, color: Color, elapsed_ms: u64) -> ClockResult {
-        // CSA client の会計規則に合わせた post-move-increment:
+        // post-move-increment:
         //   new_slot = slot - elapsed + increment
         // 初期 slot は `new` で `total + increment` 済みなので、初手でも
         // `total + increment` 秒の予算を検査できる。2 手目以降は前手の完了時に
         // increment が加算されているため実質的に post-increment 挙動。
-        // client は `black_time_ms = total + inc` + 毎手 `slot -= e; slot += inc`
-        // で動くので、server もこれに一致させる。
+        // client (#858 以降) の台帳は pre-increment (init=total、毎手 `-e+inc`)
+        // で、常に「client 台帳 = server slot - inc」の対応を保つ。
         let elapsed_sec_ms = (elapsed_ms / 1000) as i64 * 1000;
         let increment = self.increment_ms();
         let slot = self.slot_mut(color);
