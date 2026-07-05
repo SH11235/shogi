@@ -94,7 +94,7 @@ use crate::spectator_control::{
 };
 use crate::spectator_snapshot::{
     SpectatorClocks, SpectatorSnapshotInput, build_spectator_snapshot, initial_spectator_clocks,
-    is_move_broadcast, move_elapsed_secs, parse_move_row_line,
+    is_move_broadcast, move_elapsed_secs, move_rows_from_exported_csa, parse_move_row_line,
 };
 use crate::ws_route::{WsRoute, parse_ws_route};
 use crate::x1_paths::{
@@ -1299,7 +1299,7 @@ impl GameRoom {
                 .unwrap_or_else(|| initial_spectator_clocks(cfg))
         };
 
-        let moves = self.load_moves().await?;
+        let moves = self.load_spectator_snapshot_moves(cfg, finished).await?;
         let last_ply_in_snapshot = u32::try_from(moves.len()).unwrap_or(u32::MAX);
 
         let lines = build_spectator_snapshot(SpectatorSnapshotInput {
@@ -1318,6 +1318,60 @@ impl GameRoom {
         self.set_spectator_snapshot_last_ply(ws, last_ply_in_snapshot)?;
         self.flush_spectator_snapshot_queue(ws).await?;
         Ok(())
+    }
+
+    async fn load_spectator_snapshot_moves(
+        &self,
+        cfg: &PersistedConfig,
+        finished: &Option<FinishedState>,
+    ) -> Result<Vec<MoveRow>> {
+        let moves = self.load_moves().await?;
+        if finished.is_none() || !moves.is_empty() {
+            return Ok(moves);
+        }
+
+        let first_prev_ms = cfg.play_started_at_ms.unwrap_or(cfg.matched_at_ms);
+        let pending: Option<ExportPendingState> =
+            self.state.storage().get(KEY_EXPORT_PENDING).await.ok().flatten();
+        if let Some(pending) = pending
+            && pending.game_id == cfg.game_id
+        {
+            let rows = move_rows_from_exported_csa(&pending.csa_text, first_prev_ms);
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
+        }
+
+        match self.load_kifu_by_game_id(&GameId::new(cfg.game_id.clone())).await {
+            Ok(Some(csa_text)) => {
+                let rows = move_rows_from_exported_csa(&csa_text, first_prev_ms);
+                if rows.is_empty() {
+                    crate::structured_log!(
+                        event: "finished_spectator_snapshot_moves_empty",
+                        component: "game_room",
+                        game_id: cfg.game_id,
+                    );
+                }
+                Ok(rows)
+            }
+            Ok(None) => {
+                crate::structured_log!(
+                    event: "finished_spectator_snapshot_kifu_missing",
+                    component: "game_room",
+                    game_id: cfg.game_id,
+                );
+                Ok(moves)
+            }
+            Err(e) => {
+                crate::structured_log!(
+                    event: "finished_spectator_snapshot_kifu_load_failed",
+                    component: "game_room",
+                    game_id: cfg.game_id,
+                    err: format!("{e:?}"),
+                );
+                Ok(moves)
+            }
+        }
     }
 
     /// snapshot 完了後に attachment の pending queue を順次 flush する。

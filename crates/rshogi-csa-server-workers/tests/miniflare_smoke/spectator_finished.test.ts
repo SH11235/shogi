@@ -43,6 +43,12 @@ describe("miniflare smoke: 終局済み spectate", () => {
     expect(lines[0]).toBe(`##[MONITOR2] BEGIN ${gameId}`);
     expect(lines).toContain("BEGIN Game_Summary");
     expect(lines).toContain(`Game_ID:${gameId}`);
+    const blackMoveIndex = lines.findIndex((line) => line.startsWith("+7776FU,T"));
+    const whiteMoveIndex = lines.findIndex((line) => line.startsWith("-3334FU,T"));
+    const resultIndex = lines.indexOf("#RESIGN");
+    expect(blackMoveIndex).toBeGreaterThan(0);
+    expect(whiteMoveIndex).toBeGreaterThan(blackMoveIndex);
+    expect(resultIndex).toBeGreaterThan(whiteMoveIndex);
     expect(lines).toContain("#RESIGN");
     expect(lines.at(-1)).toBe("##[MONITOR2] END");
 

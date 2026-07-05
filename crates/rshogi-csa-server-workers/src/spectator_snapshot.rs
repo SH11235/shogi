@@ -191,6 +191,51 @@ pub(crate) fn move_elapsed_secs(moves: &[MoveRow], first_prev_ms: u64) -> Vec<u3
         .collect()
 }
 
+/// export 済み CSA V2 本文から snapshot 用の指し手列を復元する。
+///
+/// `KifuRecord::build_v2` が出す通常手 (`+7776FU,T3`) と直後のコメント行だけを
+/// `MoveRow` 互換に戻す。終局後は DO の `moves` テーブルを cleanup するため、
+/// late-joiner snapshot は R2 / export pending の CSA 本文を正とする。
+pub(crate) fn move_rows_from_exported_csa(csa_text: &str, first_prev_ms: u64) -> Vec<MoveRow> {
+    let mut rows: Vec<MoveRow> = Vec::new();
+    let mut cumulative_ms = 0_u64;
+
+    for raw in csa_text.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.starts_with(['+', '-']) && line.len() >= 7 {
+            let token = &line[..7];
+            let elapsed_sec = line[7..]
+                .strip_prefix(",T")
+                .and_then(|rest| {
+                    let digits_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+                    (digits_len > 0).then(|| rest[..digits_len].parse::<u32>().ok()).flatten()
+                })
+                .unwrap_or(0);
+            cumulative_ms = cumulative_ms.saturating_add(u64::from(elapsed_sec) * 1000);
+            let at_ms = first_prev_ms.saturating_add(cumulative_ms).min(i64::MAX as u64) as i64;
+            rows.push(MoveRow {
+                ply: i64::try_from(rows.len() + 1).unwrap_or(i64::MAX),
+                color: if token.starts_with('+') {
+                    "black"
+                } else {
+                    "white"
+                }
+                .to_owned(),
+                line: line.to_owned(),
+                at_ms,
+            });
+        } else if let Some(comment) = line.strip_prefix('\'')
+            && let Some(last) = rows.last_mut()
+            && !last.line.contains('\'')
+        {
+            last.line.push('\'');
+            last.line.push_str(comment);
+        }
+    }
+
+    rows
+}
+
 /// broadcast entry が「盤面を進めた指し手行」かを判定する共有ヘルパ。
 ///
 /// 指し手 broadcast は `+`/`-` で始まり `ply.is_some()`。終局理由行 (`%TORYO`
@@ -450,6 +495,32 @@ mod tests {
         assert_eq!(parse_move_row_line("+7776FU,T3'note"), ("+7776FU", Some("note")));
         // 末尾改行は除去する。
         assert_eq!(parse_move_row_line("+7776FU,T3\r\n"), ("+7776FU", None));
+    }
+
+    #[test]
+    fn move_rows_from_exported_csa_restores_moves_comments_and_elapsed() {
+        let csa = "\
+V2.2
+N+alice
+N-bob
+$GAME_ID:g1
+PI
++
++7776FU,T3
+-3334FU,T4
+'eval=12 pv 3c3d
+%TORYO
+";
+        let rows = move_rows_from_exported_csa(csa, 1_000);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].ply, 1);
+        assert_eq!(rows[0].color, "black");
+        assert_eq!(rows[0].line, "+7776FU,T3");
+        assert_eq!(rows[0].at_ms, 4_000);
+        assert_eq!(rows[1].ply, 2);
+        assert_eq!(rows[1].color, "white");
+        assert_eq!(rows[1].line, "-3334FU,T4'eval=12 pv 3c3d");
+        assert_eq!(rows[1].at_ms, 8_000);
     }
 
     #[test]
