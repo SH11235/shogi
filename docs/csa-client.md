@@ -68,7 +68,7 @@ cargo run -p rshogi-csa-client --release -- config.toml \
 host = "wdoor.c.u-tokyo.ac.jp"  # floodgate
 port = 4081
 id = "rshogi_v1"
-password = "your_password"
+password = "floodgate-300-10F,your_trip"  # floodgate は <game_name>,<trip> 形式（後述）
 floodgate = true  # 評価値・PVコメントを送信
 ```
 
@@ -141,7 +141,7 @@ save_sfen = true  # SFEN局面列（学習データ生成用）
 host = "wdoor.c.u-tokyo.ac.jp"
 port = 4081
 id = "rshogi_test"
-password = "any_string_here"
+password = "floodgate-300-10F,your_trip"  # <game_name>,<trip>（必須。理由は下記）
 floodgate = true
 
 [game]
@@ -155,6 +155,17 @@ nohup cargo run -p rshogi-csa-client --release -- config.toml > csa.log 2>&1 &
 ```
 
 Ctrl+C (SIGINT) で現在の対局完了後にgracefulに終了する。
+
+> **floodgate の参加プールは `password` で選ぶ。** floodgate は参加したい対局条件
+> （game_name = 持ち時間プリセット）を `password` 欄に **`<game_name>,<trip>`** 形式で
+> 埋めて選択する（公式: `https://wdoor.c.u-tokyo.ac.jp/shogi/`）。`csa_client` は
+> `%%GAME` を送らずサーバーの `Game_Summary` を待つため、**`password` に game_name が
+> 無いと LOGIN は成功するがどのプールにも入れず、毎時 :00/:30 のペアリングを素通りして
+> 対局が永久に始まらない。** `<game_name>` の現行名は公式ページで確認する（記載時点
+> `floodgate-300-10F` = 持ち時間 300 秒 + 1 手 10 秒加算の Fischer）。`<trip>` は任意
+> 文字列だがレーティング紐付けの識別子なので、同一エンジンでは `id` ともども固定する
+> （変えると別人格扱いでレートが継続しない）。ログイン名は任意で事前登録は不要。持ち時間
+> 自体はサーバーが `Game_Summary` で配信するため config には書かない。
 
 ### LAN 内の自前サーバーで対局（`rshogi-csa-server-tcp`）
 
