@@ -73,6 +73,7 @@ export interface HarnessOptions {
   /// 側既定 ([`config::DEFAULT_AGREE_TIMEOUT_SEC`] = 60) にフォールバック。
   agreeTimeoutSeconds?: number;
   allowFloodgateFeatures?: boolean;
+  allowViewerApi?: boolean;
   totalTimeSec?: number;
   byoyomiSec?: number;
   totalTimeMs?: number;
@@ -178,6 +179,7 @@ export async function createMiniflare(opts: HarnessOptions): Promise<Miniflare> 
       AGREE_TIMEOUT_SECONDS:
         opts.agreeTimeoutSeconds === undefined ? "" : String(opts.agreeTimeoutSeconds),
       ALLOW_FLOODGATE_FEATURES: opts.allowFloodgateFeatures ? "true" : "false",
+      ALLOW_VIEWER_API: opts.allowViewerApi ? "true" : "false",
       WS_ALLOWED_ORIGINS: opts.wsAllowedOrigins ?? "https://example.com",
       LOBBY_QUEUE_SIZE_LIMIT: String(opts.lobbyQueueSizeLimit ?? 100),
       // 未指定時は空文字を渡して server 側 fallback (= 300 秒既定) を使う。

@@ -46,6 +46,19 @@ pub struct SpectatorClocks {
     pub side_to_move: Color,
 }
 
+/// core を復元できない終局済み DO でも Game_Summary を返すための時計 fallback。
+pub(crate) fn initial_spectator_clocks(config: &PersistedConfig) -> SpectatorClocks {
+    let clock = config.clock.build_clock();
+    SpectatorClocks {
+        black_remaining_ms: clock.remaining_main_ms(Color::Black).max(0) as u64,
+        white_remaining_ms: clock.remaining_main_ms(Color::White).max(0) as u64,
+        side_to_move: match config.initial_sfen.as_deref() {
+            Some(sfen) => side_to_move_from_sfen(sfen).unwrap_or(Color::Black),
+            None => Color::Black,
+        },
+    }
+}
+
 /// `build_spectator_snapshot` への入力。
 pub struct SpectatorSnapshotInput<'a> {
     /// 永続化済み対局設定（クロック設定 / 初期 SFEN / プレイヤ名 / game_id 等）。
@@ -387,6 +400,23 @@ mod tests {
         // 正規化後の token 行 (raw の T 値ではなく at_ms 差分の T) が全て含まれる。
         assert!(lines.iter().any(|l| l == "+7776FU,T2"), "missing +7776FU,T2: {lines:?}");
         assert!(lines.iter().any(|l| l == "-3334FU,T3"), "missing -3334FU,T3: {lines:?}");
+    }
+
+    #[test]
+    fn initial_spectator_clocks_uses_config_clock_and_sfen_turn() {
+        let mut cfg = baseline_config();
+        cfg.clock = ClockSpec::CountdownMsec {
+            total_time_ms: 10_000,
+            byoyomi_ms: 100,
+        };
+        cfg.initial_sfen =
+            Some("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL w - 1".to_owned());
+
+        let cl = initial_spectator_clocks(&cfg);
+
+        assert_eq!(cl.black_remaining_ms, 10_000);
+        assert_eq!(cl.white_remaining_ms, 10_000);
+        assert_eq!(cl.side_to_move, Color::White);
     }
 
     /// `Game_ID:` / `Name+:` / `Name-:` は config 由来で snapshot に乗る。
