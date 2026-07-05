@@ -332,6 +332,89 @@ impl EngineProcess {
         }
     }
 
+    /// 任意の `go` 引数で 1 局面を探索する。
+    ///
+    /// `position_tail` は `position sfen ...` の `sfen` 以降にそのまま渡す。
+    /// 例: `lnsg... b - 1 moves 7g7f`。
+    pub fn search_raw_go(
+        &mut self,
+        position_tail: &str,
+        go_args: &str,
+        timeout: Duration,
+        mut info_callback: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<SearchOutcome> {
+        self.write_line(&format!("position sfen {position_tail}"))?;
+        let go_cmd = if go_args.trim().is_empty() {
+            "go".to_string()
+        } else {
+            format!("go {}", go_args.trim())
+        };
+        self.write_line(&go_cmd)?;
+
+        let start = Instant::now();
+        let mut snapshot = InfoSnapshot::default();
+        loop {
+            match self.rx.recv_timeout(timeout) {
+                Ok(line) => {
+                    if line.starts_with("info") {
+                        snapshot.update_from_line(&line);
+                        if let Some(cb) = info_callback.as_mut() {
+                            cb(&line);
+                        }
+                        continue;
+                    }
+                    if let Some(rest) = line.strip_prefix("bestmove ") {
+                        let mut parts = rest.split_whitespace();
+                        let mv = parts.next().unwrap_or_default().to_string();
+                        return Ok(SearchOutcome {
+                            bestmove: Some(mv),
+                            elapsed_ms: duration_to_millis(start.elapsed()),
+                            timed_out: false,
+                            eval: snapshot.into_eval_log(),
+                        });
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.write_line("stop")?;
+                    let stop_deadline = Duration::from_secs(10);
+                    loop {
+                        match self.rx.recv_timeout(stop_deadline) {
+                            Ok(line) if line.starts_with("info") => {
+                                snapshot.update_from_line(&line);
+                            }
+                            Ok(line) => {
+                                if let Some(rest) = line.strip_prefix("bestmove ") {
+                                    let mut parts = rest.split_whitespace();
+                                    let mv = parts.next().unwrap_or_default().to_string();
+                                    return Ok(SearchOutcome {
+                                        bestmove: Some(mv),
+                                        elapsed_ms: duration_to_millis(start.elapsed()),
+                                        timed_out: true,
+                                        eval: snapshot.into_eval_log(),
+                                    });
+                                }
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                return Ok(SearchOutcome {
+                                    bestmove: None,
+                                    elapsed_ms: duration_to_millis(start.elapsed()),
+                                    timed_out: true,
+                                    eval: snapshot.into_eval_log(),
+                                });
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                bail!("{}", self.engine_exited_message());
+                            }
+                        }
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("{}", self.engine_exited_message());
+                }
+            }
+        }
+    }
+
     pub fn sync_ready(&mut self) -> Result<()> {
         self.write_line("isready")?;
         loop {
