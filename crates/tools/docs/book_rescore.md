@@ -45,9 +45,15 @@ value(move) = -(子局面の score cp)
 
 ## journal と決定性
 
-子局面は ply を除いた SFEN をキーにします。同じ子局面に合流する候補手は 1 回だけ探索され、結果は journal に追記されます。
+出力 `.db` の局面行は、入力の full SFEN（末尾 ply を含む）単位で保持します。同じ盤面・手番でも末尾 ply が異なる `sfen` 行は別 entry として出力されます。
 
-USI エンジンの探索結果自体は実行環境により揺れる可能性があります。再現性が必要な場合は、同じ journal を入力として `--resume` を使ってください。同一 journal から生成する `.db` と report の内容・順序は決定的です。
+探索 cache のキーは ply を除いた SFEN です。同じ親局面や同じ子局面に合流する候補手は 1 回だけ探索され、結果は journal に追記されます。
+
+journal は JSON Lines 形式です。各行には `kind`, `sfen`, `go`, `engine_fingerprint` と、子局面なら `value`/`depth`、親局面なら `bestmove` を記録します。`engine_fingerprint` は `--engine` パスの basename と、`--engine-option` を key 昇順に正規化した文字列から作ります。
+
+`--resume` は `go` と `engine_fingerprint` の両方が現在の実行設定と一致する journal 行だけを再利用します。`--engine` や `--engine-option`（例: `EvalFile`）を変えた場合、同じ journal ファイル内の古い行は stale として無視され、再探索されます。
+
+USI エンジンの探索結果自体は実行環境により揺れる可能性があります。再現性が必要な場合は、同じ journal と同じ探索設定で `--resume` を使ってください。同一 journal から生成する `.db` と report の内容・順序は決定的です。
 
 ## report
 

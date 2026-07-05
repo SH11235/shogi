@@ -74,6 +74,8 @@ struct JournalRecord {
     kind: JournalKind,
     sfen: String,
     go: String,
+    #[serde(default)]
+    engine_fingerprint: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,15 +154,16 @@ fn main() -> Result<()> {
     rshogi_book::Book::from_path(&cli.book, true)
         .with_context(|| format!("定跡を rshogi-book で読めません: {}", cli.book.display()))?;
     let book = read_book_db(&cli.book)?;
+    let engine_fingerprint = engine_fingerprint(&cli.engine, &cli.engine_options);
     let mut journal = if cli.resume {
-        load_journal(&cli.journal, &cli.go)?
+        load_journal(&cli.journal, &cli.go, &engine_fingerprint)?
     } else {
         LoadedJournal::default()
     };
 
     let tasks = build_tasks(&book, &journal, !cli.no_parent_search)?;
     if !tasks.is_empty() {
-        run_search_tasks(&cli, tasks, &mut journal)?;
+        run_search_tasks(&cli, tasks, &engine_fingerprint, &mut journal)?;
     }
 
     write_rescored_book(&book, &journal.child, &cli.out)?;
@@ -184,7 +187,7 @@ fn read_book_db(path: &Path) -> Result<BookDb> {
         }
         if let Some(rest) = line.strip_prefix("sfen ") {
             let sfen = rest.trim().to_string();
-            let key = strip_ply(&sfen).to_string();
+            let key = sfen.clone();
             let side = side_to_move(&sfen)?;
             entries.entry(key.clone()).or_insert(PositionEntry {
                 sfen,
@@ -239,6 +242,19 @@ fn strip_ply(sfen: &str) -> &str {
     }
 }
 
+fn engine_fingerprint(engine_path: &Path, engine_options: &[String]) -> String {
+    let engine_name =
+        engine_path.file_name().map(|name| name.to_string_lossy()).unwrap_or_default();
+    let mut normalized_options: Vec<&str> = engine_options.iter().map(String::as_str).collect();
+    normalized_options
+        .sort_by(|a, b| engine_option_key(a).cmp(engine_option_key(b)).then_with(|| a.cmp(b)));
+    format!("{engine_name}\t{}", normalized_options.join("\n"))
+}
+
+fn engine_option_key(option: &str) -> &str {
+    option.split_once('=').map_or(option, |(key, _)| key)
+}
+
 fn side_to_move(sfen: &str) -> Result<Color> {
     match sfen.split_whitespace().nth(1) {
         Some("b") => Ok(Color::Black),
@@ -273,14 +289,15 @@ fn build_tasks(
     let mut child_seen = HashSet::new();
     let mut parent_seen = HashSet::new();
 
-    for (parent_key, entry) in &book.entries {
+    for entry in book.entries.values() {
+        let parent_key = strip_ply(&entry.sfen);
         if parent_search
             && !journal.parent.contains_key(parent_key)
-            && parent_seen.insert(parent_key.clone())
+            && parent_seen.insert(parent_key.to_string())
         {
             tasks.push(SearchTask {
                 kind: JournalKind::Parent,
-                key: parent_key.clone(),
+                key: parent_key.to_string(),
                 position_tail: entry.sfen.clone(),
             });
         }
@@ -302,7 +319,7 @@ fn build_tasks(
     Ok(tasks)
 }
 
-fn load_journal(path: &Path, go_args: &str) -> Result<LoadedJournal> {
+fn load_journal(path: &Path, go_args: &str, engine_fingerprint: &str) -> Result<LoadedJournal> {
     if !path.exists() {
         return Ok(LoadedJournal::default());
     }
@@ -318,7 +335,7 @@ fn load_journal(path: &Path, go_args: &str) -> Result<LoadedJournal> {
         let rec: JournalRecord = serde_json::from_str(&line).with_context(|| {
             format!("journal JSON が不正です: {}:{}", path.display(), line_no + 1)
         })?;
-        if rec.go != go_args {
+        if rec.go != go_args || rec.engine_fingerprint != engine_fingerprint {
             continue;
         }
         match rec.kind {
@@ -340,7 +357,12 @@ fn load_journal(path: &Path, go_args: &str) -> Result<LoadedJournal> {
     Ok(loaded)
 }
 
-fn run_search_tasks(cli: &Cli, tasks: Vec<SearchTask>, journal: &mut LoadedJournal) -> Result<()> {
+fn run_search_tasks(
+    cli: &Cli,
+    tasks: Vec<SearchTask>,
+    engine_fingerprint: &str,
+    journal: &mut LoadedJournal,
+) -> Result<()> {
     let (task_tx, task_rx) = chan::unbounded::<SearchTask>();
     let (result_tx, result_rx) = chan::unbounded::<WorkerMessage>();
     let task_count = tasks.len();
@@ -352,6 +374,7 @@ fn run_search_tasks(cli: &Cli, tasks: Vec<SearchTask>, journal: &mut LoadedJourn
     let engine_options = Arc::new(cli.engine_options.clone());
     let go_args = Arc::new(cli.go.clone());
     let engine_path = Arc::new(cli.engine.clone());
+    let engine_fingerprint = Arc::new(engine_fingerprint.to_string());
     let worker_count = cli.parallel;
 
     let mut handles = Vec::with_capacity(worker_count);
@@ -361,8 +384,17 @@ fn run_search_tasks(cli: &Cli, tasks: Vec<SearchTask>, journal: &mut LoadedJourn
         let engine_options = engine_options.clone();
         let go_args = go_args.clone();
         let engine_path = engine_path.clone();
+        let engine_fingerprint = engine_fingerprint.clone();
         handles.push(std::thread::spawn(move || {
-            worker_loop(worker_id, &engine_path, &engine_options, &go_args, task_rx, result_tx);
+            worker_loop(
+                worker_id,
+                &engine_path,
+                &engine_options,
+                &go_args,
+                &engine_fingerprint,
+                task_rx,
+                result_tx,
+            );
         }));
     }
     drop(result_tx);
@@ -437,6 +469,7 @@ fn worker_loop(
     engine_path: &Path,
     engine_options: &[String],
     go_args: &str,
+    engine_fingerprint: &str,
     task_rx: chan::Receiver<SearchTask>,
     result_tx: chan::Sender<WorkerMessage>,
 ) {
@@ -463,9 +496,10 @@ fn worker_loop(
     };
     let timeout = Duration::from_secs(24 * 60 * 60);
     for task in task_rx {
-        let result = search_one(&mut engine, &task, go_args, timeout).with_context(|| {
-            format!("worker {worker_id}: {:?} 探索に失敗しました: {}", task.kind, task.key)
-        });
+        let result = search_one(&mut engine, &task, go_args, engine_fingerprint, timeout)
+            .with_context(|| {
+                format!("worker {worker_id}: {:?} 探索に失敗しました: {}", task.kind, task.key)
+            });
         if result_tx.send(WorkerMessage::Task(result)).is_err() {
             break;
         }
@@ -492,6 +526,7 @@ fn search_one(
     engine: &mut EngineProcess,
     task: &SearchTask,
     go_args: &str,
+    engine_fingerprint: &str,
     timeout: Duration,
 ) -> Result<SearchResult> {
     let outcome = engine.search_raw_go(&task.position_tail, go_args, timeout, None)?;
@@ -507,6 +542,7 @@ fn search_one(
                 kind: JournalKind::Child,
                 sfen: task.key.clone(),
                 go: go_args.to_string(),
+                engine_fingerprint: engine_fingerprint.to_string(),
                 value: Some(value_from_child_score(child_score)),
                 depth: Some(depth),
                 bestmove: None,
@@ -516,6 +552,7 @@ fn search_one(
             kind: JournalKind::Parent,
             sfen: task.key.clone(),
             go: go_args.to_string(),
+            engine_fingerprint: engine_fingerprint.to_string(),
             value: None,
             depth: Some(depth),
             bestmove: outcome.bestmove,
@@ -607,8 +644,8 @@ fn write_report(
     let mut black = ReportStats::default();
     let mut white = ReportStats::default();
 
-    for (key, entry) in &book.entries {
-        if let Some(parent) = parent_records.get(key)
+    for entry in book.entries.values() {
+        if let Some(parent) = parent_records.get(strip_ply(&entry.sfen))
             && let Some(bestmove) =
                 parent.bestmove.as_deref().filter(|m| *m != "none" && *m != "resign")
         {
@@ -722,7 +759,7 @@ mod tests {
     fn db_output_from_journal_is_deterministic() {
         let mut entries = BTreeMap::new();
         entries.insert(
-            strip_ply(START).to_string(),
+            START.to_string(),
             PositionEntry {
                 sfen: START.to_string(),
                 side: Color::Black,
@@ -790,11 +827,101 @@ mod tests {
         }];
         let mut journal = LoadedJournal::default();
 
-        let err = run_search_tasks(&cli, tasks, &mut journal).unwrap_err();
+        let fingerprint = engine_fingerprint(&cli.engine, &cli.engine_options);
+        let err = run_search_tasks(&cli, tasks, &fingerprint, &mut journal).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("探索タスクが未完了です: 0/1 件完了"));
         assert!(message.contains("--resume で再開できます"));
         assert!(journal.child.is_empty());
         assert!(journal.parent.is_empty());
+    }
+
+    #[test]
+    fn read_book_db_preserves_ply_distinct_sfen_rows_and_shares_child_eval() {
+        let dir = tempfile::tempdir().unwrap();
+        let book_path = dir.path().join("input.db");
+        let out_path = dir.path().join("out.db");
+        let input = format!(
+            "{BOOK_HEADER}\n\
+             sfen {sfen_a}\n\
+             7g7f none 0 0 10\n\
+             sfen {sfen_b}\n\
+             7g7f none 0 0 20\n",
+            sfen_a = START,
+            sfen_b = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 77"
+        );
+        std::fs::write(&book_path, input).unwrap();
+
+        let book = read_book_db(&book_path).unwrap();
+        assert_eq!(book.entries.len(), 2);
+
+        let tasks = build_tasks(&book, &LoadedJournal::default(), false).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].kind, JournalKind::Child);
+
+        let mut child_records = HashMap::new();
+        child_records.insert(
+            child_key_after_move(START, "7g7f").unwrap(),
+            EvalRecord {
+                value: 123,
+                depth: 9,
+            },
+        );
+        write_rescored_book(&book, &child_records, &out_path).unwrap();
+
+        let output = std::fs::read_to_string(out_path).unwrap();
+        let expected = format!(
+            "{BOOK_HEADER}\n\
+             sfen {sfen_a}\n\
+             7g7f none 123 9 10\n\
+             sfen {sfen_b}\n\
+             7g7f none 123 9 20\n",
+            sfen_a = START,
+            sfen_b = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 77"
+        );
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn resume_ignores_journal_record_with_mismatched_engine_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.jsonl");
+        let go = "nodes 1";
+        let current_engine = dir.path().join("new-engine");
+        let current_options = vec!["EvalFile=current.nnue".to_string()];
+        let current_fingerprint = engine_fingerprint(&current_engine, &current_options);
+        let stale_record = JournalRecord {
+            kind: JournalKind::Child,
+            sfen: strip_ply(START).to_string(),
+            go: go.to_string(),
+            engine_fingerprint: engine_fingerprint(
+                Path::new("/path/to/old-engine"),
+                &["EvalFile=old.nnue".to_string()],
+            ),
+            value: Some(42),
+            depth: Some(3),
+            bestmove: None,
+        };
+        std::fs::write(
+            &journal_path,
+            format!("{}\n", serde_json::to_string(&stale_record).unwrap()),
+        )
+        .unwrap();
+
+        let loaded = load_journal(&journal_path, go, &current_fingerprint).unwrap();
+        assert!(loaded.child.is_empty());
+
+        let matching_record = JournalRecord {
+            engine_fingerprint: current_fingerprint.clone(),
+            ..stale_record
+        };
+        std::fs::write(
+            &journal_path,
+            format!("{}\n", serde_json::to_string(&matching_record).unwrap()),
+        )
+        .unwrap();
+
+        let loaded = load_journal(&journal_path, go, &current_fingerprint).unwrap();
+        assert_eq!(loaded.child[strip_ply(START)].value, 42);
     }
 }
