@@ -46,6 +46,19 @@ pub struct SpectatorClocks {
     pub side_to_move: Color,
 }
 
+/// core を復元できない終局済み DO でも Game_Summary を返すための時計 fallback。
+pub(crate) fn initial_spectator_clocks(config: &PersistedConfig) -> SpectatorClocks {
+    let clock = config.clock.build_clock();
+    SpectatorClocks {
+        black_remaining_ms: clock.remaining_main_ms(Color::Black).max(0) as u64,
+        white_remaining_ms: clock.remaining_main_ms(Color::White).max(0) as u64,
+        side_to_move: match config.initial_sfen.as_deref() {
+            Some(sfen) => side_to_move_from_sfen(sfen).unwrap_or(Color::Black),
+            None => Color::Black,
+        },
+    }
+}
+
 /// `build_spectator_snapshot` への入力。
 pub struct SpectatorSnapshotInput<'a> {
     /// 永続化済み対局設定（クロック設定 / 初期 SFEN / プレイヤ名 / game_id 等）。
@@ -176,6 +189,51 @@ pub(crate) fn move_elapsed_secs(moves: &[MoveRow], first_prev_ms: u64) -> Vec<u3
             (elapsed_ms / 1000) as u32
         })
         .collect()
+}
+
+/// export 済み CSA V2 本文から snapshot 用の指し手列を復元する。
+///
+/// `KifuRecord::build_v2` が出す通常手 (`+7776FU,T3`) と直後のコメント行だけを
+/// `MoveRow` 互換に戻す。終局後は DO の `moves` テーブルを cleanup するため、
+/// late-joiner snapshot は R2 / export pending の CSA 本文を正とする。
+pub(crate) fn move_rows_from_exported_csa(csa_text: &str, first_prev_ms: u64) -> Vec<MoveRow> {
+    let mut rows: Vec<MoveRow> = Vec::new();
+    let mut cumulative_ms = 0_u64;
+
+    for raw in csa_text.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.starts_with(['+', '-']) && line.len() >= 7 {
+            let token = &line[..7];
+            let elapsed_sec = line[7..]
+                .strip_prefix(",T")
+                .and_then(|rest| {
+                    let digits_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+                    (digits_len > 0).then(|| rest[..digits_len].parse::<u32>().ok()).flatten()
+                })
+                .unwrap_or(0);
+            cumulative_ms = cumulative_ms.saturating_add(u64::from(elapsed_sec) * 1000);
+            let at_ms = first_prev_ms.saturating_add(cumulative_ms).min(i64::MAX as u64) as i64;
+            rows.push(MoveRow {
+                ply: i64::try_from(rows.len() + 1).unwrap_or(i64::MAX),
+                color: if token.starts_with('+') {
+                    "black"
+                } else {
+                    "white"
+                }
+                .to_owned(),
+                line: line.to_owned(),
+                at_ms,
+            });
+        } else if let Some(comment) = line.strip_prefix('\'')
+            && let Some(last) = rows.last_mut()
+            && !last.line.contains('\'')
+        {
+            last.line.push('\'');
+            last.line.push_str(comment);
+        }
+    }
+
+    rows
 }
 
 /// broadcast entry が「盤面を進めた指し手行」かを判定する共有ヘルパ。
@@ -389,6 +447,23 @@ mod tests {
         assert!(lines.iter().any(|l| l == "-3334FU,T3"), "missing -3334FU,T3: {lines:?}");
     }
 
+    #[test]
+    fn initial_spectator_clocks_uses_config_clock_and_sfen_turn() {
+        let mut cfg = baseline_config();
+        cfg.clock = ClockSpec::CountdownMsec {
+            total_time_ms: 10_000,
+            byoyomi_ms: 100,
+        };
+        cfg.initial_sfen =
+            Some("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL w - 1".to_owned());
+
+        let cl = initial_spectator_clocks(&cfg);
+
+        assert_eq!(cl.black_remaining_ms, 10_000);
+        assert_eq!(cl.white_remaining_ms, 10_000);
+        assert_eq!(cl.side_to_move, Color::White);
+    }
+
     /// `Game_ID:` / `Name+:` / `Name-:` は config 由来で snapshot に乗る。
     #[test]
     fn snapshot_summary_includes_game_id_and_player_names() {
@@ -420,6 +495,32 @@ mod tests {
         assert_eq!(parse_move_row_line("+7776FU,T3'note"), ("+7776FU", Some("note")));
         // 末尾改行は除去する。
         assert_eq!(parse_move_row_line("+7776FU,T3\r\n"), ("+7776FU", None));
+    }
+
+    #[test]
+    fn move_rows_from_exported_csa_restores_moves_comments_and_elapsed() {
+        let csa = "\
+V2.2
+N+alice
+N-bob
+$GAME_ID:g1
+PI
++
++7776FU,T3
+-3334FU,T4
+'eval=12 pv 3c3d
+%TORYO
+";
+        let rows = move_rows_from_exported_csa(csa, 1_000);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].ply, 1);
+        assert_eq!(rows[0].color, "black");
+        assert_eq!(rows[0].line, "+7776FU,T3");
+        assert_eq!(rows[0].at_ms, 4_000);
+        assert_eq!(rows[1].ply, 2);
+        assert_eq!(rows[1].color, "white");
+        assert_eq!(rows[1].line, "-3334FU,T4'eval=12 pv 3c3d");
+        assert_eq!(rows[1].at_ms, 8_000);
     }
 
     #[test]

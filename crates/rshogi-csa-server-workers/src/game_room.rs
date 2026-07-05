@@ -93,8 +93,8 @@ use crate::spectator_control::{
     MonitorDecision, resolve_monitor_target, resolve_monitor_target_with_finished,
 };
 use crate::spectator_snapshot::{
-    SpectatorClocks, SpectatorSnapshotInput, build_spectator_snapshot, is_move_broadcast,
-    move_elapsed_secs, parse_move_row_line,
+    SpectatorClocks, SpectatorSnapshotInput, build_spectator_snapshot, initial_spectator_clocks,
+    is_move_broadcast, move_elapsed_secs, move_rows_from_exported_csa, parse_move_row_line,
 };
 use crate::ws_route::{WsRoute, parse_ws_route};
 use crate::x1_paths::{
@@ -106,8 +106,9 @@ const DEFAULT_MAX_MOVES: u32 = 256;
 const DEFAULT_TIME_MARGIN_MS: u64 = 1000;
 
 /// 1 部屋あたりの観戦者同時接続上限。`fetch` で `/ws/<id>/spectate` の upgrade
-/// 時にカウントし、上限に達していたら 503 を返す。MVP の DDoS 防御として最低限
-/// の gating であり、ベンチで上限を見直す際は環境変数化を検討する (現状は const)。
+/// 時にカウントし、上限に達していたら accept 後に 1013 で閉じる。MVP の DDoS
+/// 防御として最低限の gating であり、ベンチで上限を見直す際は環境変数化を検討する
+/// (現状は const)。
 const MAX_SPECTATORS_PER_ROOM: usize = 50;
 
 /// Alarm 発火時刻に上乗せする安全側マージン（ミリ秒）。Cloudflare Alarm API
@@ -309,7 +310,7 @@ impl DurableObject for GameRoom {
         let Some(route) = parse_ws_route(&path) else {
             return Response::error("Upgrade required", 426);
         };
-        let room_id = route.room_id();
+        let room_id = route.room_id().to_owned();
 
         // 初回 fetch でのみ room_id を永続化する。`start_match` 側で game_id 生成に
         // 使うため、DO 再構築後でも同じ値を参照できるよう storage に置く。
@@ -320,25 +321,12 @@ impl DurableObject for GameRoom {
             self.state.storage().put(KEY_ROOM_ID, room_id.to_owned()).await?;
         }
 
-        // 観戦者の上限チェック (MVP の DDoS 防御)。room あたり同時接続
-        // `MAX_SPECTATORS_PER_ROOM` を超える spectator upgrade は 503 で拒否。
+        // 観戦者の上限チェック (MVP の DDoS 防御)。ブラウザでは WS handshake の
+        // HTTP status/body が隠れるため、上限到達時も一度 accept して 1013 で閉じる。
         // 対局者経路 (`WsRoute::Player`) には影響しない。
-        if route.is_spectator() {
-            let count = self
-                .state
-                .get_websockets()
-                .iter()
-                .filter(|ws| {
-                    matches!(
-                        ws.deserialize_attachment::<WsAttachment>().ok().flatten(),
-                        Some(WsAttachment::Spectator { .. })
-                    )
-                })
-                .count();
-            if count >= MAX_SPECTATORS_PER_ROOM {
-                return Response::error("spectator capacity exceeded", 503);
-            }
-        }
+        let is_spectator = route.is_spectator();
+        let spectator_room_full =
+            is_spectator && self.count_spectator_sockets() >= MAX_SPECTATORS_PER_ROOM;
 
         let pair = WebSocketPair::new()?;
         let server = pair.server;
@@ -351,6 +339,21 @@ impl DurableObject for GameRoom {
         server
             .serialize_attachment(&pending)
             .map_err(|e| Error::RustError(format!("serialize_attachment: {e}")))?;
+
+        if is_spectator {
+            if spectator_room_full {
+                self.release_spectator_socket(&server, Some(1013), "room full");
+            } else if let Err(e) =
+                self.send_finished_spectator_snapshot_if_needed(&server, &room_id).await
+            {
+                crate::structured_log!(
+                    event: "finished_spectator_initial_push_failed",
+                    component: "game_room",
+                    room_id: room_id,
+                    err: format!("{e:?}"),
+                );
+            }
+        }
 
         crate::structured_log!(
             event: "websocket_upgrade_accepted",
@@ -414,8 +417,9 @@ impl DurableObject for GameRoom {
         _was_clean: bool,
     ) -> Result<()> {
         // attachment が corrupt (JSON が壊れた等) の場合は None と同じ扱いにせざるを
-        // 得ないが、診断のためにエラー内容をログへ残す。現実装では Player 以外 (Pending /
-        // corrupt) は slot 解放できないので何もせず return する。
+        // 得ないが、診断のためにエラー内容をログへ残す。Player 以外は対局状態を
+        // 動かさず、Spectator だけは上限カウントから確実に外れるよう attachment を
+        // Pending に戻す。
         let att: Option<WsAttachment> = ws.deserialize_attachment().unwrap_or_else(|e| {
             crate::structured_log!(
                 event: "websocket_close_deserialize_failed",
@@ -424,8 +428,13 @@ impl DurableObject for GameRoom {
             );
             None
         });
-        let Some(WsAttachment::Player { role, .. }) = att else {
-            return Ok(());
+        let role = match att {
+            Some(WsAttachment::Player { role, .. }) => role,
+            Some(WsAttachment::Spectator { .. }) => {
+                self.release_spectator_socket(&ws, None, "spectator closed");
+                return Ok(());
+            }
+            _ => return Ok(()),
         };
 
         // 終局後に届く close は CoreRoom を再構築して force_abnormal してしまうと
@@ -477,7 +486,18 @@ impl DurableObject for GameRoom {
         Ok(())
     }
 
-    async fn websocket_error(&self, _ws: WebSocket, _error: Error) -> Result<()> {
+    async fn websocket_error(&self, ws: WebSocket, error: Error) -> Result<()> {
+        if matches!(
+            ws.deserialize_attachment::<WsAttachment>().ok().flatten(),
+            Some(WsAttachment::Spectator { .. })
+        ) {
+            crate::structured_log!(
+                event: "spectator_websocket_error",
+                component: "game_room",
+                err: format!("{error:?}"),
+            );
+            self.release_spectator_socket(&ws, Some(1011), "spectator websocket error");
+        }
         Ok(())
     }
 
@@ -1089,6 +1109,48 @@ impl GameRoom {
         Ok(())
     }
 
+    fn count_spectator_sockets(&self) -> usize {
+        let mut count = 0;
+        for ws in self.state.get_websockets() {
+            let att = ws.deserialize_attachment::<WsAttachment>().ok().flatten();
+            let Some(att @ WsAttachment::Spectator { .. }) = att else {
+                continue;
+            };
+            if ws.serialize_attachment(&att).is_ok() {
+                count += 1;
+            } else {
+                let _ = ws.close(Some(1001), Some("stale spectator".to_owned()));
+            }
+        }
+        count
+    }
+
+    fn release_spectator_socket(&self, ws: &WebSocket, code: Option<u16>, reason: &str) {
+        let _ = ws.serialize_attachment(&WsAttachment::Pending);
+        if let Some(code) = code {
+            let _ = ws.close(Some(code), Some(reason.to_owned()));
+        }
+    }
+
+    async fn send_finished_spectator_snapshot_if_needed(
+        &self,
+        ws: &WebSocket,
+        room_id: &str,
+    ) -> Result<()> {
+        let Some(finished) = self.load_finished().await? else {
+            return Ok(());
+        };
+        let cfg_opt: Option<PersistedConfig> = self.state.storage().get(KEY_CONFIG).await?;
+        let monitor_id = cfg_opt.as_ref().map(|c| c.game_id.as_str()).unwrap_or(room_id);
+        let finished_opt = Some(finished);
+
+        send_line(ws, &format!("##[MONITOR2] BEGIN {monitor_id}"))?;
+        self.send_spectator_snapshot(ws, &finished_opt, cfg_opt.as_ref()).await?;
+        send_line(ws, "##[MONITOR2] END")?;
+        self.release_spectator_socket(ws, Some(1000), "spectate finished");
+        Ok(())
+    }
+
     /// 観戦者からの制御行。`%%CHAT` を同一 room の全参加者へ relay し、
     /// `%%MONITOR2OFF` は確認応答後に socket を閉じる。`%%MONITOR2ON` は
     /// snapshot (= Game_Summary + 既存指し手 + 終局結果) を 1 回送出する。
@@ -1160,8 +1222,8 @@ impl GameRoom {
     /// 流れ:
     /// 1. attachment の `snapshot_in_progress = true` をセット (= 以降この ws 宛
     ///    の broadcast は `send_to_spectators` で per-ws pending queue に積まれる)
-    /// 2. `ensure_core_loaded()` 後に `core` 参照スコープを最小化して
-    ///    `SpectatorClocks` を組み、`load_moves()` で snapshot 用の指し手列を確定
+    /// 2. `ensure_core_loaded()` 後に `core` があれば現在残時間、無ければ config
+    ///    由来の初期残時間で `SpectatorClocks` を組み、`load_moves()` で指し手列を確定
     /// 3. `build_spectator_snapshot` の wire 行を順次 send
     /// 4. attachment の queue を flush (`ply > last_ply_in_snapshot` のみ送る) し、
     ///    `snapshot_in_progress = false` に戻して通常 broadcast 経路へ復帰
@@ -1224,23 +1286,20 @@ impl GameRoom {
         // CoreRoom を確保し、clock / current_turn から `SpectatorClocks` を組む。
         // borrow scope は最小化し、await を伴う `load_moves` は borrow 外で呼ぶ。
         self.ensure_core_loaded().await?;
-        let clocks_opt = {
+        let clocks = {
             let borrow = self.core.borrow();
-            borrow.as_ref().map(|core| SpectatorClocks {
-                black_remaining_ms: core.clock_remaining_main_ms(Color::Black).max(0) as u64,
-                white_remaining_ms: core.clock_remaining_main_ms(Color::White).max(0) as u64,
-                side_to_move: core.current_turn(),
-            })
-        };
-        // CoreRoom が `replay_core_room` の InvalidSfen 等で復元できなかった場合
-        // (storage が破損した稀なケース)、安全側に snapshot を諦めて queue を
-        // flush する (flag も false へ戻る)。
-        let Some(clocks) = clocks_opt else {
-            self.flush_spectator_snapshot_queue(ws).await?;
-            return Ok(());
+            borrow
+                .as_ref()
+                .map(|core| SpectatorClocks {
+                    black_remaining_ms: core.clock_remaining_main_ms(Color::Black).max(0) as u64,
+                    white_remaining_ms: core.clock_remaining_main_ms(Color::White).max(0) as u64,
+                    side_to_move: core.current_turn(),
+                })
+                // 終局済み room などで CoreRoom を復元しない場合も snapshot 形式を保つ。
+                .unwrap_or_else(|| initial_spectator_clocks(cfg))
         };
 
-        let moves = self.load_moves().await?;
+        let moves = self.load_spectator_snapshot_moves(cfg, finished).await?;
         let last_ply_in_snapshot = u32::try_from(moves.len()).unwrap_or(u32::MAX);
 
         let lines = build_spectator_snapshot(SpectatorSnapshotInput {
@@ -1259,6 +1318,60 @@ impl GameRoom {
         self.set_spectator_snapshot_last_ply(ws, last_ply_in_snapshot)?;
         self.flush_spectator_snapshot_queue(ws).await?;
         Ok(())
+    }
+
+    async fn load_spectator_snapshot_moves(
+        &self,
+        cfg: &PersistedConfig,
+        finished: &Option<FinishedState>,
+    ) -> Result<Vec<MoveRow>> {
+        let moves = self.load_moves().await?;
+        if finished.is_none() || !moves.is_empty() {
+            return Ok(moves);
+        }
+
+        let first_prev_ms = cfg.play_started_at_ms.unwrap_or(cfg.matched_at_ms);
+        let pending: Option<ExportPendingState> =
+            self.state.storage().get(KEY_EXPORT_PENDING).await.ok().flatten();
+        if let Some(pending) = pending
+            && pending.game_id == cfg.game_id
+        {
+            let rows = move_rows_from_exported_csa(&pending.csa_text, first_prev_ms);
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
+        }
+
+        match self.load_kifu_by_game_id(&GameId::new(cfg.game_id.clone())).await {
+            Ok(Some(csa_text)) => {
+                let rows = move_rows_from_exported_csa(&csa_text, first_prev_ms);
+                if rows.is_empty() {
+                    crate::structured_log!(
+                        event: "finished_spectator_snapshot_moves_empty",
+                        component: "game_room",
+                        game_id: cfg.game_id,
+                    );
+                }
+                Ok(rows)
+            }
+            Ok(None) => {
+                crate::structured_log!(
+                    event: "finished_spectator_snapshot_kifu_missing",
+                    component: "game_room",
+                    game_id: cfg.game_id,
+                );
+                Ok(moves)
+            }
+            Err(e) => {
+                crate::structured_log!(
+                    event: "finished_spectator_snapshot_kifu_load_failed",
+                    component: "game_room",
+                    game_id: cfg.game_id,
+                    err: format!("{e:?}"),
+                );
+                Ok(moves)
+            }
+        }
     }
 
     /// snapshot 完了後に attachment の pending queue を順次 flush する。
