@@ -51,6 +51,7 @@ pub mod kif;
 pub mod onnx_value;
 pub mod packed_sfen;
 pub mod positions;
+pub mod progress;
 pub mod qsearch_pv;
 #[cfg(feature = "kifu-player")]
 pub mod replay;

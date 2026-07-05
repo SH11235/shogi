@@ -55,6 +55,10 @@ cargo run -p tools --release --bin book_rescore -- \
 | `--parallel <N>` | 並列エンジン数。既定 1 |
 | `--no-parent-search` | 親局面探索を無効化。既定有効 |
 
+## 進捗表示
+
+探索タスク（親局面・子局面の一意な探索数）を分母に、進捗を stderr へ表示します。`go nodes N` × 局面数で数時間規模になり得るため、% / 処理速度（pos/s）/ 残り時間 / 完了予定時刻を出します。TTY ではプログレスバー、非TTY（ログリダイレクト時）では `[book_rescore] ...` の 1 行ログを定期的に出力します（`rescore_psv` と共通の `tools::progress` を使用）。分母は `--resume` で skip された局面を除いた「実際に探索するタスク数」です。
+
 ## value の規約
 
 各候補手は、親局面にその手を適用した子局面を探索して評価します。

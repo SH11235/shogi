@@ -11,6 +11,7 @@ use crossbeam_channel as chan;
 use rshogi_core::position::Position;
 use rshogi_core::types::{Color, Move};
 use serde::{Deserialize, Serialize};
+use tools::progress::MultiFileProgress;
 use tools::selfplay::{EngineConfig, EngineProcess};
 
 const BOOK_HEADER: &str = "#YANEURAOU-DB2016 1.00";
@@ -498,30 +499,48 @@ fn run_static_onnx(
         .with_context(|| format!("journal を追記オープンできません: {}", cli.journal.display()))?;
     let writer = Mutex::new(BufWriter::new(journal_file));
 
-    // `--onnx-batch-size` 単位で推論→即 journal 追記する。全 tasks を 1 回で評価して
-    // から追記すると、途中の SIGTERM/OOM/ORT エラーで 1 件も保存されず --resume が
-    // 最初からやり直しになる。batch ごとに区切ることで、完了済み batch は journal に
-    // 残り（中断耐性）、保持する局面も 1 batch 分に抑えられる（メモリ非依存）。
-    let batch_size = cli.onnx_batch_size.max(1);
-    for chunk in tasks.chunks(batch_size) {
-        let positions: Vec<Position> = chunk.iter().map(|task| task.position.clone()).collect();
-        let child_scores = evaluator.evaluate(&positions)?;
-        for (task, child_score) in chunk.iter().zip(child_scores) {
-            let record = JournalRecord {
-                kind: JournalKind::Child,
-                sfen: task.key.clone(),
-                go: "static".to_string(),
-                engine_fingerprint: engine_fingerprint.to_string(),
-                value: Some(value_from_child_score(child_score)),
-                depth: Some(0),
-                bestmove: None,
-            };
-            append_journal_record(&writer, &record)?;
-            if let (Some(value), Some(depth)) = (record.value, record.depth) {
-                journal.child.insert(record.sfen, EvalRecord { value, depth });
+    // 進捗表示（子局面タスク数を分母に、batch 完了ごとに前進）。
+    let progress = MultiFileProgress::new(tasks.len() as u64, 1, "book_rescore");
+    let file_progress = progress.start_file("book", 1, tasks.len() as u64);
+
+    // 本体を closure に閉じ込め、途中の `?` 早期 return でもバーを確実に締める
+    // （成功→finish、失敗→abandon）。
+    let outcome = (|| -> Result<()> {
+        // `--onnx-batch-size` 単位で推論→即 journal 追記する。全 tasks を 1 回で評価して
+        // から追記すると、途中の SIGTERM/OOM/ORT エラーで 1 件も保存されず --resume が
+        // 最初からやり直しになる。batch ごとに区切ることで、完了済み batch は journal に
+        // 残り（中断耐性）、保持する局面も 1 batch 分に抑えられる（メモリ非依存）。
+        let batch_size = cli.onnx_batch_size.max(1);
+        for chunk in tasks.chunks(batch_size) {
+            let positions: Vec<Position> = chunk.iter().map(|task| task.position.clone()).collect();
+            let child_scores = evaluator.evaluate(&positions)?;
+            for (task, child_score) in chunk.iter().zip(child_scores) {
+                let record = JournalRecord {
+                    kind: JournalKind::Child,
+                    sfen: task.key.clone(),
+                    go: "static".to_string(),
+                    engine_fingerprint: engine_fingerprint.to_string(),
+                    value: Some(value_from_child_score(child_score)),
+                    depth: Some(0),
+                    bestmove: None,
+                };
+                append_journal_record(&writer, &record)?;
+                if let (Some(value), Some(depth)) = (record.value, record.depth) {
+                    journal.child.insert(record.sfen, EvalRecord { value, depth });
+                }
+                file_progress.inc(1);
             }
         }
+        Ok(())
+    })();
+    match &outcome {
+        Ok(()) => file_progress.finish_with_message("完了"),
+        Err(_) => file_progress.abandon_with_message("中断"),
     }
+    // 単一ファイルジョブなので overall は無く finish() は no-op（最終行は
+    // file_progress 側が出す）。複数ファイル化した場合の overall 締め用に呼んでおく。
+    progress.finish();
+    outcome?;
     Ok(())
 }
 
@@ -594,69 +613,92 @@ fn run_search_tasks(
     }
     drop(result_tx);
 
-    let journal_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&cli.journal)
-        .with_context(|| format!("journal を追記オープンできません: {}", cli.journal.display()))?;
-    let writer = Mutex::new(BufWriter::new(journal_file));
+    // 進捗表示（探索タスク数を分母に、完了ごとに前進）。`go nodes N` × 局面数で
+    // 数時間規模になり得るため、% / pos/s / 残り時間 / 完了予定時刻を出す。worker
+    // 起動後に生成し、engine 起動時間を elapsed/ETA に混ぜない。
+    let progress = MultiFileProgress::new(task_count as u64, 1, "book_rescore");
+    let file_progress = progress.start_file("book", 1, task_count as u64);
 
-    let mut first_error: Option<anyhow::Error> = None;
-    let mut processed_count = 0usize;
-    for message in result_rx {
-        match message {
-            WorkerMessage::Task(Ok(search_result)) => {
-                processed_count += 1;
-                append_journal_record(&writer, &search_result.record)?;
-                match search_result.record.kind {
-                    JournalKind::Child => {
-                        if let (Some(value), Some(depth)) =
-                            (search_result.record.value, search_result.record.depth)
-                        {
-                            journal
-                                .child
-                                .insert(search_result.record.sfen, EvalRecord { value, depth });
+    // 本体を closure に閉じ込め、`?`/早期 return でもバーを確実に締める
+    // （成功→finish、失敗→abandon）。
+    let fp = &file_progress;
+    let outcome = (move || -> Result<()> {
+        let journal_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&cli.journal)
+            .with_context(|| {
+                format!("journal を追記オープンできません: {}", cli.journal.display())
+            })?;
+        let writer = Mutex::new(BufWriter::new(journal_file));
+
+        let mut first_error: Option<anyhow::Error> = None;
+        let mut processed_count = 0usize;
+        for message in result_rx {
+            match message {
+                WorkerMessage::Task(Ok(search_result)) => {
+                    processed_count += 1;
+                    fp.inc(1);
+                    append_journal_record(&writer, &search_result.record)?;
+                    match search_result.record.kind {
+                        JournalKind::Child => {
+                            if let (Some(value), Some(depth)) =
+                                (search_result.record.value, search_result.record.depth)
+                            {
+                                journal
+                                    .child
+                                    .insert(search_result.record.sfen, EvalRecord { value, depth });
+                            }
+                        }
+                        JournalKind::Parent => {
+                            journal.parent.insert(
+                                search_result.record.sfen,
+                                ParentRecord {
+                                    bestmove: search_result.record.bestmove,
+                                },
+                            );
                         }
                     }
-                    JournalKind::Parent => {
-                        journal.parent.insert(
-                            search_result.record.sfen,
-                            ParentRecord {
-                                bestmove: search_result.record.bestmove,
-                            },
-                        );
+                }
+                WorkerMessage::Task(Err(err)) => {
+                    processed_count += 1;
+                    fp.inc(1);
+                    if first_error.is_none() {
+                        first_error = Some(err);
                     }
                 }
+                WorkerMessage::Fatal(err) if first_error.is_none() => first_error = Some(err),
+                WorkerMessage::Fatal(_) => {}
             }
-            WorkerMessage::Task(Err(err)) => {
-                processed_count += 1;
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-            WorkerMessage::Fatal(err) if first_error.is_none() => first_error = Some(err),
-            WorkerMessage::Fatal(_) => {}
         }
-    }
 
-    for handle in handles {
-        handle.join().map_err(|_| anyhow!("worker thread が panic しました"))?;
+        for handle in handles {
+            handle.join().map_err(|_| anyhow!("worker thread が panic しました"))?;
+        }
+        if processed_count < task_count {
+            return Err(search_tasks_incomplete_error(
+                processed_count,
+                task_count,
+                &cli.journal,
+                first_error,
+            ));
+        }
+        if let Some(err) = first_error {
+            return Err(err.context(format!(
+                "探索中にエラーが発生しました。journal には途中結果が追記済みのため --resume で再開できます: {}",
+                cli.journal.display()
+            )));
+        }
+        Ok(())
+    })();
+    match &outcome {
+        Ok(()) => file_progress.finish_with_message("完了"),
+        Err(_) => file_progress.abandon_with_message("中断"),
     }
-    if processed_count < task_count {
-        return Err(search_tasks_incomplete_error(
-            processed_count,
-            task_count,
-            &cli.journal,
-            first_error,
-        ));
-    }
-    if let Some(err) = first_error {
-        return Err(err.context(format!(
-            "探索中にエラーが発生しました。journal には途中結果が追記済みのため --resume で再開できます: {}",
-            cli.journal.display()
-        )));
-    }
-    Ok(())
+    // 単一ファイルジョブなので overall は無く finish() は no-op（最終行は
+    // file_progress 側が出す）。複数ファイル化した場合の overall 締め用に呼んでおく。
+    progress.finish();
+    outcome
 }
 
 fn worker_loop(
