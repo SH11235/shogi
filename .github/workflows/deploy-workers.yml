@@ -171,10 +171,10 @@ jobs:
       # step を skip して 30〜60 秒短縮する。
       #
       # ⚠️ バージョン更新時の二重管理に注意:
-      #   `cargo install worker-build@^0.8` を `^0.9` 系に上げる場合、本キャッシュキー
-      #   末尾の `v0.8` も同時に `v0.9` へ更新する必要がある。`v0.8` のままだと
-      #   過去 cache が hit して 0.8.x バイナリが使われ続け、新 0.9.x が install
-      #   step で skip される。インストールコマンドとキャッシュキーの **2 箇所同時更新** が必須。
+      #   worker-build は `@=0.8.1` に固定している（`@^0.8` だと 0.8.5 を引き当て、
+      #   wasm-bindgen 0.2.118 と非互換でデプロイが壊れるため）。別バージョンへ上げる場合は
+      #   `cargo install worker-build@=0.8.1` と本キャッシュキー末尾の `v0.8.1` を同時に
+      #   更新する。key を据え置くと過去 cache が hit して旧バイナリが使われ続け skip される。
       #   本 cache key は `deploy-production` job と共有しているので、bump 時は staging /
       #   production 両方の install コマンド + key 末尾の **計 4 箇所同時更新** が必要。
       - name: Cache worker-build binary
@@ -183,10 +183,10 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/worker-build
-          key: worker-build-${{ runner.os }}-${{ runner.arch }}-v0.8
+          key: worker-build-${{ runner.os }}-${{ runner.arch }}-v0.8.1
       - name: Install worker-build
         if: steps.check.outputs.can_deploy == 'true' && steps.cache-worker-build.outputs.cache-hit != 'true'
-        run: cargo install -q worker-build@^0.8 --locked
+        run: cargo install -q worker-build@=0.8.1 --locked
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: steps.check.outputs.can_deploy == 'true'
         with:
@@ -388,10 +388,10 @@ jobs:
             exit 1
           }
       # ⚠️ バージョン更新時の二重管理に注意:
-      #   `cargo install worker-build@^0.8` を `^0.9` 系に上げる場合、本キャッシュキー
-      #   末尾の `v0.8` も同時に `v0.9` へ更新する必要がある。`v0.8` のままだと
-      #   過去 cache が hit して 0.8.x バイナリが使われ続け、新 0.9.x が install
-      #   step で skip される。インストールコマンドとキャッシュキーの **2 箇所同時更新** が必須。
+      #   worker-build は `@=0.8.1` に固定している（`@^0.8` だと 0.8.5 を引き当て、
+      #   wasm-bindgen 0.2.118 と非互換でデプロイが壊れるため）。別バージョンへ上げる場合は
+      #   `cargo install worker-build@=0.8.1` と本キャッシュキー末尾の `v0.8.1` を同時に
+      #   更新する。key を据え置くと過去 cache が hit して旧バイナリが使われ続け skip される。
       #   本 cache key は `deploy-staging` job と共有しているので、bump 時は staging /
       #   production 両方の install コマンド + key 末尾の **計 4 箇所同時更新** が必要。
       - name: Cache worker-build binary
@@ -400,10 +400,10 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/worker-build
-          key: worker-build-${{ runner.os }}-${{ runner.arch }}-v0.8
+          key: worker-build-${{ runner.os }}-${{ runner.arch }}-v0.8.1
       - name: Install worker-build
         if: steps.check.outputs.can_deploy == 'true' && steps.cache-worker-build.outputs.cache-hit != 'true'
-        run: cargo install -q worker-build@^0.8 --locked
+        run: cargo install -q worker-build@=0.8.1 --locked
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: steps.check.outputs.can_deploy == 'true'
         with:
