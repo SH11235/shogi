@@ -3356,6 +3356,7 @@ dependencies = [
  "rayon",
  "regex",
  "reqwest",
+ "rshogi-book",
  "rshogi-core",
  "rshogi-csa",
  "serde",

@@ -12,6 +12,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `analyze_selfplay` | 自己対局の JSONL ログを集計。勝率・Elo 差・NPS 等を表示 |
 | `jsonl_to_kif` | tournament 等の JSONL 対局ログから KIF 棋譜を生成（id/skip/limit でフィルタ可） |
 | `kifu_player` | PSV / tournament JSONL / CSA を同じ TUI で再生・閲覧（`kifu-player` feature、評価値グラフ・検索/絞り込み（SFEN 局面検索含む）付き。[詳細](kifu_player.md)） |
+| `book_from_csa` | CSA 棋譜群から YANEURAOU-DB2016 テキスト定跡 `.db` を生成。消費時間による定跡手判定（手番側ごとの即指しプレフィックス）・レート/勝敗/手数フィルタ・最小 ply 集約・ponder 集計。決定的（[詳細](book_from_csa.md)） |
 
 ## ベンチマーク・評価
 
