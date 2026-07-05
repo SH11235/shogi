@@ -1,0 +1,56 @@
+{
+  "variants": [
+    {
+      "variant": "Toryo",
+      "csa_code": "#RESIGN",
+      "end_reason": "RESIGN"
+    },
+    {
+      "variant": "TimeUp",
+      "csa_code": "#TIME_UP",
+      "end_reason": "TIME_UP"
+    },
+    {
+      "variant": "IllegalMove",
+      "csa_code": "#ILLEGAL_MOVE",
+      "end_reason": "ILLEGAL"
+    },
+    {
+      "variant": "Kachi",
+      "csa_code": "#JISHOGI",
+      "end_reason": "JISHOGI"
+    },
+    {
+      "variant": "OuteSennichite",
+      "csa_code": "#OUTE_SENNICHITE",
+      "end_reason": "OUTE_SENNICHITE"
+    },
+    {
+      "variant": "Sennichite",
+      "csa_code": "#SENNICHITE",
+      "end_reason": "SENNICHITE"
+    },
+    {
+      "variant": "MaxMoves",
+      "csa_code": "#MAX_MOVES",
+      "end_reason": "MAX_MOVES"
+    },
+    {
+      "variant": "Abnormal",
+      "csa_code": "#ABNORMAL",
+      "end_reason": "ABNORMAL"
+    }
+  ],
+  "csa_outcome_codes": [
+    "#WIN",
+    "#LOSE",
+    "#DRAW",
+    "#CENSORED"
+  ],
+  "result_kinds": [
+    "WIN_BLACK",
+    "WIN_WHITE",
+    "DRAW",
+    "ABORT"
+  ]
+}
