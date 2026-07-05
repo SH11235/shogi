@@ -99,13 +99,19 @@ pub struct SweepStats {
     /// 発生した事実をログ / metric から検知できるようにする。恒常的に非 0 なら
     /// finalize 経路の live-index delete が慢性的に失敗している疑い。
     pub hard_ttl_deleted: u64,
-    /// meta 不在かつ hard-TTL 内のため保持した live entry 件数。
-    /// 進行中または終局時 meta PUT 失敗の可能性がある、read-only 棚卸し用の gauge。
-    /// 本文を読めず状態不明だった entry (`read_live_entry_fields` が `None`) は
-    /// ゾンビに数えないため、この値は下振れしうる。
-    pub zombie_within_ttl: u64,
-    /// `zombie_within_ttl` の最大 age。対象が無い場合は 0。
-    pub oldest_zombie_age_ms: u64,
+    /// `kifu-by-id/<id>.meta.json` が不在かつ hard-TTL 内で保持した live entry 件数。
+    /// meta は終局時に書かれるため、**通常の進行中対局も終局までは meta 不在**で
+    /// ここに一時的に計上される。したがって本値は「ゾンビ(終局済みだが kifu 未書き込み)」
+    /// そのものではなく「meta 不在の live entry 数(進行中 + export 失敗)」の gauge。
+    /// R2 の可視信号だけでは進行中と export 失敗を正の判定で区別できない(meta 自体が
+    /// 終局信号)ため、真のゾンビ候補は下の `oldest_live_without_meta_age_ms` が通常の
+    /// 対局時間を大きく超えるエントリとして掃除判断に使う。本文を読めず状態不明だった
+    /// entry (`read_live_entry_fields` が `None`) は計上しないため、値は下振れしうる。
+    pub live_without_meta_within_ttl: u64,
+    /// `live_without_meta_within_ttl` に計上した entry の最大 age。対象が無い場合は 0。
+    /// 通常の対局時間を大きく超える値は「終局済みだが export 失敗した真のゾンビ」の
+    /// 主要シグナル。
+    pub oldest_live_without_meta_age_ms: u64,
     /// 走査した R2 list page 数 (https://github.com/SH11235/rshogi/issues/629)。pagination loop 化に伴って導入。
     /// 1 cron で複数 page を処理した状況をログから確認するための運用 metric。
     pub pages: u32,
@@ -117,15 +123,15 @@ pub struct SweepStats {
     pub max_pages_reached: bool,
     /// bucket binding 取得失敗 / R2 list 失敗 / truncated なのに cursor 欠落、
     /// といった異常で走査を打ち切った場合に `true`。deadline / max_pages と併せて
-    /// summary の件数が完全走査でないことを示す。監視側が「ゾンビ 0 件」を
+    /// summary の件数が完全走査でないことを示す。監視側が「meta 不在 0 件」を
     /// 完全走査の 0 と誤認しないための gate。
     pub aborted: bool,
 }
 
 impl SweepStats {
-    pub(crate) fn record_zombie_within_ttl(&mut self, age_ms: u64) {
-        self.zombie_within_ttl = self.zombie_within_ttl.saturating_add(1);
-        self.oldest_zombie_age_ms = self.oldest_zombie_age_ms.max(age_ms);
+    pub(crate) fn record_live_without_meta(&mut self, age_ms: u64) {
+        self.live_without_meta_within_ttl = self.live_without_meta_within_ttl.saturating_add(1);
+        self.oldest_live_without_meta_age_ms = self.oldest_live_without_meta_age_ms.max(age_ms);
     }
 }
 
@@ -447,7 +453,7 @@ mod imp {
                     // meta が無い & TTL 内 = まだ進行中 (or 終局時 meta put 失敗)。
                     // 前者は正常状態、後者は本 sweep の対象外 (設計 v3 §3 の意図的
                     // な保守)。
-                    stats.record_zombie_within_ttl(age_ms);
+                    stats.record_live_without_meta(age_ms);
                     if Date::now().as_millis().saturating_sub(started_at_ms) >= SWEEP_DEADLINE_MS {
                         stats.deadline_reached = true;
                         break 'outer;
@@ -545,8 +551,8 @@ mod imp {
             total_live_entries_scanned: stats.listed,
             finished_deleted: stats.deleted,
             hard_ttl_deleted: stats.hard_ttl_deleted,
-            zombie_within_ttl: stats.zombie_within_ttl,
-            oldest_zombie_age_ms: stats.oldest_zombie_age_ms,
+            live_without_meta_within_ttl: stats.live_without_meta_within_ttl,
+            oldest_live_without_meta_age_ms: stats.oldest_live_without_meta_age_ms,
             pages_scanned: stats.pages,
             deadline_reached: stats.deadline_reached,
             max_pages_reached: stats.max_pages_reached,
@@ -704,8 +710,8 @@ mod tests {
                 listed: 0,
                 deleted: 0,
                 hard_ttl_deleted: 0,
-                zombie_within_ttl: 0,
-                oldest_zombie_age_ms: 0,
+                live_without_meta_within_ttl: 0,
+                oldest_live_without_meta_age_ms: 0,
                 pages: 0,
                 deadline_reached: false,
                 max_pages_reached: false,
@@ -715,15 +721,15 @@ mod tests {
     }
 
     #[test]
-    fn sweep_stats_records_zombie_inventory_summary() {
+    fn sweep_stats_records_live_without_meta_summary() {
         let mut stats = SweepStats::default();
 
-        stats.record_zombie_within_ttl(1_000);
-        stats.record_zombie_within_ttl(500);
-        stats.record_zombie_within_ttl(2_500);
+        stats.record_live_without_meta(1_000);
+        stats.record_live_without_meta(500);
+        stats.record_live_without_meta(2_500);
 
-        assert_eq!(stats.zombie_within_ttl, 3);
-        assert_eq!(stats.oldest_zombie_age_ms, 2_500);
+        assert_eq!(stats.live_without_meta_within_ttl, 3);
+        assert_eq!(stats.oldest_live_without_meta_age_ms, 2_500);
     }
 
     #[test]
