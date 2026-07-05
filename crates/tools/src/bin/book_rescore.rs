@@ -498,21 +498,28 @@ fn run_static_onnx(
         .with_context(|| format!("journal を追記オープンできません: {}", cli.journal.display()))?;
     let writer = Mutex::new(BufWriter::new(journal_file));
 
-    let positions: Vec<Position> = tasks.iter().map(|task| task.position.clone()).collect();
-    let child_scores = evaluator.evaluate(&positions)?;
-    for (task, child_score) in tasks.into_iter().zip(child_scores) {
-        let record = JournalRecord {
-            kind: JournalKind::Child,
-            sfen: task.key,
-            go: "static".to_string(),
-            engine_fingerprint: engine_fingerprint.to_string(),
-            value: Some(value_from_child_score(child_score)),
-            depth: Some(0),
-            bestmove: None,
-        };
-        append_journal_record(&writer, &record)?;
-        if let (Some(value), Some(depth)) = (record.value, record.depth) {
-            journal.child.insert(record.sfen, EvalRecord { value, depth });
+    // `--onnx-batch-size` 単位で推論→即 journal 追記する。全 tasks を 1 回で評価して
+    // から追記すると、途中の SIGTERM/OOM/ORT エラーで 1 件も保存されず --resume が
+    // 最初からやり直しになる。batch ごとに区切ることで、完了済み batch は journal に
+    // 残り（中断耐性）、保持する局面も 1 batch 分に抑えられる（メモリ非依存）。
+    let batch_size = cli.onnx_batch_size.max(1);
+    for chunk in tasks.chunks(batch_size) {
+        let positions: Vec<Position> = chunk.iter().map(|task| task.position.clone()).collect();
+        let child_scores = evaluator.evaluate(&positions)?;
+        for (task, child_score) in chunk.iter().zip(child_scores) {
+            let record = JournalRecord {
+                kind: JournalKind::Child,
+                sfen: task.key.clone(),
+                go: "static".to_string(),
+                engine_fingerprint: engine_fingerprint.to_string(),
+                value: Some(value_from_child_score(child_score)),
+                depth: Some(0),
+                bestmove: None,
+            };
+            append_journal_record(&writer, &record)?;
+            if let (Some(value), Some(depth)) = (record.value, record.depth) {
+                journal.child.insert(record.sfen, EvalRecord { value, depth });
+            }
         }
     }
     Ok(())

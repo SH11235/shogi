@@ -86,7 +86,7 @@ ONNX 静的評価モードでは journal の `go` は常に `static` です。`e
 
 `--resume` は `go` と `engine_fingerprint` の両方が現在の実行設定と一致する journal 行だけを再利用します。`--engine` や `--engine-option`（例: `EvalFile`）を変えた場合、同じ journal ファイル内の古い行は stale として無視され、再探索されます。
 
-ONNX 静的評価モードでは、journal への追記は評価 batch 全体が完了してから行います。そのため静的評価中に中断した場合、その batch は all-or-nothing で、batch 内の途中結果単位では resume されません。
+ONNX 静的評価モードでは、journal への追記を `--onnx-batch-size` 単位で行います（1 batch 推論するごとにその結果を追記）。完了済みの batch は journal に残るため、静的評価中に中断しても `--resume` で未処理の batch から再開できます。中断した batch 内の途中結果は all-or-nothing で保存されません。
 
 USI エンジンの探索結果自体は実行環境により揺れる可能性があります。再現性が必要な場合は、同じ journal と同じ探索設定で `--resume` を使ってください。同一 journal から生成する `.db` と report の内容・順序は決定的です。
 
