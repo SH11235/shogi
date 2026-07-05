@@ -99,12 +99,40 @@ pub struct SweepStats {
     /// 発生した事実をログ / metric から検知できるようにする。恒常的に非 0 なら
     /// finalize 経路の live-index delete が慢性的に失敗している疑い。
     pub hard_ttl_deleted: u64,
+    /// `kifu-by-id/<id>.meta.json` が不在かつ hard-TTL 内で保持した live entry 件数。
+    /// meta は終局時に書かれるため、**通常の進行中対局も終局までは meta 不在**で
+    /// ここに一時的に計上される。したがって本値は「ゾンビ(終局済みだが kifu 未書き込み)」
+    /// そのものではなく「meta 不在の live entry 数(進行中 + export 失敗)」の gauge。
+    /// R2 の可視信号だけでは進行中と export 失敗を正の判定で区別できない(meta 自体が
+    /// 終局信号)ため、真のゾンビ候補は下の `oldest_live_without_meta_age_ms` が通常の
+    /// 対局時間を大きく超えるエントリとして掃除判断に使う。本文を読めず状態不明だった
+    /// entry (`read_live_entry_fields` が `None`) は計上しないため、値は下振れしうる。
+    pub live_without_meta_within_ttl: u64,
+    /// `live_without_meta_within_ttl` に計上した entry の最大 age。対象が無い場合は 0。
+    /// 通常の対局時間を大きく超える値は「終局済みだが export 失敗した真のゾンビ」の
+    /// 主要シグナル。
+    pub oldest_live_without_meta_age_ms: u64,
     /// 走査した R2 list page 数 (https://github.com/SH11235/rshogi/issues/629)。pagination loop 化に伴って導入。
     /// 1 cron で複数 page を処理した状況をログから確認するための運用 metric。
     pub pages: u32,
     /// `SWEEP_DEADLINE_MS` 経過で打ち切った場合に `true`。`true` の cron が
     /// 連続したら page size または cron 頻度の見直しが必要 (https://github.com/SH11235/rshogi/issues/629)。
     pub deadline_reached: bool,
+    /// `SWEEP_MAX_PAGES` に到達して打ち切った場合に `true`。summary の件数が
+    /// 部分走査であることを明示するために記録する。
+    pub max_pages_reached: bool,
+    /// bucket binding 取得失敗 / R2 list 失敗 / truncated なのに cursor 欠落、
+    /// といった異常で走査を打ち切った場合に `true`。deadline / max_pages と併せて
+    /// summary の件数が完全走査でないことを示す。監視側が「meta 不在 0 件」を
+    /// 完全走査の 0 と誤認しないための gate。
+    pub aborted: bool,
+}
+
+impl SweepStats {
+    pub(crate) fn record_live_without_meta(&mut self, age_ms: u64) {
+        self.live_without_meta_within_ttl = self.live_without_meta_within_ttl.saturating_add(1);
+        self.oldest_live_without_meta_age_ms = self.oldest_live_without_meta_age_ms.max(age_ms);
+    }
 }
 
 /// `kifu-by-id/<id>.meta.json` の本文を deserialize する最小 view。
@@ -331,6 +359,8 @@ mod imp {
                     component: "backfill",
                     err: format!("{e:?}"),
                 );
+                stats.aborted = true;
+                log_live_orphan_sweep_summary(&stats, started_at_ms);
                 return Ok(stats);
             }
         };
@@ -360,6 +390,7 @@ mod imp {
                         pages: stats.pages,
                         err: format!("{e:?}"),
                     );
+                    stats.aborted = true;
                     break;
                 }
             };
@@ -422,6 +453,7 @@ mod imp {
                     // meta が無い & TTL 内 = まだ進行中 (or 終局時 meta put 失敗)。
                     // 前者は正常状態、後者は本 sweep の対象外 (設計 v3 §3 の意図的
                     // な保守)。
+                    stats.record_live_without_meta(age_ms);
                     if Date::now().as_millis().saturating_sub(started_at_ms) >= SWEEP_DEADLINE_MS {
                         stats.deadline_reached = true;
                         break 'outer;
@@ -472,6 +504,7 @@ mod imp {
                 break;
             }
             if stats.pages >= SWEEP_MAX_PAGES {
+                stats.max_pages_reached = true;
                 crate::structured_log!(
                     event: "live_orphan_sweep_max_pages_reached",
                     component: "backfill",
@@ -481,8 +514,15 @@ mod imp {
             }
             cursor = page.cursor();
             if cursor.is_none() {
-                // truncated == true なのに cursor が None の場合は安全側に break
-                // (R2 仕様上は通常起こらない)。
+                // ここは line 488 の `!truncated` break を通過済み = truncated == true。
+                // にもかかわらず cursor が None は R2 仕様上通常起こらない異常なので、
+                // 部分走査として安全側に break し aborted を立てる。
+                stats.aborted = true;
+                crate::structured_log!(
+                    event: "live_orphan_sweep_cursor_missing",
+                    component: "backfill",
+                    pages: stats.pages,
+                );
                 break;
             }
         }
@@ -498,7 +538,28 @@ mod imp {
             deadline_reached: stats.deadline_reached,
             elapsed_ms: elapsed_ms,
         );
+        log_live_orphan_sweep_summary(&stats, started_at_ms);
         Ok(stats)
+    }
+
+    fn log_live_orphan_sweep_summary(stats: &SweepStats, started_at_ms: u64) {
+        let elapsed_ms = Date::now().as_millis().saturating_sub(started_at_ms);
+        crate::structured_log!(
+            event: "live_orphan_sweep_summary",
+            component: "backfill",
+            level: "info",
+            total_live_entries_scanned: stats.listed,
+            finished_deleted: stats.deleted,
+            hard_ttl_deleted: stats.hard_ttl_deleted,
+            live_without_meta_within_ttl: stats.live_without_meta_within_ttl,
+            oldest_live_without_meta_age_ms: stats.oldest_live_without_meta_age_ms,
+            pages_scanned: stats.pages,
+            deadline_reached: stats.deadline_reached,
+            max_pages_reached: stats.max_pages_reached,
+            aborted: stats.aborted,
+            partial_scan: stats.deadline_reached || stats.max_pages_reached || stats.aborted,
+            elapsed_ms: elapsed_ms,
+        );
     }
 
     /// `live-games-index/<key>` の本文を読んで orphan sweep 判定に必要な field
@@ -649,10 +710,26 @@ mod tests {
                 listed: 0,
                 deleted: 0,
                 hard_ttl_deleted: 0,
+                live_without_meta_within_ttl: 0,
+                oldest_live_without_meta_age_ms: 0,
                 pages: 0,
                 deadline_reached: false,
+                max_pages_reached: false,
+                aborted: false,
             }
         );
+    }
+
+    #[test]
+    fn sweep_stats_records_live_without_meta_summary() {
+        let mut stats = SweepStats::default();
+
+        stats.record_live_without_meta(1_000);
+        stats.record_live_without_meta(500);
+        stats.record_live_without_meta(2_500);
+
+        assert_eq!(stats.live_without_meta_within_ttl, 3);
+        assert_eq!(stats.oldest_live_without_meta_age_ms, 2_500);
     }
 
     #[test]
