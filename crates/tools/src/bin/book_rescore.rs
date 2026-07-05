@@ -17,16 +17,28 @@ const BOOK_HEADER: &str = "#YANEURAOU-DB2016 1.00";
 const MATE_CAP: i32 = 30_000;
 
 #[derive(Parser, Debug)]
-#[command(about = "YANEURAOU-DB2016 テキスト定跡に USI 探索評価値を付与する")]
+#[command(about = "YANEURAOU-DB2016 テキスト定跡に USI 探索または ONNX 静的評価値を付与する")]
 struct Cli {
     #[arg(long)]
     book: PathBuf,
     #[arg(long)]
     out: PathBuf,
     #[arg(long)]
-    engine: PathBuf,
+    engine: Option<PathBuf>,
     #[arg(long = "engine-option", num_args = 1)]
     engine_options: Vec<String>,
+    #[arg(long)]
+    dlshogi_onnx_model: Option<PathBuf>,
+    #[arg(long, default_value_t = 256)]
+    onnx_batch_size: usize,
+    #[arg(long, default_value_t = 0)]
+    onnx_gpu_id: i32,
+    #[arg(long)]
+    onnx_tensorrt: bool,
+    #[arg(long)]
+    onnx_tensorrt_cache: Option<PathBuf>,
+    #[arg(long, default_value_t = 600.0)]
+    eval_scale: f32,
     #[arg(long, default_value = "nodes 100000")]
     go: String,
     #[arg(long)]
@@ -107,6 +119,23 @@ struct SearchResult {
     record: JournalRecord,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunMode {
+    UsiSearch,
+    #[cfg(feature = "dlshogi-onnx")]
+    StaticOnnx,
+}
+
+impl RunMode {
+    fn go_field(self, cli: &Cli) -> &str {
+        match self {
+            RunMode::UsiSearch => &cli.go,
+            #[cfg(feature = "dlshogi-onnx")]
+            RunMode::StaticOnnx => "static",
+        }
+    }
+}
+
 #[derive(Debug)]
 enum WorkerMessage {
     Task(Result<SearchResult>),
@@ -147,30 +176,92 @@ impl ReportStats {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if cli.parallel == 0 {
-        bail!("--parallel は 1 以上を指定してください");
-    }
+    let mode = validate_cli(&cli)?;
 
     rshogi_book::Book::from_path(&cli.book, true)
         .with_context(|| format!("定跡を rshogi-book で読めません: {}", cli.book.display()))?;
     let book = read_book_db(&cli.book)?;
-    let engine_fingerprint = engine_fingerprint(&cli.engine, &cli.engine_options);
+    let engine_fingerprint = run_fingerprint(&cli, mode)?;
+    let go_field = mode.go_field(&cli);
     let mut journal = if cli.resume {
-        load_journal(&cli.journal, &cli.go, &engine_fingerprint)?
+        load_journal(&cli.journal, go_field, &engine_fingerprint)?
     } else {
         LoadedJournal::default()
     };
 
-    let tasks = build_tasks(&book, &journal, !cli.no_parent_search)?;
-    if !tasks.is_empty() {
-        run_search_tasks(&cli, tasks, &engine_fingerprint, &mut journal)?;
+    match mode {
+        RunMode::UsiSearch => {
+            let tasks = build_tasks(&book, &journal, !cli.no_parent_search)?;
+            if !tasks.is_empty() {
+                run_search_tasks(&cli, tasks, &engine_fingerprint, &mut journal)?;
+            }
+        }
+        #[cfg(feature = "dlshogi-onnx")]
+        RunMode::StaticOnnx => {
+            run_static_onnx(&cli, &book, &engine_fingerprint, &mut journal)?;
+        }
     }
 
     write_rescored_book(&book, &journal.child, &cli.out)?;
     if let Some(path) = &cli.report {
-        write_report(&book, &journal.child, &journal.parent, path)?;
+        write_report(&book, &journal.child, &journal.parent, path, mode == RunMode::UsiSearch)?;
     }
     Ok(())
+}
+
+fn validate_cli(cli: &Cli) -> Result<RunMode> {
+    if cli.parallel == 0 {
+        bail!("--parallel は 1 以上を指定してください");
+    }
+    let use_engine = cli.engine.is_some();
+    let use_static_onnx = cli.dlshogi_onnx_model.is_some();
+    match (use_engine, use_static_onnx) {
+        (true, false) => Ok(RunMode::UsiSearch),
+        (false, true) => {
+            if cli.onnx_batch_size == 0 {
+                bail!("--onnx-batch-size must be > 0");
+            }
+            if cli.onnx_tensorrt && cli.onnx_gpu_id < 0 {
+                bail!("--onnx-tensorrt requires a GPU (--onnx-gpu-id >= 0)");
+            }
+            if !cli.eval_scale.is_finite() || cli.eval_scale <= 0.0 {
+                bail!("--eval-scale must be a positive finite value, got {}", cli.eval_scale);
+            }
+            #[cfg(not(feature = "dlshogi-onnx"))]
+            {
+                bail!(
+                    "--dlshogi-onnx-model requires the 'dlshogi-onnx' feature (on by default; this build disabled it).\n\
+                     Rebuild with default features: cargo build --release -p tools --bin book_rescore"
+                );
+            }
+            #[cfg(feature = "dlshogi-onnx")]
+            {
+                Ok(RunMode::StaticOnnx)
+            }
+        }
+        (true, true) => bail!("--engine and --dlshogi-onnx-model are mutually exclusive"),
+        (false, false) => bail!("exactly one of --engine or --dlshogi-onnx-model is required"),
+    }
+}
+
+fn run_fingerprint(cli: &Cli, mode: RunMode) -> Result<String> {
+    match mode {
+        RunMode::UsiSearch => {
+            let engine = cli
+                .engine
+                .as_deref()
+                .ok_or_else(|| anyhow!("内部エラー: --engine がありません"))?;
+            Ok(engine_fingerprint(engine, &cli.engine_options))
+        }
+        #[cfg(feature = "dlshogi-onnx")]
+        RunMode::StaticOnnx => {
+            let model = cli
+                .dlshogi_onnx_model
+                .as_deref()
+                .ok_or_else(|| anyhow!("内部エラー: --dlshogi-onnx-model がありません"))?;
+            Ok(onnx_fingerprint(model, cli.eval_scale))
+        }
+    }
 }
 
 fn read_book_db(path: &Path) -> Result<BookDb> {
@@ -251,6 +342,12 @@ fn engine_fingerprint(engine_path: &Path, engine_options: &[String]) -> String {
     format!("{engine_name}\t{}", normalized_options.join("\n"))
 }
 
+#[cfg(feature = "dlshogi-onnx")]
+fn onnx_fingerprint(model_path: &Path, eval_scale: f32) -> String {
+    let model_name = model_path.file_name().map(|name| name.to_string_lossy()).unwrap_or_default();
+    format!("dlshogi-onnx\tmodel={model_name}\teval_scale={eval_scale:.9}")
+}
+
 fn engine_option_key(option: &str) -> &str {
     option.split_once('=').map_or(option, |(key, _)| key)
 }
@@ -264,6 +361,11 @@ fn side_to_move(sfen: &str) -> Result<Color> {
 }
 
 fn child_key_after_move(parent_sfen: &str, move_usi: &str) -> Result<String> {
+    let pos = child_position_after_move(parent_sfen, move_usi)?;
+    Ok(strip_ply(&pos.to_sfen()).to_string())
+}
+
+fn child_position_after_move(parent_sfen: &str, move_usi: &str) -> Result<Position> {
     let mut pos = Position::new();
     pos.set_sfen(parent_sfen)
         .map_err(|e| anyhow!("親局面 SFEN が不正です: {parent_sfen}: {e}"))?;
@@ -277,7 +379,7 @@ fn child_key_after_move(parent_sfen: &str, move_usi: &str) -> Result<String> {
     }
     let gives_check = pos.gives_check(mv);
     pos.do_move(mv, gives_check);
-    Ok(strip_ply(&pos.to_sfen()).to_string())
+    Ok(pos)
 }
 
 fn build_tasks(
@@ -335,7 +437,7 @@ fn load_journal(path: &Path, go_args: &str, engine_fingerprint: &str) -> Result<
         let rec: JournalRecord = serde_json::from_str(&line).with_context(|| {
             format!("journal JSON が不正です: {}:{}", path.display(), line_no + 1)
         })?;
-        if rec.go != go_args || rec.engine_fingerprint != engine_fingerprint {
+        if !journal_record_matches(&rec, go_args, engine_fingerprint) {
             continue;
         }
         match rec.kind {
@@ -357,6 +459,91 @@ fn load_journal(path: &Path, go_args: &str, engine_fingerprint: &str) -> Result<
     Ok(loaded)
 }
 
+fn journal_record_matches(rec: &JournalRecord, go_args: &str, engine_fingerprint: &str) -> bool {
+    rec.go == go_args && rec.engine_fingerprint == engine_fingerprint
+}
+
+#[cfg(feature = "dlshogi-onnx")]
+fn run_static_onnx(
+    cli: &Cli,
+    book: &BookDb,
+    engine_fingerprint: &str,
+    journal: &mut LoadedJournal,
+) -> Result<()> {
+    use tools::onnx_value::{OnnxValueConfig, OnnxValueEvaluator};
+
+    let tasks = build_static_tasks(book, journal)?;
+    if tasks.is_empty() {
+        return Ok(());
+    }
+
+    let model_path = cli
+        .dlshogi_onnx_model
+        .clone()
+        .ok_or_else(|| anyhow!("内部エラー: --dlshogi-onnx-model がありません"))?;
+    let cfg = OnnxValueConfig {
+        model_path,
+        gpu_id: cli.onnx_gpu_id,
+        use_tensorrt: cli.onnx_tensorrt,
+        tensorrt_cache: cli.onnx_tensorrt_cache.clone(),
+        eval_scale: cli.eval_scale,
+        batch_size: cli.onnx_batch_size,
+    };
+    let mut evaluator = OnnxValueEvaluator::new(&cfg)?;
+
+    let journal_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&cli.journal)
+        .with_context(|| format!("journal を追記オープンできません: {}", cli.journal.display()))?;
+    let writer = Mutex::new(BufWriter::new(journal_file));
+
+    let positions: Vec<Position> = tasks.iter().map(|task| task.position.clone()).collect();
+    let child_scores = evaluator.evaluate(&positions)?;
+    for (task, child_score) in tasks.into_iter().zip(child_scores) {
+        let record = JournalRecord {
+            kind: JournalKind::Child,
+            sfen: task.key,
+            go: "static".to_string(),
+            engine_fingerprint: engine_fingerprint.to_string(),
+            value: Some(value_from_child_score(child_score)),
+            depth: Some(0),
+            bestmove: None,
+        };
+        append_journal_record(&writer, &record)?;
+        if let (Some(value), Some(depth)) = (record.value, record.depth) {
+            journal.child.insert(record.sfen, EvalRecord { value, depth });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dlshogi-onnx")]
+struct StaticTask {
+    key: String,
+    position: Position,
+}
+
+#[cfg(feature = "dlshogi-onnx")]
+fn build_static_tasks(book: &BookDb, journal: &LoadedJournal) -> Result<Vec<StaticTask>> {
+    let mut tasks = Vec::new();
+    let mut child_seen = HashSet::new();
+    for entry in book.entries.values() {
+        for book_move in &entry.moves {
+            let Some(move_usi) = &book_move.move_usi else {
+                continue;
+            };
+            let position = child_position_after_move(&entry.sfen, move_usi)?;
+            let key = strip_ply(&position.to_sfen()).to_string();
+            if journal.child.contains_key(&key) || !child_seen.insert(key.clone()) {
+                continue;
+            }
+            tasks.push(StaticTask { key, position });
+        }
+    }
+    Ok(tasks)
+}
+
 fn run_search_tasks(
     cli: &Cli,
     tasks: Vec<SearchTask>,
@@ -373,7 +560,8 @@ fn run_search_tasks(
 
     let engine_options = Arc::new(cli.engine_options.clone());
     let go_args = Arc::new(cli.go.clone());
-    let engine_path = Arc::new(cli.engine.clone());
+    let engine_path =
+        Arc::new(cli.engine.clone().ok_or_else(|| anyhow!("内部エラー: --engine がありません"))?);
     let engine_fingerprint = Arc::new(engine_fingerprint.to_string());
     let worker_count = cli.parallel;
 
@@ -586,7 +774,7 @@ fn mate_to_cp(mate: i32) -> i32 {
 }
 
 fn value_from_child_score(child_score: i32) -> i32 {
-    -child_score.clamp(-MATE_CAP, MATE_CAP)
+    -child_score
 }
 
 fn write_rescored_book(
@@ -639,13 +827,15 @@ fn write_report(
     child_records: &HashMap<String, EvalRecord>,
     parent_records: &HashMap<String, ParentRecord>,
     path: &Path,
+    include_parent: bool,
 ) -> Result<()> {
     let mut all = ReportStats::default();
     let mut black = ReportStats::default();
     let mut white = ReportStats::default();
 
     for entry in book.entries.values() {
-        if let Some(parent) = parent_records.get(strip_ply(&entry.sfen))
+        if include_parent
+            && let Some(parent) = parent_records.get(strip_ply(&entry.sfen))
             && let Some(bestmove) =
                 parent.bestmove.as_deref().filter(|m| *m != "none" && *m != "resign")
         {
@@ -687,9 +877,9 @@ fn write_report(
         .with_context(|| format!("report を作成できません: {}", path.display()))?;
     let mut writer = BufWriter::new(file);
     writeln!(writer, "section\tside\tmetric\tvalue")?;
-    write_stats(&mut writer, "all", &all)?;
-    write_stats(&mut writer, "black", &black)?;
-    write_stats(&mut writer, "white", &white)?;
+    write_stats(&mut writer, "all", &all, include_parent)?;
+    write_stats(&mut writer, "black", &black, include_parent)?;
+    write_stats(&mut writer, "white", &white, include_parent)?;
     writer.flush()?;
     Ok(())
 }
@@ -705,18 +895,25 @@ fn side_stats_mut<'a>(
     }
 }
 
-fn write_stats(writer: &mut impl Write, side: &str, stats: &ReportStats) -> Result<()> {
-    writeln!(writer, "parent\t{side}\ttotal\t{}", stats.parent_total)?;
-    writeln!(
-        writer,
-        "parent\t{side}\tbestmove_in_book_rate\t{:.6}",
-        ratio(stats.best_in_book, stats.parent_total)
-    )?;
-    writeln!(
-        writer,
-        "parent\t{side}\tbestmove_is_count_top_rate\t{:.6}",
-        ratio(stats.best_is_count_top, stats.parent_total)
-    )?;
+fn write_stats(
+    writer: &mut impl Write,
+    side: &str,
+    stats: &ReportStats,
+    include_parent: bool,
+) -> Result<()> {
+    if include_parent {
+        writeln!(writer, "parent\t{side}\ttotal\t{}", stats.parent_total)?;
+        writeln!(
+            writer,
+            "parent\t{side}\tbestmove_in_book_rate\t{:.6}",
+            ratio(stats.best_in_book, stats.parent_total)
+        )?;
+        writeln!(
+            writer,
+            "parent\t{side}\tbestmove_is_count_top_rate\t{:.6}",
+            ratio(stats.best_is_count_top, stats.parent_total)
+        )?;
+    }
     writeln!(writer, "move\t{side}\ttotal\t{}", stats.move_total)?;
     writeln!(writer, "move\t{side}\tgap_ge_100\t{}", stats.gap_ge_100)?;
     writeln!(writer, "move\t{side}\tgap_ge_200\t{}", stats.gap_ge_200)?;
@@ -742,6 +939,48 @@ mod tests {
     fn value_uses_parent_perspective_by_negating_child_score() {
         assert_eq!(value_from_child_score(123), -123);
         assert_eq!(value_from_child_score(-456), 456);
+    }
+
+    #[test]
+    fn static_value_uses_parent_perspective_by_negating_child_stm_cp() {
+        let child_stm_cp = 321;
+        assert_eq!(value_from_child_score(child_stm_cp), -321);
+    }
+
+    #[test]
+    #[cfg(feature = "dlshogi-onnx")]
+    fn onnx_fingerprint_changes_by_model_basename_or_eval_scale() {
+        let a = onnx_fingerprint(Path::new("/tmp/model-a.onnx"), 600.0);
+        let same = onnx_fingerprint(Path::new("/other/model-a.onnx"), 600.0);
+        let different_model = onnx_fingerprint(Path::new("/tmp/model-b.onnx"), 600.0);
+        let different_scale = onnx_fingerprint(Path::new("/tmp/model-a.onnx"), 650.0);
+
+        assert_eq!(a, same);
+        assert_ne!(a, different_model);
+        assert_ne!(a, different_scale);
+    }
+
+    #[test]
+    #[cfg(feature = "dlshogi-onnx")]
+    fn journal_match_requires_go_and_fingerprint() {
+        let fingerprint = onnx_fingerprint(Path::new("/tmp/static.onnx"), 600.0);
+        let record = JournalRecord {
+            kind: JournalKind::Child,
+            sfen: strip_ply(START).to_string(),
+            go: "static".to_string(),
+            engine_fingerprint: fingerprint.clone(),
+            value: Some(1),
+            depth: Some(0),
+            bestmove: None,
+        };
+
+        assert!(journal_record_matches(&record, "static", &fingerprint));
+        assert!(!journal_record_matches(&record, "nodes 1", &fingerprint));
+        assert!(!journal_record_matches(
+            &record,
+            "static",
+            &onnx_fingerprint(Path::new("/tmp/other.onnx"), 600.0)
+        ));
     }
 
     #[test]
@@ -811,8 +1050,14 @@ mod tests {
         let cli = Cli {
             book: dir.path().join("input.db"),
             out: dir.path().join("out.db"),
-            engine: dir.path().join("missing-engine"),
+            engine: Some(dir.path().join("missing-engine")),
             engine_options: Vec::new(),
+            dlshogi_onnx_model: None,
+            onnx_batch_size: 256,
+            onnx_gpu_id: 0,
+            onnx_tensorrt: false,
+            onnx_tensorrt_cache: None,
+            eval_scale: 600.0,
             go: "nodes 1".to_string(),
             journal: dir.path().join("journal.jsonl"),
             resume: false,
@@ -827,7 +1072,7 @@ mod tests {
         }];
         let mut journal = LoadedJournal::default();
 
-        let fingerprint = engine_fingerprint(&cli.engine, &cli.engine_options);
+        let fingerprint = engine_fingerprint(cli.engine.as_deref().unwrap(), &cli.engine_options);
         let err = run_search_tasks(&cli, tasks, &fingerprint, &mut journal).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("探索タスクが未完了です: 0/1 件完了"));
