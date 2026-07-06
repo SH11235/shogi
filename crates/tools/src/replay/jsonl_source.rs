@@ -234,13 +234,39 @@ fn index_one_file(
 
     let mut open: HashMap<u32, u64> = HashMap::new();
     let mut closed: HashSet<u32> = HashSet::new();
+    // 進行中対局 (result 行なし) の手数を索引に載せるため move 行を game_id 別に数える。
+    let mut move_counts: HashMap<u32, u32> = HashMap::new();
     // game_id ごとの評価値指標。move 行は interleave しうるので game_id で束ねる。
     let mut evals: HashMap<u32, EvalAccumulator> = HashMap::new();
 
+    // 進行中対局の末尾行は書き込み途中でありうる (csa_client の live 追記を読者が
+    // 同時に開くのが正常運用)。末尾の切れた行だけは破損でなく「追記中」とみなして
+    // 無視し、その手前までを索引する (次の再読込で完全化する)。
+    let mut last_complete_end: u64 = offset;
     while let Some((line_start, line_len)) = read_line(&mut reader, &mut offset, &mut line_buf)? {
-        let value: Value = serde_json::from_slice(&line_buf).with_context(|| {
-            format!("{}: invalid JSON line at offset {line_start}", path.display())
-        })?;
+        if line_buf.iter().all(|b| b.is_ascii_whitespace()) {
+            last_complete_end = line_start + line_len;
+            continue;
+        }
+        let value: Value = match serde_json::from_slice(&line_buf) {
+            Ok(v) => v,
+            Err(e) => {
+                // 改行で終わっていない行 = read_until が EOF に当たった切れた末尾
+                // (JSON 行は生の改行を含まないため)。EOF 到達の再確認だと read と
+                // 確認の間の追記で誤って破損扱いしうるので、行内容だけで判定する。
+                if !line_buf.ends_with(b"\n") {
+                    warnings.push(format!(
+                        "{}: 末尾行が JSON として不完全のため無視しました (書き込み途中の可能性)",
+                        path.display()
+                    ));
+                    break;
+                }
+                return Err(e).with_context(|| {
+                    format!("{}: invalid JSON line at offset {line_start}", path.display())
+                });
+            }
+        };
+        last_complete_end = line_start + line_len;
         match value.get("type").and_then(Value::as_str) {
             Some("move") => {
                 let game_id = value.get("game_id").and_then(Value::as_u64).ok_or_else(|| {
@@ -254,6 +280,7 @@ fn index_one_file(
                     );
                 }
                 open.entry(game_id).or_insert(line_start);
+                *move_counts.entry(game_id).or_default() += 1;
                 if let Some(cp) = move_black_pov_cp(&value) {
                     evals.entry(game_id).or_default().push(cp);
                 }
@@ -303,11 +330,34 @@ fn index_one_file(
     }
 
     if !open.is_empty() {
+        // result 行を伴わない対局 = 進行中 (csa_client の live 追記や実行中の tournament)
+        // または途中終了。勝敗不明の対局として索引する (live 再読込で完了時に置き換わる)。
+        // HashMap の反復順に依存しないよう開始 offset 順で並べる。
+        let mut open_games: Vec<(u32, u64)> = open.into_iter().collect();
+        open_games.sort_by_key(|&(_, start)| start);
         warnings.push(format!(
-            "{}: {} 局が result 行を伴わず終端しました（実行中・途中終了したファイルの可能性）。索引から除外します。",
+            "{}: {} 局が result 行を伴わず終端しました（進行中・途中終了）。勝敗不明として索引します。",
             path.display(),
-            open.len()
+            open_games.len()
         ));
+        for (game_id, start_offset) in open_games {
+            entries.push(GameIndexEntry {
+                source: GameSourceRef::Jsonl {
+                    file_idx,
+                    game_id,
+                    start_offset,
+                    // 切れた末尾行を再生範囲に含めない (完全な行までを読む)。
+                    end_offset: last_complete_end,
+                },
+                outcome: None,
+                error: false,
+                ply_count: move_counts.get(&game_id).copied().unwrap_or(0),
+                pair_index: None,
+                pair_slot: None,
+                startpos_idx: None,
+                metrics: evals.remove(&game_id).unwrap_or_default().finish(),
+            });
+        }
     }
 
     Ok(Some(PairFileMeta {
@@ -510,6 +560,31 @@ mod tests {
     }
 
     #[test]
+    fn tolerates_torn_tail_line_of_live_file() {
+        // live 追記中のファイルは末尾行が書き込み途中でありうる。切れた末尾行は
+        // 無視して手前までを索引し、再生範囲にも含めない。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a-vs-b.jsonl");
+        let mut body = format!(
+            "{}
+{}
+",
+            meta_line("a", "b"),
+            move_line(1, 1, "7g7f")
+        );
+        body.push_str(r#"{"type":"move","game_id":1,"ply":2,"sfen_"#); // 途中で切れた行
+        std::fs::write(&path, body).expect("write");
+
+        let source = JsonlSource::new(dir.path());
+        let index = source.build_index().expect("切れた末尾行で index 全体を落とさない");
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].ply_count, 1, "完全な行の 1 手だけを数える");
+        assert!(index.warnings.iter().any(|w| w.contains("不完全")));
+        let game = source.load_game(&index, &index.entries[0]).expect("load_game");
+        assert_eq!(game.moves.len(), 1, "切れた行は再生範囲に含めない");
+    }
+
+    #[test]
     fn accepts_csa_client_per_game_jsonl_names() {
         // csa_client の per-game 記録(`_vs_`)も tournament ペアファイルと同じスキーマで
         // 索引でき、ファイル名から日時キーが取れる。
@@ -605,17 +680,28 @@ mod tests {
     }
 
     #[test]
-    fn warns_and_drops_incomplete_trailing_game() {
+    fn indexes_incomplete_trailing_game_as_in_progress() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(
             dir.path(),
             "a-vs-b.jsonl",
-            &[meta_line("a", "b"), move_line(1, 1, "7g7f")], // result 行が無いまま終端
+            &[
+                meta_line("a", "b"),
+                move_line(1, 1, "7g7f"),
+                move_line(1, 2, "3c3d"), // result 行が無いまま終端 = 進行中
+            ],
         );
 
-        let index = JsonlSource::new(dir.path()).build_index().expect("build_index");
-        assert_eq!(index.entries.len(), 0);
+        let source = JsonlSource::new(dir.path());
+        let index = source.build_index().expect("build_index");
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].outcome, None);
+        assert!(!index.entries[0].error);
+        assert_eq!(index.entries[0].ply_count, 2);
         assert!(!index.warnings.is_empty());
+        // 進行中対局も既存のバイト範囲経路でそのまま再生できる。
+        let game = source.load_game(&index, &index.entries[0]).expect("load_game");
+        assert_eq!(game.moves.len(), 2);
     }
 
     #[test]

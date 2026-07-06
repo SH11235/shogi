@@ -801,3 +801,127 @@ fn nonfatal_sink_does_not_invoke_on_error_and_session_continues() {
     assert!(outcome.is_ok(), "対局は NonFatal でも完了するはず: {outcome:?}");
     assert_eq!(*error_calls.lock().unwrap(), 0, "NonFatal 時は on_error が呼ばれないこと");
 }
+
+// ────────────────────────────────────────────
+// live JSONL (`[record] live_jsonl`) の対局中追記
+// ────────────────────────────────────────────
+
+/// jsonl_dir 内の唯一の `.jsonl` の行数を返す (無ければ 0)。
+fn live_jsonl_line_count(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .map(|e| std::fs::read_to_string(e.path()).map(|t| t.lines().count()).unwrap_or(0))
+        .sum()
+}
+
+/// MoveConfirmed のたびに live JSONL の行数を観測する sink。
+struct LiveWatchSink {
+    jsonl_dir: PathBuf,
+    observed: Arc<Mutex<Vec<(&'static str, usize)>>>,
+}
+
+impl SessionEventSink for LiveWatchSink {
+    fn on_event(&mut self, event: SessionProgress) -> Result<(), SinkError> {
+        let label = label_for(&event);
+        if label.starts_with("MoveConfirmed") {
+            self.observed
+                .lock()
+                .unwrap()
+                .push((label, live_jsonl_line_count(&self.jsonl_dir)));
+        }
+        Ok(())
+    }
+
+    fn on_error(&mut self, _error: &SessionError) -> Result<(), SinkError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn live_jsonl_grows_during_game() {
+    // 自分 +7776FU → 相手 -3334FU → #WIN の最小 2 手対局。
+    let port = spawn_mock_tcp_server(|reader, writer| {
+        let _ = read_line(reader);
+        write_lines(writer, &["LOGIN:alice OK"]);
+        let lines = game_summary_lines("g-live");
+        let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_lines(writer, &line_refs);
+        let agree = read_line(reader);
+        assert!(agree.starts_with("AGREE"), "expected AGREE, got: {agree}");
+        write_lines(writer, &["START:g-live"]);
+        let mv = read_line(reader);
+        assert!(mv.starts_with("+7776FU"), "expected +7776FU, got: {mv}");
+        write_lines(writer, &["+7776FU,T2"]);
+        write_lines(writer, &["-3334FU,T1"]);
+        write_lines(writer, &["#WIN"]);
+        let _ = read_line(reader);
+    });
+
+    let record_root = tempfile_root().join(format!("csa_live_jsonl_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&record_root);
+    let engine_path = mock_usi_engine_script();
+    let mut config = mock_config(engine_path, SearchInfoEmitPolicy::EveryLine);
+    config.record.enabled = true;
+    config.record.save_jsonl = true;
+    config.record.live_jsonl = true;
+    config.record.dir = record_root.clone();
+    let jsonl_dir = config.record.jsonl_dir().expect("jsonl_dir");
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut conn = CsaConnection::connect("127.0.0.1", port, false).expect("connect");
+    conn.login("alice", "pw").expect("login");
+    let mut engine = UsiEngine::spawn(
+        &config.engine.path,
+        &config.engine.options,
+        SpawnOptions {
+            ponder: config.game.ponder,
+            startup_timeout: Duration::from_secs(5),
+            stderr_passthrough: false,
+        },
+    )
+    .expect("spawn engine");
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = LiveWatchSink {
+        jsonl_dir: jsonl_dir.clone(),
+        observed: Arc::clone(&observed),
+    };
+    let outcome = run_game_session_with_events(
+        &config,
+        &mut conn,
+        &mut engine,
+        Arc::clone(&shutdown),
+        &mut sink,
+    );
+    engine.quit();
+    let outcome = outcome.expect("session outcome");
+
+    // 対局中の観測: 自手確定時点で meta+1 手、相手手確定時点で meta+2 手が
+    // 既にディスク上で読める (= 手単位のリアルタイム追記)。
+    let observed = observed.lock().unwrap();
+    assert_eq!(
+        observed.as_slice(),
+        &[("MoveConfirmedSelf", 2), ("MoveConfirmedOpp", 3)],
+        "observed: {observed:?}"
+    );
+
+    // セッション終了直後 (main の write_game_jsonl 前) の live ファイルは
+    // meta + move x2 のまま result 行を持たない。
+    assert_eq!(live_jsonl_line_count(&jsonl_dir), 3);
+    // main 相当の最終書き出しで canonical (result 行込み) に置き換わる。
+    let path = rshogi_csa_client::jsonl::write_game_jsonl(
+        &jsonl_dir,
+        &outcome.record,
+        &config,
+        &outcome.result,
+    )
+    .expect("final write");
+    let text = std::fs::read_to_string(&path).expect("read final");
+    assert_eq!(text.lines().count(), 4);
+    assert!(text.lines().last().unwrap().contains("\"type\":\"result\""));
+    let _ = std::fs::remove_dir_all(&record_root);
+}

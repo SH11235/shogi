@@ -170,6 +170,11 @@ pub struct RecordConfig {
     /// JSONL 出力先ディレクトリの上書き。`None` のとき `dir/jsonl/` に保存する。
     #[serde(default)]
     pub jsonl_out: Option<PathBuf>,
+    /// 対局中に JSONL を手単位で live 追記する（`kifu_player --live` での自局
+    /// リアルタイム観戦用）。追記中のファイルには result 行が無く、終局時に
+    /// canonical な全内容へ置き換わる。`save_jsonl` が無効なら効果なし。
+    #[serde(default)]
+    pub live_jsonl: bool,
 }
 
 impl Default for RecordConfig {
@@ -182,6 +187,7 @@ impl Default for RecordConfig {
             save_sfen: true,
             save_jsonl: true,
             jsonl_out: None,
+            live_jsonl: false,
         }
     }
 }
@@ -275,6 +281,14 @@ mod tests {
             ..RecordConfig::default()
         };
         assert_eq!(config.jsonl_dir(), None);
+    }
+
+    #[test]
+    fn record_live_jsonl_defaults_off() {
+        let config: CsaClientConfig = toml::from_str("[record]\nenabled = true\n").unwrap();
+        assert!(!config.record.live_jsonl);
+        let config: CsaClientConfig = toml::from_str("[record]\nlive_jsonl = true\n").unwrap();
+        assert!(config.record.live_jsonl);
     }
 
     #[test]

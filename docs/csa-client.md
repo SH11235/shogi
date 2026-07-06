@@ -128,9 +128,18 @@ dir = "./records"
 filename_template = "{datetime}_{sente}_vs_{gote}"
 save_csa = true   # CSA形式
 save_sfen = true  # SFEN局面列（学習データ生成用）
+save_jsonl = true # analyze_selfplay / kifu_player 互換 JSONL（dir/jsonl/ に 1 局 1 ファイル）
+live_jsonl = false # 対局中に JSONL を手単位で live 追記（下記）
 ```
 
 テンプレート変数: `{datetime}`, `{game_id}`, `{sente}`, `{gote}`
+
+`live_jsonl = true` にすると、対局中に JSONL ファイル（`save_jsonl` と同じパス）へ
+確定した手を 1 手ずつ追記する。`kifu_player --tournament-dir <dir>/jsonl --live` で
+開いておくと、**自エンジンの進行中対局を評価値付き・手単位でリアルタイム観戦**できる
+（wdoor を経由しないので低遅延）。追記中のファイルには result 行が無く、読者は
+進行中対局（勝敗不明）として扱う。終局時は従来どおりの完全な内容（result 行込み）へ
+置き換わる。追記の失敗は警告のみで対局は続行する。`save_jsonl = false` なら効果なし。
 
 ## 使い方の例
 

@@ -34,6 +34,7 @@ use crate::events::{
     SearchInfoSnapshot, SearchOrigin, SessionError, SessionEventSink, SessionOutcome,
     SessionProgress, Side, SinkError,
 };
+use crate::jsonl::LiveJsonlWriter;
 use crate::protocol::{
     CsaConnection, GameResult, GameSummary, ReconnectState as ProtocolReconnectState,
     parse_game_result, parse_server_move,
@@ -295,6 +296,9 @@ struct SessionState<'a, E: ?Sized + 'a, S: ?Sized + 'a> {
     /// 直前に ponder miss が発生したか。次の自手番の fresh search に
     /// `SearchOrigin::PonderMiss` を載せるためのフラグ。
     pending_ponder_miss: bool,
+    /// 対局中の JSONL live 追記 (`[record] live_jsonl`)。作成・追記に失敗したら
+    /// `None` に落として対局は続行する(補助機能で進行を妨げない)。
+    live_jsonl: Option<LiveJsonlWriter>,
 }
 
 /// 探索結果の処理結果
@@ -348,6 +352,7 @@ where
         sink,
         info_throttle: SearchInfoThrottle::new(config.game.search_info_emit.clone()),
         pending_ponder_miss: false,
+        live_jsonl: None,
     };
 
     // 途中局面の手順を適用 (Fresh で `initial_moves` がある時のみ。resume では
@@ -373,6 +378,10 @@ where
         push_opponent_jsonl(&mut s.record, initial_sfen_before, usi, move_color, time_sec);
         move_color = opposite(move_color);
     }
+
+    // initial_moves (途中局面開始) や resume 済みの手も含めて書き出すため、
+    // 手順の反映が終わってから live ライターを作る。
+    s.live_jsonl = make_live_writer(config, &s.record);
 
     loop {
         // 各イテレーション先頭で sink.should_continue() を確認
@@ -695,6 +704,7 @@ where
         time_ms: info.time_ms,
         nps: info.nps,
     });
+    live_append(&mut s.live_jsonl, &s.record);
 
     // MoveSent 発火 (送信直後、サーバ echo の time_sec はまだ未確定)
     let move_sent_event = MoveEvent {
@@ -854,6 +864,7 @@ where
                 opposite(s.my_color),
                 time_sec,
             );
+            live_append(&mut s.live_jsonl, &s.record);
 
             // 相手の手 MoveConfirmed
             let opp_event = MoveEvent {
@@ -933,6 +944,7 @@ where
                 opposite(s.my_color),
                 time_sec,
             );
+            live_append(&mut s.live_jsonl, &s.record);
             let opp_event = MoveEvent {
                 player: MovePlayer::Opponent,
                 csa_move: mv.clone(),
@@ -973,6 +985,7 @@ where
             opposite(s.my_color),
             time_sec,
         );
+        live_append(&mut s.live_jsonl, &s.record);
         let opp_event = MoveEvent {
             player: MovePlayer::Opponent,
             csa_move: mv,
@@ -1546,6 +1559,32 @@ fn label_for_color(record: &GameRecord, color: Color) -> String {
         "unknown".to_string()
     } else {
         raw.clone()
+    }
+}
+
+/// `[record] live_jsonl` 有効時に live ライターを作る。失敗は warn に留めて `None`
+/// (live 追記は補助機能で、対局の進行を妨げない)。`save_jsonl` 無効時も `None`。
+fn make_live_writer(config: &CsaClientConfig, record: &GameRecord) -> Option<LiveJsonlWriter> {
+    if !config.record.live_jsonl {
+        return None;
+    }
+    let dir = config.record.jsonl_dir()?;
+    match LiveJsonlWriter::create(&dir, record, config) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            log::warn!("live JSONL の作成に失敗 (追記なしで続行): {e:#}");
+            None
+        }
+    }
+}
+
+/// live JSONL へ未書き出しの手を追記する。失敗したら以後の追記を止める(対局は続行)。
+fn live_append(live: &mut Option<LiveJsonlWriter>, record: &GameRecord) {
+    if let Some(w) = live.as_mut()
+        && let Err(e) = w.append_new_moves(record)
+    {
+        log::warn!("live JSONL 追記に失敗 (以後の追記を停止): {e:#}");
+        *live = None;
     }
 }
 

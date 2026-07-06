@@ -44,8 +44,12 @@ pub fn write_game_jsonl(
     })?;
 
     let path = out_dir.join(jsonl_filename(record));
-    let file = File::create(&path)
-        .with_context(|| format!("JSONL ファイルを作成できません: {}", path.display()))?;
+    // live 追記 (`LiveJsonlWriter`) 有効時は同じパスを読者 (kifu_player --live 等) が
+    // 開いていることがあるため、truncate 書き込みでなく tmp→rename で置き換え、
+    // 読者が常に完全な内容だけを見るようにする。
+    let tmp = path.with_extension("jsonl.tmp");
+    let file = File::create(&tmp)
+        .with_context(|| format!("JSONL ファイルを作成できません: {}", tmp.display()))?;
     let mut writer = BufWriter::new(file);
 
     write_meta(&mut writer, record, config, &path)?;
@@ -53,7 +57,56 @@ pub fn write_game_jsonl(
     write_result(&mut writer, record, result, plies)?;
 
     writer.flush().context("JSONL flush に失敗")?;
+    fs::rename(&tmp, &path)
+        .with_context(|| format!("JSONL の rename に失敗: {}", path.display()))?;
     Ok(path)
+}
+
+/// 対局中に同スキーマの JSONL を手単位で追記する live ライター
+/// (`[record] live_jsonl = true` で session が使う)。meta 行と確定済み move 行のみを
+/// 常に完全な行単位で保ち、result 行は書かない。読者 (kifu_player 等) は result 行の
+/// 無いファイルを進行中対局として扱う。終局時は [`write_game_jsonl`] が同じパスへ
+/// canonical な全内容 (result 行込み) を rename で書き換える。
+pub struct LiveJsonlWriter {
+    writer: BufWriter<File>,
+    /// 書き出し済みの move 行数 (`record.moves` / `jsonl_moves` の消費位置)。
+    written: usize,
+}
+
+impl LiveJsonlWriter {
+    /// 対局開始時 (Game_Summary 確定後) に作る。record が既に持つ手 (途中局面開始・
+    /// resume 済みの手) もすべて書き出してから追記を続ける。
+    pub fn create(out_dir: &Path, record: &GameRecord, config: &CsaClientConfig) -> Result<Self> {
+        fs::create_dir_all(out_dir).with_context(|| {
+            format!("JSONL 出力ディレクトリを作成できません: {}", out_dir.display())
+        })?;
+        let path = out_dir.join(jsonl_filename(record));
+        let file = File::create(&path)
+            .with_context(|| format!("live JSONL を作成できません: {}", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        write_meta(&mut writer, record, config, &path)?;
+        let mut live = Self { writer, written: 0 };
+        live.append_new_moves(record)?;
+        // 手が 0 の作成直後でも meta 行を読者から見えるようにする
+        // (append_new_moves は書くものが無いと flush しない)。
+        live.writer.flush().context("live JSONL flush に失敗")?;
+        Ok(live)
+    }
+
+    /// record に追加された未書き出しの move 行を追記して flush する。
+    pub fn append_new_moves(&mut self, record: &GameRecord) -> Result<()> {
+        let upto = record.moves.len().min(record.jsonl_moves.len());
+        if self.written >= upto {
+            // flush 済み内容から進んでいなければ何もしない (毎手呼ばれる想定)。
+            return Ok(());
+        }
+        for idx in self.written..upto {
+            let ply = (idx as u32) + 1;
+            write_move_line(&mut self.writer, &record.moves[idx], &record.jsonl_moves[idx], ply)?;
+        }
+        self.written = upto;
+        self.writer.flush().context("live JSONL flush に失敗")
+    }
 }
 
 /// `<datetime>_<sente>_vs_<gote>.jsonl` 形式のファイル名を生成する。
@@ -281,6 +334,30 @@ struct EvalLog {
     pv: Option<Vec<String>>,
 }
 
+fn write_move_line<W: Write>(
+    writer: &mut W,
+    m: &RecordedMove,
+    extra: &JsonlMoveExtra,
+    ply: u32,
+) -> Result<()> {
+    let entry = MoveLog {
+        kind: "move",
+        game_id: 1,
+        ply,
+        side_to_move: side_label_char(m.side_to_move),
+        sfen_before: &extra.sfen_before,
+        move_usi: &extra.move_usi,
+        engine: &extra.engine_label,
+        elapsed_ms: extra.elapsed_ms,
+        think_limit_ms: extra.think_limit_ms,
+        timed_out: false,
+        eval: build_eval_log(m, extra),
+    };
+    serde_json::to_writer(&mut *writer, &entry)?;
+    writer.write_all(b"\n")?;
+    Ok(())
+}
+
 fn write_moves<W: Write>(writer: &mut W, record: &GameRecord) -> Result<u32> {
     let mut plies: u32 = 0;
     // RecordedMove と JsonlMoveExtra は session.rs で同時に push されるため、
@@ -288,23 +365,7 @@ fn write_moves<W: Write>(writer: &mut W, record: &GameRecord) -> Result<u32> {
     for (idx, (m, extra)) in record.moves.iter().zip(record.jsonl_moves.iter()).enumerate() {
         let ply = (idx as u32) + 1;
         plies = ply;
-        let side_char = side_label_char(m.side_to_move);
-        let eval = build_eval_log(m, extra);
-        let entry = MoveLog {
-            kind: "move",
-            game_id: 1,
-            ply,
-            side_to_move: side_char,
-            sfen_before: &extra.sfen_before,
-            move_usi: &extra.move_usi,
-            engine: &extra.engine_label,
-            elapsed_ms: extra.elapsed_ms,
-            think_limit_ms: extra.think_limit_ms,
-            timed_out: false,
-            eval,
-        };
-        serde_json::to_writer(&mut *writer, &entry)?;
-        writer.write_all(b"\n")?;
+        write_move_line(writer, m, extra, ply)?;
     }
     Ok(plies)
 }
@@ -406,5 +467,92 @@ fn winner_label(record: &GameRecord, result: &GameResult) -> Option<String> {
         (GameResult::Lose, Color::Black) => Some(record.gote_name.clone()),
         (GameResult::Lose, Color::White) => Some(record.sente_name.clone()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{GameResult, GameSummary, TimeConfig};
+    use rshogi_csa::{Color, initial_position};
+
+    fn summary() -> GameSummary {
+        GameSummary {
+            game_id: "g".to_owned(),
+            my_color: Color::Black,
+            sente_name: "ME".to_owned(),
+            gote_name: "OPP".to_owned(),
+            position: initial_position(),
+            initial_moves: Vec::new(),
+            black_time: TimeConfig::default(),
+            white_time: TimeConfig::default(),
+            reconnect_token: None,
+        }
+    }
+
+    fn push_move(record: &mut GameRecord, side: Color, sfen_before: &str, usi: &str) {
+        record.add_move("+7776FU", 1, None, side);
+        record.add_jsonl_move(JsonlMoveExtra {
+            sfen_before: sfen_before.to_owned(),
+            move_usi: usi.to_owned(),
+            engine_label: "ME".to_owned(),
+            elapsed_ms: 100,
+            think_limit_ms: 1000,
+            seldepth: None,
+            nodes: None,
+            time_ms: None,
+            nps: None,
+        });
+    }
+
+    #[test]
+    fn live_writer_appends_then_final_write_replaces_with_result() {
+        let dir = std::env::temp_dir().join("csa_live_jsonl_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = CsaClientConfig::default();
+        let mut record = GameRecord::new(&summary());
+
+        let mut live = LiveJsonlWriter::create(&dir, &record, &config).unwrap();
+        let path = dir.join(jsonl_filename(&record));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1, "作成直後は meta 行のみ");
+        assert!(text.contains("\"type\":\"meta\""));
+
+        push_move(&mut record, Color::Black, "sfen1", "7g7f");
+        live.append_new_moves(&record).unwrap();
+        push_move(&mut record, Color::White, "sfen2", "3c3d");
+        live.append_new_moves(&record).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 3, "meta + move x2");
+        assert!(!text.contains("\"type\":\"result\""), "live 中は result 行なし");
+
+        // 新しい手が無ければ追記しない(毎手呼ばれる想定の冪等性)
+        live.append_new_moves(&record).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+
+        // 終局: 同じパスへ canonical な全内容 (result 行込み) が rename で置き換わる
+        let final_path = write_game_jsonl(&dir, &record, &config, &GameResult::Win).unwrap();
+        assert_eq!(final_path, path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 4, "meta + move x2 + result");
+        assert!(text.lines().last().unwrap().contains("\"type\":\"result\""));
+        assert!(!path.with_extension("jsonl.tmp").exists(), "tmp 残骸なし");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_writer_rewrites_preexisting_moves_on_create() {
+        // 途中局面開始・resume では record が既に手を持つ。create がそれらも書き出す。
+        let dir = std::env::temp_dir().join("csa_live_jsonl_resume_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = CsaClientConfig::default();
+        let mut record = GameRecord::new(&summary());
+        push_move(&mut record, Color::Black, "sfen1", "7g7f");
+        push_move(&mut record, Color::White, "sfen2", "3c3d");
+
+        let _live = LiveJsonlWriter::create(&dir, &record, &config).unwrap();
+        let path = dir.join(jsonl_filename(&record));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
