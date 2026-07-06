@@ -188,7 +188,8 @@ struct App {
     /// live 再読込の状態。`None` なら従来どおり静的表示。
     live: Option<LiveState>,
     /// ライブ追従モード（`f`）。ON の間は選択対局の最新手を表示し続ける。
-    /// 手を戻す操作（`h`/`←`、`n`/`N`、`Home`/`g`）で自動解除する。
+    /// 末尾から離れて特定の手を見る操作（`h`/`←`、`n`/`N`、`Home`/`g`）で自動解除する
+    /// （実際に表示位置が動いたときのみ。末尾での `n` 空振り等では解除しない）。
     follow: bool,
 }
 
@@ -451,11 +452,21 @@ impl App {
         }
     }
 
-    /// 手を戻す操作の前処理: 追従中なら解除する（追従が即座に末尾へ引き戻すのを防ぐ）。
+    /// 末尾から離れる操作の後処理: 追従中なら解除する（追従が即座に末尾へ引き戻すのを防ぐ）。
     fn break_follow(&mut self) {
         if self.follow {
             self.follow = false;
             self.status = "ライブ追従を解除（f で再開）".to_string();
+        }
+    }
+
+    /// ナビゲーション操作を実行し、表示位置が実際に動いたときのみ追従を解除する
+    /// （末尾での `n` 空振り等、位置が変わらない操作で黙って解除しない）。
+    fn nav_breaking_follow(&mut self, nav: impl FnOnce(&mut Self)) {
+        let before = self.current_move;
+        nav(self);
+        if self.current_move != before {
+            self.break_follow();
         }
     }
 
@@ -509,27 +520,15 @@ impl App {
             },
             Mode::Browse => match code {
                 KeyCode::Char('q') | KeyCode::Esc => return false,
-                KeyCode::Char('h') | KeyCode::Left => {
-                    self.break_follow();
-                    self.prev_move();
-                }
+                KeyCode::Char('h') | KeyCode::Left => self.nav_breaking_follow(App::prev_move),
                 KeyCode::Char('l') | KeyCode::Right => self.next_move(),
                 KeyCode::Char('j') | KeyCode::Down => self.next_game(),
                 KeyCode::Char('k') | KeyCode::Up => self.prev_game(),
-                KeyCode::Home | KeyCode::Char('g') => {
-                    self.break_follow();
-                    self.first_move();
-                }
+                KeyCode::Home | KeyCode::Char('g') => self.nav_breaking_follow(App::first_move),
                 KeyCode::End | KeyCode::Char('G') => self.last_move(),
                 KeyCode::Char('f') => self.toggle_follow(),
-                KeyCode::Char('n') => {
-                    self.break_follow();
-                    self.jump_to_next_eval_swing();
-                }
-                KeyCode::Char('N') => {
-                    self.break_follow();
-                    self.jump_to_prev_eval_swing();
-                }
+                KeyCode::Char('n') => self.nav_breaking_follow(App::jump_to_next_eval_swing),
+                KeyCode::Char('N') => self.nav_breaking_follow(App::jump_to_prev_eval_swing),
                 KeyCode::Char('s') => self.cycle_sort_mode(),
                 KeyCode::Char('/') => self.mode = Mode::Filter,
                 KeyCode::Char('?') => self.mode = Mode::Help,
@@ -1326,10 +1325,11 @@ fn draw_status_bar(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
             // 通常時はヘルプを行頭に固定する（手を動かしても位置がずれないよう、可変長の
             // 注釈はここに出さず指し手パネル側へ移した）。エラー等の status がある時は、
             // 長いヘルプで末尾 truncate されて隠れないよう status を先頭に置く（優先情報）。
+            // 現在の並び順は対局一覧のタイトルに出す（可変長ラベルをここに出すと
+            // 並び替えのたびにレイアウトシフトする）。
             let follow_hint = if app.live.is_some() { "  f:追従" } else { "" };
             let help = format!(
-                "h/l:手  Home/End:先頭/末尾  j/k:対局  n/N:評価値急変  s:並替({}){follow_hint}  /:検索  ?:ヘルプ  q:終了",
-                app.sort_mode.label()
+                "h/l:手  Home/End:先頭/末尾  j/k:対局  n/N:評価値急変  s:並替{follow_hint}  /:検索  ?:ヘルプ  q:終了"
             );
             if app.status.is_empty() {
                 format!("[{help}]")
@@ -1879,9 +1879,12 @@ mod tests {
         // 対局切替で開いた対局の最新手から表示する
         app.next_game();
         assert_eq!(app.current_move, 3);
+        // 位置が動かない空振り操作（末尾で急変ジャンプ、評価値なし）では解除しない
+        app.nav_breaking_follow(App::jump_to_next_eval_swing);
+        assert!(app.follow);
+        assert_eq!(app.current_move, 3);
         // 手を戻す操作で追従は自動解除される
-        app.break_follow();
-        app.prev_move();
+        app.nav_breaking_follow(App::prev_move);
         assert!(!app.follow);
         assert_eq!(app.current_move, 2);
     }
