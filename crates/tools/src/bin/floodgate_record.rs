@@ -69,7 +69,8 @@ struct Cli {
 
     /// キャッシュがこの秒数以内に更新済みならネットワーク取得をスキップして
     /// キャッシュを直接使う(0 = 常に取得)。レートページは日次生成なので
-    /// 数時間 (例: 21600 = 6h) で十分。
+    /// 数時間 (例: 21600 = 6h) で十分。履歴併用時、履歴に当日分が無ければ
+    /// 鮮度内でも取得する(履歴を欠かさないため)。
     #[arg(long, default_value_t = 0, requires = "fetch_ratings")]
     ratings_max_age: u64,
 
@@ -91,16 +92,17 @@ struct Effective {
 
 fn resolve_effective(cli: &Cli, config: Option<(&Path, &CsaClientConfig)>) -> Result<Effective> {
     // TOML 内の相対パスは csa_client 実行時の cwd ではなく config ファイル基準で解決する
-    // (集計は別 cwd から叩かれるため。運用 config は絶対パス推奨)。
+    // (集計は別 cwd から叩かれるため。運用 config は絶対パス推奨)。csa_client の CLI
+    // 上書き (--record-dir 等) はここからは見えず、TOML の値のみを使う。
     fn resolve(base: &Path, p: PathBuf) -> PathBuf {
         if p.is_absolute() { p } else { base.join(p) }
     }
-    let config_base = |path: &Path| path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let based = config.map(|(path, cfg)| (path, path.parent().unwrap_or(Path::new(".")), cfg));
 
-    let dir = match (&cli.dir, config) {
+    let dir = match (&cli.dir, based) {
         (Some(d), _) => d.clone(),
-        (None, Some((path, cfg))) => match cfg.record.jsonl_dir() {
-            Some(d) => resolve(&config_base(path), d),
+        (None, Some((path, base, cfg))) => match cfg.record.jsonl_dir() {
+            Some(d) => resolve(base, d),
             None => bail!(
                 "config {} は JSONL 出力が無効 (record.enabled / record.save_jsonl を確認)。\
                  集計元が導出できないため --dir で明示すること",
@@ -110,25 +112,29 @@ fn resolve_effective(cli: &Cli, config: Option<(&Path, &CsaClientConfig)>) -> Re
         (None, None) => PathBuf::from("."),
     };
 
-    let me = cli
-        .me
-        .clone()
-        .or_else(|| config.map(|(_, c)| c.server.id.clone()).filter(|id| !id.is_empty()));
+    // JSONL 内の engine ラベルは sanitize 済み(`.` や `@` は `_` になる)なので、
+    // server.id 由来の me も同じ正規化を通さないと全局が対象不参加になる。
+    let me = cli.me.clone().or_else(|| {
+        based
+            .map(|(_, _, c)| c.server.id.as_str())
+            .filter(|id| !id.is_empty())
+            .map(rshogi_csa_client::jsonl::sanitize_for_filename)
+    });
 
     // キャッシュ / 履歴の config 既定は --fetch-ratings 時のみ意味を持つ(clap の
     // `requires` と整合。fetch しないのに既定パスを作らない)。
-    let derived = |explicit: &Option<PathBuf>, filename: &str| {
-        if !cli.fetch_ratings {
-            return None;
-        }
-        explicit.clone().or_else(|| {
-            config.map(|(path, cfg)| {
-                resolve(&config_base(path), cfg.record.dir.clone()).join(filename)
-            })
-        })
-    };
-    let ratings_cache = derived(&cli.ratings_cache, "ratings_cache.tsv");
-    let ratings_history = derived(&cli.ratings_history, "ratings_history.tsv");
+    let record_dir = cli
+        .fetch_ratings
+        .then(|| based.map(|(_, base, cfg)| resolve(base, cfg.record.dir.clone())))
+        .flatten();
+    let ratings_cache = cli
+        .ratings_cache
+        .clone()
+        .or_else(|| record_dir.as_ref().map(|d| d.join("ratings_cache.tsv")));
+    let ratings_history = cli
+        .ratings_history
+        .clone()
+        .or_else(|| record_dir.as_ref().map(|d| d.join("ratings_history.tsv")));
 
     Ok(Effective {
         dir,
@@ -282,11 +288,11 @@ fn median(xs: &mut [f64]) -> f64 {
 
 /// wdoor floodgate の現在レート表を取得し (ページ日付 YYYYMMDD, name -> rating) を作る。
 /// 取得・解析は `tools::common::floodgate`(reqwest, in-repo)を再利用。
-fn fetch_ratings_map() -> Result<(Option<String>, BTreeMap<String, f64>)> {
+fn fetch_ratings_map() -> Result<(String, BTreeMap<String, f64>)> {
     let client = Client::builder().build().context("reqwest client 生成失敗")?;
-    let (url, html) = fg::fetch_latest_rating_page(&client)?;
+    let (url, date, html) = fg::fetch_latest_rating_page(&client)?;
     eprintln!("レート取得: {url}");
-    Ok((fg::rating_page_date(&url), fg::parse_rating_page(&html).into_iter().collect()))
+    Ok((date, fg::parse_rating_page(&html).into_iter().collect()))
 }
 
 /// キャッシュの mtime が `max_age_sec` 以内か。0 は常に false(= 常に fetch)。
@@ -302,36 +308,51 @@ fn cache_is_fresh(path: &Path, max_age_sec: u64) -> bool {
         .is_some_and(|age| age.as_secs() <= max_age_sec)
 }
 
+/// 履歴 (`date<TAB>name<TAB>rate` 行) に (date, name) のエントリが既にあるか。
+fn history_has_entry(text: &str, date: &str, name: &str) -> bool {
+    let prefix = format!("{date}\t{name}\t");
+    text.lines().any(|l| l.starts_with(&prefix))
+}
+
+/// 履歴が当日 (JST。レートページの日付は floodgate サーバ基準 = JST) の (date, me) を
+/// 記録済みか。履歴未設定なら true(鮮度スキップを妨げない)。当日ページ未生成の
+/// 早朝帯は fetch が前日ページに解決されて追記なしになるため、当日分が載るまで
+/// 鮮度内でも毎回 fetch になる(1 GET/実行なので許容)。
+fn history_recorded_today(history: Option<&Path>, me: &str) -> bool {
+    let Some(path) = history else { return true };
+    let jst = chrono::FixedOffset::east_opt(9 * 3600).expect("JST は有効なオフセット");
+    let today = chrono::Utc::now().with_timezone(&jst).format("%Y%m%d").to_string();
+    std::fs::read_to_string(path).is_ok_and(|text| history_has_entry(&text, &today, me))
+}
+
 /// 履歴ファイルに `date<TAB>name<TAB>rate` を 1 行追記する。同一 (date, name) の行が
 /// 既にあれば何もしない(レートページは日次生成のため、同日の再実行で重複させない)。
-/// 追記したら `Ok(true)`。
+/// 全体を tmp に書いて rename で置き換えるので、並行実行の追記競合や過去の尻切れ行に
+/// 新行が連結される破損が起きない。追記したら `Ok(true)`。
 fn append_ratings_history(path: &Path, date: &str, name: &str, rate: f64) -> Result<bool> {
-    use std::io::Write;
-    let prefix = format!("{date}\t{name}\t");
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            if text.lines().any(|l| l.starts_with(&prefix)) {
-                return Ok(false);
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    if history_has_entry(&text, date, name) {
+        return Ok(false);
     }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    writeln!(f, "{prefix}{rate}")?;
+    let mut lines: Vec<&str> = text.lines().collect();
+    let new_line = format!("{date}\t{name}\t{rate}");
+    lines.push(&new_line);
+    write_atomic(path, &(lines.join("\n") + "\n"))?;
     Ok(true)
 }
 
-/// レートマップを用意する。鮮度内キャッシュがあれば fetch せず直接使う。それ以外は
-/// fetch し、成功時はキャッシュ書き出し + 履歴追記、失敗時はキャッシュ読み戻しで
-/// フォールバック。opt-in の補助機能なので、失敗はすべて警告にとどめ空マップで続行する。
+/// レートマップを用意する。鮮度内キャッシュがあれば fetch せず直接使う(ただし履歴が
+/// 当日分を未記録なら、履歴を欠かさないため鮮度内でも fetch する)。fetch 成功時は
+/// キャッシュ書き出し + 履歴追記、失敗時はキャッシュ読み戻しでフォールバック。
+/// opt-in の補助機能なので、失敗はすべて警告にとどめ空マップで続行する。
 fn obtain_ratings(eff: &Effective, max_age_sec: u64, me: &str) -> BTreeMap<String, f64> {
     if let Some(cache) = &eff.ratings_cache
         && cache_is_fresh(cache, max_age_sec)
+        && history_recorded_today(eff.ratings_history.as_deref(), me)
     {
         match read_ratings_cache(cache) {
             Ok(map) if !map.is_empty() => {
@@ -344,65 +365,66 @@ fn obtain_ratings(eff: &Effective, max_age_sec: u64, me: &str) -> BTreeMap<Strin
     }
     // 取得失敗・空取得はキャッシュへフォールバック。書き出しは「取得成功かつ非空」の
     // ときのみ(空取得で last-known-good を潰さない)。
-    let fetched = match fetch_ratings_map() {
-        Ok((date, map)) if !map.is_empty() => Some((date, map)),
-        Ok(_) => {
-            eprintln!("⚠ レート表が空(取得 0 件)。キャッシュにフォールバック");
-            None
-        }
-        Err(e) => {
-            eprintln!("⚠ レート取得失敗: {e:#}");
-            None
+    let (date, map) = match fetch_ratings_map() {
+        Ok((date, map)) if !map.is_empty() => (date, map),
+        res => {
+            match res {
+                Ok(_) => eprintln!("⚠ レート表が空(取得 0 件)。キャッシュにフォールバック"),
+                Err(e) => eprintln!("⚠ レート取得失敗: {e:#}"),
+            }
+            let Some(cache) = &eff.ratings_cache else {
+                return BTreeMap::new();
+            };
+            return read_ratings_cache(cache).unwrap_or_else(|e| {
+                eprintln!("⚠ キャッシュ読み戻しも失敗(注釈なしで続行): {e:#}");
+                BTreeMap::new()
+            });
         }
     };
-    match fetched {
-        Some((date, map)) => {
-            if let Some(cache) = &eff.ratings_cache
-                && let Err(e) = write_ratings_cache(cache, &map)
-            {
-                eprintln!("⚠ レートキャッシュ書き出し失敗: {e:#}");
-            }
-            if let Some(history) = &eff.ratings_history {
-                match (&date, map.get(me)) {
-                    (Some(d), Some(rate)) => match append_ratings_history(history, d, me, *rate) {
-                        Ok(true) => eprintln!("レート履歴追記: {d} {me} R{rate}"),
-                        Ok(false) => {}
-                        Err(e) => eprintln!("⚠ レート履歴追記失敗: {e:#}"),
-                    },
-                    (None, _) => eprintln!("⚠ ページ日付を URL から特定できず履歴追記をスキップ"),
-                    (_, None) => eprintln!("⚠ {me} がレート表に無いため履歴追記をスキップ"),
-                }
-            }
-            map
-        }
-        None => match &eff.ratings_cache {
-            Some(cache) => read_ratings_cache(cache).unwrap_or_else(|e2| {
-                eprintln!("⚠ キャッシュ読み戻しも失敗(注釈なしで続行): {e2:#}");
-                BTreeMap::new()
-            }),
-            None => BTreeMap::new(),
-        },
+    if let Some(cache) = &eff.ratings_cache
+        && let Err(e) = write_ratings_cache(cache, &map)
+    {
+        eprintln!("⚠ レートキャッシュ書き出し失敗: {e:#}");
     }
+    if let Some(history) = &eff.ratings_history {
+        match map.get(me) {
+            Some(rate) => match append_ratings_history(history, &date, me, *rate) {
+                Ok(true) => eprintln!("レート履歴追記: {date} {me} R{rate}"),
+                Ok(false) => {}
+                Err(e) => eprintln!("⚠ レート履歴追記失敗: {e:#}"),
+            },
+            None => eprintln!("⚠ {me} がレート表に無いため履歴追記をスキップ"),
+        }
+    }
+    map
+}
+
+/// 同一 dir の一時ファイルに書いてから rename で置き換える(部分書き込みで既存
+/// ファイルを壊さない)。親ディレクトリが無ければ作る(config 由来の record.dir が
+/// まだ作られていない初期状態でも cache / 履歴が機能するように)。
+fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    use std::io::Write;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temp file in {}", parent.display()))?;
+    tmp.write_all(content.as_bytes())
+        .with_context(|| format!("write temp file for {}", path.display()))?;
+    tmp.persist(path).with_context(|| format!("rename to {}", path.display()))?;
+    Ok(())
 }
 
 /// レートマップを `name<TAB>rate` でキャッシュへ書き出す(BTreeMap 順で決定的)。
-fn write_ratings_cache(path: &std::path::Path, map: &BTreeMap<String, f64>) -> Result<()> {
-    use std::io::Write;
-    // 同一 dir の tmp に書いてから rename する(部分書き込みで既存 cache を壊さない)。
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    {
-        let mut f = std::io::BufWriter::new(
-            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?,
-        );
-        for (name, rate) in map {
-            writeln!(f, "{name}\t{rate}")?;
-        }
-        f.flush()?;
+fn write_ratings_cache(path: &Path, map: &BTreeMap<String, f64>) -> Result<()> {
+    use std::fmt::Write;
+    let mut content = String::new();
+    for (name, rate) in map {
+        writeln!(content, "{name}\t{rate}").expect("String への write は失敗しない");
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
-    Ok(())
+    write_atomic(path, &content)
 }
 
 /// キャッシュ(`name<TAB>rate`)を name -> rating に読み戻す。壊れた行・非有限値は捨てる。
@@ -421,20 +443,36 @@ fn read_ratings_cache(path: &std::path::Path) -> Result<BTreeMap<String, f64>> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // config は --config > 環境変数 CSA_CLIENT_CONFIG。指定があるのに読めないのは
-    // 設定ミスなので fail-fast(config 無しで集計したい場合は引数/env を外す)。
-    let config_path = cli
-        .config
-        .clone()
-        .or_else(|| std::env::var_os("CSA_CLIENT_CONFIG").map(PathBuf::from));
+    // config は --config > 環境変数 CSA_CLIENT_CONFIG(空値は未設定扱い)。指定が
+    // あるのに読めないのは設定ミスなので fail-fast(config 無しで集計したい場合は
+    // 引数/env を外す)。
+    let (config_path, config_source) = match cli.config.clone() {
+        Some(p) => (Some(p), "--config"),
+        None => (
+            std::env::var_os("CSA_CLIENT_CONFIG")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            "env CSA_CLIENT_CONFIG",
+        ),
+    };
     let config = config_path
         .as_deref()
         .map(|path| {
-            CsaClientConfig::from_file(path)
-                .with_context(|| format!("config 読み込み失敗: {}", path.display()))
+            CsaClientConfig::from_file(path).with_context(|| {
+                format!("config 読み込み失敗: {} ({config_source})", path.display())
+            })
         })
         .transpose()?;
     let eff = resolve_effective(&cli, config_path.as_deref().zip(config.as_ref()))?;
+    if let Some(path) = &config_path {
+        // env 経由の暗黙適用でも「どの config から何が導出されたか」を可視化する。
+        eprintln!(
+            "config 適用: {} ({config_source}) → dir={}, me={}",
+            path.display(),
+            eff.dir.display(),
+            eff.me.as_deref().unwrap_or("(自動判定)")
+        );
+    }
 
     let pattern = eff.dir.join("*.jsonl");
     let pattern = pattern.to_string_lossy();
@@ -750,17 +788,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// clap 定義そのものから既定値を得る(struct literal の複製だと default_value_t と
+    /// 乖離しうる)。
     fn cli_default() -> Cli {
-        Cli {
-            config: None,
-            dir: None,
-            me: None,
-            watch: Vec::new(),
-            fetch_ratings: false,
-            ratings_cache: None,
-            ratings_max_age: 0,
-            ratings_history: None,
-        }
+        Cli::try_parse_from(["floodgate_record"]).unwrap()
     }
 
     fn config_from(toml_text: &str) -> CsaClientConfig {
@@ -850,6 +881,29 @@ mod tests {
         let cfg = config_from("[record]\ndir = \"/d\"\n");
         let eff = resolve_effective(&cli_default(), Some((Path::new("/x/a.toml"), &cfg))).unwrap();
         assert_eq!(eff.me, None);
+    }
+
+    #[test]
+    fn resolve_effective_sanitizes_config_me_like_jsonl_labels() {
+        // JSONL の engine ラベルは sanitize 済みなので `.` を含む server.id は `_` で比較。
+        let cfg = config_from("[server]\nid = \"ramu.v2\"\n[record]\ndir = \"/d\"\n");
+        let eff = resolve_effective(&cli_default(), Some((Path::new("/x/a.toml"), &cfg))).unwrap();
+        assert_eq!(eff.me.as_deref(), Some("ramu_v2"));
+    }
+
+    #[test]
+    fn ratings_history_creates_parent_dir_and_heals_unterminated_line() {
+        let dir = std::env::temp_dir().join("fg_record_history_nested_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("sub").join("hist.tsv");
+        // 親 dir が無くても追記できる(config 由来の record.dir が未作成のケース)
+        assert!(append_ratings_history(&path, "20260707", "ME", 3400.0).unwrap());
+        // 尻切れ行(改行なし)が残っていても新行が連結されない
+        std::fs::write(&path, "20260706\tME\t33").unwrap();
+        assert!(append_ratings_history(&path, "20260707", "ME", 3400.0).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "20260706\tME\t33\n20260707\tME\t3400\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

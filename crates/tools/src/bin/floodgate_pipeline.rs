@@ -212,7 +212,7 @@ fn run_fetch_ratings(url: Option<&str>, min_rating: u32, out: &str) -> Result<()
             fg::http_get_text(&client, u)?
         }
         None => {
-            let (u, html) = fg::fetch_latest_rating_page(&client)?;
+            let (u, _date, html) = fg::fetch_latest_rating_page(&client)?;
             eprintln!("Fetched latest rating page: {u}");
             html
         }

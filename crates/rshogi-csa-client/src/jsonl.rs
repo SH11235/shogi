@@ -64,7 +64,10 @@ fn jsonl_filename(record: &GameRecord) -> String {
     format!("{datetime}_{sente}_vs_{gote}.jsonl")
 }
 
-fn sanitize_for_filename(name: &str) -> String {
+/// ファイル名・JSONL `engine` ラベルの名前正規化。英数字と `-` `_` 以外を `_` に置換する
+/// (空文字は "unknown")。JSONL のラベルと外部由来の名前 (`server.id` 等) を突き合わせる
+/// consumer は、この関数を通して比較しないと `.` や `@` を含む id が一致しない。
+pub fn sanitize_for_filename(name: &str) -> String {
     if name.is_empty() {
         return "unknown".to_string();
     }
