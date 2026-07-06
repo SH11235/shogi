@@ -87,6 +87,9 @@ impl LiveJsonlWriter {
         write_meta(&mut writer, record, config, &path)?;
         let mut live = Self { writer, written: 0 };
         live.append_new_moves(record)?;
+        // 手が 0 の作成直後でも meta 行を読者から見えるようにする
+        // (append_new_moves は書くものが無いと flush しない)。
+        live.writer.flush().context("live JSONL flush に失敗")?;
         Ok(live)
     }
 
