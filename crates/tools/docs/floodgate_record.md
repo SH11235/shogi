@@ -41,14 +41,14 @@ floodgate_record --dir ~/floodgate/records/jsonl --fetch-ratings --ratings-cache
 |-----------|------|
 | `--config <TOML>` | `csa_client` と同一の設定ファイル。`record` 設定から集計 dir、`server.id` から `--me`、`record.dir` からキャッシュ/履歴の既定パスを導出する(対応する明示引数が優先)。省略時は環境変数 `CSA_CLIENT_CONFIG` を参照(空値は未設定扱い)。適用時は導出結果を stderr に 1 行表示する。TOML 内の相対パスは **config ファイルのあるディレクトリ基準**で解決(`csa_client` 実行時 cwd 基準とは異なるので運用 config は絶対パス推奨)。`csa_client` 側の CLI 上書き(`--record-dir` 等)は見えず TOML の値のみ使う。config の `record.enabled` / `record.save_jsonl` が無効で集計元を導出できない場合はエラー(`--dir` 明示で回避可) |
 | `--dir <PATH>` | 集計対象 JSONL のあるディレクトリ(再帰なし)。省略時は config から導出、それも無ければ `.` |
-| `--me <NAME>` | 集計対象エンジン名。省略時は config の `server.id`(JSONL の engine ラベルと同じ正規化を適用: 英数字と `-` `_` 以外は `_`)、それも無ければ全局に最も多く出現するエンジンを自動判定(別ハンドルのログが混在する dir では config / 明示指定が確実) |
+| `--me <NAME>` | 集計対象エンジン名。省略時は config の `server.id`、それも無ければ全局に最も多く出現するエンジンを自動判定(別ハンドルのログが混在する dir では config / 明示指定が確実) |
 | `--watch <NAMES>` | 注目相手(カンマ区切り・部分一致)。指定時のみ「注目相手との対戦」節を出力 |
 | `--fetch-ratings` | wdoor floodgate の現在レート表を取得し、自分/相手に ` (R<rate>)` を併記(要ネットワーク)。wdoor は per-game レートを出さないので**現在値**(対局時点ではない)。取得・解析は `tools::common::floodgate` を再利用。取得失敗時はレート併記だけ諦め、集計は続行 |
 | `--ratings-cache <FILE>` | `--fetch-ratings` 併用。fetch 成功時は `name<TAB>rate` を FILE へ書き出し、失敗時は FILE を読み戻してフォールバック併記する(一時障害でも直近値を維持)。config 指定時の既定は `<record.dir>/ratings_cache.tsv` |
 | `--ratings-max-age <SEC>` | `--fetch-ratings` 併用。キャッシュの mtime が SEC 秒以内なら**ネットワーク取得をスキップ**してキャッシュを直接使う。既定 0(常に取得)。レートページは日次生成なので数時間(例: `21600` = 6h)で十分。履歴併用時、履歴に当日(JST)分が無ければ鮮度内でも取得する(スキップで履歴の日付が抜けないように) |
 | `--ratings-history <FILE>` | `--fetch-ratings` 併用。fetch 成功時に自分(`--me`)の現在レートを `ページ日付<TAB>名前<TAB>レート` で FILE へ追記する(R 推移のローカル記録)。同一(日付, 名前)は再追記せず**その日最初の観測値**を保持。書き込みは tmp→rename の全置換(並行実行でも行が壊れない)。config 指定時の既定は `<record.dir>/ratings_history.tsv` |
 
-レート併記は**名前の完全一致**で引く(表に無い/名前不一致の相手は併記なし)。
+**名前の突き合わせはすべて正規化キー**(英数字と `-` `_` 以外を `_` に置換。JSONL のファイル名・meta ラベルと同じ規則)で行う。JSONL の `move.engine` / `result.winner` は raw の CSA 名、ファイル名は正規化済みという混在があるため、集計・`--me`・`--watch`・レート表・キャッシュのキーを入口で同一空間に揃えている。レート併記は正規化キーの**完全一致**で引く(表に無い相手は併記なし)。
 
 ## 出力
 

@@ -25,6 +25,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use reqwest::blocking::Client;
 use rshogi_csa_client::config::CsaClientConfig;
+use rshogi_csa_client::jsonl::sanitize_for_filename;
 use serde::Deserialize;
 use tools::common::floodgate as fg;
 
@@ -112,14 +113,13 @@ fn resolve_effective(cli: &Cli, config: Option<(&Path, &CsaClientConfig)>) -> Re
         (None, None) => PathBuf::from("."),
     };
 
-    // JSONL 内の engine ラベルは sanitize 済み(`.` や `@` は `_` になる)なので、
-    // server.id 由来の me も同じ正規化を通さないと全局が対象不参加になる。
-    let me = cli.me.clone().or_else(|| {
-        based
-            .map(|(_, _, c)| c.server.id.as_str())
-            .filter(|id| !id.is_empty())
-            .map(rshogi_csa_client::jsonl::sanitize_for_filename)
-    });
+    // 集計キーは sanitize 名に統一している(parse_game 参照)ので、CLI / server.id
+    // 由来の me も同じ正規化を通す(英数字と `-` `_` には no-op)。
+    let me = cli
+        .me
+        .as_deref()
+        .or_else(|| based.map(|(_, _, c)| c.server.id.as_str()).filter(|id| !id.is_empty()))
+        .map(sanitize_for_filename);
 
     // キャッシュ / 履歴の config 既定は --fetch-ratings 時のみ意味を持つ(clap の
     // `requires` と整合。fetch しないのに既定パスを作らない)。
@@ -208,6 +208,10 @@ fn parse_game(path: &std::path::Path) -> Result<Option<Game>> {
         match l.kind.as_str() {
             "move" => {
                 if let Some(eng) = l.engine {
+                    // JSONL の move.engine / result.winner は raw の CSA 名、ファイル名と
+                    // meta ラベルは sanitize 済みという混在なので、集計キーは入口で
+                    // sanitize に統一する(`.` 等を含む名前でも突き合わせが揃う)。
+                    let eng = sanitize_for_filename(&eng);
                     if l.ply == Some(1) {
                         sente_ply1 = Some(eng.clone());
                     }
@@ -224,7 +228,7 @@ fn parse_game(path: &std::path::Path) -> Result<Option<Game>> {
             }
             "result" => {
                 has_result = true;
-                winner = l.winner.filter(|w| !w.is_empty());
+                winner = l.winner.filter(|w| !w.is_empty()).map(|w| sanitize_for_filename(&w));
                 reason = l.reason.unwrap_or_default();
                 plies = l.plies.unwrap_or(0);
             }
@@ -287,12 +291,17 @@ fn median(xs: &mut [f64]) -> f64 {
 }
 
 /// wdoor floodgate の現在レート表を取得し (ページ日付 YYYYMMDD, name -> rating) を作る。
-/// 取得・解析は `tools::common::floodgate`(reqwest, in-repo)を再利用。
+/// 取得・解析は `tools::common::floodgate`(reqwest, in-repo)を再利用。キーは集計側と
+/// 同じ sanitize 名に正規化する(raw 表示名が `.` 等を含んでも引ける。衝突は後勝ち)。
 fn fetch_ratings_map() -> Result<(String, BTreeMap<String, f64>)> {
     let client = Client::builder().build().context("reqwest client 生成失敗")?;
     let (url, date, html) = fg::fetch_latest_rating_page(&client)?;
     eprintln!("レート取得: {url}");
-    Ok((date, fg::parse_rating_page(&html).into_iter().collect()))
+    let map = fg::parse_rating_page(&html)
+        .into_iter()
+        .map(|(name, rate)| (sanitize_for_filename(&name), rate))
+        .collect();
+    Ok((date, map))
 }
 
 /// キャッシュの mtime が `max_age_sec` 以内か。0 は常に false(= 常に fetch)。
@@ -428,6 +437,7 @@ fn write_ratings_cache(path: &Path, map: &BTreeMap<String, f64>) -> Result<()> {
 }
 
 /// キャッシュ(`name<TAB>rate`)を name -> rating に読み戻す。壊れた行・非有限値は捨てる。
+/// キーは書き出し時と同じ sanitize 名に正規化する(raw 名で書かれた古いキャッシュも引ける)。
 fn read_ratings_cache(path: &std::path::Path) -> Result<BTreeMap<String, f64>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     Ok(text
@@ -435,7 +445,7 @@ fn read_ratings_cache(path: &std::path::Path) -> Result<BTreeMap<String, f64>> {
         .filter_map(|line| line.split_once('\t'))
         .filter_map(|(n, r)| {
             let v = r.trim().parse::<f64>().ok().filter(|v| v.is_finite())?;
-            Some((n.trim().to_owned(), v))
+            Some((sanitize_for_filename(n.trim()), v))
         })
         .collect())
 }
@@ -507,6 +517,9 @@ fn main() -> Result<()> {
                 .context("対象エンジンを自動判定できない")?
         }
     };
+
+    // 注目相手パターンも sanitize 名の集計キーに部分一致させる(`.` 入りパターンでも当たる)。
+    let watch: Vec<String> = cli.watch.iter().map(|w| sanitize_for_filename(w)).collect();
 
     // レートは現在値(対局時点ではない)。取得失敗・空取得はレート併記だけ諦め、集計は続行する
     // (opt-in の補助機能のために primary output を落とさない)。
@@ -629,7 +642,7 @@ fn main() -> Result<()> {
         }
         any_gw = true;
         let opp = &g.sente;
-        let star = if cli.watch.iter().any(|w| opp.contains(w.as_str())) {
+        let star = if watch.iter().any(|w| opp.contains(w.as_str())) {
             "  ★上位AI"
         } else {
             ""
@@ -667,7 +680,7 @@ fn main() -> Result<()> {
         }
     }
 
-    if !cli.watch.is_empty() {
+    if !watch.is_empty() {
         println!("\n=== 注目相手との対戦 ===");
         for g in &games {
             if g.sente != me && g.gote != me {
@@ -675,7 +688,7 @@ fn main() -> Result<()> {
             }
             let is_sente = g.sente == me;
             let opp = if is_sente { &g.gote } else { &g.sente };
-            if !cli.watch.iter().any(|w| opp.contains(w.as_str())) {
+            if !watch.iter().any(|w| opp.contains(w.as_str())) {
                 continue;
             }
             let Some(res) = result_for(g, &me) else {
@@ -885,10 +898,41 @@ mod tests {
 
     #[test]
     fn resolve_effective_sanitizes_config_me_like_jsonl_labels() {
-        // JSONL の engine ラベルは sanitize 済みなので `.` を含む server.id は `_` で比較。
+        // 集計キーは sanitize 名に統一しているので `.` を含む server.id は `_` で比較。
         let cfg = config_from("[server]\nid = \"ramu.v2\"\n[record]\ndir = \"/d\"\n");
         let eff = resolve_effective(&cli_default(), Some((Path::new("/x/a.toml"), &cfg))).unwrap();
         assert_eq!(eff.me.as_deref(), Some("ramu_v2"));
+    }
+
+    #[test]
+    fn parse_game_sanitizes_raw_names() {
+        // move.engine / result.winner は raw の CSA 名で書かれるため、集計キーは
+        // sanitize 名に揃えて読み込む。
+        let path = std::env::temp_dir().join("fg_record_test_sanitize.jsonl");
+        let body = concat!(
+            r#"{"type":"move","ply":1,"engine":"ramu.v2"}"#,
+            "\n",
+            r#"{"type":"move","ply":2,"engine":"opp@x"}"#,
+            "\n",
+            r#"{"type":"result","outcome":"black_win","reason":"resign","plies":2,"winner":"ramu.v2"}"#,
+            "\n",
+        );
+        std::fs::write(&path, body).unwrap();
+        let g = parse_game(&path).unwrap().expect("完了局");
+        assert_eq!(g.sente, "ramu_v2");
+        assert_eq!(g.gote, "opp_x");
+        assert!(matches!(result_for(&g, "ramu_v2"), Some(Res::Win)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ratings_cache_normalizes_names() {
+        // raw 名で書かれた古いキャッシュも sanitize キーで引ける。
+        let path = std::env::temp_dir().join("fg_record_cache_sanitize.tsv");
+        std::fs::write(&path, "ramu.v2\t3400\n").unwrap();
+        let m = read_ratings_cache(&path).unwrap();
+        assert_eq!(m.get("ramu_v2"), Some(&3400.0));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
