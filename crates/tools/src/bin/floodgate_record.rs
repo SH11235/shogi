@@ -149,11 +149,19 @@ fn parse_game(path: &std::path::Path) -> Result<Option<Game>> {
     }))
 }
 
-fn result_for(g: &Game, me: &str) -> Res {
+/// me から見た結果。`None` は集計対象外(中断/検閲/error など未完了局)。
+///
+/// winner なしの局は reason で判別する: `sennichite` / `max_moves` / `jishogi` は正当な
+/// 引き分け、それ以外(csa_client が中断・検閲を `outcome="draw"` + `reason="interrupted"`
+/// で書く等)は勝率を歪めないよう除外する。
+fn result_for(g: &Game, me: &str) -> Option<Res> {
     match &g.winner {
-        Some(w) if w == me => Res::Win,
-        Some(_) => Res::Loss,
-        None => Res::Draw,
+        Some(w) if w == me => Some(Res::Win),
+        Some(_) => Some(Res::Loss),
+        None => match g.reason.as_str() {
+            "sennichite" | "max_moves" | "jishogi" => Some(Res::Draw),
+            _ => None,
+        },
     }
 }
 
@@ -215,11 +223,20 @@ fn main() -> Result<()> {
     // 相手別 (W, L, D)
     let mut by_opp: BTreeMap<String, [usize; 3]> = BTreeMap::new();
     let mut my_nps: Vec<f64> = Vec::new();
+    let mut skipped_foreign = 0usize; // me が参加していない局
+    let mut skipped_incomplete = 0usize; // 中断/検閲/error など未完了局
 
     for g in &games {
+        if g.sente != me && g.gote != me {
+            skipped_foreign += 1;
+            continue;
+        }
+        let Some(res) = result_for(g, &me) else {
+            skipped_incomplete += 1;
+            continue;
+        };
         let is_sente = g.sente == me;
         let opp = if is_sente { &g.gote } else { &g.sente };
-        let res = result_for(g, &me);
         let idx = match res {
             Res::Win => 0,
             Res::Loss => 1,
@@ -237,7 +254,8 @@ fn main() -> Result<()> {
         }
     }
 
-    let n = games.len();
+    let total = games.len();
+    let n = w + l + d;
     let pct = |num: usize, den: usize| {
         if den == 0 {
             0.0
@@ -245,7 +263,12 @@ fn main() -> Result<()> {
             num as f64 / den as f64 * 100.0
         }
     };
-    println!("集計対象: {me}   ソース: {n} 局");
+    println!("集計対象: {me}   JSONL {total} 局 → 集計 {n} 局");
+    if skipped_foreign > 0 || skipped_incomplete > 0 {
+        println!(
+            "  (除外: 対象不参加 {skipped_foreign} 局 / 中断・未完了 {skipped_incomplete} 局)"
+        );
+    }
     println!(
         "=== 通算: {w}勝 {l}敗 {d}分  ({n}局)  勝率 {:.0}% (引分除 {:.0}%) ===",
         pct(w, n),
@@ -272,10 +295,13 @@ fn main() -> Result<()> {
     println!("\n=== 非勝(負け/引分) ===");
     let mut any = false;
     for g in &games {
-        let res = result_for(g, &me);
-        if res == Res::Win {
+        if g.sente != me && g.gote != me {
             continue;
         }
+        let res = match result_for(g, &me) {
+            Some(r) if r != Res::Win => r,
+            _ => continue, // 勝ち・中断は非勝一覧に載せない
+        };
         any = true;
         let is_sente = g.sente == me;
         let opp = if is_sente { &g.gote } else { &g.sente };
@@ -290,13 +316,19 @@ fn main() -> Result<()> {
     if !cli.watch.is_empty() {
         println!("\n=== 注目相手との対戦 ===");
         for g in &games {
+            if g.sente != me && g.gote != me {
+                continue;
+            }
             let is_sente = g.sente == me;
             let opp = if is_sente { &g.gote } else { &g.sente };
             if !cli.watch.iter().any(|w| opp.contains(w.as_str())) {
                 continue;
             }
+            let Some(res) = result_for(g, &me) else {
+                continue;
+            };
             let col = if is_sente { "先" } else { "後" };
-            let mark = match result_for(g, &me) {
+            let mark = match res {
                 Res::Win => "○",
                 Res::Loss => "●",
                 Res::Draw => "△",
@@ -312,25 +344,28 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn game(sente: &str, gote: &str, winner: Option<&str>) -> Game {
+    fn game(sente: &str, gote: &str, winner: Option<&str>, reason: &str) -> Game {
         Game {
             stem: "t".to_owned(),
             sente: sente.to_owned(),
             gote: gote.to_owned(),
             winner: winner.map(str::to_owned),
-            reason: "win".to_owned(),
+            reason: reason.to_owned(),
             plies: 100,
             nps: BTreeMap::new(),
         }
     }
 
     #[test]
-    fn result_for_win_loss_draw() {
+    fn result_classification() {
         let me = "ME";
-        assert!(matches!(result_for(&game("ME", "X", Some("ME")), me), Res::Win));
-        assert!(matches!(result_for(&game("X", "ME", Some("X")), me), Res::Loss));
-        // winner なし(引き分け)
-        assert!(matches!(result_for(&game("X", "ME", None), me), Res::Draw));
+        assert!(matches!(result_for(&game("ME", "X", Some("ME"), "win"), me), Some(Res::Win)));
+        assert!(matches!(result_for(&game("X", "ME", Some("X"), "resign"), me), Some(Res::Loss)));
+        // winner なし + 正当な引き分け reason → Draw
+        assert!(matches!(result_for(&game("X", "ME", None, "sennichite"), me), Some(Res::Draw)));
+        assert!(matches!(result_for(&game("X", "ME", None, "max_moves"), me), Some(Res::Draw)));
+        // winner なし + 中断系 reason → 集計対象外(None)
+        assert!(result_for(&game("X", "ME", None, "interrupted"), me).is_none());
     }
 
     #[test]
