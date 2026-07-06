@@ -190,6 +190,21 @@ pub fn players_from_path(rel: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// レート表 TSV(`name<TAB>rate`)を読み込む。壊れた行・非有限値は捨てる。
+/// `floodgate_record --ratings-cache` の書き出しと同形式。名前は raw のまま返す
+/// (正規化キーへの変換は用途側で行う)。
+pub fn read_ratings_tsv(path: &Path) -> Result<Vec<(String, f64)>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(text
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter_map(|(n, r)| {
+            let v = r.trim().parse::<f64>().ok().filter(|v| v.is_finite())?;
+            Some((n.trim().to_owned(), v))
+        })
+        .collect())
+}
+
 /// プレイヤーファイルを読み込みパターンリストとして返す。
 /// 形式: 1行1名、または TSV (`name\trating`) の場合は最初のフィールドを名前として使用。
 /// 部分一致フィルタ用（[`player_matches`] と組み合わせて使う）。

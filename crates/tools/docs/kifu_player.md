@@ -38,8 +38,10 @@ cargo run -p tools --release --features kifu-player --bin kifu_player -- \
   --tournament-dir runs/selfplay/<out-dir>
 ```
 
-out-dir 配下の `*-vs-*.jsonl`（`tournament` が出力するペアファイル）を横断して 1 つの
+out-dir 配下の `*-vs-*.jsonl`（`tournament` が出力するペアファイル）と
+`*_vs_*.jsonl`（`csa_client` の per-game 記録。スキーマは共通）を横断して 1 つの
 対局リストにまとめる。対局データを含まない付随ファイルは自動的に除外する。
+`csa_client` の JSONL dir（`[record].dir/jsonl/`）をそのまま渡せる。
 
 ### CSA を開く
 
@@ -62,6 +64,29 @@ cargo run -p tools --release --features kifu-player --bin kifu_player -- \
 - **評価値**は棋譜に埋め込まれたエンジンのコメントから読み取る。コメントの無い手・対局は
   評価値なし（グラフに打点しない）。片方のエンジンしか評価値を書いていない対局では、
   その側の手だけが打点される。
+
+### live モード（`--live [SECS]`）
+
+```bash
+# floodgate 連続対局の記録 dir を開いたまま、新しい完了局を自動で一覧に追加する
+cargo run -p tools --release --features kifu-player --bin kifu_player -- \
+  --csa ~/floodgate/records --live 5 --ratings ~/floodgate/records/ratings_cache.tsv
+```
+
+`--live [SECS]`（値省略時 5 秒）を付けると、SECS 秒ごとに入力の (パス, サイズ, mtime) の
+フィンガープリントを確認し、変化があったときだけ索引を取り直して一覧を更新する
+（変化が無い間はファイル内容を読まない）。csa_client は終局時に棋譜を一括書き出しするため、
+追加されるのは**完了局**（準リアルタイム。進行中の局の手は追えない）。選択中の対局と表示中の
+手は再読込をまたいで維持される。対局が 1 局も無い記録 dir を開いて待つこともできる。
+`--tournament-dir` でも使えるが、変化のたびに全ファイルを読み直すため巨大な out-dir では
+間隔を長めにする。`--psv` では使えない。一覧タイトルに `[live]` を表示する。
+
+### レート併記（`--ratings <TSV>`）
+
+`name<TAB>rate` の TSV（`floodgate_record --ratings-cache` の出力）を渡すと、対局一覧の
+各行に ` R3706/3512`（先手/後手、片方不明は `-`）を併記し、`rate:>N` フィルタが使える。
+ネットワークは使わない（レートの取得・更新は `floodgate_record --fetch-ratings` 側で行う）。
+名前の突き合わせは floodgate_record と同じ正規化キー（英数字と `-` `_` 以外を `_` に置換）。
 
 ## 画面構成
 
@@ -102,6 +127,8 @@ cargo run -p tools --release --features kifu-player --bin kifu_player -- \
 | `winner:sente\|gote` | 勝者側（`black`/`white` も可） | 完全一致 |
 | `len:>N` / `len:<N` / `len:N` | 手数 | 比較 |
 | `swing:>N` / `swing:<N` / `swing:N` | 評価値の振れ幅（cp） | 比較 |
+| `rate:>N` / `rate:<N` / `rate:N` | 対局の代表レート（両対局者の高い方。`--ratings` 供給時のみ） | 比較 |
+| `date:YYYYMMDD` | ファイル名由来の対局日時（`date:202607` 等の部分指定も可） | 前方一致 |
 | `reversal` | 両者が 300cp 以上優勢になった局面がある（形勢逆転） | 述語 |
 | `decisive` | 勝敗が付いた（引き分け・エラー・不明でない） | 述語 |
 | `sfen:<SFEN>` | 局面本体（各手の着手前局面） | 完全一致（手数フィールドを除く、`Enter` で逐次スキャン） |
@@ -142,10 +169,15 @@ prefix を付けずに**数字のみ**を入力すると、数値フィールド
 保つ安定ソート）。評価値による並べ替えは降順で、評価値の無い対局は末尾へ寄せる。
 
 1. 発見順（デフォルト）
-2. 勝敗別（エラー→先手勝ち→後手勝ち→引き分け→不明）
-3. 対局長（手数の降順）
-4. 決着の大きさ（最終評価値の絶対値の降順）
-5. 評価値の振れ幅（降順）
+2. 日付(新)（ファイル名由来の対局日時の降順。日時の無い対局は末尾）
+3. 勝敗別（エラー→先手勝ち→後手勝ち→引き分け→不明）
+4. 対局長（手数の降順）
+5. 決着の大きさ（最終評価値の絶対値の降順）
+6. 評価値の振れ幅（降順）
+
+日時はファイル名から抽出する（csa_client 記録の `YYYYMMDD_HHMMSS_` prefix、wdoor floodgate の
+末尾 14 桁タイムスタンプに対応）。tournament ペアファイルのように日時を持たないファイルの
+対局は「日付(新)」では末尾に寄り、`date:` フィルタにヒットしない。
 
 ## 評価値急変ジャンプ（`n` / `N`）
 
@@ -169,7 +201,8 @@ prefix を付けずに**数字のみ**を入力すると、数値フィールド
 
 ## スコープ外
 
-- 実行中の tournament のライブ追従（オフライン解析専用）
+- 進行中対局の手単位のライブ追従（`--live` が拾うのは完了局のみ。手単位の追従は
+  csa_client 側のイベント出力が必要で未対応）
 - セッションをまたいだ「最後に見ていた対局」の記憶
 - 棋譜ファイルへの書き込み・KIF/CSA へのエクスポート（`jsonl_to_kif` 等の既存ツールで代替）
 - 評価値グラフの Y 軸の自動スケール（現状は固定範囲）

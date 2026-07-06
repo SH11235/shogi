@@ -23,7 +23,8 @@ use crate::kif::format_move_label;
 
 use super::model::{
     EvalAccumulator, GameIndex, GameIndexEntry, GameOutcomeView, GameRecord, GameSource,
-    GameSourceRef, MoveAnnotation, MoveView, PairFileMeta, move_is_legal,
+    GameSourceRef, MoveAnnotation, MoveView, PairFileMeta, date_key_from_filename,
+    fingerprint_paths, move_is_legal,
 };
 
 /// CSA 棋譜（rshogi csa_client 出力形式）の `GameSource` 実装。
@@ -121,10 +122,13 @@ impl GameSource for CsaSource {
                 startpos_idx: None,
                 metrics: acc.finish(),
             });
+            let date_key =
+                path.file_name().and_then(|n| n.to_str()).and_then(date_key_from_filename);
             pair_files.push(PairFileMeta {
                 path: path.clone(),
                 black_label: info.black_name.unwrap_or_else(|| "先手".to_string()),
                 white_label: info.white_name.unwrap_or_else(|| "後手".to_string()),
+                date_key,
             });
         }
 
@@ -133,6 +137,10 @@ impl GameSource for CsaSource {
             pair_files,
             warnings,
         })
+    }
+
+    fn live_fingerprint(&self) -> Result<Option<u64>> {
+        Ok(Some(fingerprint_paths(&self.collect_paths()?)))
     }
 
     fn load_game(&self, index: &GameIndex, entry: &GameIndexEntry) -> Result<GameRecord> {
