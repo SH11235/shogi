@@ -2,7 +2,7 @@
 
 Floodgate（`wdoor.c.u-tokyo.ac.jp`）の公開棋譜を取得し、NNUE 学習向けに
 CSA → SFEN へ変換するパイプライン。サブコマンドは `fetch-ratings` /
-`fetch-index` / `download` / `extract` の 4 つ。
+`fetch-index` / `download` / `live-mirror` / `extract` の 5 つ。
 
 通信は `reqwest`（rustls）で行う。Floodgate は http アクセスを https へ 301
 誘導するため、既定 root は https を直接指す（`--root` に http を渡しても
@@ -51,6 +51,38 @@ cargo run -p tools --bin floodgate_pipeline -- download \
 - `--date-from` / `--date-to <YYYY-MM-DD>`: 日付フィルタ。
 - `--player-file <PATH>`: いずれかの対局者が含まれる対局のみ取得（`fetch-ratings` の出力を渡す）。
 - `--concurrency <N>`: 並列数（既定 8、`0` で CPU コア数）。
+
+### `live-mirror`
+
+当日 (JST) の対局 CSA をローカル dir へミラーし続ける。`kifu_player --csa <dir> --live`
+と組み合わせて、wdoor floodgate のほぼリアルタイム観戦に使う。
+
+```bash
+cargo run -p tools --bin floodgate_pipeline -- live-mirror \
+  --out-dir /tmp/wdoor-live --watch RAMU_TF,Suisho --interval 10
+```
+
+- `--out-dir <DIR>`: ミラー先（ファイル名は wdoor のまま。`kifu_player` の日付ソート・
+  `date:` フィルタが末尾 14 桁タイムスタンプを認識する）。
+- `--interval <SECS>`: 進行中対局の再取得間隔（既定 10 秒）。対局一覧（日次 autoindex）
+  の確認は約 60 秒ごと（`--interval` がそれより長い場合はそのパス頻度。ペアリングは
+  毎時 :00/:30 のため秒単位で追う意味は薄い）。
+- `--watch <NAMES>`: 対局者名の部分一致フィルタ（カンマ区切り）。未指定は当日の全対局。
+- `--once`: 1 パスだけ実行して終了（動作確認用）。
+
+挙動:
+
+- wdoor の CSA は対局開始時に作られ**進行中も逐次追記**されるため、間隔ごとに毎回取得する
+  （`Last-Modified` は秒精度で同秒追記を 304 に取り逃がすため条件付き GET は使わない。
+  本文は数十 KB で転送コストは小さい）。追記のみで単調増加する性質から、同サイズなら
+  ローカルへの書き込みを省く。
+- **終局（`'$END_TIME:` コメント）を検出したファイルは以後取得しない**。過去の実行で
+  ミラー済みの完全な棋譜も再取得しない。約 1 時間変化の無い進行中ファイルは中断対局と
+  みなし追跡を止める（部分棋譜は「勝敗不明」として残る）。
+- 書き込みは tmp→rename の全置換なので、`kifu_player --live` 側は常に完全な内容だけを読む。
+- 取得は逐次 (1 リクエスト 30 秒タイムアウト)。`--watch` 無しで進行中対局が非常に多い日は
+  1 パスが `--interval` を超えることがある (その場合は間隔を長めに、または `--watch` で絞る)。
+- 停止は Ctrl-C。
 
 ### `extract`
 

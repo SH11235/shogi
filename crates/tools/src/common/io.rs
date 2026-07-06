@@ -77,3 +77,20 @@ pub fn open_writer<P: AsRef<Path>>(path: P) -> io::Result<Writer> {
     let f = File::create(p)?;
     Ok(Writer::Plain(BufWriter::new(f)))
 }
+
+/// 同一 dir の一時ファイルに書いてから rename で置き換える(部分書き込みで既存
+/// ファイルを壊さず、読者は常に完全な内容だけを見る)。親ディレクトリが無ければ作る。
+pub fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temp file in {}", parent.display()))?;
+    tmp.write_all(content.as_bytes())
+        .with_context(|| format!("write temp file for {}", path.display()))?;
+    tmp.persist(path).with_context(|| format!("rename to {}", path.display()))?;
+    Ok(())
+}

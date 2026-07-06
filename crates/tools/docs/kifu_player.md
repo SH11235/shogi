@@ -84,6 +84,25 @@ SFEN 局面検索とは併用に制約がある: スキャン走査中は再読�
 `sfen:` の絞り込み結果は新しい索引へ引き継げないためクリアされて全件表示に戻る
 （ステータスの件数表示で分かる）。
 
+再読込で**選択中の対局が伸びていた場合**（進行中対局の逐次追記）は読み直し、末尾の手を
+表示していたなら新しい末尾へ自動追従する（途中の手を見ていたならその位置を維持）。
+
+#### wdoor floodgate のリアルタイム観戦
+
+`floodgate_pipeline live-mirror` と組み合わせると、wdoor の進行中対局を手単位で追える
+（[詳細](floodgate_pipeline.md)）:
+
+```bash
+# 端末 1: 当日の対局をローカルへミラーし続ける (終局したら fetch を止める)
+floodgate_pipeline live-mirror --out-dir /tmp/wdoor-live --interval 10
+
+# 端末 2: ミラー dir を live で開く (自エンジン以外の対局も観戦できる)
+kifu_player --csa /tmp/wdoor-live --live 5 --ratings ~/floodgate/records/ratings_cache.tsv
+```
+
+TUI 自体はネットワークに触れない（ミラー dir を読むだけ）ので、オフライン解析の
+`--csa <dir>` 単体利用と完全に同じコードパスで動く。
+
 ### レート併記（`--ratings <TSV>`）
 
 `name<TAB>rate` の TSV（`floodgate_record --ratings-cache` の出力）を渡すと、対局一覧の

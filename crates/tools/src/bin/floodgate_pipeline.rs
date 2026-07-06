@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tools::common::dedup::DedupSet;
 use tools::common::floodgate as fg;
-use tools::common::io::open_writer;
+use tools::common::io::{open_writer, write_atomic};
 use tools::common::sfen_ops::{canonicalize_4t_with_mirror, mirror_horizontal};
 
 #[derive(Parser)]
@@ -90,6 +90,28 @@ enum Cmd {
         /// 並列ダウンロード数（0 = CPU コア数に自動設定）
         #[arg(long, default_value_t = 8)]
         concurrency: usize,
+    },
+    /// 当日 (JST) の対局 CSA をローカル dir へミラーし続ける。進行中の対局は逐次
+    /// 追記されるため間隔ごとに再取得し、終局 (`'$END_TIME:`) を検出したら以後取得
+    /// しない。`kifu_player --csa <dir> --live` と組で wdoor のほぼリアルタイム観戦に
+    /// 使う。停止は Ctrl-C (書き込みは tmp→rename で常に完全な内容)。
+    LiveMirror {
+        /// ミラー先ディレクトリ (ファイル名は wdoor のまま)
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// 進行中対局の再取得間隔 (秒)。対局一覧 (日次 index) の確認は約 60 秒ごと
+        /// (interval がそれより長い場合はそのパス頻度)
+        #[arg(long, default_value_t = 10)]
+        interval: u64,
+        /// 対局者名の部分一致フィルタ (カンマ区切り)。未指定は当日の全対局をミラー
+        #[arg(long, value_delimiter = ',')]
+        watch: Vec<String>,
+        /// Root URL（既定は HTTPS）
+        #[arg(long, default_value = fg::DEFAULT_ROOT)]
+        root: String,
+        /// 1 パスだけ実行して終了 (動作確認用)
+        #[arg(long)]
+        once: bool,
     },
     /// ローカルのCSAファイルからSFENを抽出
     Extract {
@@ -177,6 +199,13 @@ fn main() -> Result<()> {
             player_file.as_deref(),
             concurrency,
         ),
+        Cmd::LiveMirror {
+            out_dir,
+            interval,
+            watch,
+            root,
+            once,
+        } => run_live_mirror(&out_dir, interval, &watch, &root, once),
         Cmd::Extract {
             root,
             out,
@@ -202,6 +231,162 @@ fn main() -> Result<()> {
             run_extract(&root, &out, &opts)
         }
     }
+}
+
+/// live-mirror が追跡する 1 リモートファイルぶんの状態。
+struct MirrorState {
+    url: String,
+    local: PathBuf,
+    /// 直近取得の本文サイズ。CSA は追記のみで単調増加するため「同サイズ = 変化なし」。
+    size: u64,
+    /// 終局検出済み(または放棄)。以後は取得しない。
+    finished: bool,
+    /// 内容が変わらなかった連続パス数。閾値超過で放棄する(回線断等で中断された
+    /// 対局を永遠にポーリングしない)。
+    unchanged_polls: u32,
+}
+
+/// 対局一覧 (日次 autoindex) の確認間隔。ペアリングは毎時 :00/:30 なので秒単位で追う
+/// 意味が薄く、wdoor への負荷を抑えるため進行中ファイルの再取得とは別に長めへ固定する。
+const INDEX_POLL_SECS: u64 = 60;
+
+fn run_live_mirror(
+    out_dir: &Path,
+    interval: u64,
+    watch: &[String],
+    root: &str,
+    once: bool,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    anyhow::ensure!(interval >= 1, "--interval は 1 秒以上を指定してください");
+    fs::create_dir_all(out_dir).with_context(|| format!("create dir {}", out_dir.display()))?;
+    // 無人常駐が前提なので、応答しないピアで単一スレッドのループ全体が
+    // 止まらないようリクエストにタイムアウトを付ける。
+    let client = Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
+    // 変化なしがこのパス数続いた進行中ファイルは放棄する(interval=10s で約 1 時間)。
+    let stale_limit: u32 = (3600 / interval).max(10) as u32;
+
+    let mut states: std::collections::HashMap<String, MirrorState> =
+        std::collections::HashMap::new();
+    let mut last_index_poll: Option<Instant> = None;
+    loop {
+        // 1) 日次 index から対局を発見(INDEX_POLL_SECS ごと)。
+        if last_index_poll.is_none_or(|t| t.elapsed().as_secs() >= INDEX_POLL_SECS) {
+            last_index_poll = Some(Instant::now());
+            let day_url_and_html = fg::day_dir_url(root, fg::jst_today())
+                .and_then(|u| fg::http_get_text(&client, &u).map(|h| (u, h)));
+            match day_url_and_html {
+                Ok((day_url, html)) => {
+                    let mut added = 0usize;
+                    for name in fg::parse_autoindex_csa_names(&html) {
+                        if !watch.is_empty() && !watch.iter().any(|w| name.contains(w.as_str())) {
+                            continue;
+                        }
+                        if states.contains_key(&name) {
+                            continue;
+                        }
+                        // 過去の実行で完全な棋譜をミラー済みなら取得しない。
+                        let local = out_dir.join(&name);
+                        let finished = fs::read_to_string(&local)
+                            .map(|t| fg::csa_is_finished(&t))
+                            .unwrap_or(false);
+                        states.insert(
+                            name.clone(),
+                            MirrorState {
+                                url: format!("{day_url}{name}"),
+                                local,
+                                size: 0,
+                                finished,
+                                unchanged_polls: 0,
+                            },
+                        );
+                        added += 1;
+                    }
+                    if added > 0 {
+                        eprintln!("live-mirror: 対局発見 +{added} (追跡 {} 局)", states.len());
+                    }
+                    // 終局済みで前日以前の対局は追跡から外す(常駐時のメモリじわ増防止)。
+                    // 当日 index には現れないので再発見されず、仮に再発見されても
+                    // ローカルの完全棋譜チェックが再取得を防ぐ。
+                    let today = fg::jst_today().format("%Y%m%d").to_string();
+                    states.retain(|name, st| {
+                        !(st.finished && csa_name_date(name).is_some_and(|d| d < today.as_str()))
+                    });
+                }
+                Err(e) => eprintln!("⚠ 対局一覧の取得失敗(次回再試行): {e:#}"),
+            }
+        }
+
+        // 2) 進行中ファイルの再取得。
+        let mut updated = 0usize;
+        let mut in_progress = 0usize;
+        for st in states.values_mut().filter(|s| !s.finished) {
+            match mirror_one(&client, st) {
+                Ok(true) => {
+                    updated += 1;
+                    if st.finished {
+                        eprintln!("live-mirror: 終局 {}", st.local.display());
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // 恒久的な失敗 (404 等) も放棄カウントに含める。一時的な障害は
+                    // 閾値まで至らず、回復すれば成功時にリセットされる。
+                    st.unchanged_polls += 1;
+                    eprintln!("⚠ 取得失敗(次回再試行) {}: {e:#}", st.url);
+                }
+            }
+            if !st.finished {
+                if st.unchanged_polls > stale_limit {
+                    // 追跡だけ止める(ローカルの部分棋譜は勝敗不明として残る)。
+                    st.finished = true;
+                    eprintln!(
+                        "⚠ {} は {stale_limit} パス変化なし(または取得失敗)。中断対局とみなし追跡を止める",
+                        st.local.display()
+                    );
+                } else {
+                    in_progress += 1;
+                }
+            }
+        }
+        if updated > 0 {
+            eprintln!(
+                "live-mirror: 更新 {updated} 局 (進行中 {in_progress} / 追跡 {} 局)",
+                states.len()
+            );
+        }
+        if once {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(interval));
+    }
+    Ok(())
+}
+
+/// wdoor ファイル名 (`...+YYYYMMDDHHMMSS.csa`) から日付部 (`YYYYMMDD`) を取り出す。
+fn csa_name_date(name: &str) -> Option<&str> {
+    let stem = name.strip_suffix(".csa")?;
+    let tail = stem.rsplit('+').next()?;
+    (tail.len() == 14 && tail.bytes().all(|b| b.is_ascii_digit())).then(|| &tail[..8])
+}
+
+/// 1 ファイルを取得してローカルへ反映する。書いたら `Ok(true)`。
+/// 条件付き GET (`If-Modified-Since`) は使わない: `Last-Modified` は秒精度で、
+/// 前回取得と同じ秒内の追記(最終手や `'$END_TIME:` を含みうる)が 304 に化けて
+/// 恒久的に取り逃がされるため。CSA 本文は数十 KB なので毎回取得し、追記のみで
+/// 単調増加する性質から「同サイズ = 変化なし」で書き込みだけを省く。
+fn mirror_one(client: &Client, st: &mut MirrorState) -> Result<bool> {
+    let body = fg::http_get_text(client, &st.url)?;
+    if body.len() as u64 == st.size {
+        st.unchanged_polls += 1;
+        return Ok(false);
+    }
+    write_atomic(&st.local, &body)?;
+    st.size = body.len() as u64;
+    st.finished = fg::csa_is_finished(&body);
+    st.unchanged_polls = 0;
+    Ok(true)
 }
 
 fn run_fetch_ratings(url: Option<&str>, min_rating: u32, out: &str) -> Result<()> {
@@ -590,4 +775,19 @@ fn in_ply_range(ply: u32, min_ply: u32, max_ply: u32) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csa_name_date_extracts_wdoor_date() {
+        assert_eq!(
+            csa_name_date("wdoor+floodgate-300-10F+A+B+20260707013003.csa"),
+            Some("20260707")
+        );
+        assert_eq!(csa_name_date("wdoor+floodgate-300-10F+A+B+2026070701.csa"), None);
+        assert_eq!(csa_name_date("no_date.csa"), None);
+    }
 }
