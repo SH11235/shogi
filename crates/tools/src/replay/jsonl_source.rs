@@ -20,7 +20,8 @@ use crate::selfplay::EvalLog;
 
 use super::model::{
     EvalAccumulator, GameIndex, GameIndexEntry, GameOutcomeView, GameRecord, GameSource,
-    GameSourceRef, MoveAnnotation, MoveView, PairFileMeta,
+    GameSourceRef, MoveAnnotation, MoveView, PairFileMeta, date_key_from_filename,
+    fingerprint_paths,
 };
 
 pub struct JsonlSource {
@@ -33,10 +34,8 @@ impl JsonlSource {
             out_dir: out_dir.into(),
         }
     }
-}
 
-impl GameSource for JsonlSource {
-    fn build_index(&self) -> Result<GameIndex> {
+    fn collect_paths(&self) -> Result<Vec<PathBuf>> {
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&self.out_dir)
             .with_context(|| format!("failed to read directory {}", self.out_dir.display()))?
             .filter_map(|e| e.ok())
@@ -45,6 +44,13 @@ impl GameSource for JsonlSource {
             .collect();
         // file_idx を実行のたびに安定させるため、列挙順をファイル名でソートする。
         paths.sort();
+        Ok(paths)
+    }
+}
+
+impl GameSource for JsonlSource {
+    fn build_index(&self) -> Result<GameIndex> {
+        let paths = self.collect_paths()?;
 
         let mut entries = Vec::new();
         let mut pair_files = Vec::new();
@@ -64,6 +70,10 @@ impl GameSource for JsonlSource {
             pair_files,
             warnings,
         })
+    }
+
+    fn live_fingerprint(&self) -> Result<Option<u64>> {
+        Ok(Some(fingerprint_paths(&self.collect_paths()?)))
     }
 
     fn load_game(&self, index: &GameIndex, entry: &GameIndexEntry) -> Result<GameRecord> {
@@ -122,10 +132,13 @@ impl GameSource for JsonlSource {
     }
 }
 
+/// tournament のペアファイル(`{A}-vs-{B}.jsonl`)と csa_client の per-game 記録
+/// (`{datetime}_{sente}_vs_{gote}.jsonl`)の両方を対局ファイルとして扱う
+/// (スキーマは共通で、meta 行の検証は `index_one_file` が行う)。
 fn is_pair_jsonl_name(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(".jsonl") && n.contains("-vs-"))
+        .is_some_and(|n| n.ends_with(".jsonl") && (n.contains("-vs-") || n.contains("_vs_")))
 }
 
 #[derive(Deserialize)]
@@ -301,6 +314,7 @@ fn index_one_file(
         path: path.to_path_buf(),
         black_label: meta_line.engine_cmd.label_black,
         white_label: meta_line.engine_cmd.label_white,
+        date_key: path.file_name().and_then(|n| n.to_str()).and_then(date_key_from_filename),
     }))
 }
 
@@ -493,6 +507,19 @@ mod tests {
         let index = JsonlSource::new(dir.path()).build_index().expect("build_index");
         assert_eq!(index.pair_files.len(), 1);
         assert_eq!(index.pair_files[0].black_label, "a");
+    }
+
+    #[test]
+    fn accepts_csa_client_per_game_jsonl_names() {
+        // csa_client の per-game 記録(`_vs_`)も tournament ペアファイルと同じスキーマで
+        // 索引でき、ファイル名から日時キーが取れる。
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(dir.path(), "20260707_010203_A_vs_B.jsonl", &[meta_line("A", "B")]);
+
+        let index = JsonlSource::new(dir.path()).build_index().expect("build_index");
+        assert_eq!(index.pair_files.len(), 1);
+        assert_eq!(index.pair_files[0].black_label, "A");
+        assert_eq!(index.pair_files[0].date_key, Some(20260707010203));
     }
 
     #[test]

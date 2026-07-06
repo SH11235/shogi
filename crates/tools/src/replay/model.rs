@@ -132,6 +132,54 @@ pub struct PairFileMeta {
     pub path: PathBuf,
     pub black_label: String,
     pub white_label: String,
+    /// ファイル名から抽出した対局日時キー（`YYYYMMDDHHMMSS` の数値）。日付ソート・
+    /// `date:` フィルタ用。ファイル名に日時が無い出典（tournament ペアファイル等)は `None`。
+    pub date_key: Option<u64>,
+}
+
+/// ファイル名から対局日時キー（`YYYYMMDDHHMMSS`）を抽出する。対応する形式:
+/// - csa_client 記録: `20260707_010203_A_vs_B.(csa|jsonl)`（先頭 `YYYYMMDD_HHMMSS`）
+/// - wdoor floodgate: `wdoor+floodgate-300-10F+A+B+20260707010203.csa`（末尾 14 桁）
+pub fn date_key_from_filename(name: &str) -> Option<u64> {
+    let stem = name
+        .strip_suffix(".csa")
+        .or_else(|| name.strip_suffix(".jsonl"))
+        .unwrap_or(name);
+    // 先頭 `YYYYMMDD_HHMMSS`
+    let head: &str = stem.get(..15).unwrap_or(stem);
+    if head.len() == 15
+        && head.as_bytes()[8] == b'_'
+        && head[..8].bytes().all(|b| b.is_ascii_digit())
+        && head[9..].bytes().all(|b| b.is_ascii_digit())
+    {
+        return format!("{}{}", &head[..8], &head[9..]).parse().ok();
+    }
+    // 末尾 14 桁（wdoor の `+YYYYMMDDHHMMSS`）
+    let tail = stem.rsplit('+').next().unwrap_or("");
+    if tail.len() == 14 && tail.bytes().all(|b| b.is_ascii_digit()) {
+        return tail.parse().ok();
+    }
+    None
+}
+
+/// live 再読込判定用に、ファイル集合の (パス, サイズ, mtime) をハッシュする。
+/// 中身は読まない(stat のみ)。stat に失敗したファイルはパスのみで算入する
+/// (書き込み途中の削除等でも fingerprint は変わり、再読込は発火する)。
+pub fn fingerprint_paths(paths: &[PathBuf]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for path in paths {
+        path.hash(&mut h);
+        if let Ok(md) = std::fs::metadata(path) {
+            md.len().hash(&mut h);
+            if let Ok(mtime) = md.modified()
+                && let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH)
+            {
+                (d.as_secs(), d.subsec_nanos()).hash(&mut h);
+            }
+        }
+    }
+    h.finish()
 }
 
 /// 索引全体。`entries` は出典を問わず1つの横断リストとしてフラット化されている。
@@ -199,6 +247,14 @@ pub trait GameSource {
     /// `index` は `file_idx` から `PairFileMeta`（出典パス）を引くために使う
     /// （`GameIndexEntry` 自体にはパスを複製しない）。PSV ソースでは未使用。
     fn load_game(&self, index: &GameIndex, entry: &GameIndexEntry) -> Result<GameRecord>;
+
+    /// live 再読込用の軽量フィンガープリント。対象ファイル集合の (パス, サイズ, mtime)
+    /// のみから計算し、中身は読まない(数百ファイルでも stat だけで済む)。値が前回と
+    /// 変わったときだけ `build_index` を取り直す、が想定用途。`None` は live 非対応
+    /// (PSV 等)。既定実装は非対応。
+    fn live_fingerprint(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// 対局一覧に出す表示ラベルを、保持済みの文字列ではなくその場で組み立てる
@@ -218,5 +274,28 @@ pub fn display_label(index: &GameIndex, entry: &GameIndexEntry) -> String {
             }
             None => format!("?-vs-? #{:03}", ordinal + 1),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_key_from_filename_supported_formats() {
+        // csa_client 記録形式(先頭 YYYYMMDD_HHMMSS)
+        assert_eq!(
+            date_key_from_filename("20260707_010203_RAMU_TF_vs_Suisho.csa"),
+            Some(20260707010203)
+        );
+        assert_eq!(date_key_from_filename("20260707_010203_A_vs_B.jsonl"), Some(20260707010203));
+        // wdoor floodgate 形式(末尾 14 桁)
+        assert_eq!(
+            date_key_from_filename("wdoor+floodgate-300-10F+A+B+20260707010203.csa"),
+            Some(20260707010203)
+        );
+        // 日時を持たない出典
+        assert_eq!(date_key_from_filename("rsA-vs-rsB.jsonl"), None);
+        assert_eq!(date_key_from_filename("2026_bad.csa"), None);
     }
 }

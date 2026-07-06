@@ -1,7 +1,9 @@
 //! ratatui ベースの棋譜プレイヤー画面・イベントループ。
 
+use std::collections::BTreeMap;
 use std::io::{self};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -22,18 +24,46 @@ use rshogi_core::types::{Color, Move, PieceType, Square};
 
 use crate::kif::piece_label;
 
+use rshogi_csa_client::jsonl::sanitize_for_filename;
+
 use super::model::{
-    GameIndexEntry, GameOutcomeView, GameRecord, GameSource, GameSourceRef, MoveView,
+    GameIndexEntry, GameOutcomeView, GameRecord, GameSource, GameSourceRef, MoveView, PairFileMeta,
 };
 use super::{GameIndex, display_label};
 
+/// TUI 起動オプション。
+#[derive(Default)]
+pub struct RunOptions {
+    /// live 再読込の間隔。指定するとこの間隔でソースのフィンガープリントを確認し、
+    /// 変化があれば索引を取り直して新しい対局を一覧へ追加する。`None` は従来どおり
+    /// 起動時読み込みのみ。
+    pub live_interval: Option<Duration>,
+    /// 正規化名(`sanitize_for_filename` 済み) -> レート。空なら R 併記・`rate:`
+    /// フィルタは不活性。
+    pub ratings: BTreeMap<String, f64>,
+}
+
 /// 棋譜プレイヤー TUI を起動する。`Ctrl-C`／`q` で終了するまでブロックする。
-pub fn run(source: Box<dyn GameSource>) -> Result<()> {
+pub fn run(source: Box<dyn GameSource>, opts: RunOptions) -> Result<()> {
     let index = source.build_index()?;
     for warning in &index.warnings {
         eprintln!("warning: {warning}");
     }
-    if index.entries.is_empty() {
+    let live = match opts.live_interval {
+        Some(interval) => {
+            let Some(fingerprint) = source.live_fingerprint()? else {
+                anyhow::bail!("--live はこの入力形式では使えません(ディレクトリ横断ソースのみ)");
+            };
+            Some(LiveState {
+                interval,
+                last_poll: Instant::now(),
+                fingerprint,
+            })
+        }
+        None => None,
+    };
+    // live 中は「まだ 1 局も無い記録 dir を開いて対局を待つ」使い方を許す。
+    if index.entries.is_empty() && live.is_none() {
         anyhow::bail!("対局が1件も見つかりませんでした");
     }
 
@@ -52,7 +82,7 @@ pub fn run(source: Box<dyn GameSource>) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(source, index);
+    let mut app = App::new(source, index, opts.ratings, live);
     let result = run_event_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;
@@ -74,6 +104,8 @@ enum Mode {
 enum SortMode {
     /// ファイル列挙順→完了順（従来のデフォルト）。
     Discovery,
+    /// ファイル名由来の対局日時の降順（新しい対局が先頭）。日時の無い対局は末尾。
+    Date,
     /// エラー→黒勝ち→白勝ち→引き分け→不明の順にグルーピング。
     Outcome,
     /// 対局長（手数）の降順。
@@ -87,7 +119,8 @@ enum SortMode {
 impl SortMode {
     fn next(self) -> Self {
         match self {
-            SortMode::Discovery => SortMode::Outcome,
+            SortMode::Discovery => SortMode::Date,
+            SortMode::Date => SortMode::Outcome,
             SortMode::Outcome => SortMode::Length,
             SortMode::Length => SortMode::Decisiveness,
             SortMode::Decisiveness => SortMode::Swing,
@@ -98,6 +131,7 @@ impl SortMode {
     fn label(self) -> &'static str {
         match self {
             SortMode::Discovery => "発見順",
+            SortMode::Date => "日付(新)",
             SortMode::Outcome => "勝敗別",
             SortMode::Length => "対局長",
             SortMode::Decisiveness => "決着の大きさ",
@@ -122,6 +156,15 @@ struct SfenScan {
     matches: Vec<usize>,
 }
 
+/// live 再読込の進行状態。
+struct LiveState {
+    interval: Duration,
+    /// 最後にフィンガープリントを確認した時刻(間隔制御用)。
+    last_poll: Instant,
+    /// 前回確認したソースのフィンガープリント。変化検出にのみ使う。
+    fingerprint: u64,
+}
+
 struct App {
     source: Box<dyn GameSource>,
     index: GameIndex,
@@ -140,10 +183,19 @@ struct App {
     status: String,
     /// 実行中の SFEN 局面検索（逐次スキャン）。`None` なら通常操作。
     scan: Option<SfenScan>,
+    /// 正規化名 -> レート（`RunOptions::ratings`）。
+    ratings: BTreeMap<String, f64>,
+    /// live 再読込の状態。`None` なら従来どおり静的表示。
+    live: Option<LiveState>,
 }
 
 impl App {
-    fn new(source: Box<dyn GameSource>, index: GameIndex) -> Self {
+    fn new(
+        source: Box<dyn GameSource>,
+        index: GameIndex,
+        ratings: BTreeMap<String, f64>,
+        live: Option<LiveState>,
+    ) -> Self {
         let all: Vec<usize> = (0..index.entries.len()).collect();
         let mut app = Self {
             source,
@@ -158,9 +210,25 @@ impl App {
             current_move: 0,
             status: String::new(),
             scan: None,
+            ratings,
+            live,
         };
         app.load_selected();
         app
+    }
+
+    /// 正規化キーでレートを引く。`--ratings` 未供給なら常に `None`。
+    fn rate_of(&self, name: &str) -> Option<f64> {
+        if self.ratings.is_empty() {
+            return None;
+        }
+        self.ratings.get(&sanitize_for_filename(name)).copied()
+    }
+
+    /// 対局の代表レート（両対局者のうち高い方）。`rate:` フィルタ用。
+    fn entry_rate(&self, entry: &GameIndexEntry) -> Option<f64> {
+        let meta = file_meta(&self.index, entry)?;
+        combined_rate(self.rate_of(&meta.black_label), self.rate_of(&meta.white_label))
     }
 
     fn selected_entry(&self) -> Option<&GameIndexEntry> {
@@ -188,6 +256,20 @@ impl App {
         self.base_filtered = (0..self.index.entries.len())
             .filter(|&i| entry_matches(&self.index, &self.index.entries[i], filter))
             .collect();
+        // `rate:` は App の保持するレート表が要るため `entry_matches` の外で絞る
+        // (`sfen:` が逐次スキャンで扱われるのと同様、entry_matches では常に一致扱い)。
+        // floodgate のレートは負値がありうるので符号付きで比較する。
+        if let Filter::Field(FieldKind::Rate, spec) = filter {
+            self.base_filtered = self
+                .base_filtered
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    self.entry_rate(&self.index.entries[i])
+                        .is_some_and(|r| matches_signed_cmp(r.round() as i64, spec))
+                })
+                .collect();
+        }
         self.resort();
     }
 
@@ -195,10 +277,77 @@ impl App {
     /// 集合はそのままに並び順だけ変えるので、SFEN スキャン結果も並べ替えで維持される。
     fn resort(&mut self) {
         let mut filtered = self.base_filtered.clone();
-        sort_filtered(&mut filtered, &self.index.entries, self.sort_mode);
+        sort_filtered(&mut filtered, &self.index.entries, self.sort_mode, |e| {
+            entry_date_key(&self.index, e)
+        });
         self.filtered = filtered;
         self.selected = 0;
         self.load_selected();
+    }
+
+    /// live: 間隔経過時にソースのフィンガープリントを確認し、変化があれば索引を取り直す。
+    /// 失敗はステータス表示に留めて操作を継続する(次の間隔で再試行)。
+    fn maybe_live_reload(&mut self) {
+        let Some(live) = &self.live else { return };
+        if live.last_poll.elapsed() < live.interval {
+            return;
+        }
+        let old_fp = live.fingerprint;
+        if let Some(l) = self.live.as_mut() {
+            l.last_poll = Instant::now();
+        }
+        let fp = match self.source.live_fingerprint() {
+            Ok(Some(fp)) => fp,
+            Ok(None) => return,
+            Err(e) => {
+                self.status = format!("live 再読込チェック失敗: {e}");
+                return;
+            }
+        };
+        if fp == old_fp {
+            return;
+        }
+        if let Some(l) = self.live.as_mut() {
+            l.fingerprint = fp;
+        }
+        match self.source.build_index() {
+            Ok(new_index) => self.replace_index(new_index),
+            Err(e) => self.status = format!("live 再読込失敗: {e}"),
+        }
+    }
+
+    /// 索引を live 再読込の結果へ差し替える。選択中の対局は (出典パス, game_id) で追跡し、
+    /// 見つかれば選択位置・表示中の手を維持する(完了局の内容は追記されない前提で、同一
+    /// キーなら読み直さない)。
+    fn replace_index(&mut self, new_index: GameIndex) {
+        let old_len = self.index.entries.len();
+        let selected_key = self.selected_entry().and_then(|e| entry_key(&self.index, e));
+        let saved_game = self.current_game.take();
+        let saved_move = self.current_move;
+
+        self.index = new_index;
+        // SFEN スキャンの一致集合は旧索引の添字なので新索引へは引き継げない。クリアして
+        // 全件表示へ戻す(ステータスの件数表示で気づける)。
+        if sfen_query_from_input(&self.filter_input).is_some() {
+            self.filter_input.clear();
+        }
+        self.apply_filter();
+
+        if let Some(key) = selected_key
+            && let Some(pos) = self.filtered.iter().position(|&i| {
+                entry_key(&self.index, &self.index.entries[i]).as_ref() == Some(&key)
+            })
+        {
+            self.selected = pos;
+            self.current_game = saved_game;
+            self.current_move = saved_move;
+        }
+        let new_len = self.index.entries.len();
+        self.status = if new_len >= old_len {
+            format!("live: {} 局追加 (計 {new_len} 局)", new_len - old_len)
+        } else {
+            format!("live: 再読込 (計 {new_len} 局)")
+        };
     }
 
     fn cycle_sort_mode(&mut self) {
@@ -386,6 +535,35 @@ fn jsonl_game_id(entry: &GameIndexEntry) -> Option<u32> {
     }
 }
 
+/// 対局の出典ファイルメタ（PSV はファイル単位のメタを持たないため `None`）。
+fn file_meta<'a>(index: &'a GameIndex, entry: &GameIndexEntry) -> Option<&'a PairFileMeta> {
+    match entry.source {
+        GameSourceRef::Jsonl { file_idx, .. } | GameSourceRef::Csa { file_idx, .. } => {
+            index.pair_file(file_idx)
+        }
+        GameSourceRef::Psv { .. } => None,
+    }
+}
+
+fn entry_date_key(index: &GameIndex, entry: &GameIndexEntry) -> Option<u64> {
+    file_meta(index, entry).and_then(|m| m.date_key)
+}
+
+/// live 再読込を跨いで同一対局を同定するキー（出典パス + ファイル内 game_id）。
+/// 再読込で `file_idx` や ordinal は振り直されるため添字では追跡できない。
+fn entry_key(index: &GameIndex, entry: &GameIndexEntry) -> Option<(PathBuf, Option<u32>)> {
+    file_meta(index, entry).map(|m| (m.path.clone(), jsonl_game_id(entry)))
+}
+
+/// 両対局者のレートから対局の代表レート（高い方）を出す。
+fn combined_rate(black: Option<f64>, white: Option<f64>) -> Option<f64> {
+    match (black, white) {
+        (Some(b), Some(w)) => Some(b.max(w)),
+        (b, None) => b,
+        (None, w) => w,
+    }
+}
+
 /// `/` 検索クエリを解析した結果。判定ロジックは `entry_matches` に集約する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Filter<'a> {
@@ -419,6 +597,12 @@ enum FieldKind {
     Len,
     /// `swing:>N|<N|N`。評価値振れ幅（`max_swing_cp`）で絞り込む。
     Swing,
+    /// `rate:>N|<N|N`。対局の代表レート（両対局者の高い方）で絞り込む。判定はレート表を
+    /// 持つ `App::apply_filter` 側で行う（`entry_matches` では常に一致扱い）。
+    Rate,
+    /// `date:YYYYMMDD`。ファイル名由来の対局日時キーへの前方一致（`date:202607` 等の
+    /// 部分指定も可）。
+    Date,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,6 +633,8 @@ fn parse_filter(query: &str) -> Filter<'_> {
             "winner" => Some(FieldKind::Winner),
             "len" => Some(FieldKind::Len),
             "swing" => Some(FieldKind::Swing),
+            "rate" => Some(FieldKind::Rate),
+            "date" => Some(FieldKind::Date),
             _ => None,
         };
         if let Some(field) = field {
@@ -477,6 +663,18 @@ fn matches_numeric_cmp(actual: u32, spec: &str) -> bool {
     }
 }
 
+/// [`matches_numeric_cmp`] の符号付き版。負値がありうる指標(floodgate レート等)用で、
+/// `rate:>-100` / `rate:<-500` のような負の閾値も受け付ける。
+fn matches_signed_cmp(actual: i64, spec: &str) -> bool {
+    if let Some(n) = spec.strip_prefix('>') {
+        n.parse::<i64>().is_ok_and(|n| actual > n)
+    } else if let Some(n) = spec.strip_prefix('<') {
+        n.parse::<i64>().is_ok_and(|n| actual < n)
+    } else {
+        spec.parse::<i64>().is_ok_and(|n| actual == n)
+    }
+}
+
 fn entry_matches(index: &GameIndex, entry: &GameIndexEntry, filter: Filter<'_>) -> bool {
     match filter {
         Filter::Empty => true,
@@ -498,6 +696,11 @@ fn entry_matches(index: &GameIndex, entry: &GameIndexEntry, filter: Filter<'_>) 
         Filter::Field(FieldKind::Len, v) => matches_numeric_cmp(entry.ply_count, v),
         Filter::Field(FieldKind::Swing, v) => {
             entry.metrics.max_swing_cp.is_some_and(|s| matches_numeric_cmp(s, v))
+        }
+        // レート表は App が持つため即時フィルタでは絞らない（`apply_filter` で絞る）。
+        Filter::Field(FieldKind::Rate, _) => true,
+        Filter::Field(FieldKind::Date, v) => {
+            entry_date_key(index, entry).is_some_and(|k| k.to_string().starts_with(v))
         }
         Filter::Keyword(KeywordKind::Reversal) => entry.metrics.had_reversal(REVERSAL_THRESHOLD_CP),
         Filter::Keyword(KeywordKind::Decisive) => {
@@ -574,11 +777,22 @@ fn outcome_sort_key(entry: &GameIndexEntry) -> u8 {
 
 /// `filtered`（`index.entries` への index 列）を `mode` に従って安定ソートする。
 /// 安定ソートなので、同一キー内の相対順は呼び出し前の順序（発見順）を維持する。
-fn sort_filtered(filtered: &mut [usize], entries: &[GameIndexEntry], mode: SortMode) {
+/// `date_key` は対局の日時キーを引く closure（`SortMode::Date` のみ使用。テストからは
+/// 索引を組み立てずに注入できる）。
+fn sort_filtered(
+    filtered: &mut [usize],
+    entries: &[GameIndexEntry],
+    mode: SortMode,
+    date_key: impl Fn(&GameIndexEntry) -> Option<u64>,
+) {
     use std::cmp::Reverse;
     // 指標ソートは降順。評価値の無い対局（None）は末尾へ寄せる（`is_none` を第 1 キーに）。
     match mode {
         SortMode::Discovery => {}
+        SortMode::Date => filtered.sort_by_key(|&i| {
+            let k = date_key(&entries[i]);
+            (k.is_none(), Reverse(k.unwrap_or(0)))
+        }),
         SortMode::Outcome => filtered.sort_by_key(|&i| outcome_sort_key(&entries[i])),
         SortMode::Length => filtered.sort_by_key(|&i| Reverse(entries[i].ply_count)),
         SortMode::Decisiveness => filtered.sort_by_key(|&i| {
@@ -591,6 +805,10 @@ fn sort_filtered(filtered: &mut [usize], entries: &[GameIndexEntry], mode: SortM
         }),
     }
 }
+
+/// live 有効時の入力待ちの上限。この間隔で入力待ちを切り上げて再読込チェックへ回る
+/// （実際に fingerprint を見るかは `LiveState::interval` が制御する）。
+const LIVE_POLL_TICK: Duration = Duration::from_millis(250);
 
 fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -610,6 +828,19 @@ fn run_event_loop(
                 }
             } else {
                 app.advance_sfen_scan();
+            }
+        } else if app.live.is_some() {
+            // live 中はブロック読みだと新規対局に気づけないため、短い tick で入力待ちを
+            // 切り上げて再読込チェックを回す。
+            if event::poll(LIVE_POLL_TICK)? {
+                if let Event::Key(key) = event::read()?
+                    && key.kind == KeyEventKind::Press
+                    && !app.handle_key(key.code)
+                {
+                    return Ok(());
+                }
+            } else {
+                app.maybe_live_reload();
             }
         } else if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
@@ -670,12 +901,13 @@ fn draw_game_list(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::
                     None => "",
                 }
             };
-            ListItem::new(format!("{label}{marker}"))
+            ListItem::new(format!("{label}{marker}{}", rate_suffix(app, entry)))
         })
         .collect();
 
+    let live_mark = if app.live.is_some() { " [live]" } else { "" };
     let title = format!(
-        "対局一覧 ({}/{}) [{}]",
+        "対局一覧 ({}/{}) [{}]{live_mark}",
         app.filtered.len(),
         app.index.entries.len(),
         app.sort_mode.label()
@@ -689,6 +921,26 @@ fn draw_game_list(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::
         state.select(Some(app.selected));
     }
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// `--ratings` 供給時のみ、対局者のレートを ` R3706/3512`（先手/後手）形式で付ける。
+/// 片方だけ引けたら引けない側は `-`、両方引けなければ空文字。
+fn rate_suffix(app: &App, entry: &GameIndexEntry) -> String {
+    if app.ratings.is_empty() {
+        return String::new();
+    }
+    let Some(meta) = file_meta(&app.index, entry) else {
+        return String::new();
+    };
+    let black = app.rate_of(&meta.black_label);
+    let white = app.rate_of(&meta.white_label);
+    if black.is_none() && white.is_none() {
+        return String::new();
+    }
+    let fmt = |r: Option<f64>| {
+        r.map(|r| format!("{}", r.round() as i64)).unwrap_or_else(|| "-".to_string())
+    };
+    format!(" R{}/{}", fmt(black), fmt(white))
 }
 
 /// 対局・盤面・指し手ペインが「表示できる手が無い」ときに、その理由を区別する。
@@ -966,7 +1218,7 @@ fn draw_status_bar(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
             app.index.entries.len()
         ),
         Mode::Filter => format!(
-            "検索 [id: pair: outcome: winner:sente|gote len:>N swing:>N reversal sfen: label:]: {}_   （一致 {}件）",
+            "検索 [id: pair: outcome: winner:sente|gote len:>N swing:>N rate:>N date: reversal sfen: label:]: {}_   （一致 {}件）",
             app.filter_input,
             app.filtered.len()
         ),
@@ -1001,8 +1253,9 @@ fn draw_help_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Line::from("n        次の評価値急変手へジャンプ"),
         Line::from("N        前の評価値急変手へジャンプ"),
         Line::from(format!(
-            "s        対局リストの並べ替えを切り替え（{}/{}/{}/{}/{}）",
+            "s        対局リストの並べ替えを切り替え（{}/{}/{}/{}/{}/{}）",
             SortMode::Discovery.label(),
+            SortMode::Date.label(),
             SortMode::Outcome.label(),
             SortMode::Length.label(),
             SortMode::Decisiveness.label(),
@@ -1016,6 +1269,8 @@ fn draw_help_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Line::from(
             "          winner:sente|gote  len:>N|<N|N  swing:>N  reversal  decisive|draw|error",
         ),
+        Line::from("          rate:>N|<N|N  対局の代表レートで絞り込み（--ratings 供給時のみ）"),
+        Line::from("          date:YYYYMMDD  ファイル名由来の対局日時へ前方一致（date:202607 等）"),
         Line::from(
             "          sfen:<SFEN>  局面本体を全対局走査（Enter で実行 / Esc・q で中断 / 手数は無視）",
         ),
@@ -1354,6 +1609,77 @@ mod tests {
         GameIndex::default()
     }
 
+    /// `date_key` 付きの pair_files を 1 件持つ索引と、それを指す JSONL エントリを作る。
+    fn index_with_dated_file(date_key: Option<u64>) -> (GameIndex, GameIndexEntry) {
+        let index = GameIndex {
+            entries: Vec::new(),
+            pair_files: vec![PairFileMeta {
+                path: PathBuf::from("20260707_010203_A_vs_B.jsonl"),
+                black_label: "A".to_string(),
+                white_label: "B".to_string(),
+                date_key,
+            }],
+            warnings: Vec::new(),
+        };
+        let entry = jsonl_entry(1, None, None, None, None, false, 0);
+        (index, entry)
+    }
+
+    #[test]
+    fn parse_filter_recognizes_rate_and_date() {
+        assert_eq!(parse_filter("rate:>3800"), Filter::Field(FieldKind::Rate, ">3800"));
+        assert_eq!(parse_filter("date:20260707"), Filter::Field(FieldKind::Date, "20260707"));
+    }
+
+    #[test]
+    fn date_filter_prefix_matches_date_key() {
+        let (index, entry) = index_with_dated_file(Some(20260707010203));
+        assert!(entry_matches(&index, &entry, parse_filter("date:20260707")));
+        assert!(entry_matches(&index, &entry, parse_filter("date:202607")));
+        assert!(!entry_matches(&index, &entry, parse_filter("date:20260708")));
+        // 日時キーの無い対局は date: にヒットしない
+        let (index, entry) = index_with_dated_file(None);
+        assert!(!entry_matches(&index, &entry, parse_filter("date:2026")));
+        // rate: は entry_matches では絞らない(App::apply_filter がレート表で絞る)
+        assert!(entry_matches(&index, &entry, parse_filter("rate:>9999")));
+    }
+
+    #[test]
+    fn sort_date_puts_newest_first_and_none_last() {
+        let entries: Vec<GameIndexEntry> = (0..3u32)
+            .map(|i| jsonl_entry(i, None, None, None, None, false, i as usize))
+            .collect();
+        let keys = [Some(20260706010203u64), None, Some(20260707010203u64)];
+        let mut filtered = vec![0, 1, 2];
+        sort_filtered(&mut filtered, &entries, SortMode::Date, |e| {
+            let GameSourceRef::Jsonl { file_idx, .. } = e.source else {
+                return None;
+            };
+            keys[file_idx]
+        });
+        assert_eq!(filtered, vec![2, 0, 1]); // 新→旧→日時なし
+    }
+
+    #[test]
+    fn combined_rate_takes_max_and_tolerates_missing_side() {
+        assert_eq!(combined_rate(Some(3700.0), Some(3500.0)), Some(3700.0));
+        assert_eq!(combined_rate(None, Some(3500.0)), Some(3500.0));
+        assert_eq!(combined_rate(Some(3700.0), None), Some(3700.0));
+        assert_eq!(combined_rate(None, None), None);
+    }
+
+    #[test]
+    fn signed_cmp_supports_negative_ratings() {
+        // floodgate には負レートのプレイヤーが実在する。0 に clamp せず符号付きで比較する。
+        assert!(matches_signed_cmp(-1769, "-1769"));
+        assert!(!matches_signed_cmp(-1769, "0"));
+        assert!(matches_signed_cmp(-1769, "<0"));
+        assert!(matches_signed_cmp(-100, ">-500"));
+        assert!(!matches_signed_cmp(-1769, ">-500"));
+        assert!(matches_signed_cmp(3706, ">3500"));
+        assert!(!matches_signed_cmp(3706, ">3800"));
+    }
+
     #[test]
     fn black_pov_cp_keeps_sign_for_black_mover() {
         // 先手が指した手で score_cp=+120（先手にとって +120）なら、
@@ -1611,7 +1937,7 @@ mod tests {
             vec!["lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 40".to_string()],
         ]);
         let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
 
         app.start_sfen_scan(HIRATE_SFEN);
         drain_scan(&mut app);
@@ -1629,7 +1955,7 @@ mod tests {
             vec!["lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 7".to_string()];
         let source = fake_source(games);
         let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
 
         app.start_sfen_scan(HIRATE_SFEN);
         let mut ticks = 0;
@@ -1657,7 +1983,7 @@ mod tests {
         }
         let source = fake_source(games);
         let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
         app.filter_input = "len:3".to_string();
         app.apply_filter();
         let filtered_before = app.filtered.clone();
@@ -1685,7 +2011,7 @@ mod tests {
             error_ordinals: vec![1],
         };
         let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
         app.start_sfen_scan(HIRATE_SFEN);
         drain_scan(&mut app);
         assert_eq!(app.filtered, vec![2], "load 失敗の対局は一致に含めない");
@@ -1703,7 +2029,7 @@ mod tests {
             vec!["lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 40".to_string()],
         ]);
         let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
         // Enter 経由と同じく filter_input を残したままスキャン（`s` の再フィルタ源）。
         app.filter_input = format!("sfen:{HIRATE_SFEN}");
         app.start_sfen_scan(HIRATE_SFEN);
@@ -1720,7 +2046,7 @@ mod tests {
     fn invalid_sfen_query_does_not_start_scan() {
         let source = fake_source(vec![vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()]]);
         let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
         app.start_sfen_scan("   "); // 空
         assert!(app.scan.is_none(), "空クエリではスキャンを開始しない");
         assert!(app.status.contains("不正"), "不正入力はエラー表示: {}", app.status);
@@ -1779,7 +2105,8 @@ mod tests {
 
     #[test]
     fn sort_mode_cycles_through_all_variants() {
-        assert_eq!(SortMode::Discovery.next(), SortMode::Outcome);
+        assert_eq!(SortMode::Discovery.next(), SortMode::Date);
+        assert_eq!(SortMode::Date.next(), SortMode::Outcome);
         assert_eq!(SortMode::Outcome.next(), SortMode::Length);
         assert_eq!(SortMode::Length.next(), SortMode::Decisiveness);
         assert_eq!(SortMode::Decisiveness.next(), SortMode::Swing);
@@ -1821,7 +2148,7 @@ mod tests {
             jsonl_entry(4, None, None, None, Some(GameOutcomeView::Win(Color::Black)), false, 0), // idx 3: b-win
         ];
         let mut filtered: Vec<usize> = (0..entries.len()).collect();
-        sort_filtered(&mut filtered, &entries, SortMode::Outcome);
+        sort_filtered(&mut filtered, &entries, SortMode::Outcome, |_| None);
         // error(2) → b-win(1,3、発見順維持) → draw(0)
         assert_eq!(filtered, vec![2, 1, 3, 0]);
     }
@@ -1836,7 +2163,7 @@ mod tests {
         ];
         let key = |mode| {
             let mut f: Vec<usize> = (0..entries.len()).collect();
-            sort_filtered(&mut f, &entries, mode);
+            sort_filtered(&mut f, &entries, mode, |_| None);
             f
         };
         // 対局長 降順。
@@ -1892,7 +2219,7 @@ mod tests {
             jsonl_entry(2, None, None, None, None, false, 0),
         ];
         let mut filtered: Vec<usize> = (0..entries.len()).collect();
-        sort_filtered(&mut filtered, &entries, SortMode::Discovery);
+        sort_filtered(&mut filtered, &entries, SortMode::Discovery, |_| None);
         assert_eq!(filtered, vec![0, 1]);
     }
 

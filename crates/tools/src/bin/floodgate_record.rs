@@ -439,14 +439,9 @@ fn write_ratings_cache(path: &Path, map: &BTreeMap<String, f64>) -> Result<()> {
 /// キャッシュ(`name<TAB>rate`)を name -> rating に読み戻す。壊れた行・非有限値は捨てる。
 /// キーは書き出し時と同じ sanitize 名に正規化する(raw 名で書かれた古いキャッシュも引ける)。
 fn read_ratings_cache(path: &std::path::Path) -> Result<BTreeMap<String, f64>> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(text
-        .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .filter_map(|(n, r)| {
-            let v = r.trim().parse::<f64>().ok().filter(|v| v.is_finite())?;
-            Some((sanitize_for_filename(n.trim()), v))
-        })
+    Ok(fg::read_ratings_tsv(path)?
+        .into_iter()
+        .map(|(n, r)| (sanitize_for_filename(&n), r))
         .collect())
 }
 

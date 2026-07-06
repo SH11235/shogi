@@ -3,9 +3,11 @@
 //! 詳細は `crates/tools/docs/kifu_player.md` を参照。
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Parser};
+use rshogi_csa_client::jsonl::sanitize_for_filename;
 use tools::replay::{CsaSource, GameSource, JsonlSource, PsvSource, tui};
 
 #[derive(Parser, Debug)]
@@ -29,6 +31,16 @@ struct Cli {
     /// 横断）または単一 `.csa` ファイルを指定する。
     #[arg(long)]
     csa: Option<PathBuf>,
+
+    /// SECS 秒ごとに入力を再スキャンし、新しい対局を一覧へ自動追加する（値省略時 5 秒）。
+    /// csa_client の記録 dir を連続対局中に開いておく用途。--psv では使えない。
+    #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "5")]
+    live: Option<u64>,
+
+    /// レート表 TSV（`name<TAB>rate`、`floodgate_record --ratings-cache` の出力形式）。
+    /// 対局一覧に R を併記し、`rate:>N` フィルタを有効にする（ネットワークは使わない）。
+    #[arg(long)]
+    ratings: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -43,5 +55,17 @@ fn main() -> Result<()> {
     } else {
         bail!("--psv / --tournament-dir / --csa のいずれか一つを指定してください");
     };
-    tui::run(source)
+    let mut opts = tui::RunOptions::default();
+    if let Some(secs) = cli.live {
+        anyhow::ensure!(secs >= 1, "--live は 1 秒以上を指定してください");
+        opts.live_interval = Some(Duration::from_secs(secs));
+    }
+    if let Some(path) = &cli.ratings {
+        // TUI 内の突き合わせは正規化キーで行うため、読み込み時に変換して渡す。
+        opts.ratings = tools::common::floodgate::read_ratings_tsv(path)?
+            .into_iter()
+            .map(|(name, rate)| (sanitize_for_filename(&name), rate))
+            .collect();
+    }
+    tui::run(source, opts)
 }
