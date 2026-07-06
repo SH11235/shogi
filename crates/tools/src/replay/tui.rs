@@ -258,6 +258,7 @@ impl App {
             .collect();
         // `rate:` は App の保持するレート表が要るため `entry_matches` の外で絞る
         // (`sfen:` が逐次スキャンで扱われるのと同様、entry_matches では常に一致扱い)。
+        // floodgate のレートは負値がありうるので符号付きで比較する。
         if let Filter::Field(FieldKind::Rate, spec) = filter {
             self.base_filtered = self
                 .base_filtered
@@ -265,7 +266,7 @@ impl App {
                 .copied()
                 .filter(|&i| {
                     self.entry_rate(&self.index.entries[i])
-                        .is_some_and(|r| matches_numeric_cmp(r.max(0.0).round() as u32, spec))
+                        .is_some_and(|r| matches_signed_cmp(r.round() as i64, spec))
                 })
                 .collect();
         }
@@ -659,6 +660,18 @@ fn matches_numeric_cmp(actual: u32, spec: &str) -> bool {
         n.parse::<u32>().is_ok_and(|n| actual < n)
     } else {
         spec.parse::<u32>().is_ok_and(|n| actual == n)
+    }
+}
+
+/// [`matches_numeric_cmp`] の符号付き版。負値がありうる指標(floodgate レート等)用で、
+/// `rate:>-100` / `rate:<-500` のような負の閾値も受け付ける。
+fn matches_signed_cmp(actual: i64, spec: &str) -> bool {
+    if let Some(n) = spec.strip_prefix('>') {
+        n.parse::<i64>().is_ok_and(|n| actual > n)
+    } else if let Some(n) = spec.strip_prefix('<') {
+        n.parse::<i64>().is_ok_and(|n| actual < n)
+    } else {
+        spec.parse::<i64>().is_ok_and(|n| actual == n)
     }
 }
 
@@ -1653,6 +1666,18 @@ mod tests {
         assert_eq!(combined_rate(None, Some(3500.0)), Some(3500.0));
         assert_eq!(combined_rate(Some(3700.0), None), Some(3700.0));
         assert_eq!(combined_rate(None, None), None);
+    }
+
+    #[test]
+    fn signed_cmp_supports_negative_ratings() {
+        // floodgate には負レートのプレイヤーが実在する。0 に clamp せず符号付きで比較する。
+        assert!(matches_signed_cmp(-1769, "-1769"));
+        assert!(!matches_signed_cmp(-1769, "0"));
+        assert!(matches_signed_cmp(-1769, "<0"));
+        assert!(matches_signed_cmp(-100, ">-500"));
+        assert!(!matches_signed_cmp(-1769, ">-500"));
+        assert!(matches_signed_cmp(3706, ">3500"));
+        assert!(!matches_signed_cmp(3706, ">3800"));
     }
 
     #[test]

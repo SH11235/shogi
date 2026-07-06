@@ -80,6 +80,9 @@ cargo run -p tools --release --features kifu-player --bin kifu_player -- \
 手は再読込をまたいで維持される。対局が 1 局も無い記録 dir を開いて待つこともできる。
 `--tournament-dir` でも使えるが、変化のたびに全ファイルを読み直すため巨大な out-dir では
 間隔を長めにする。`--psv` では使えない。一覧タイトルに `[live]` を表示する。
+SFEN 局面検索とは併用に制約がある: スキャン走査中は再読込を保留し、再読込が走ると
+`sfen:` の絞り込み結果は新しい索引へ引き継げないためクリアされて全件表示に戻る
+（ステータスの件数表示で分かる）。
 
 ### レート併記（`--ratings <TSV>`）
 
@@ -127,7 +130,7 @@ cargo run -p tools --release --features kifu-player --bin kifu_player -- \
 | `winner:sente\|gote` | 勝者側（`black`/`white` も可） | 完全一致 |
 | `len:>N` / `len:<N` / `len:N` | 手数 | 比較 |
 | `swing:>N` / `swing:<N` / `swing:N` | 評価値の振れ幅（cp） | 比較 |
-| `rate:>N` / `rate:<N` / `rate:N` | 対局の代表レート（両対局者の高い方。`--ratings` 供給時のみ） | 比較 |
+| `rate:>N` / `rate:<N` / `rate:N` | 対局の代表レート（両対局者の高い方。`--ratings` 供給時のみ。負レートも比較可: `rate:<0` 等） | 比較 |
 | `date:YYYYMMDD` | ファイル名由来の対局日時（`date:202607` 等の部分指定も可） | 前方一致 |
 | `reversal` | 両者が 300cp 以上優勢になった局面がある（形勢逆転） | 述語 |
 | `decisive` | 勝敗が付いた（引き分け・エラー・不明でない） | 述語 |
