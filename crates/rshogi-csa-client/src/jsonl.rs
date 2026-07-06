@@ -57,9 +57,34 @@ pub fn write_game_jsonl(
     write_result(&mut writer, record, result, plies)?;
 
     writer.flush().context("JSONL flush に失敗")?;
-    fs::rename(&tmp, &path)
-        .with_context(|| format!("JSONL の rename に失敗: {}", path.display()))?;
+    rename_with_retry(&tmp, &path)?;
     Ok(path)
+}
+
+/// tmp から最終パスへの rename。Windows では宛先を `FILE_SHARE_DELETE` なしで開く
+/// 第三者プロセス (ウイルススキャナ・エディタ等) と重なると sharing violation で
+/// 失敗しうるため、短いバックオフ付きでリトライする (Unix では通常初回で成功する)。
+/// 最終的に失敗した場合は、手動救済できるよう書き出し済み tmp のパスをエラーに含める。
+fn rename_with_retry(tmp: &Path, path: &Path) -> Result<()> {
+    const ATTEMPTS: u32 = 3;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(BACKOFF);
+        }
+        match fs::rename(tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("ATTEMPTS > 0 のため必ず Some")).with_context(|| {
+        format!(
+            "JSONL の rename に失敗しました: {} (書き出し済みの内容は {} に残っています)",
+            path.display(),
+            tmp.display()
+        )
+    })
 }
 
 /// 対局中に同スキーマの JSONL を手単位で追記する live ライター
@@ -537,6 +562,35 @@ mod tests {
         assert_eq!(text.lines().count(), 4, "meta + move x2 + result");
         assert!(text.lines().last().unwrap().contains("\"type\":\"result\""));
         assert!(!path.with_extension("jsonl.tmp").exists(), "tmp 残骸なし");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_with_retry_replaces_existing_destination() {
+        let dir = std::env::temp_dir().join("csa_jsonl_rename_retry_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("a.jsonl.tmp");
+        let dst = dir.join("a.jsonl");
+        std::fs::write(&tmp, "new").unwrap();
+        std::fs::write(&dst, "old").unwrap();
+        rename_with_retry(&tmp, &dst).unwrap();
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "new");
+        assert!(!tmp.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_with_retry_error_mentions_tmp_path() {
+        let dir = std::env::temp_dir().join("csa_jsonl_rename_retry_err_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // tmp が存在しない → 全 attempt 失敗。エラーに tmp パスが含まれ手動救済の
+        // 手がかりになる。
+        let tmp = dir.join("missing.jsonl.tmp");
+        let dst = dir.join("a.jsonl");
+        let err = rename_with_retry(&tmp, &dst).unwrap_err();
+        assert!(format!("{err:#}").contains("missing.jsonl.tmp"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
