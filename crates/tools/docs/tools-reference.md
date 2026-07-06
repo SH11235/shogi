@@ -10,7 +10,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `gensfen` | NNUE 学習用 PSV/pack/hcpe3 教師局面の生成（engine vs engine／NativeBackend） |
 | `csa_client` | USI エンジンを floodgate 等の CSA サーバーに接続して連続対局 |
 | `analyze_selfplay` | 自己対局の JSONL ログを集計。勝率・Elo 差・NPS 等を表示 |
-| `floodgate_record` | csa_client の per-game JSONL から 1 エンジンの戦績を集計（先後別・相手別・非勝一覧・実戦 NPS。floodgate 連続対局向け、[詳細](floodgate_record.md)） |
+| `floodgate_record` | csa_client の per-game JSONL から 1 エンジンの戦績を集計（先後別勝率・相手別・後手勝ち/負け/引分・実戦 NPS、`--fetch-ratings` で wdoor 現在レート併記。floodgate 連続対局向け、[詳細](floodgate_record.md)） |
 | `jsonl_to_kif` | tournament 等の JSONL 対局ログから KIF 棋譜を生成（id/skip/limit でフィルタ可） |
 | `kifu_player` | PSV / tournament JSONL / CSA を同じ TUI で再生・閲覧（`kifu-player` feature、評価値グラフ・検索/絞り込み（SFEN 局面検索含む）付き。[詳細](kifu_player.md)） |
 | `book_from_csa` | CSA 棋譜群から YANEURAOU-DB2016 テキスト定跡 `.db` を生成。消費時間による定跡手判定（手番側ごとの即指しプレフィックス）・レート/勝敗/手数フィルタ・最小 ply 集約・ponder 集計。決定的（[詳細](book_from_csa.md)） |

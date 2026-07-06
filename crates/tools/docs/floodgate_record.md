@@ -28,6 +28,9 @@ floodgate_record --dir ~/floodgate/records/jsonl
 
 # 対象エンジンを明示し、注目相手(部分一致)を指定
 floodgate_record --dir ./jsonl --me RAMU_TF --watch Suisho,dlshogi,nshogi
+
+# 自分/相手の現在レートを wdoor から取得して併記(キャッシュ併用で障害時フォールバック)
+floodgate_record --dir ~/floodgate/records/jsonl --fetch-ratings --ratings-cache ratings.tsv
 ```
 
 | オプション | 説明 |
@@ -35,6 +38,10 @@ floodgate_record --dir ./jsonl --me RAMU_TF --watch Suisho,dlshogi,nshogi
 | `--dir <PATH>` | 集計対象 JSONL のあるディレクトリ(再帰なし、既定 `.`) |
 | `--me <NAME>` | 集計対象エンジン名。省略時は全局に最も多く出現するエンジンを自動判定 |
 | `--watch <NAMES>` | 注目相手(カンマ区切り・部分一致)。指定時のみ「注目相手との対戦」節を出力 |
+| `--fetch-ratings` | wdoor floodgate の現在レート表を**起動の度に**取得し、自分/相手に ` (R<rate>)` を併記(要ネットワーク)。wdoor は per-game レートを出さないので**現在値**(対局時点ではない)。取得・解析は `tools::common::floodgate` を再利用。取得失敗時はレート併記だけ諦め、集計は続行 |
+| `--ratings-cache <FILE>` | `--fetch-ratings` 併用。fetch 成功時は `name<TAB>rate` を FILE へ書き出し、失敗時は FILE を読み戻してフォールバック併記する(一時障害でも直近値を維持) |
+
+レート併記は**名前の完全一致**で引く(表に無い/名前不一致の相手は併記なし)。
 
 ## 出力
 
