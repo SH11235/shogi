@@ -2,8 +2,9 @@
 //! エンジンの戦績を集計する CLI。floodgate 連続対局のように相手が毎局変わる
 //! ログ群を、先後別・相手別・非勝一覧・実戦 NPS で要約する。
 //!
-//! JSONL は両対局者の指し手を `engine` 名付きで記録するため、手番・相手・勝敗は
-//! ファイル名に依らず JSONL だけで判定できる(ply1 の `engine` が先手)。
+//! JSONL は両対局者の指し手を `engine` 名付きで記録するので、手番・相手は move 行から
+//! 判定できる(ply1 の `engine` が先手)。後手が 1 手も指さず負けた局だけは move に相手が
+//! 現れないため、ファイル名 `..._vs_{gote}` から相手を補完する(取りこぼし防止)。
 //!
 //! # 例
 //! ```text
@@ -86,7 +87,7 @@ fn parse_game(path: &std::path::Path) -> Result<Option<Game>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
 
-    let mut sente: Option<String> = None;
+    let mut sente_ply1: Option<String> = None;
     let mut engines: Vec<String> = Vec::new(); // 出現順の distinct engine
     let mut nps: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut winner: Option<String> = None;
@@ -106,7 +107,7 @@ fn parse_game(path: &std::path::Path) -> Result<Option<Game>> {
             "move" => {
                 if let Some(eng) = l.engine {
                     if l.ply == Some(1) {
-                        sente = Some(eng.clone());
+                        sente_ply1 = Some(eng.clone());
                     }
                     if !engines.contains(&eng) {
                         engines.push(eng.clone());
@@ -132,11 +133,16 @@ fn parse_game(path: &std::path::Path) -> Result<Option<Game>> {
     if !has_result {
         return Ok(None); // 進行中 / 未完了の局はスキップ
     }
-    let sente = match sente {
+    let sente = match sente_ply1 {
         Some(s) => s,
         None => return Ok(None), // 手が 1 手も無い異常局
     };
-    let gote = engines.iter().find(|e| **e != sente).cloned().unwrap_or_default();
+    // 相手(後手)は move から判定するが、後手が 1 手も指さず負けた局(初手前に time_up 等)は
+    // move に現れず取りこぼす。その場合はファイル名 `..._vs_{gote}` から補完する。
+    let gote = match engines.iter().find(|e| **e != sente) {
+        Some(g) => g.clone(),
+        None => stem.rsplit_once("_vs_").map(|(_, g)| g.to_owned()).unwrap_or_default(),
+    };
 
     Ok(Some(Game {
         stem,
@@ -263,11 +269,14 @@ fn main() -> Result<()> {
             num as f64 / den as f64 * 100.0
         }
     };
-    println!("集計対象: {me}   JSONL {total} 局 → 集計 {n} 局");
+    println!("集計対象: {me}   完了局 {total} 局 → 集計 {n} 局");
     if skipped_foreign > 0 || skipped_incomplete > 0 {
         println!(
             "  (除外: 対象不参加 {skipped_foreign} 局 / 中断・未完了 {skipped_incomplete} 局)"
         );
+    }
+    if n == 0 {
+        println!("  ⚠ 集計対象が 0 局。--me の名前を確認(全局が対象不参加/未完了)。");
     }
     println!(
         "=== 通算: {w}勝 {l}敗 {d}分  ({n}局)  勝率 {:.0}% (引分除 {:.0}%) ===",
@@ -279,10 +288,19 @@ fn main() -> Result<()> {
     for (i, name) in names.iter().enumerate() {
         let [cw, cl, cd] = by_color[i];
         let games_c = cw + cl + cd;
+        if games_c == 0 {
+            println!("  {name}: (0局)");
+            continue;
+        }
+        // 全引分だと「引分除」の母数が 0 なので N/A(`-`)で 0% と区別する。
+        let ex_draw = if cw + cl == 0 {
+            "-".to_owned()
+        } else {
+            format!("{:.0}%", pct(cw, cw + cl))
+        };
         println!(
-            "  {name}: {cw}勝 {cl}敗 {cd}分 ({games_c}局)  勝率 {:.0}% (引分除 {:.0}%)",
-            pct(cw, games_c),
-            pct(cw, cw + cl)
+            "  {name}: {cw}勝 {cl}敗 {cd}分 ({games_c}局)  勝率 {:.0}% (引分除 {ex_draw})",
+            pct(cw, games_c)
         );
     }
 
@@ -309,7 +327,7 @@ fn main() -> Result<()> {
         }
         any_gw = true;
         let opp = &g.sente;
-        let star = if !cli.watch.is_empty() && cli.watch.iter().any(|w| opp.contains(w.as_str())) {
+        let star = if cli.watch.iter().any(|w| opp.contains(w.as_str())) {
             "  ★上位AI"
         } else {
             ""
@@ -426,6 +444,25 @@ mod tests {
         assert_eq!(g.plies, 2);
         // time_ms>=500 の nps が両者ぶん取れている
         assert_eq!(g.nps.get("ME").map(Vec::len), Some(1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gote_recovered_from_filename_when_never_moved() {
+        // 後手(ME)が 1 手も指さず負けた局: move は先手(OPP)のみ。gote はファイル名
+        // ..._vs_{gote} から補完され、参加判定で取りこぼさない(#878 Codex 指摘)。
+        let path = std::env::temp_dir().join("20260706_010003_OPP_vs_ME.jsonl");
+        let body = concat!(
+            r#"{"type":"move","ply":1,"engine":"OPP"}"#,
+            "\n",
+            r#"{"type":"result","outcome":"black_win","reason":"time_up","plies":1,"winner":"OPP"}"#,
+            "\n",
+        );
+        std::fs::write(&path, body).unwrap();
+        let g = parse_game(&path).unwrap().expect("完了局");
+        assert_eq!(g.sente, "OPP");
+        assert_eq!(g.gote, "ME");
+        assert!(matches!(result_for(&g, "ME"), Some(Res::Loss)));
         let _ = std::fs::remove_file(&path);
     }
 }
