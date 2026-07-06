@@ -65,7 +65,9 @@ config から自動導出する。
 | `CSA_CLIENT_CONFIG` | `~/floodgate/active.toml`（stats.sh が補完） | stats |
 
 シェルスクリプトは bash 前提（Linux / WSL / macOS。空配列展開は bash 3.2 でも動く形で
-ガード済み）。
+ガード済み）。ただし `rebuild_tools.sh` の csa_client 稼働中検出は GNU pgrep の
+`-a`（full command line 出力）前提のため、macOS（BSD pgrep）では効かない。macOS で
+floodgate を常駐させる場合は手動で停止を確認してからビルドすること。
 
 ## 注意
 
