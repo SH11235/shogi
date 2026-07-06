@@ -55,7 +55,9 @@ cargo run -p tools --bin floodgate_pipeline -- download \
 ### `live-mirror`
 
 当日 (JST) の対局 CSA をローカル dir へミラーし続ける。`kifu_player --csa <dir> --live`
-と組み合わせて、wdoor floodgate のほぼリアルタイム観戦に使う。
+と組み合わせて、wdoor floodgate のほぼリアルタイム観戦に使う。両者を 1 コマンドに
+まとめた wrapper 例が [docs/examples/floodgate/](../../../docs/examples/floodgate/README.md)
+にある（`watch.sh` / `watch.ps1`）。
 
 ```bash
 cargo run -p tools --bin floodgate_pipeline -- live-mirror \

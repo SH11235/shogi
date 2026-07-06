@@ -147,7 +147,9 @@ live_jsonl = false # 対局中に JSONL を手単位で live 追記（下記）
 
 実運用の全項目を含む設定例は **[docs/examples/csa-client-floodgate.toml.example](examples/csa-client-floodgate.toml.example)**
 をコピーして使う(`~/floodgate/active.toml` のように OSS repo 外へ置き、名前・トリップ・
-パスを自分の値へ差し替える。認証情報を含むため repo 内には置かない)。要点は接続部分:
+パスを自分の値へ差し替える。認証情報を含むため repo 内には置かない)。日常運用
+(観戦・戦績集計・再ビルド) を 1 コマンド化する wrapper スクリプト例は
+[docs/examples/floodgate/](examples/floodgate/README.md) にある。要点は接続部分:
 
 ```toml
 [server]
