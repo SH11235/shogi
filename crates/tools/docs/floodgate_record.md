@@ -60,7 +60,9 @@ floodgate_record --dir ~/floodgate/records/jsonl --fetch-ratings --ratings-cache
 | `--ratings-history <FILE>` | `--fetch-ratings` 併用。fetch 成功時に自分(`--me`)の現在レートを `ページ日付<TAB>名前<TAB>レート` で FILE へ追記する(R 推移のローカル記録)。同一(日付, 名前)は再追記せず**その日最初の観測値**を保持。書き込みは tmp→rename の全置換(並行実行でも行が壊れない)。config 指定時の既定は `<record.dir>/ratings_history.tsv` |
 
 `--config` に渡す TOML は csa_client の設定そのもので、本ツールが読むのは次の部分
-(完全な floodgate 用 config の例は `docs/csa-client.md` を参照):
+(完全な floodgate 用 config の例は
+[docs/examples/csa-client-floodgate.toml.example](../../../docs/examples/csa-client-floodgate.toml.example)、
+解説は [docs/csa-client.md](../../../docs/csa-client.md) を参照):
 
 ```toml
 [server]

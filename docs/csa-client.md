@@ -145,56 +145,21 @@ live_jsonl = false # 対局中に JSONL を手単位で live 追記（下記）
 
 ### floodgate で連続対局
 
-実運用の全項目を含む config の例（`~/floodgate/active.toml` のように OSS repo 外へ置き、
-名前・トリップ・パスを自分の値へ差し替える）:
+実運用の全項目を含む設定例は **[docs/examples/csa-client-floodgate.toml.example](examples/csa-client-floodgate.toml.example)**
+をコピーして使う(`~/floodgate/active.toml` のように OSS repo 外へ置き、名前・トリップ・
+パスを自分の値へ差し替える。認証情報を含むため repo 内には置かない)。要点は接続部分:
 
 ```toml
 [server]
-host = "wdoor.c.u-tokyo.ac.jp"   # 本番 floodgate。scheme 省略 = TCP 経路
+host = "wdoor.c.u-tokyo.ac.jp"
 port = 4081
-id = "YourEngineName"            # floodgate 上の公開エンジン名（事前登録不要・任意）
-password = "floodgate-300-10F,your-secret-trip"  # <game_name>,<trip>（必須。理由は下記）
-floodgate = true                 # 評価値/PV コメントを送信
-
-[server.keepalive]
-tcp = true                       # 中間 NAT の無通信切断対策
-ping_interval_sec = 60
-
-[engine]
-path = "/path/to/your-usi-engine"
-startup_timeout_sec = 30
-
-[engine.options]                 # 任意の USI オプションを Name = Value で列挙
-EvalFile = "/path/to/model.bin"
-Threads = 16
-USI_Hash = 2048
-Stochastic_Ponder = true
-
-[time]
-margin_msec = 1500               # 秒読みマージン。エンジン側 NetworkDelay と併用可
+id = "YourEngineName"
+password = "floodgate-300-10F,your-secret-trip"  # <game_name>,<trip>(必須。理由は下記)
+floodgate = true
 
 [game]
-max_games = 0                    # 0 = 無制限連続対局
+max_games = 0
 ponder = true
-restart_engine_every_game = false
-
-[retry]
-initial_delay_sec = 10
-max_delay_sec = 60
-
-[record]
-enabled = true
-dir = "/path/to/floodgate/records"
-filename_template = "{datetime}_{sente}_vs_{gote}"
-save_csa = true
-save_sfen = true
-save_jsonl = true                # 戦績集計 (floodgate_record) と TUI 閲覧が読む
-live_jsonl = true                # 対局中の手単位追記（kifu_player --live で自局観戦）
-
-[log]
-level = "info"
-dir = "/path/to/floodgate/logs"
-stdout = true
 ```
 
 ```bash
