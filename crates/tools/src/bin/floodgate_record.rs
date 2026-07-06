@@ -278,7 +278,12 @@ fn main() -> Result<()> {
     let names = ["先手番", "後手番"];
     for (i, name) in names.iter().enumerate() {
         let [cw, cl, cd] = by_color[i];
-        println!("  {name}: {cw}勝 {cl}敗 {cd}分 ({}局)", cw + cl + cd);
+        let games_c = cw + cl + cd;
+        println!(
+            "  {name}: {cw}勝 {cl}敗 {cd}分 ({games_c}局)  勝率 {:.0}% (引分除 {:.0}%)",
+            pct(cw, games_c),
+            pct(cw, cw + cl)
+        );
     }
 
     if !my_nps.is_empty() {
@@ -292,25 +297,48 @@ fn main() -> Result<()> {
         println!("  {ow}勝 {ol}敗 {od}分  vs {opp}");
     }
 
-    println!("\n=== 非勝(負け/引分) ===");
-    let mut any = false;
+    // 後手勝ちは最上位帯では希少で価値が高いので、相手名付きで individually 列挙する。
+    println!("\n=== 後手勝ち(価値大) ===");
+    let mut any_gw = false;
     for g in &games {
-        if g.sente != me && g.gote != me {
+        if g.gote != me {
+            continue; // 後手が me の局のみ
+        }
+        if result_for(g, &me) != Some(Res::Win) {
             continue;
         }
-        let res = match result_for(g, &me) {
-            Some(r) if r != Res::Win => r,
-            _ => continue, // 勝ち・中断は非勝一覧に載せない
+        any_gw = true;
+        let opp = &g.sente;
+        let star = if !cli.watch.is_empty() && cli.watch.iter().any(|w| opp.contains(w.as_str())) {
+            "  ★上位AI"
+        } else {
+            ""
         };
-        any = true;
-        let is_sente = g.sente == me;
-        let opp = if is_sente { &g.gote } else { &g.sente };
-        let col = if is_sente { "先" } else { "後" };
-        let mark = if res == Res::Loss { "●敗" } else { "△分" };
-        println!("  {}  {col}手  {mark}  vs {opp}  ({}, {}手)", g.stem, g.reason, g.plies);
+        println!("  {}  vs {opp}  ({}, {}手){star}", g.stem, g.reason, g.plies);
     }
-    if !any {
+    if !any_gw {
         println!("  (なし)");
+    }
+
+    for (title, target) in [("負け", Res::Loss), ("引分", Res::Draw)] {
+        println!("\n=== {title} ===");
+        let mut any = false;
+        for g in &games {
+            if g.sente != me && g.gote != me {
+                continue;
+            }
+            if result_for(g, &me) != Some(target) {
+                continue;
+            }
+            any = true;
+            let is_sente = g.sente == me;
+            let opp = if is_sente { &g.gote } else { &g.sente };
+            let col = if is_sente { "先" } else { "後" };
+            println!("  {}  {col}手  vs {opp}  ({}, {}手)", g.stem, g.reason, g.plies);
+        }
+        if !any {
+            println!("  (なし)");
+        }
     }
 
     if !cli.watch.is_empty() {

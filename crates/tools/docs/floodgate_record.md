@@ -38,10 +38,11 @@ floodgate_record --dir ./jsonl --me RAMU_TF --watch Suisho,dlshogi,nshogi
 ## 出力
 
 - 通算 W-L-D と勝率(全体 / 引分除く)
-- 先手番 / 後手番 別の W-L-D
+- 先手番 / 後手番 別の W-L-D と勝率(最上位帯は先手ほぼ必勝・後手勝ちの価値が大きい)
 - 対象エンジンの実戦 NPS(`time_ms>=500` の本探索の median)
 - 相手別 W-L-D
-- 非勝(負け/引分)一覧(手番・相手・reason・手数)
+- 後手勝ち一覧(相手名・reason・手数。`--watch` 該当相手は `★上位AI` 表示)
+- 負け一覧 / 引分一覧(それぞれ手番・相手・reason・手数)
 - `--watch` 指定時: 注目相手との対戦一覧
 
 勝敗判定は `result.winner` を基準にする(`winner==me`→勝ち、他名→負け)。winner が無い局は
