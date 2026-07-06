@@ -28,6 +28,7 @@ use rshogi_csa_client::config::CsaClientConfig;
 use rshogi_csa_client::jsonl::sanitize_for_filename;
 use serde::Deserialize;
 use tools::common::floodgate as fg;
+use tools::common::io::write_atomic;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -406,24 +407,6 @@ fn obtain_ratings(eff: &Effective, max_age_sec: u64, me: &str) -> BTreeMap<Strin
         }
     }
     map
-}
-
-/// 同一 dir の一時ファイルに書いてから rename で置き換える(部分書き込みで既存
-/// ファイルを壊さない)。親ディレクトリが無ければ作る(config 由来の record.dir が
-/// まだ作られていない初期状態でも cache / 履歴が機能するように)。
-fn write_atomic(path: &Path, content: &str) -> Result<()> {
-    use std::io::Write;
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    std::fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temp file in {}", parent.display()))?;
-    tmp.write_all(content.as_bytes())
-        .with_context(|| format!("write temp file for {}", path.display()))?;
-    tmp.persist(path).with_context(|| format!("rename to {}", path.display()))?;
-    Ok(())
 }
 
 /// レートマップを `name<TAB>rate` でキャッシュへ書き出す(BTreeMap 順で決定的)。

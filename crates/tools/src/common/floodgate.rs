@@ -112,17 +112,47 @@ pub fn rating_page_url(root: &str, date_yyyymmdd: &str) -> Result<String> {
     join_url(root, &format!("{RATING_PAGE_REL_PREFIX}{date_yyyymmdd}.html"))
 }
 
+/// floodgate サーバ基準 (JST/+0900) の「今日」。ページ名・日次ディレクトリ名は JST 日付
+/// なので、ホスト TZ に依存せず JST で求める。UTC など JST より遅れた TZ のホストでは
+/// 現地 today が当日分を取りこぼしうるため。
+pub fn jst_today() -> chrono::NaiveDate {
+    let jst = chrono::FixedOffset::east_opt(9 * 3600).expect("JST は有効なオフセット");
+    chrono::Utc::now().with_timezone(&jst).date_naive()
+}
+
+/// 指定日の棋譜ディレクトリ URL (`<root>YYYY/MM/DD/`) を組む。Apache autoindex を返し、
+/// 当日ぶんは対局開始直後のファイル(進行中・逐次追記)も列挙される。
+pub fn day_dir_url(root: &str, date: chrono::NaiveDate) -> Result<String> {
+    join_url(root, &date.format("%Y/%m/%d/").to_string())
+}
+
+/// Apache autoindex HTML から `*.csa` のファイル名(`href` 値)を抽出する。
+/// 相対 href のみ対象(親ディレクトリ等へのリンクは `.csa` で終わらないため落ちる)。
+pub fn parse_autoindex_csa_names(html: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for chunk in html.split("href=\"").skip(1) {
+        let Some(end) = chunk.find('"') else { continue };
+        let href = &chunk[..end];
+        if href.ends_with(".csa") && !href.contains('/') && !names.iter().any(|n| n == href) {
+            names.push(href.to_string());
+        }
+    }
+    names
+}
+
+/// CSA テキストが終局済みか。shogi-server は終局時に `'$END_TIME:` コメントを書くため、
+/// その有無で判定する(進行中の逐次追記ファイルには無い)。
+pub fn csa_is_finished(text: &str) -> bool {
+    text.lines().any(|l| l.starts_with("'$END_TIME:"))
+}
+
 /// 直近のレーティングページを取得し (URL, ページ日付 `YYYYMMDD`, HTML) を返す。
 ///
 /// ページは日次生成の日付スタンプ付きで当日分が未生成のこともあるため、
 /// 今日から数日遡って最初に取得できたページを採用する。
 pub fn fetch_latest_rating_page(client: &Client) -> Result<(String, String, String)> {
     const LOOKBACK_DAYS: i64 = 7;
-    // ファイル名は floodgate サーバ (JST/+0900) 基準の日付なので、ホスト TZ に依存せず
-    // JST で当日を求める。UTC など JST より遅れた TZ のホストでは現地 today が当日分を
-    // 取りこぼしうるため。
-    let jst = chrono::FixedOffset::east_opt(9 * 3600).expect("JST は有効なオフセット");
-    let today = chrono::Utc::now().with_timezone(&jst).date_naive();
+    let today = jst_today();
     let mut last_err: Option<anyhow::Error> = None;
     for back in 0..=LOOKBACK_DAYS {
         let date = (today - chrono::Duration::days(back)).format("%Y%m%d").to_string();
@@ -252,6 +282,43 @@ mod tests {
             "https://wdoor.c.u-tokyo.ac.jp/shogi/x/rating/players-floodgate-20260620.html"
         );
     }
+    #[test]
+    fn test_day_dir_url() {
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 7).unwrap();
+        assert_eq!(
+            day_dir_url(DEFAULT_ROOT, d).unwrap(),
+            "https://wdoor.c.u-tokyo.ac.jp/shogi/x/2026/07/07/"
+        );
+    }
+
+    #[test]
+    fn test_parse_autoindex_csa_names() {
+        let html = r#"
+        <tr><td><a href="?C=N;O=D">Name</a></td></tr>
+        <tr><td><a href="/shogi/x/2026/07/">Parent Directory</a></td></tr>
+        <tr><td><a href="wdoor+floodgate-300-10F+A+B+20260707000001.csa">wdoor+...csa</a></td></tr>
+        <tr><td><a href="wdoor+floodgate-300-10F+C+D+20260707000002.csa">wdoor+...csa</a></td></tr>
+        <tr><td><a href="wdoor+floodgate-300-10F+A+B+20260707000001.csa">dup</a></td></tr>
+        <tr><td><a href="00INDEX.html">index</a></td></tr>
+        "#;
+        let names = parse_autoindex_csa_names(html);
+        assert_eq!(
+            names,
+            vec![
+                "wdoor+floodgate-300-10F+A+B+20260707000001.csa",
+                "wdoor+floodgate-300-10F+C+D+20260707000002.csa"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_csa_is_finished() {
+        assert!(csa_is_finished(
+            "+7776FU\n%TORYO\n'summary:toryo\n'$END_TIME:2026/07/07 01:52:29\n"
+        ));
+        assert!(!csa_is_finished("'$START_TIME:2026/07/07 01:30:00\n+7776FU\n-3334FU\n"));
+    }
+
     #[test]
     fn test_parse_rating_page() {
         let html = r#"

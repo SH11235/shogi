@@ -322,8 +322,13 @@ impl App {
     fn replace_index(&mut self, new_index: GameIndex) {
         let old_len = self.index.entries.len();
         let selected_key = self.selected_entry().and_then(|e| entry_key(&self.index, e));
+        let old_ply = self.selected_entry().map(|e| e.ply_count);
         let saved_game = self.current_game.take();
         let saved_move = self.current_move;
+        // 末尾の手を見ていたなら、対局が伸びたとき新しい末尾へ追従する(観戦用)。
+        let was_at_tail = saved_game
+            .as_ref()
+            .is_some_and(|g| !g.moves.is_empty() && saved_move + 1 == g.moves.len());
 
         self.index = new_index;
         // SFEN スキャンの一致集合は旧索引の添字なので新索引へは引き継げない。クリアして
@@ -339,8 +344,25 @@ impl App {
             })
         {
             self.selected = pos;
-            self.current_game = saved_game;
-            self.current_move = saved_move;
+            let new_ply = self.index.entries[self.filtered[pos]].ply_count;
+            if old_ply == Some(new_ply) {
+                // 内容が変わっていない(完了局)なら読み直さず手の位置を維持。
+                self.current_game = saved_game;
+                self.current_move = saved_move;
+            } else {
+                // 進行中対局が伸びた(live-mirror 経由等)。読み直して位置を復元し、
+                // 末尾を見ていたなら新しい末尾へ追従する。
+                self.load_selected();
+                if let Some(game) = &self.current_game
+                    && !game.moves.is_empty()
+                {
+                    self.current_move = if was_at_tail {
+                        game.moves.len() - 1
+                    } else {
+                        saved_move.min(game.moves.len() - 1)
+                    };
+                }
+            }
         }
         let new_len = self.index.entries.len();
         self.status = if new_len >= old_len {
@@ -1658,6 +1680,91 @@ mod tests {
             keys[file_idx]
         });
         assert_eq!(filtered, vec![2, 0, 1]); // 新→旧→日時なし
+    }
+
+    /// live 再読込テスト用の CSA 形式 fake。共有 `games` を差し替えて対局の成長・追加を
+    /// 模せる(実ファイル不要)。
+    struct SharedCsaSource(std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>);
+
+    impl GameSource for SharedCsaSource {
+        fn build_index(&self) -> Result<GameIndex> {
+            let games = self.0.borrow();
+            let entries = (0..games.len())
+                .map(|i| GameIndexEntry {
+                    source: GameSourceRef::Csa {
+                        file_idx: i,
+                        ordinal: i as u32,
+                    },
+                    outcome: None,
+                    error: false,
+                    ply_count: games[i].len() as u32,
+                    pair_index: None,
+                    pair_slot: None,
+                    startpos_idx: None,
+                    metrics: Default::default(),
+                })
+                .collect();
+            let pair_files = (0..games.len())
+                .map(|i| PairFileMeta {
+                    path: PathBuf::from(format!("g{i}.csa")),
+                    black_label: "A".to_string(),
+                    white_label: "B".to_string(),
+                    date_key: None,
+                })
+                .collect();
+            Ok(GameIndex {
+                entries,
+                pair_files,
+                warnings: Vec::new(),
+            })
+        }
+
+        fn load_game(&self, _index: &GameIndex, entry: &GameIndexEntry) -> Result<GameRecord> {
+            let GameSourceRef::Csa { file_idx, .. } = entry.source else {
+                unreachable!("SharedCsaSource yields only Csa refs");
+            };
+            let moves = self.0.borrow()[file_idx].iter().map(|s| move_with_sfen(s)).collect();
+            Ok(GameRecord {
+                moves,
+                leading_gap_is_drop: false,
+            })
+        }
+    }
+
+    #[test]
+    fn replace_index_reloads_grown_game_and_follows_tail() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let games = Rc::new(RefCell::new(vec![
+            vec![HIRATE_SFEN.to_string(); 2],
+            vec![HIRATE_SFEN.to_string(); 3],
+        ]));
+        let source = SharedCsaSource(games.clone());
+        let index = source.build_index().unwrap();
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
+        // 対局 1 (3 手) を選び末尾の手を表示
+        app.next_game();
+        app.current_move = 2;
+        assert_eq!(app.current_game.as_ref().unwrap().moves.len(), 3);
+
+        // 対局 1 が 5 手へ伸び、新しい対局が 1 局増えた
+        games.borrow_mut()[1] = vec![HIRATE_SFEN.to_string(); 5];
+        games.borrow_mut().push(vec![HIRATE_SFEN.to_string(); 1]);
+        let new_index = app.source.build_index().unwrap();
+        app.replace_index(new_index);
+        // 選択は同じ対局のまま読み直され、末尾を見ていたので新しい末尾へ追従
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.current_game.as_ref().unwrap().moves.len(), 5);
+        assert_eq!(app.current_move, 4);
+        assert!(app.status.contains("1 局追加"), "status: {}", app.status);
+
+        // 変化の無い完了局は読み直さず手の位置を維持する
+        app.prev_game();
+        app.current_move = 1;
+        let new_index = app.source.build_index().unwrap();
+        app.replace_index(new_index);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.current_move, 1);
     }
 
     #[test]

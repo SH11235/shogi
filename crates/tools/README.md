@@ -12,7 +12,7 @@
 | `analyze_selfplay` | tournament 出力の集計・Elo/nElo 算出・SPRT post-hoc 判定 |
 | `floodgate_record` | csa_client の per-game JSONL から 1 エンジンの戦績を集計（先後別勝率・相手別・後手勝ち/負け/引分・実戦 NPS、`--config` で csa_client 設定から入力導出、`--fetch-ratings` で wdoor 現在レート併記・履歴記録。floodgate 連続対局向け、[詳細](docs/floodgate_record.md)） |
 | `gensfen` | NNUE 学習用 PSV/pack/hcpe3 教師局面の生成（USI engine vs engine／NativeBackend） |
-| `floodgate_pipeline` | Floodgate棋譜のダウンロード・変換（[詳細](docs/floodgate_pipeline.md)） |
+| `floodgate_pipeline` | Floodgate棋譜のダウンロード・変換・`live-mirror`リアルタイムミラー（[詳細](docs/floodgate_pipeline.md)） |
 | `book_from_csa` | CSA 棋譜群から YANEURAOU-DB2016 テキスト定跡 `.db` を生成（消費時間による定跡手判定・レート/勝敗フィルタ、[詳細](docs/book_from_csa.md)） |
 | `book_rescore` | YANEURAOU-DB2016 テキスト定跡の候補手に USI 探索または ONNX 静的評価値を付与、実行中は進捗/ETA を stderr 表示（[詳細](docs/book_rescore.md)） |
 
@@ -20,7 +20,7 @@
 
 | ツール | 説明 |
 |--------|------|
-| `kifu_player` | PSV / tournament JSONL / CSA を同じ TUI で再生・閲覧（`kifu-player` feature、評価値グラフ・検索/絞り込み（SFEN 局面検索含む）・`--live` 追記監視・`--ratings` レート併記付き。[詳細](docs/kifu_player.md)） |
+| `kifu_player` | PSV / tournament JSONL / CSA を同じ TUI で再生・閲覧（`kifu-player` feature、評価値グラフ・検索/絞り込み（SFEN 局面検索含む）・`--live` 追記監視 (live-mirror と組で wdoor 観戦)・`--ratings` レート併記付き。[詳細](docs/kifu_player.md)） |
 
 ### 学習データ処理
 
@@ -83,7 +83,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 各ツールの詳細は `docs/` を参照：
 
 - [tournament](docs/tournament.md) - 並列トーナメント・SPRT 検定
-- [kifu_player](docs/kifu_player.md) - PSV / tournament JSONL / CSA 共通の棋譜プレイヤー TUI（評価値グラフ・検索/絞り込み（SFEN 局面検索含む）・`--live` 追記監視・`--ratings` レート併記付き）
+- [kifu_player](docs/kifu_player.md) - PSV / tournament JSONL / CSA 共通の棋譜プレイヤー TUI（評価値グラフ・検索/絞り込み（SFEN 局面検索含む）・`--live` 追記監視 (live-mirror と組で wdoor 観戦)・`--ratings` レート併記付き）
 - [gensfen](docs/gensfen.md) - 教師局面生成ツールの詳細
 - [benchmark](docs/benchmark.md) - ベンチマークツールの詳細
 - [pack_tools](docs/pack_tools.md) - 学習データ処理ツール群
