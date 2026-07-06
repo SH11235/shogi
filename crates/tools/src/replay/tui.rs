@@ -365,12 +365,17 @@ impl App {
             }
         }
         let new_len = self.index.entries.len();
-        self.status = if new_len > old_len {
-            format!("live: {} 局追加 (計 {new_len} 局)", new_len - old_len)
-        } else {
-            // 局数が変わらない再読込 = 進行中対局の追記など。「0 局追加」だと紛らわしい。
-            format!("live: 更新 (計 {new_len} 局)")
-        };
+        // 読み込みエラーが出ている(current_game が無い)ときは、その診断メッセージを
+        // live 概況で上書きしない(盤面ペインが「ステータスバー参照」と誘導するため)。
+        let load_failed = self.current_game.is_none() && !self.filtered.is_empty();
+        if !load_failed {
+            self.status = if new_len > old_len {
+                format!("live: {} 局追加 (計 {new_len} 局)", new_len - old_len)
+            } else {
+                // 局数が変わらない再読込 = 進行中対局の追記など。「0 局追加」だと紛らわしい。
+                format!("live: 更新 (計 {new_len} 局)")
+            };
+        }
     }
 
     fn cycle_sort_mode(&mut self) {

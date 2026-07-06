@@ -99,7 +99,8 @@ enum Cmd {
         /// ミラー先ディレクトリ (ファイル名は wdoor のまま)
         #[arg(long)]
         out_dir: PathBuf,
-        /// 進行中対局の再取得間隔 (秒)。対局一覧 (日次 index) の確認は 60 秒ごと固定
+        /// 進行中対局の再取得間隔 (秒)。対局一覧 (日次 index) の確認は約 60 秒ごと
+        /// (interval がそれより長い場合はそのパス頻度)
         #[arg(long, default_value_t = 10)]
         interval: u64,
         /// 対局者名の部分一致フィルタ (カンマ区切り)。未指定は当日の全対局をミラー
@@ -262,7 +263,9 @@ fn run_live_mirror(
 
     anyhow::ensure!(interval >= 1, "--interval は 1 秒以上を指定してください");
     fs::create_dir_all(out_dir).with_context(|| format!("create dir {}", out_dir.display()))?;
-    let client = Client::builder().build()?;
+    // 無人常駐が前提なので、応答しないピアで単一スレッドのループ全体が
+    // 止まらないようリクエストにタイムアウトを付ける。
+    let client = Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
     // 変化なしがこのパス数続いた進行中ファイルは放棄する(interval=10s で約 1 時間)。
     let stale_limit: u32 = (3600 / interval).max(10) as u32;
 
@@ -306,6 +309,13 @@ fn run_live_mirror(
                     if added > 0 {
                         eprintln!("live-mirror: 対局発見 +{added} (追跡 {} 局)", states.len());
                     }
+                    // 終局済みで前日以前の対局は追跡から外す(常駐時のメモリじわ増防止)。
+                    // 当日 index には現れないので再発見されず、仮に再発見されても
+                    // ローカルの完全棋譜チェックが再取得を防ぐ。
+                    let today = fg::jst_today().format("%Y%m%d").to_string();
+                    states.retain(|name, st| {
+                        !(st.finished && csa_name_date(name).is_some_and(|d| d < today.as_str()))
+                    });
                 }
                 Err(e) => eprintln!("⚠ 対局一覧の取得失敗(次回再試行): {e:#}"),
             }
@@ -323,14 +333,19 @@ fn run_live_mirror(
                     }
                 }
                 Ok(false) => {}
-                Err(e) => eprintln!("⚠ 取得失敗(次回再試行) {}: {e:#}", st.url),
+                Err(e) => {
+                    // 恒久的な失敗 (404 等) も放棄カウントに含める。一時的な障害は
+                    // 閾値まで至らず、回復すれば成功時にリセットされる。
+                    st.unchanged_polls += 1;
+                    eprintln!("⚠ 取得失敗(次回再試行) {}: {e:#}", st.url);
+                }
             }
             if !st.finished {
                 if st.unchanged_polls > stale_limit {
                     // 追跡だけ止める(ローカルの部分棋譜は勝敗不明として残る)。
                     st.finished = true;
                     eprintln!(
-                        "⚠ {} は {stale_limit} パス変化なし。中断対局とみなし追跡を止める",
+                        "⚠ {} は {stale_limit} パス変化なし(または取得失敗)。中断対局とみなし追跡を止める",
                         st.local.display()
                     );
                 } else {
@@ -350,6 +365,13 @@ fn run_live_mirror(
         std::thread::sleep(Duration::from_secs(interval));
     }
     Ok(())
+}
+
+/// wdoor ファイル名 (`...+YYYYMMDDHHMMSS.csa`) から日付部 (`YYYYMMDD`) を取り出す。
+fn csa_name_date(name: &str) -> Option<&str> {
+    let stem = name.strip_suffix(".csa")?;
+    let tail = stem.rsplit('+').next()?;
+    (tail.len() == 14 && tail.bytes().all(|b| b.is_ascii_digit())).then(|| &tail[..8])
 }
 
 /// 1 ファイルを取得してローカルへ反映する。書いたら `Ok(true)`。
@@ -773,4 +795,19 @@ fn in_ply_range(ply: u32, min_ply: u32, max_ply: u32) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csa_name_date_extracts_wdoor_date() {
+        assert_eq!(
+            csa_name_date("wdoor+floodgate-300-10F+A+B+20260707013003.csa"),
+            Some("20260707")
+        );
+        assert_eq!(csa_name_date("wdoor+floodgate-300-10F+A+B+2026070701.csa"), None);
+        assert_eq!(csa_name_date("no_date.csa"), None);
+    }
 }
