@@ -103,6 +103,20 @@ kifu_player --csa /tmp/wdoor-live --live 5 --ratings ~/floodgate/records/ratings
 TUI 自体はネットワークに触れない（ミラー dir を読むだけ）ので、オフライン解析の
 `--csa <dir>` 単体利用と完全に同じコードパスで動く。
 
+#### 自エンジンの対局を低遅延で追う（csa_client の live JSONL）
+
+自分の csa_client が指している対局は、wdoor を経由せず直接追える。csa_client の
+設定で `[record] live_jsonl = true` にすると対局中の JSONL に手が逐次追記されるので、
+その dir を live で開くだけでよい:
+
+```bash
+kifu_player --tournament-dir ~/floodgate/records/jsonl --live 3
+```
+
+進行中の対局は result 行が無いため「勝敗不明」として一覧に載り、手が追記されるたびに
+再読込される（末尾の手を表示していれば自動追従）。終局すると通常の完了局に置き換わる。
+評価値・PV は自エンジンの USI info 由来なので wdoor のコメントより情報が濃い。
+
 ### レート併記（`--ratings <TSV>`）
 
 `name<TAB>rate` の TSV（`floodgate_record --ratings-cache` の出力）を渡すと、対局一覧の

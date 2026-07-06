@@ -234,6 +234,8 @@ fn index_one_file(
 
     let mut open: HashMap<u32, u64> = HashMap::new();
     let mut closed: HashSet<u32> = HashSet::new();
+    // 進行中対局 (result 行なし) の手数を索引に載せるため move 行を game_id 別に数える。
+    let mut move_counts: HashMap<u32, u32> = HashMap::new();
     // game_id ごとの評価値指標。move 行は interleave しうるので game_id で束ねる。
     let mut evals: HashMap<u32, EvalAccumulator> = HashMap::new();
 
@@ -254,6 +256,7 @@ fn index_one_file(
                     );
                 }
                 open.entry(game_id).or_insert(line_start);
+                *move_counts.entry(game_id).or_default() += 1;
                 if let Some(cp) = move_black_pov_cp(&value) {
                     evals.entry(game_id).or_default().push(cp);
                 }
@@ -303,11 +306,33 @@ fn index_one_file(
     }
 
     if !open.is_empty() {
+        // result 行を伴わない対局 = 進行中 (csa_client の live 追記や実行中の tournament)
+        // または途中終了。勝敗不明の対局として索引する (live 再読込で完了時に置き換わる)。
+        // HashMap の反復順に依存しないよう開始 offset 順で並べる。
+        let mut open_games: Vec<(u32, u64)> = open.into_iter().collect();
+        open_games.sort_by_key(|&(_, start)| start);
         warnings.push(format!(
-            "{}: {} 局が result 行を伴わず終端しました（実行中・途中終了したファイルの可能性）。索引から除外します。",
+            "{}: {} 局が result 行を伴わず終端しました（進行中・途中終了）。勝敗不明として索引します。",
             path.display(),
-            open.len()
+            open_games.len()
         ));
+        for (game_id, start_offset) in open_games {
+            entries.push(GameIndexEntry {
+                source: GameSourceRef::Jsonl {
+                    file_idx,
+                    game_id,
+                    start_offset,
+                    end_offset: offset,
+                },
+                outcome: None,
+                error: false,
+                ply_count: move_counts.get(&game_id).copied().unwrap_or(0),
+                pair_index: None,
+                pair_slot: None,
+                startpos_idx: None,
+                metrics: evals.remove(&game_id).unwrap_or_default().finish(),
+            });
+        }
     }
 
     Ok(Some(PairFileMeta {
@@ -605,17 +630,28 @@ mod tests {
     }
 
     #[test]
-    fn warns_and_drops_incomplete_trailing_game() {
+    fn indexes_incomplete_trailing_game_as_in_progress() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(
             dir.path(),
             "a-vs-b.jsonl",
-            &[meta_line("a", "b"), move_line(1, 1, "7g7f")], // result 行が無いまま終端
+            &[
+                meta_line("a", "b"),
+                move_line(1, 1, "7g7f"),
+                move_line(1, 2, "3c3d"), // result 行が無いまま終端 = 進行中
+            ],
         );
 
-        let index = JsonlSource::new(dir.path()).build_index().expect("build_index");
-        assert_eq!(index.entries.len(), 0);
+        let source = JsonlSource::new(dir.path());
+        let index = source.build_index().expect("build_index");
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].outcome, None);
+        assert!(!index.entries[0].error);
+        assert_eq!(index.entries[0].ply_count, 2);
         assert!(!index.warnings.is_empty());
+        // 進行中対局も既存のバイト範囲経路でそのまま再生できる。
+        let game = source.load_game(&index, &index.entries[0]).expect("load_game");
+        assert_eq!(game.moves.len(), 2);
     }
 
     #[test]
