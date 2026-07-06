@@ -120,6 +120,10 @@ kifu_player --csa /tmp/wdoor-live --live 5 --ratings ~/floodgate/records/ratings
 TUI 自体はネットワークに触れない（ミラー dir を読むだけ）ので、オフライン解析の
 `--csa <dir>` 単体利用と完全に同じコードパスで動く。
 
+この 2 プロセスを 1 コマンドにまとめた wrapper 例（`watch.sh` / Windows 用 `watch.ps1`、
+TUI 終了でミラーも自動停止）が
+[docs/examples/floodgate/](../../../docs/examples/floodgate/README.md) にある。
+
 #### 自エンジンの対局を低遅延で追う（csa_client の live JSONL）
 
 自分の csa_client が指している対局は、wdoor を経由せず直接追える。csa_client の
