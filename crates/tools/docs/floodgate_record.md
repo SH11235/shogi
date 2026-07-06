@@ -14,7 +14,8 @@
 
 - `move` 行: `engine`(指した側の名前)/ `ply` / `eval.nps` / `eval.time_ms`。
   **両対局者の手が engine 名付きで記録される**ため、`ply==1` の `engine` が先手、もう一方が後手。
-  ファイル名に依存せず手番・相手を判定できる。
+  後手が 1 手も指さず負けた局だけは move に相手が出ないので、その相手はファイル名
+  `..._vs_{gote}` から補完する(取りこぼし防止)。
 - `result` 行: `winner`(勝者名。引き分けは無し)/ `reason` / `plies`。
 
 `result` 行が無いファイル(進行中の局)は自動でスキップする。
@@ -38,10 +39,15 @@ floodgate_record --dir ./jsonl --me RAMU_TF --watch Suisho,dlshogi,nshogi
 ## 出力
 
 - 通算 W-L-D と勝率(全体 / 引分除く)
-- 先手番 / 後手番 別の W-L-D
+- 先手番 / 後手番 別の W-L-D と勝率(最上位帯は先手ほぼ必勝・後手勝ちの価値が大きい)
 - 対象エンジンの実戦 NPS(`time_ms>=500` の本探索の median)
 - 相手別 W-L-D
-- 非勝(負け/引分)一覧(手番・相手・reason・手数)
+- 後手勝ち一覧(相手名・reason・手数。`--watch` 該当相手は `★上位AI` 表示)
+- 負け一覧 / 引分一覧(それぞれ手番・相手・reason・手数)
 - `--watch` 指定時: 注目相手との対戦一覧
 
-勝敗判定は `result.winner` を基準にする(`winner==me`→勝ち、他名→負け、無し→引分)。
+勝敗判定は `result.winner` を基準にする(`winner==me`→勝ち、他名→負け)。winner が無い局は
+`reason` で判別し、`sennichite` / `max_moves` / `jishogi` のみ引き分けに数える。中断・検閲・error
+など未完了局(csa_client は `outcome="draw"` / `reason="interrupted"` で書く)は勝率を歪めないよう
+**集計対象外**。対象エンジンが参加していない局(別ハンドルのログ混在)も除外する。除外があれば
+ヘッダに件数(対象不参加 / 中断・未完了)を表示する。

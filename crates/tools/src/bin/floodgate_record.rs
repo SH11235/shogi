@@ -2,8 +2,9 @@
 //! エンジンの戦績を集計する CLI。floodgate 連続対局のように相手が毎局変わる
 //! ログ群を、先後別・相手別・非勝一覧・実戦 NPS で要約する。
 //!
-//! JSONL は両対局者の指し手を `engine` 名付きで記録するため、手番・相手・勝敗は
-//! ファイル名に依らず JSONL だけで判定できる(ply1 の `engine` が先手)。
+//! JSONL は両対局者の指し手を `engine` 名付きで記録するので、手番・相手は move 行から
+//! 判定できる(ply1 の `engine` が先手)。後手が 1 手も指さず負けた局だけは move に相手が
+//! 現れないため、ファイル名 `..._vs_{gote}` から相手を補完する(取りこぼし防止)。
 //!
 //! # 例
 //! ```text
@@ -86,7 +87,7 @@ fn parse_game(path: &std::path::Path) -> Result<Option<Game>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
 
-    let mut sente: Option<String> = None;
+    let mut sente_ply1: Option<String> = None;
     let mut engines: Vec<String> = Vec::new(); // 出現順の distinct engine
     let mut nps: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut winner: Option<String> = None;
@@ -106,7 +107,7 @@ fn parse_game(path: &std::path::Path) -> Result<Option<Game>> {
             "move" => {
                 if let Some(eng) = l.engine {
                     if l.ply == Some(1) {
-                        sente = Some(eng.clone());
+                        sente_ply1 = Some(eng.clone());
                     }
                     if !engines.contains(&eng) {
                         engines.push(eng.clone());
@@ -132,11 +133,16 @@ fn parse_game(path: &std::path::Path) -> Result<Option<Game>> {
     if !has_result {
         return Ok(None); // 進行中 / 未完了の局はスキップ
     }
-    let sente = match sente {
+    let sente = match sente_ply1 {
         Some(s) => s,
         None => return Ok(None), // 手が 1 手も無い異常局
     };
-    let gote = engines.iter().find(|e| **e != sente).cloned().unwrap_or_default();
+    // 相手(後手)は move から判定するが、後手が 1 手も指さず負けた局(初手前に time_up 等)は
+    // move に現れず取りこぼす。その場合はファイル名 `..._vs_{gote}` から補完する。
+    let gote = match engines.iter().find(|e| **e != sente) {
+        Some(g) => g.clone(),
+        None => stem.rsplit_once("_vs_").map(|(_, g)| g.to_owned()).unwrap_or_default(),
+    };
 
     Ok(Some(Game {
         stem,
@@ -149,11 +155,19 @@ fn parse_game(path: &std::path::Path) -> Result<Option<Game>> {
     }))
 }
 
-fn result_for(g: &Game, me: &str) -> Res {
+/// me から見た結果。`None` は集計対象外(中断/検閲/error など未完了局)。
+///
+/// winner なしの局は reason で判別する: `sennichite` / `max_moves` / `jishogi` は正当な
+/// 引き分け、それ以外(csa_client が中断・検閲を `outcome="draw"` + `reason="interrupted"`
+/// で書く等)は勝率を歪めないよう除外する。
+fn result_for(g: &Game, me: &str) -> Option<Res> {
     match &g.winner {
-        Some(w) if w == me => Res::Win,
-        Some(_) => Res::Loss,
-        None => Res::Draw,
+        Some(w) if w == me => Some(Res::Win),
+        Some(_) => Some(Res::Loss),
+        None => match g.reason.as_str() {
+            "sennichite" | "max_moves" | "jishogi" => Some(Res::Draw),
+            _ => None,
+        },
     }
 }
 
@@ -215,11 +229,20 @@ fn main() -> Result<()> {
     // 相手別 (W, L, D)
     let mut by_opp: BTreeMap<String, [usize; 3]> = BTreeMap::new();
     let mut my_nps: Vec<f64> = Vec::new();
+    let mut skipped_foreign = 0usize; // me が参加していない局
+    let mut skipped_incomplete = 0usize; // 中断/検閲/error など未完了局
 
     for g in &games {
+        if g.sente != me && g.gote != me {
+            skipped_foreign += 1;
+            continue;
+        }
+        let Some(res) = result_for(g, &me) else {
+            skipped_incomplete += 1;
+            continue;
+        };
         let is_sente = g.sente == me;
         let opp = if is_sente { &g.gote } else { &g.sente };
-        let res = result_for(g, &me);
         let idx = match res {
             Res::Win => 0,
             Res::Loss => 1,
@@ -237,7 +260,8 @@ fn main() -> Result<()> {
         }
     }
 
-    let n = games.len();
+    let total = games.len();
+    let n = w + l + d;
     let pct = |num: usize, den: usize| {
         if den == 0 {
             0.0
@@ -245,7 +269,15 @@ fn main() -> Result<()> {
             num as f64 / den as f64 * 100.0
         }
     };
-    println!("集計対象: {me}   ソース: {n} 局");
+    println!("集計対象: {me}   完了局 {total} 局 → 集計 {n} 局");
+    if skipped_foreign > 0 || skipped_incomplete > 0 {
+        println!(
+            "  (除外: 対象不参加 {skipped_foreign} 局 / 中断・未完了 {skipped_incomplete} 局)"
+        );
+    }
+    if n == 0 {
+        println!("  ⚠ 集計対象が 0 局。--me の名前を確認(全局が対象不参加/未完了)。");
+    }
     println!(
         "=== 通算: {w}勝 {l}敗 {d}分  ({n}局)  勝率 {:.0}% (引分除 {:.0}%) ===",
         pct(w, n),
@@ -255,7 +287,21 @@ fn main() -> Result<()> {
     let names = ["先手番", "後手番"];
     for (i, name) in names.iter().enumerate() {
         let [cw, cl, cd] = by_color[i];
-        println!("  {name}: {cw}勝 {cl}敗 {cd}分 ({}局)", cw + cl + cd);
+        let games_c = cw + cl + cd;
+        if games_c == 0 {
+            println!("  {name}: (0局)");
+            continue;
+        }
+        // 全引分だと「引分除」の母数が 0 なので N/A(`-`)で 0% と区別する。
+        let ex_draw = if cw + cl == 0 {
+            "-".to_owned()
+        } else {
+            format!("{:.0}%", pct(cw, cw + cl))
+        };
+        println!(
+            "  {name}: {cw}勝 {cl}敗 {cd}分 ({games_c}局)  勝率 {:.0}% (引分除 {ex_draw})",
+            pct(cw, games_c)
+        );
     }
 
     if !my_nps.is_empty() {
@@ -269,34 +315,66 @@ fn main() -> Result<()> {
         println!("  {ow}勝 {ol}敗 {od}分  vs {opp}");
     }
 
-    println!("\n=== 非勝(負け/引分) ===");
-    let mut any = false;
+    // 後手勝ちは最上位帯では希少で価値が高いので、相手名付きで individually 列挙する。
+    println!("\n=== 後手勝ち(価値大) ===");
+    let mut any_gw = false;
     for g in &games {
-        let res = result_for(g, &me);
-        if res == Res::Win {
+        if g.gote != me {
+            continue; // 後手が me の局のみ
+        }
+        if result_for(g, &me) != Some(Res::Win) {
             continue;
         }
-        any = true;
-        let is_sente = g.sente == me;
-        let opp = if is_sente { &g.gote } else { &g.sente };
-        let col = if is_sente { "先" } else { "後" };
-        let mark = if res == Res::Loss { "●敗" } else { "△分" };
-        println!("  {}  {col}手  {mark}  vs {opp}  ({}, {}手)", g.stem, g.reason, g.plies);
+        any_gw = true;
+        let opp = &g.sente;
+        let star = if cli.watch.iter().any(|w| opp.contains(w.as_str())) {
+            "  ★上位AI"
+        } else {
+            ""
+        };
+        println!("  {}  vs {opp}  ({}, {}手){star}", g.stem, g.reason, g.plies);
     }
-    if !any {
+    if !any_gw {
         println!("  (なし)");
+    }
+
+    for (title, target) in [("負け", Res::Loss), ("引分", Res::Draw)] {
+        println!("\n=== {title} ===");
+        let mut any = false;
+        for g in &games {
+            if g.sente != me && g.gote != me {
+                continue;
+            }
+            if result_for(g, &me) != Some(target) {
+                continue;
+            }
+            any = true;
+            let is_sente = g.sente == me;
+            let opp = if is_sente { &g.gote } else { &g.sente };
+            let col = if is_sente { "先" } else { "後" };
+            println!("  {}  {col}手  vs {opp}  ({}, {}手)", g.stem, g.reason, g.plies);
+        }
+        if !any {
+            println!("  (なし)");
+        }
     }
 
     if !cli.watch.is_empty() {
         println!("\n=== 注目相手との対戦 ===");
         for g in &games {
+            if g.sente != me && g.gote != me {
+                continue;
+            }
             let is_sente = g.sente == me;
             let opp = if is_sente { &g.gote } else { &g.sente };
             if !cli.watch.iter().any(|w| opp.contains(w.as_str())) {
                 continue;
             }
+            let Some(res) = result_for(g, &me) else {
+                continue;
+            };
             let col = if is_sente { "先" } else { "後" };
-            let mark = match result_for(g, &me) {
+            let mark = match res {
                 Res::Win => "○",
                 Res::Loss => "●",
                 Res::Draw => "△",
@@ -312,25 +390,28 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn game(sente: &str, gote: &str, winner: Option<&str>) -> Game {
+    fn game(sente: &str, gote: &str, winner: Option<&str>, reason: &str) -> Game {
         Game {
             stem: "t".to_owned(),
             sente: sente.to_owned(),
             gote: gote.to_owned(),
             winner: winner.map(str::to_owned),
-            reason: "win".to_owned(),
+            reason: reason.to_owned(),
             plies: 100,
             nps: BTreeMap::new(),
         }
     }
 
     #[test]
-    fn result_for_win_loss_draw() {
+    fn result_classification() {
         let me = "ME";
-        assert!(matches!(result_for(&game("ME", "X", Some("ME")), me), Res::Win));
-        assert!(matches!(result_for(&game("X", "ME", Some("X")), me), Res::Loss));
-        // winner なし(引き分け)
-        assert!(matches!(result_for(&game("X", "ME", None), me), Res::Draw));
+        assert!(matches!(result_for(&game("ME", "X", Some("ME"), "win"), me), Some(Res::Win)));
+        assert!(matches!(result_for(&game("X", "ME", Some("X"), "resign"), me), Some(Res::Loss)));
+        // winner なし + 正当な引き分け reason → Draw
+        assert!(matches!(result_for(&game("X", "ME", None, "sennichite"), me), Some(Res::Draw)));
+        assert!(matches!(result_for(&game("X", "ME", None, "max_moves"), me), Some(Res::Draw)));
+        // winner なし + 中断系 reason → 集計対象外(None)
+        assert!(result_for(&game("X", "ME", None, "interrupted"), me).is_none());
     }
 
     #[test]
@@ -363,6 +444,25 @@ mod tests {
         assert_eq!(g.plies, 2);
         // time_ms>=500 の nps が両者ぶん取れている
         assert_eq!(g.nps.get("ME").map(Vec::len), Some(1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gote_recovered_from_filename_when_never_moved() {
+        // 後手(ME)が 1 手も指さず負けた局: move は先手(OPP)のみ。gote はファイル名
+        // ..._vs_{gote} から補完され、参加判定で取りこぼさない(#878 Codex 指摘)。
+        let path = std::env::temp_dir().join("20260706_010003_OPP_vs_ME.jsonl");
+        let body = concat!(
+            r#"{"type":"move","ply":1,"engine":"OPP"}"#,
+            "\n",
+            r#"{"type":"result","outcome":"black_win","reason":"time_up","plies":1,"winner":"OPP"}"#,
+            "\n",
+        );
+        std::fs::write(&path, body).unwrap();
+        let g = parse_game(&path).unwrap().expect("完了局");
+        assert_eq!(g.sente, "OPP");
+        assert_eq!(g.gote, "ME");
+        assert!(matches!(result_for(&g, "ME"), Some(Res::Loss)));
         let _ = std::fs::remove_file(&path);
     }
 }
