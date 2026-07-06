@@ -239,10 +239,32 @@ fn index_one_file(
     // game_id ごとの評価値指標。move 行は interleave しうるので game_id で束ねる。
     let mut evals: HashMap<u32, EvalAccumulator> = HashMap::new();
 
+    // 進行中対局の末尾行は書き込み途中でありうる (csa_client の live 追記を読者が
+    // 同時に開くのが正常運用)。末尾の切れた行だけは破損でなく「追記中」とみなして
+    // 無視し、その手前までを索引する (次の再読込で完全化する)。
+    let mut last_complete_end: u64 = offset;
     while let Some((line_start, line_len)) = read_line(&mut reader, &mut offset, &mut line_buf)? {
-        let value: Value = serde_json::from_slice(&line_buf).with_context(|| {
-            format!("{}: invalid JSON line at offset {line_start}", path.display())
-        })?;
+        if line_buf.iter().all(|b| b.is_ascii_whitespace()) {
+            last_complete_end = line_start + line_len;
+            continue;
+        }
+        let value: Value = match serde_json::from_slice(&line_buf) {
+            Ok(v) => v,
+            Err(e) => {
+                let at_eof = reader.fill_buf().map(|b| b.is_empty()).unwrap_or(true);
+                if at_eof {
+                    warnings.push(format!(
+                        "{}: 末尾行が JSON として不完全のため無視しました (書き込み途中の可能性)",
+                        path.display()
+                    ));
+                    break;
+                }
+                return Err(e).with_context(|| {
+                    format!("{}: invalid JSON line at offset {line_start}", path.display())
+                });
+            }
+        };
+        last_complete_end = line_start + line_len;
         match value.get("type").and_then(Value::as_str) {
             Some("move") => {
                 let game_id = value.get("game_id").and_then(Value::as_u64).ok_or_else(|| {
@@ -322,7 +344,8 @@ fn index_one_file(
                     file_idx,
                     game_id,
                     start_offset,
-                    end_offset: offset,
+                    // 切れた末尾行を再生範囲に含めない (完全な行までを読む)。
+                    end_offset: last_complete_end,
                 },
                 outcome: None,
                 error: false,
@@ -532,6 +555,31 @@ mod tests {
         let index = JsonlSource::new(dir.path()).build_index().expect("build_index");
         assert_eq!(index.pair_files.len(), 1);
         assert_eq!(index.pair_files[0].black_label, "a");
+    }
+
+    #[test]
+    fn tolerates_torn_tail_line_of_live_file() {
+        // live 追記中のファイルは末尾行が書き込み途中でありうる。切れた末尾行は
+        // 無視して手前までを索引し、再生範囲にも含めない。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a-vs-b.jsonl");
+        let mut body = format!(
+            "{}
+{}
+",
+            meta_line("a", "b"),
+            move_line(1, 1, "7g7f")
+        );
+        body.push_str(r#"{"type":"move","game_id":1,"ply":2,"sfen_"#); // 途中で切れた行
+        std::fs::write(&path, body).expect("write");
+
+        let source = JsonlSource::new(dir.path());
+        let index = source.build_index().expect("切れた末尾行で index 全体を落とさない");
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].ply_count, 1, "完全な行の 1 手だけを数える");
+        assert!(index.warnings.iter().any(|w| w.contains("不完全")));
+        let game = source.load_game(&index, &index.entries[0]).expect("load_game");
+        assert_eq!(game.moves.len(), 1, "切れた行は再生範囲に含めない");
     }
 
     #[test]
