@@ -365,10 +365,11 @@ impl App {
             }
         }
         let new_len = self.index.entries.len();
-        self.status = if new_len >= old_len {
+        self.status = if new_len > old_len {
             format!("live: {} 局追加 (計 {new_len} 局)", new_len - old_len)
         } else {
-            format!("live: 再読込 (計 {new_len} 局)")
+            // 局数が変わらない再読込 = 進行中対局の追記など。「0 局追加」だと紛らわしい。
+            format!("live: 更新 (計 {new_len} 局)")
         };
     }
 
