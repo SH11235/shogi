@@ -2080,7 +2080,8 @@ mod tests {
 
     #[test]
     fn sort_mode_cycles_through_all_variants() {
-        assert_eq!(SortMode::Discovery.next(), SortMode::Outcome);
+        assert_eq!(SortMode::Discovery.next(), SortMode::Date);
+        assert_eq!(SortMode::Date.next(), SortMode::Outcome);
         assert_eq!(SortMode::Outcome.next(), SortMode::Length);
         assert_eq!(SortMode::Length.next(), SortMode::Decisiveness);
         assert_eq!(SortMode::Decisiveness.next(), SortMode::Swing);
