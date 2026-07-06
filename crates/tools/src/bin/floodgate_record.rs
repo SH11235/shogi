@@ -20,7 +20,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use reqwest::blocking::Client;
 use serde::Deserialize;
+use tools::common::floodgate as fg;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -40,6 +42,16 @@ struct Cli {
     /// 注目相手(カンマ区切り・部分一致)。指定時のみ「注目相手との対戦」節を出力。
     #[arg(long, value_delimiter = ',')]
     watch: Vec<String>,
+
+    /// 指定すると wdoor floodgate の現在レートを取得し、自分/相手に ` (R<rate>)` を併記する。
+    /// per-game でなく現在値。ネットワークが要る(取得・解析は `tools::common::floodgate`)。
+    #[arg(long)]
+    fetch_ratings: bool,
+
+    /// `--fetch-ratings` と併用するキャッシュファイル(`name<TAB>rate`)。fetch 成功時はここへ
+    /// 書き出し、失敗時はここを読み戻してフォールバック併記する(一時障害でも直近値を維持)。
+    #[arg(long, requires = "fetch_ratings")]
+    ratings_cache: Option<PathBuf>,
 }
 
 /// JSONL 1 行の必要フィールドだけを拾う(未使用 type 行は無視)。
@@ -184,6 +196,48 @@ fn median(xs: &mut [f64]) -> f64 {
     }
 }
 
+/// wdoor floodgate の現在レート表を取得し name -> rating を作る。
+/// 取得・解析は `tools::common::floodgate`(reqwest, in-repo)を再利用。
+fn fetch_ratings_map() -> Result<BTreeMap<String, f64>> {
+    let client = Client::builder().build().context("reqwest client 生成失敗")?;
+    let (url, html) = fg::fetch_latest_rating_page(&client)?;
+    eprintln!("レート取得: {url}");
+    Ok(fg::parse_rating_page(&html).into_iter().collect())
+}
+
+/// レートマップを `name<TAB>rate` でキャッシュへ書き出す(BTreeMap 順で決定的)。
+fn write_ratings_cache(path: &std::path::Path, map: &BTreeMap<String, f64>) -> Result<()> {
+    use std::io::Write;
+    // 同一 dir の tmp に書いてから rename する(部分書き込みで既存 cache を壊さない)。
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        let mut f = std::io::BufWriter::new(
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?,
+        );
+        for (name, rate) in map {
+            writeln!(f, "{name}\t{rate}")?;
+        }
+        f.flush()?;
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+    Ok(())
+}
+
+/// キャッシュ(`name<TAB>rate`)を name -> rating に読み戻す。壊れた行・非有限値は捨てる。
+fn read_ratings_cache(path: &std::path::Path) -> Result<BTreeMap<String, f64>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(text
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter_map(|(n, r)| {
+            let v = r.trim().parse::<f64>().ok().filter(|v| v.is_finite())?;
+            Some((n.trim().to_owned(), v))
+        })
+        .collect())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -218,6 +272,49 @@ fn main() -> Result<()> {
                 .map(|(name, _)| name.to_string())
                 .context("対象エンジンを自動判定できない")?
         }
+    };
+
+    // レートは現在値(対局時点ではない)。取得失敗・空取得はレート併記だけ諦め、集計は続行する
+    // (opt-in の補助機能のために primary output を落とさない)。
+    // --ratings-cache 併用時は「取得成功かつ非空」でのみ書き出し、それ以外は cache を読み戻して
+    // フォールバックする(空取得で last-known-good を潰さない)。
+    let ratings: BTreeMap<String, f64> = if cli.fetch_ratings {
+        let fetched = match fetch_ratings_map() {
+            Ok(map) if !map.is_empty() => Some(map),
+            Ok(_) => {
+                eprintln!("⚠ レート表が空(取得 0 件)。キャッシュにフォールバック");
+                None
+            }
+            Err(e) => {
+                eprintln!("⚠ レート取得失敗: {e:#}");
+                None
+            }
+        };
+        match fetched {
+            Some(map) => {
+                if let Some(cache) = &cli.ratings_cache
+                    && let Err(e) = write_ratings_cache(cache, &map)
+                {
+                    eprintln!("⚠ レートキャッシュ書き出し失敗: {e:#}");
+                }
+                map
+            }
+            None => match &cli.ratings_cache {
+                Some(cache) => read_ratings_cache(cache).unwrap_or_else(|e2| {
+                    eprintln!("⚠ キャッシュ読み戻しも失敗(注釈なしで続行): {e2:#}");
+                    BTreeMap::new()
+                }),
+                None => BTreeMap::new(),
+            },
+        }
+    } else {
+        BTreeMap::new()
+    };
+    let rlabel = |name: &str| -> String {
+        ratings
+            .get(name)
+            .map(|r| format!(" (R{})", r.round() as i64))
+            .unwrap_or_default()
     };
 
     // 集計
@@ -269,7 +366,7 @@ fn main() -> Result<()> {
             num as f64 / den as f64 * 100.0
         }
     };
-    println!("集計対象: {me}   完了局 {total} 局 → 集計 {n} 局");
+    println!("集計対象: {me}{}   完了局 {total} 局 → 集計 {n} 局", rlabel(&me));
     if skipped_foreign > 0 || skipped_incomplete > 0 {
         println!(
             "  (除外: 対象不参加 {skipped_foreign} 局 / 中断・未完了 {skipped_incomplete} 局)"
@@ -312,7 +409,7 @@ fn main() -> Result<()> {
 
     println!("\n=== 相手別 ===");
     for (opp, [ow, ol, od]) in &by_opp {
-        println!("  {ow}勝 {ol}敗 {od}分  vs {opp}");
+        println!("  {ow}勝 {ol}敗 {od}分  vs {opp}{}", rlabel(opp));
     }
 
     // 後手勝ちは最上位帯では希少で価値が高いので、相手名付きで individually 列挙する。
@@ -332,7 +429,7 @@ fn main() -> Result<()> {
         } else {
             ""
         };
-        println!("  {}  vs {opp}  ({}, {}手){star}", g.stem, g.reason, g.plies);
+        println!("  {}  vs {opp}{}  ({}, {}手){star}", g.stem, rlabel(opp), g.reason, g.plies);
     }
     if !any_gw {
         println!("  (なし)");
@@ -352,7 +449,13 @@ fn main() -> Result<()> {
             let is_sente = g.sente == me;
             let opp = if is_sente { &g.gote } else { &g.sente };
             let col = if is_sente { "先" } else { "後" };
-            println!("  {}  {col}手  vs {opp}  ({}, {}手)", g.stem, g.reason, g.plies);
+            println!(
+                "  {}  {col}手  vs {opp}{}  ({}, {}手)",
+                g.stem,
+                rlabel(opp),
+                g.reason,
+                g.plies
+            );
         }
         if !any {
             println!("  (なし)");
@@ -379,7 +482,7 @@ fn main() -> Result<()> {
                 Res::Loss => "●",
                 Res::Draw => "△",
             };
-            println!("  {}  {col}手  {mark}  vs {opp}  ({})", g.stem, g.reason);
+            println!("  {}  {col}手  {mark}  vs {opp}{}  ({})", g.stem, rlabel(opp), g.reason);
         }
     }
 
@@ -463,6 +566,32 @@ mod tests {
         assert_eq!(g.sente, "OPP");
         assert_eq!(g.gote, "ME");
         assert!(matches!(result_for(&g, "ME"), Some(Res::Loss)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ratings_cache_round_trip() {
+        let path = std::env::temp_dir().join("fg_record_ratings_cache_test.tsv");
+        let mut m = BTreeMap::new();
+        m.insert("RAMU_TF".to_owned(), 3427.0);
+        m.insert("Foo-Bar_1".to_owned(), -12.0); // 負レートも保持
+        write_ratings_cache(&path, &m).unwrap();
+        let back = read_ratings_cache(&path).unwrap();
+        assert_eq!(back.get("RAMU_TF"), Some(&3427.0));
+        assert_eq!(back.get("Foo-Bar_1"), Some(&-12.0));
+        assert_eq!(back.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ratings_cache_drops_non_finite_and_corrupt() {
+        let path = std::env::temp_dir().join("fg_record_ratings_cache_corrupt.tsv");
+        std::fs::write(&path, "Good\t3400\nBadNaN\tNaN\nBadInf\tinf\nNoTab 1\nEmpty\t\n").unwrap();
+        let m = read_ratings_cache(&path).unwrap();
+        assert_eq!(m.get("Good"), Some(&3400.0));
+        assert!(!m.contains_key("BadNaN")); // NaN は is_finite で除外
+        assert!(!m.contains_key("BadInf")); // inf も除外
+        assert_eq!(m.len(), 1); // tab 無し・空 rate も落ちる
         let _ = std::fs::remove_file(&path);
     }
 }
