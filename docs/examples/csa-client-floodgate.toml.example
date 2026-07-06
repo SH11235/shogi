@@ -1,0 +1,51 @@
+# csa_client で wdoor floodgate に連続対局(レーティング)参加するための設定例。
+# `~/floodgate/active.toml` のように OSS repo 外へコピーし、名前・トリップ・パスを
+# 自分の値へ差し替えて使う(認証情報と絶対パスを含むため repo には置かない)。
+# 各項目の意味は docs/csa-client.md を参照。
+
+[server]
+host = "wdoor.c.u-tokyo.ac.jp"   # 本番 floodgate。scheme 省略 = TCP 経路
+port = 4081
+id = "YourEngineName"            # floodgate 上の公開エンジン名(事前登録不要・任意)
+password = "floodgate-300-10F,your-secret-trip"  # <game_name>,<trip>。game_name で参加プールを選ぶ(必須)
+floodgate = true                 # 評価値/PV コメントを送信
+
+[server.keepalive]
+tcp = true                       # 中間 NAT の無通信切断対策
+ping_interval_sec = 60
+
+[engine]
+path = "/path/to/your-usi-engine"
+startup_timeout_sec = 30
+
+[engine.options]                 # 任意の USI オプションを Name = Value で列挙
+EvalFile = "/path/to/model.bin"
+Threads = 16
+USI_Hash = 2048
+Stochastic_Ponder = true
+
+[time]
+margin_msec = 1500               # 秒読みマージン。エンジン側 NetworkDelay と併用可
+
+[game]
+max_games = 0                    # 0 = 無制限連続対局(SIGINT で現局完了後に graceful 終了)
+ponder = true
+restart_engine_every_game = false
+
+[retry]
+initial_delay_sec = 10
+max_delay_sec = 60
+
+[record]
+enabled = true
+dir = "/path/to/floodgate/records"
+filename_template = "{datetime}_{sente}_vs_{gote}"
+save_csa = true
+save_sfen = true
+save_jsonl = true                # 戦績集計(floodgate_record)と TUI 閲覧が読む
+live_jsonl = true                # 対局中の手単位追記(kifu_player --live で自局観戦)
+
+[log]
+level = "info"
+dir = "/path/to/floodgate/logs"
+stdout = true

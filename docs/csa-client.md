@@ -145,12 +145,16 @@ live_jsonl = false # 対局中に JSONL を手単位で live 追記（下記）
 
 ### floodgate で連続対局
 
+実運用の全項目を含む設定例は **[docs/examples/csa-client-floodgate.toml.example](examples/csa-client-floodgate.toml.example)**
+をコピーして使う(`~/floodgate/active.toml` のように OSS repo 外へ置き、名前・トリップ・
+パスを自分の値へ差し替える。認証情報を含むため repo 内には置かない)。要点は接続部分:
+
 ```toml
 [server]
 host = "wdoor.c.u-tokyo.ac.jp"
 port = 4081
-id = "rshogi_test"
-password = "floodgate-300-10F,your_trip"  # <game_name>,<trip>（必須。理由は下記）
+id = "YourEngineName"
+password = "floodgate-300-10F,your-secret-trip"  # <game_name>,<trip>(必須。理由は下記)
 floodgate = true
 
 [game]
