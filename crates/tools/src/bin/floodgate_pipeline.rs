@@ -237,8 +237,6 @@ fn main() -> Result<()> {
 struct MirrorState {
     url: String,
     local: PathBuf,
-    /// 直近取得の `Last-Modified`(そのまま `If-Modified-Since` に返す)。
-    last_modified: Option<String>,
     /// 直近取得の本文サイズ。CSA は追記のみで単調増加するため「同サイズ = 変化なし」。
     size: u64,
     /// 終局検出済み(または放棄)。以後は取得しない。
@@ -298,7 +296,6 @@ fn run_live_mirror(
                             MirrorState {
                                 url: format!("{day_url}{name}"),
                                 local,
-                                last_modified: None,
                                 size: 0,
                                 finished,
                                 unchanged_polls: 0,
@@ -375,35 +372,18 @@ fn csa_name_date(name: &str) -> Option<&str> {
 }
 
 /// 1 ファイルを取得してローカルへ反映する。書いたら `Ok(true)`。
-/// `If-Modified-Since` の 304 と同サイズ本文(IMS 非対応時の保険)は変化なし扱い。
+/// 条件付き GET (`If-Modified-Since`) は使わない: `Last-Modified` は秒精度で、
+/// 前回取得と同じ秒内の追記(最終手や `'$END_TIME:` を含みうる)が 304 に化けて
+/// 恒久的に取り逃がされるため。CSA 本文は数十 KB なので毎回取得し、追記のみで
+/// 単調増加する性質から「同サイズ = 変化なし」で書き込みだけを省く。
 fn mirror_one(client: &Client, st: &mut MirrorState) -> Result<bool> {
-    use reqwest::header::{ACCEPT_ENCODING, HeaderValue, IF_MODIFIED_SINCE, LAST_MODIFIED};
-
-    let mut req = client
-        .get(&st.url)
-        .header(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    if let Some(lm) = &st.last_modified {
-        req = req.header(IF_MODIFIED_SINCE, lm.clone());
-    }
-    let res = req.send().with_context(|| format!("GET {}", st.url))?;
-    if res.status() == reqwest::StatusCode::NOT_MODIFIED {
-        st.unchanged_polls += 1;
-        return Ok(false);
-    }
-    anyhow::ensure!(res.status().is_success(), "HTTP {} for {}", res.status(), st.url);
-    let last_modified = res
-        .headers()
-        .get(LAST_MODIFIED)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let body = res.text().with_context(|| format!("read body: {}", st.url))?;
+    let body = fg::http_get_text(client, &st.url)?;
     if body.len() as u64 == st.size {
         st.unchanged_polls += 1;
         return Ok(false);
     }
     write_atomic(&st.local, &body)?;
     st.size = body.len() as u64;
-    st.last_modified = last_modified;
     st.finished = fg::csa_is_finished(&body);
     st.unchanged_polls = 0;
     Ok(true)
