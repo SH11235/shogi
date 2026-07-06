@@ -10,7 +10,7 @@
 |--------|------|
 | `tournament` | 複数エンジンの round-robin 並列トーナメント、SPRT 検定 |
 | `analyze_selfplay` | tournament 出力の集計・Elo/nElo 算出・SPRT post-hoc 判定 |
-| `floodgate_record` | csa_client の per-game JSONL から 1 エンジンの戦績を集計（先後別勝率・相手別・後手勝ち/負け/引分・実戦 NPS、`--fetch-ratings` で wdoor 現在レート併記。floodgate 連続対局向け、[詳細](docs/floodgate_record.md)） |
+| `floodgate_record` | csa_client の per-game JSONL から 1 エンジンの戦績を集計（先後別勝率・相手別・後手勝ち/負け/引分・実戦 NPS、`--config` で csa_client 設定から入力導出、`--fetch-ratings` で wdoor 現在レート併記・履歴記録。floodgate 連続対局向け、[詳細](docs/floodgate_record.md)） |
 | `gensfen` | NNUE 学習用 PSV/pack/hcpe3 教師局面の生成（USI engine vs engine／NativeBackend） |
 | `floodgate_pipeline` | Floodgate棋譜のダウンロード・変換（[詳細](docs/floodgate_pipeline.md)） |
 | `book_from_csa` | CSA 棋譜群から YANEURAOU-DB2016 テキスト定跡 `.db` を生成（消費時間による定跡手判定・レート/勝敗フィルタ、[詳細](docs/book_from_csa.md)） |

@@ -23,11 +23,15 @@
 ## 使い方
 
 ```bash
-# 対象エンジンは自動判定(全局に最も多く出現するエンジン=自分)
-floodgate_record --dir ~/floodgate/records/jsonl
+# csa_client と同じ config から dir / --me / キャッシュ・履歴の既定を導出(推奨)
+floodgate_record --config ~/floodgate/active.toml --fetch-ratings
 
-# 対象エンジンを明示し、注目相手(部分一致)を指定
-floodgate_record --dir ./jsonl --me RAMU_TF --watch Suisho,dlshogi,nshogi
+# 環境変数に config を置けば引数はさらに減る(明示引数はいつでも config に優先)
+export CSA_CLIENT_CONFIG=~/floodgate/active.toml
+floodgate_record --fetch-ratings --watch Suisho,dlshogi,nshogi
+
+# config なしの従来形。対象エンジンは自動判定(全局に最も多く出現するエンジン=自分)
+floodgate_record --dir ~/floodgate/records/jsonl
 
 # 自分/相手の現在レートを wdoor から取得して併記(キャッシュ併用で障害時フォールバック)
 floodgate_record --dir ~/floodgate/records/jsonl --fetch-ratings --ratings-cache ratings.tsv
@@ -35,11 +39,14 @@ floodgate_record --dir ~/floodgate/records/jsonl --fetch-ratings --ratings-cache
 
 | オプション | 説明 |
 |-----------|------|
-| `--dir <PATH>` | 集計対象 JSONL のあるディレクトリ(再帰なし、既定 `.`) |
-| `--me <NAME>` | 集計対象エンジン名。省略時は全局に最も多く出現するエンジンを自動判定 |
+| `--config <TOML>` | `csa_client` と同一の設定ファイル。`record` 設定から集計 dir、`server.id` から `--me`、`record.dir` からキャッシュ/履歴の既定パスを導出する(対応する明示引数が優先)。省略時は環境変数 `CSA_CLIENT_CONFIG` を参照。TOML 内の相対パスは **config ファイルのあるディレクトリ基準**で解決(`csa_client` 実行時 cwd 基準とは異なるので運用 config は絶対パス推奨)。config の `record.enabled` / `record.save_jsonl` が無効で集計元を導出できない場合はエラー(`--dir` 明示で回避可) |
+| `--dir <PATH>` | 集計対象 JSONL のあるディレクトリ(再帰なし)。省略時は config から導出、それも無ければ `.` |
+| `--me <NAME>` | 集計対象エンジン名。省略時は config の `server.id`、それも無ければ全局に最も多く出現するエンジンを自動判定(別ハンドルのログが混在する dir では config / 明示指定が確実) |
 | `--watch <NAMES>` | 注目相手(カンマ区切り・部分一致)。指定時のみ「注目相手との対戦」節を出力 |
-| `--fetch-ratings` | wdoor floodgate の現在レート表を**起動の度に**取得し、自分/相手に ` (R<rate>)` を併記(要ネットワーク)。wdoor は per-game レートを出さないので**現在値**(対局時点ではない)。取得・解析は `tools::common::floodgate` を再利用。取得失敗時はレート併記だけ諦め、集計は続行 |
-| `--ratings-cache <FILE>` | `--fetch-ratings` 併用。fetch 成功時は `name<TAB>rate` を FILE へ書き出し、失敗時は FILE を読み戻してフォールバック併記する(一時障害でも直近値を維持) |
+| `--fetch-ratings` | wdoor floodgate の現在レート表を取得し、自分/相手に ` (R<rate>)` を併記(要ネットワーク)。wdoor は per-game レートを出さないので**現在値**(対局時点ではない)。取得・解析は `tools::common::floodgate` を再利用。取得失敗時はレート併記だけ諦め、集計は続行 |
+| `--ratings-cache <FILE>` | `--fetch-ratings` 併用。fetch 成功時は `name<TAB>rate` を FILE へ書き出し、失敗時は FILE を読み戻してフォールバック併記する(一時障害でも直近値を維持)。config 指定時の既定は `<record.dir>/ratings_cache.tsv` |
+| `--ratings-max-age <SEC>` | `--fetch-ratings` 併用。キャッシュの mtime が SEC 秒以内なら**ネットワーク取得をスキップ**してキャッシュを直接使う。既定 0(常に取得)。レートページは日次生成なので数時間(例: `21600` = 6h)で十分 |
+| `--ratings-history <FILE>` | `--fetch-ratings` 併用。fetch 成功時に自分(`--me`)の現在レートを `ページ日付<TAB>名前<TAB>レート` で FILE へ追記する(R 推移のローカル記録)。同一(日付, 名前)は再追記せず**その日最初の観測値**を保持。config 指定時の既定は `<record.dir>/ratings_history.tsv` |
 
 レート併記は**名前の完全一致**で引く(表に無い/名前不一致の相手は併記なし)。
 

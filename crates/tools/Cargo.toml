@@ -87,6 +87,10 @@ rshogi-csa = { path = "../rshogi-csa" }
 # edition(NNUE)軸には触れないため default-features=false とし、rshogi-core の feature は
 # 本 crate 側の指定に委ねる(rshogi-usi と同じ方針)。
 rshogi-book = { path = "../rshogi-book", default-features = false }
+# csa_client と同一の TOML (CsaClientConfig) を floodgate_record が読むための依存。
+# 設定型の再利用のみで transport / CLI は使わないため、default-features=false で
+# tungstenite / rustls / clap 系依存を切り落とす。
+rshogi-csa-client = { path = "../rshogi-csa-client", default-features = false }
 
 # Additional dependencies
 sysinfo = "0.37"

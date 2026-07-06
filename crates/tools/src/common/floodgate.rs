@@ -112,6 +112,15 @@ pub fn rating_page_url(root: &str, date_yyyymmdd: &str) -> Result<String> {
     join_url(root, &format!("{RATING_PAGE_REL_PREFIX}{date_yyyymmdd}.html"))
 }
 
+/// レーティングページ URL からページ日付 (`YYYYMMDD`) を取り出す。
+/// [`rating_page_url`] が組む `players-floodgate-YYYYMMDD.html` 形式の逆変換で、
+/// 形式が合わなければ `None`。
+pub fn rating_page_date(url: &str) -> Option<String> {
+    let stem = url.rsplit('/').next()?.strip_suffix(".html")?;
+    let date = stem.rsplit('-').next()?;
+    (date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit())).then(|| date.to_string())
+}
+
 /// 直近のレーティングページを取得し (URL, HTML) を返す。
 ///
 /// ページは日次生成の日付スタンプ付きで当日分が未生成のこともあるため、
@@ -236,6 +245,15 @@ mod tests {
             u,
             "https://wdoor.c.u-tokyo.ac.jp/shogi/x/rating/players-floodgate-20260620.html"
         );
+    }
+    #[test]
+    fn test_rating_page_date() {
+        let u = rating_page_url(DEFAULT_ROOT, "20260620").unwrap();
+        assert_eq!(rating_page_date(&u).as_deref(), Some("20260620"));
+        // 日付部が 8 桁数字でない・形式外は None
+        assert_eq!(rating_page_date("https://x/players-floodgate-2026062.html"), None);
+        assert_eq!(rating_page_date("https://x/players-floodgate-20260620"), None);
+        assert_eq!(rating_page_date("https://x/other.html"), None);
     }
     #[test]
     fn test_parse_rating_page() {

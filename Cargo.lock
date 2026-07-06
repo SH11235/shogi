@@ -3359,6 +3359,7 @@ dependencies = [
  "rshogi-book",
  "rshogi-core",
  "rshogi-csa",
+ "rshogi-csa-client",
  "serde",
  "serde_json",
  "sha2",
