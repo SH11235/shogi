@@ -102,9 +102,9 @@ enum Mode {
 /// （同じキー内の相対順は発見順を維持する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortMode {
-    /// ファイル列挙順→完了順（従来のデフォルト）。
+    /// ファイル列挙順→完了順。
     Discovery,
-    /// ファイル名由来の対局日時の降順（新しい対局が先頭）。日時の無い対局は末尾。
+    /// ファイル名由来の対局日時の降順（新しい対局が先頭）。日時の無い対局は末尾。既定。
     Date,
     /// エラー→黒勝ち→白勝ち→引き分け→不明の順にグルーピング。
     Outcome,
@@ -187,6 +187,10 @@ struct App {
     ratings: BTreeMap<String, f64>,
     /// live 再読込の状態。`None` なら従来どおり静的表示。
     live: Option<LiveState>,
+    /// ライブ追従モード（`f`）。ON の間は選択対局の最新手を表示し続ける。
+    /// 末尾から離れて特定の手を見る操作（`h`/`←`、`n`/`N`、`Home`/`g`）で自動解除する
+    /// （実際に表示位置が動いたときのみ。末尾での `n` 空振り等では解除しない）。
+    follow: bool,
 }
 
 impl App {
@@ -205,15 +209,17 @@ impl App {
             selected: 0,
             mode: Mode::Browse,
             filter_input: String::new(),
-            sort_mode: SortMode::Discovery,
+            sort_mode: SortMode::Date,
             current_game: None,
             current_move: 0,
             status: String::new(),
             scan: None,
             ratings,
             live,
+            follow: false,
         };
-        app.load_selected();
+        // 初期表示から既定ソート（日付(新)）を適用する。`resort` が `load_selected` も行う。
+        app.resort();
         app
     }
 
@@ -244,6 +250,10 @@ impl App {
         match self.source.load_game(&self.index, entry) {
             Ok(game) => {
                 self.status.clear();
+                // 追従中は開いた対局の最新手から表示する（j/k での対局切替も含む）。
+                if self.follow && !game.moves.is_empty() {
+                    self.current_move = game.moves.len() - 1;
+                }
                 self.current_game = Some(game);
             }
             Err(e) => self.status = format!("対局の読み込みに失敗しました: {e}"),
@@ -326,9 +336,11 @@ impl App {
         let saved_game = self.current_game.take();
         let saved_move = self.current_move;
         // 末尾の手を見ていたなら、対局が伸びたとき新しい末尾へ追従する(観戦用)。
-        let was_at_tail = saved_game
-            .as_ref()
-            .is_some_and(|g| !g.moves.is_empty() && saved_move + 1 == g.moves.len());
+        // 追従モード(f)中は途中の手を見ていても常に新しい末尾へ。
+        let was_at_tail = self.follow
+            || saved_game
+                .as_ref()
+                .is_some_and(|g| !g.moves.is_empty() && saved_move + 1 == g.moves.len());
 
         self.index = new_index;
         // SFEN スキャンの一致集合は旧索引の添字なので新索引へは引き継げない。クリアして
@@ -411,6 +423,53 @@ impl App {
         }
     }
 
+    /// 最初の手（開始直後の局面）へジャンプする（`Home`/`g`）。
+    fn first_move(&mut self) {
+        self.current_move = 0;
+    }
+
+    /// 最終手へジャンプする（`End`/`G`）。live なら以降は暗黙の末尾追従に入る。
+    fn last_move(&mut self) {
+        if let Some(game) = &self.current_game
+            && !game.moves.is_empty()
+        {
+            self.current_move = game.moves.len() - 1;
+        }
+    }
+
+    /// ライブ追従モードのトグル（`f`）。live モード外では効かない。
+    fn toggle_follow(&mut self) {
+        if self.live.is_none() {
+            self.status = "追従 (f) は --live 時のみ有効".to_string();
+            return;
+        }
+        self.follow = !self.follow;
+        if self.follow {
+            self.last_move();
+            self.status = "ライブ追従: 選択対局の最新手を表示（手を戻すと解除）".to_string();
+        } else {
+            self.status = "ライブ追従を解除".to_string();
+        }
+    }
+
+    /// 末尾から離れる操作の後処理: 追従中なら解除する（追従が即座に末尾へ引き戻すのを防ぐ）。
+    fn break_follow(&mut self) {
+        if self.follow {
+            self.follow = false;
+            self.status = "ライブ追従を解除（f で再開）".to_string();
+        }
+    }
+
+    /// ナビゲーション操作を実行し、表示位置が実際に動いたときのみ追従を解除する
+    /// （末尾での `n` 空振り等、位置が変わらない操作で黙って解除しない）。
+    fn nav_breaking_follow(&mut self, nav: impl FnOnce(&mut Self)) {
+        let before = self.current_move;
+        nav(self);
+        if self.current_move != before {
+            self.break_follow();
+        }
+    }
+
     fn jump_to_next_eval_swing(&mut self) {
         if let Some(game) = &self.current_game
             && let Some(idx) = next_eval_swing(game, self.current_move, EVAL_SWING_THRESHOLD_CP)
@@ -461,12 +520,15 @@ impl App {
             },
             Mode::Browse => match code {
                 KeyCode::Char('q') | KeyCode::Esc => return false,
-                KeyCode::Char('h') | KeyCode::Left => self.prev_move(),
+                KeyCode::Char('h') | KeyCode::Left => self.nav_breaking_follow(App::prev_move),
                 KeyCode::Char('l') | KeyCode::Right => self.next_move(),
                 KeyCode::Char('j') | KeyCode::Down => self.next_game(),
                 KeyCode::Char('k') | KeyCode::Up => self.prev_game(),
-                KeyCode::Char('n') => self.jump_to_next_eval_swing(),
-                KeyCode::Char('N') => self.jump_to_prev_eval_swing(),
+                KeyCode::Home | KeyCode::Char('g') => self.nav_breaking_follow(App::first_move),
+                KeyCode::End | KeyCode::Char('G') => self.last_move(),
+                KeyCode::Char('f') => self.toggle_follow(),
+                KeyCode::Char('n') => self.nav_breaking_follow(App::jump_to_next_eval_swing),
+                KeyCode::Char('N') => self.nav_breaking_follow(App::jump_to_prev_eval_swing),
                 KeyCode::Char('s') => self.cycle_sort_mode(),
                 KeyCode::Char('/') => self.mode = Mode::Filter,
                 KeyCode::Char('?') => self.mode = Mode::Help,
@@ -933,7 +995,15 @@ fn draw_game_list(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::
         })
         .collect();
 
-    let live_mark = if app.live.is_some() { " [live]" } else { "" };
+    let live_mark = if app.live.is_some() {
+        if app.follow {
+            " [live 追従]"
+        } else {
+            " [live]"
+        }
+    } else {
+        ""
+    };
     let title = format!(
         "対局一覧 ({}/{}) [{}]{live_mark}",
         app.filtered.len(),
@@ -1255,9 +1325,11 @@ fn draw_status_bar(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
             // 通常時はヘルプを行頭に固定する（手を動かしても位置がずれないよう、可変長の
             // 注釈はここに出さず指し手パネル側へ移した）。エラー等の status がある時は、
             // 長いヘルプで末尾 truncate されて隠れないよう status を先頭に置く（優先情報）。
+            // 現在の並び順は対局一覧のタイトルに出す（可変長ラベルをここに出すと
+            // 並び替えのたびにレイアウトシフトする）。
+            let follow_hint = if app.live.is_some() { "  f:追従" } else { "" };
             let help = format!(
-                "h/l:手  j/k:対局  n/N:評価値急変  s:並替({})  /:検索  ?:ヘルプ  q:終了",
-                app.sort_mode.label()
+                "h/l:手  Home/End:先頭/末尾  j/k:対局  n/N:評価値急変  s:並替{follow_hint}  /:検索  ?:ヘルプ  q:終了"
             );
             if app.status.is_empty() {
                 format!("[{help}]")
@@ -1278,6 +1350,11 @@ fn draw_help_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Line::from("l / →    1手進める"),
         Line::from("j / ↓    次の対局（フィルタ後のリスト内）"),
         Line::from("k / ↑    前の対局"),
+        Line::from("Home / g 最初の手へジャンプ"),
+        Line::from("End / G  最終手へジャンプ"),
+        Line::from(
+            "f        ライブ追従の切り替え（--live 時のみ。選択対局の最新手を表示し続ける）",
+        ),
         Line::from("n        次の評価値急変手へジャンプ"),
         Line::from("N        前の評価値急変手へジャンプ"),
         Line::from(format!(
@@ -1771,6 +1848,62 @@ mod tests {
         app.replace_index(new_index);
         assert_eq!(app.selected, 0);
         assert_eq!(app.current_move, 1);
+    }
+
+    #[test]
+    fn home_end_jump_to_first_and_last_move() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let games = Rc::new(RefCell::new(vec![vec![HIRATE_SFEN.to_string(); 4]]));
+        let source = SharedCsaSource(games);
+        let index = source.build_index().unwrap();
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
+        app.last_move();
+        assert_eq!(app.current_move, 3);
+        app.first_move();
+        assert_eq!(app.current_move, 0);
+    }
+
+    #[test]
+    fn follow_jumps_to_tail_on_game_switch_and_breaks_on_back_navigation() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let games = Rc::new(RefCell::new(vec![
+            vec![HIRATE_SFEN.to_string(); 2],
+            vec![HIRATE_SFEN.to_string(); 4],
+        ]));
+        let source = SharedCsaSource(games);
+        let index = source.build_index().unwrap();
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
+        app.follow = true;
+        // 対局切替で開いた対局の最新手から表示する
+        app.next_game();
+        assert_eq!(app.current_move, 3);
+        // 位置が動かない空振り操作（末尾で急変ジャンプ、評価値なし）では解除しない
+        app.nav_breaking_follow(App::jump_to_next_eval_swing);
+        assert!(app.follow);
+        assert_eq!(app.current_move, 3);
+        // 手を戻す操作で追従は自動解除される
+        app.nav_breaking_follow(App::prev_move);
+        assert!(!app.follow);
+        assert_eq!(app.current_move, 2);
+    }
+
+    #[test]
+    fn replace_index_with_follow_jumps_to_tail_from_middle() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let games = Rc::new(RefCell::new(vec![vec![HIRATE_SFEN.to_string(); 3]]));
+        let source = SharedCsaSource(games.clone());
+        let index = source.build_index().unwrap();
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
+        // 途中の手を表示していても、追従中は伸びた対局の新しい末尾へジャンプする
+        app.follow = true;
+        app.current_move = 0;
+        games.borrow_mut()[0] = vec![HIRATE_SFEN.to_string(); 6];
+        let new_index = app.source.build_index().unwrap();
+        app.replace_index(new_index);
+        assert_eq!(app.current_move, 5);
     }
 
     #[test]
