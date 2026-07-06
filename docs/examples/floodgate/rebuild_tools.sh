@@ -1,6 +1,8 @@
 #!/bin/bash
 # floodgate 関連バイナリ (csa_client / kifu_player / floodgate_record /
 # floodgate_pipeline) を最新ソースで再ビルドする。
+# 冒頭で `git pull --ff-only` する (repo が main を checkout し upstream 設定済みである
+# ことが前提。feature branch 作業中などは失敗して止まる = 意図しない pull はしない)。
 #
 # csa_client (floodgate) 稼働中は、ビルドが対局エンジンと CPU を取り合うため
 # 警告して確認を求める (y で続行 / それ以外は中止)。-y / --yes で確認をスキップ。
@@ -36,6 +38,6 @@ fi
 cd "$REPO"
 git pull --ff-only
 cargo build --release -p rshogi-csa-client --bin csa_client
-cargo build --release -p tools --features kifu-player \
+cargo build --release -p tools \
   --bin kifu_player --bin floodgate_record --bin floodgate_pipeline
 echo "done: $REPO/target/release/{csa_client,kifu_player,floodgate_record,floodgate_pipeline}"

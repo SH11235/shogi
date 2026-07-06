@@ -11,9 +11,22 @@ PIPELINE="${FLOODGATE_PIPELINE:-$REPO/target/release/floodgate_pipeline}"
 PLAYER="${KIFU_PLAYER:-$REPO/target/release/kifu_player}"
 BASE="${FLOODGATE_WATCH_DIR:-$HOME/floodgate-mirror}"
 
+# ミラーは裏で起動するためバイナリ不在のエラーがログ行きになり原因が見えない。先に検証する。
+for bin in "$PIPELINE" "$PLAYER"; do
+  if [ ! -x "$bin" ]; then
+    echo "error: $bin がありません。先にビルドしてください:" >&2
+    echo "  cargo build --release -p tools --bin kifu_player --bin floodgate_pipeline" >&2
+    echo "  (repo: $REPO。場所が違う場合は RSHOGI_REPO で指定)" >&2
+    exit 1
+  fi
+done
+
 watch="${1:-}"
 if [ -n "$watch" ]; then
-  dir="$BASE/${watch//,/+}"
+  # dir 名は引数から作るため、パス区切りは無害化する (名前に / は現れない想定の防御)
+  sub="${watch//,/+}"
+  sub="${sub//[\/\\]/_}"
+  dir="$BASE/$sub"
   mirror_args=(--watch "$watch")
 else
   dir="$BASE/all"
@@ -26,11 +39,13 @@ player_args=()
 ratings="${FLOODGATE_RATINGS:-$HOME/floodgate/records/ratings_cache.tsv}"
 [ -f "$ratings" ] && player_args+=(--ratings "$ratings")
 
-# ミラーは裏で回す。ログは dir 内 (kifu_player は *.csa しか読まないので混ざらない)
-"$PIPELINE" live-mirror --out-dir "$dir" "${mirror_args[@]}" >"$dir/live-mirror.log" 2>&1 &
+# ミラーは裏で回す。ログは dir 内 (kifu_player は *.csa しか読まないので混ざらない)。
+# 空配列の展開は ${arr[@]+...} でガード (bash 4.4 未満の set -u は空配列展開でエラー)。
+"$PIPELINE" live-mirror --out-dir "$dir" ${mirror_args[@]+"${mirror_args[@]}"} \
+  >"$dir/live-mirror.log" 2>&1 &
 mirror_pid=$!
 trap 'kill "$mirror_pid" 2>/dev/null || true' EXIT
 
 exec_status=0
-"$PLAYER" --csa "$dir" --live 5 "${player_args[@]}" || exec_status=$?
+"$PLAYER" --csa "$dir" --live 5 ${player_args[@]+"${player_args[@]}"} || exec_status=$?
 exit "$exec_status"

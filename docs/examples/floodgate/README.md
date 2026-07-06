@@ -15,7 +15,8 @@ wdoor floodgate まわりの日常運用（観戦・戦績集計・自分の記�
 ## まず観戦だけしたい（config 不要）
 
 ```bash
-cp docs/examples/floodgate/watch.sh ~/floodgate/   # 置き場所は任意
+# repo root で実行（置き場所は任意）
+cp docs/examples/floodgate/watch.sh ~/floodgate/
 ~/floodgate/watch.sh                 # 当日の全対局
 ~/floodgate/watch.sh Sora_Ginko      # 指定 AI の対局のみ（対局者名の部分一致、, 区切りで複数）
 ```
@@ -26,7 +27,9 @@ wdoor から当日の棋譜をミラーし続け、前面で `kifu_player`
 選んで `f` を押すとライブ追従（最新手を表示し続ける）。TUI を閉じる（`q`）とミラーも
 自動停止する。ミラーした棋譜は `~/floodgate-mirror/<対象>/` に残るので後から見返せる。
 
-Windows は `watch.ps1` を使う（PowerShell、Windows Terminal 推奨）。動作は同じ。
+Windows は `watch.ps1` を使う（**PowerShell 7 = pwsh 必須**。Windows PowerShell 5.1 は
+BOM なし UTF-8 の日本語コメントを化けさせるため対象外。Windows Terminal 推奨）。動作は
+同じで、複数指定も `.\watch.ps1 名前,名前` のままでよい。
 
 ## csa_client 運用レイアウト（stats.sh / tui.sh の前提）
 
@@ -52,13 +55,17 @@ config から自動導出する。
 
 | 変数 | 既定 | 使うスクリプト |
 |---|---|---|
-| `RSHOGI_REPO` | `~/development/rshogi` | watch / rebuild_tools |
+| `RSHOGI_REPO` | `~/development/rshogi` | watch / tui / stats / rebuild_tools |
 | `KIFU_PLAYER` | `$RSHOGI_REPO/target/release/kifu_player` | watch / tui |
 | `FLOODGATE_PIPELINE` | 同 `floodgate_pipeline` | watch |
 | `FLOODGATE_RECORD` | 同 `floodgate_record` | stats |
 | `FLOODGATE_WATCH_DIR` | `~/floodgate-mirror` | watch |
 | `FLOODGATE_RATINGS` | `~/floodgate/records/ratings_cache.tsv` | watch |
-| `CSA_CLIENT_CONFIG` | （必須・上記参照） | stats |
+| `FLOODGATE_RECORDS` | `~/floodgate/records` | tui |
+| `CSA_CLIENT_CONFIG` | `~/floodgate/active.toml`（stats.sh が補完） | stats |
+
+シェルスクリプトは bash 前提（Linux / WSL / macOS。空配列展開は bash 3.2 でも動く形で
+ガード済み）。
 
 ## 注意
 
