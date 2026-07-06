@@ -8,12 +8,15 @@ PSV (PackedSfenValue) ファイル、`tournament` の出力 JSONL、CSA 棋譜�
 
 ## ビルド
 
-対話的 TUI 用の依存（`ratatui`/`crossterm`）を default feature に含めていないため、
-`kifu-player` feature を有効にしてビルドする。
+`kifu-player` feature は default に含まれるため、素の release ビルドでそのまま作られる。
 
 ```bash
-cargo build -p tools --release --features kifu-player --bin kifu_player
+cargo build -p tools --release --bin kifu_player
 ```
+
+TUI 依存（`ratatui`/`crossterm`）を持ち込みたくない学習パイプライン等の用途では
+`--no-default-features --features nnue-arch` 等でオプトアウトできる（このとき
+`kifu_player` バイナリはビルドされない）。
 
 ## 使い方
 
@@ -22,7 +25,7 @@ cargo build -p tools --release --features kifu-player --bin kifu_player
 ### PSV を開く
 
 ```bash
-cargo run -p tools --release --features kifu-player --bin kifu_player -- \
+cargo run -p tools --release --bin kifu_player -- \
   --psv runs/gensfen/<run>/gensfen.psv
 ```
 
@@ -34,7 +37,7 @@ cargo run -p tools --release --features kifu-player --bin kifu_player -- \
 ### tournament の out-dir を開く
 
 ```bash
-cargo run -p tools --release --features kifu-player --bin kifu_player -- \
+cargo run -p tools --release --bin kifu_player -- \
   --tournament-dir runs/selfplay/<out-dir>
 ```
 
@@ -47,11 +50,11 @@ out-dir 配下の `*-vs-*.jsonl`（`tournament` が出力するペアファイ�
 
 ```bash
 # 単一ファイル
-cargo run -p tools --release --features kifu-player --bin kifu_player -- \
+cargo run -p tools --release --bin kifu_player -- \
   --csa runs/csa_match/game.csa
 
 # ディレクトリ（配下の *.csa をサブディレクトリまで再帰して横断）
-cargo run -p tools --release --features kifu-player --bin kifu_player -- \
+cargo run -p tools --release --bin kifu_player -- \
   --csa runs/csa_match
 ```
 
@@ -69,7 +72,7 @@ cargo run -p tools --release --features kifu-player --bin kifu_player -- \
 
 ```bash
 # floodgate 連続対局の記録 dir を開いたまま、新しい完了局を自動で一覧に追加する
-cargo run -p tools --release --features kifu-player --bin kifu_player -- \
+cargo run -p tools --release --bin kifu_player -- \
   --csa ~/floodgate/records --live 5 --ratings ~/floodgate/records/ratings_cache.tsv
 ```
 
@@ -204,12 +207,12 @@ prefix を付けずに**数字のみ**を入力すると、数値フィールド
 `s` を押すたびに次の順序へ循環する（絞り込み後のリストに適用、同順のものは元の順序を
 保つ安定ソート）。評価値による並べ替えは降順で、評価値の無い対局は末尾へ寄せる。
 
-1. 発見順（デフォルト）
-2. 日付(新)（ファイル名由来の対局日時の降順。日時の無い対局は末尾）
-3. 勝敗別（エラー→先手勝ち→後手勝ち→引き分け→不明）
-4. 対局長（手数の降順）
-5. 決着の大きさ（最終評価値の絶対値の降順）
-6. 評価値の振れ幅（降順）
+1. 日付(新)（デフォルト。ファイル名由来の対局日時の降順＝新しい対局が先頭。日時の無い対局は末尾）
+2. 勝敗別（エラー→先手勝ち→後手勝ち→引き分け→不明）
+3. 対局長（手数の降順）
+4. 決着の大きさ（最終評価値の絶対値の降順）
+5. 評価値の振れ幅（降順）
+6. 発見順（ファイル列挙順→完了順）
 
 日時はファイル名から抽出する（csa_client 記録の `YYYYMMDD_HHMMSS_` prefix、wdoor floodgate の
 末尾 14 桁タイムスタンプに対応）。tournament ペアファイルのように日時を持たないファイルの

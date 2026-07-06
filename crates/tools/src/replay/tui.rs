@@ -102,9 +102,9 @@ enum Mode {
 /// （同じキー内の相対順は発見順を維持する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortMode {
-    /// ファイル列挙順→完了順（従来のデフォルト）。
+    /// ファイル列挙順→完了順。
     Discovery,
-    /// ファイル名由来の対局日時の降順（新しい対局が先頭）。日時の無い対局は末尾。
+    /// ファイル名由来の対局日時の降順（新しい対局が先頭）。日時の無い対局は末尾。既定。
     Date,
     /// エラー→黒勝ち→白勝ち→引き分け→不明の順にグルーピング。
     Outcome,
@@ -205,7 +205,7 @@ impl App {
             selected: 0,
             mode: Mode::Browse,
             filter_input: String::new(),
-            sort_mode: SortMode::Discovery,
+            sort_mode: SortMode::Date,
             current_game: None,
             current_move: 0,
             status: String::new(),
@@ -213,7 +213,8 @@ impl App {
             ratings,
             live,
         };
-        app.load_selected();
+        // 初期表示から既定ソート（日付(新)）を適用する。`resort` が `load_selected` も行う。
+        app.resort();
         app
     }
 

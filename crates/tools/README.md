@@ -20,7 +20,7 @@
 
 | ツール | 説明 |
 |--------|------|
-| `kifu_player` | PSV / tournament JSONL / CSA を同じ TUI で再生・閲覧（`kifu-player` feature、評価値グラフ・検索/絞り込み（SFEN 局面検索含む）・`--live` 追記監視 (live-mirror と組で wdoor 観戦、csa_client の `live_jsonl` と組で自局の手単位リアルタイム観戦)・`--ratings` レート併記付き。[詳細](docs/kifu_player.md)） |
+| `kifu_player` | PSV / tournament JSONL / CSA を同じ TUI で再生・閲覧（評価値グラフ・検索/絞り込み（SFEN 局面検索含む）・`--live` 追記監視 (live-mirror と組で wdoor 観戦、csa_client の `live_jsonl` と組で自局の手単位リアルタイム観戦)・`--ratings` レート併記付き。[詳細](docs/kifu_player.md)） |
 
 ### 学習データ処理
 

@@ -8,12 +8,12 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/SH11235/rshogi"
 
 [features]
-# default は解析対象 NNUE アーキテクチャ集合 (nnue-arch) と DL 教師リスコア用 ONNX
-# (dlshogi-onnx) から成る。ort は load-dynamic なので dlshogi-onnx を default にしても
-# build 時に libonnxruntime は不要 (実行時 dlopen)。両者を分離しておくことで ONNX 依存
-# だけを外したビルド (`--no-default-features --features nnue-arch`) を表現でき、CI も
-# その構成 (ONNX 無効フォールバック経路) を lint できる。
-default = ["nnue-arch", "dlshogi-onnx"]
+# default は解析対象 NNUE アーキテクチャ集合 (nnue-arch)、DL 教師リスコア用 ONNX
+# (dlshogi-onnx)、棋譜プレイヤー TUI (kifu-player) から成る。ort は load-dynamic なので
+# dlshogi-onnx を default にしても build 時に libonnxruntime は不要 (実行時 dlopen)。
+# 分離しておくことで依存を外したビルド (`--no-default-features --features nnue-arch`) を
+# 表現でき、CI もその構成 (ONNX 無効フォールバック経路) を lint できる。
+default = ["nnue-arch", "dlshogi-onnx", "kifu-player"]
 
 # 解析対象 NNUE アーキテクチャ (LayerStack L1 サイズ + FT variant 5 種) の既定集合。
 nnue-arch = [
@@ -60,8 +60,10 @@ aobazero-onnx = ["dep:ort", "dep:ndarray"]
 dlshogi-onnx = ["dep:ort", "dep:ndarray"]
 
 # 棋譜プレイヤー TUI（PSV / tournament JSONL 共通の対局再生ビューア）。
-# default に含めない: 学習パイプライン専用に checkout・ビルドする側へ
-# 対話的 TUI 依存 (ratatui/crossterm) を持ち込まないため。
+# default に含める: 素の `cargo build --release` で kifu_player だけ旧版のまま
+# 取り残されるのを防ぐ (required-features 付き bin は feature 無しだとビルド対象外)。
+# TUI 依存 (ratatui/crossterm) を持ち込みたくない学習パイプライン等は
+# `--no-default-features` でオプトアウトする。
 kifu-player = ["dep:ratatui", "dep:crossterm"]
 
 [[bin]]
