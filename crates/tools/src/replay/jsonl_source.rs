@@ -251,8 +251,10 @@ fn index_one_file(
         let value: Value = match serde_json::from_slice(&line_buf) {
             Ok(v) => v,
             Err(e) => {
-                let at_eof = reader.fill_buf().map(|b| b.is_empty()).unwrap_or(true);
-                if at_eof {
+                // 改行で終わっていない行 = read_until が EOF に当たった切れた末尾
+                // (JSON 行は生の改行を含まないため)。EOF 到達の再確認だと read と
+                // 確認の間の追記で誤って破損扱いしうるので、行内容だけで判定する。
+                if !line_buf.ends_with(b"\n") {
                     warnings.push(format!(
                         "{}: 末尾行が JSON として不完全のため無視しました (書き込み途中の可能性)",
                         path.display()
