@@ -20,6 +20,17 @@
 
 `result` 行が無いファイル(進行中の局)は自動でスキップする。
 
+## ビルドと実行
+
+```bash
+# ビルド(以降の例はビルド済みバイナリ名で表記する)
+cargo build --release -p tools --bin floodgate_record
+# → target/release/floodgate_record
+
+# ビルドせず直接実行する場合は次の形に読み替える
+cargo run --release -p tools --bin floodgate_record -- <args>
+```
+
 ## 使い方
 
 ```bash
@@ -47,6 +58,19 @@ floodgate_record --dir ~/floodgate/records/jsonl --fetch-ratings --ratings-cache
 | `--ratings-cache <FILE>` | `--fetch-ratings` 併用。fetch 成功時は `name<TAB>rate` を FILE へ書き出し、失敗時は FILE を読み戻してフォールバック併記する(一時障害でも直近値を維持)。config 指定時の既定は `<record.dir>/ratings_cache.tsv` |
 | `--ratings-max-age <SEC>` | `--fetch-ratings` 併用。キャッシュの mtime が SEC 秒以内なら**ネットワーク取得をスキップ**してキャッシュを直接使う。既定 0(常に取得)。レートページは日次生成なので数時間(例: `21600` = 6h)で十分。履歴併用時、履歴に当日(JST)分が無ければ鮮度内でも取得する(スキップで履歴の日付が抜けないように) |
 | `--ratings-history <FILE>` | `--fetch-ratings` 併用。fetch 成功時に自分(`--me`)の現在レートを `ページ日付<TAB>名前<TAB>レート` で FILE へ追記する(R 推移のローカル記録)。同一(日付, 名前)は再追記せず**その日最初の観測値**を保持。書き込みは tmp→rename の全置換(並行実行でも行が壊れない)。config 指定時の既定は `<record.dir>/ratings_history.tsv` |
+
+`--config` に渡す TOML は csa_client の設定そのもので、本ツールが読むのは次の部分
+(完全な floodgate 用 config の例は `docs/csa-client.md` を参照):
+
+```toml
+[server]
+id = "YourEngineName"      # --me の既定値になる
+
+[record]
+dir = "/path/to/floodgate/records"  # 集計 dir は <dir>/jsonl/、キャッシュ・履歴の既定は <dir>/ 直下
+save_jsonl = true                   # false だと集計元が無くエラー(--dir 明示で回避可)
+# jsonl_out = "/path/to/elsewhere"  # JSONL 出力先を上書きしている場合はそちらを集計
+```
 
 **名前の突き合わせはすべて正規化キー**(英数字と `-` `_` 以外を `_` に置換。JSONL のファイル名・meta ラベルと同じ規則)で行う。JSONL の `move.engine` / `result.winner` は raw の CSA 名、ファイル名は正規化済みという混在があるため、集計・`--me`・`--watch`・レート表・キャッシュのキーを入口で同一空間に揃えている。レート併記は正規化キーの**完全一致**で引く(表に無い相手は併記なし)。
 
