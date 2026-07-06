@@ -112,11 +112,11 @@ pub fn rating_page_url(root: &str, date_yyyymmdd: &str) -> Result<String> {
     join_url(root, &format!("{RATING_PAGE_REL_PREFIX}{date_yyyymmdd}.html"))
 }
 
-/// 直近のレーティングページを取得し (URL, HTML) を返す。
+/// 直近のレーティングページを取得し (URL, ページ日付 `YYYYMMDD`, HTML) を返す。
 ///
 /// ページは日次生成の日付スタンプ付きで当日分が未生成のこともあるため、
 /// 今日から数日遡って最初に取得できたページを採用する。
-pub fn fetch_latest_rating_page(client: &Client) -> Result<(String, String)> {
+pub fn fetch_latest_rating_page(client: &Client) -> Result<(String, String, String)> {
     const LOOKBACK_DAYS: i64 = 7;
     // ファイル名は floodgate サーバ (JST/+0900) 基準の日付なので、ホスト TZ に依存せず
     // JST で当日を求める。UTC など JST より遅れた TZ のホストでは現地 today が当日分を
@@ -125,10 +125,10 @@ pub fn fetch_latest_rating_page(client: &Client) -> Result<(String, String)> {
     let today = chrono::Utc::now().with_timezone(&jst).date_naive();
     let mut last_err: Option<anyhow::Error> = None;
     for back in 0..=LOOKBACK_DAYS {
-        let date = today - chrono::Duration::days(back);
-        let url = rating_page_url(DEFAULT_ROOT, &date.format("%Y%m%d").to_string())?;
+        let date = (today - chrono::Duration::days(back)).format("%Y%m%d").to_string();
+        let url = rating_page_url(DEFAULT_ROOT, &date)?;
         match http_get_text(client, &url) {
-            Ok(html) => return Ok((url, html)),
+            Ok(html) => return Ok((url, date, html)),
             Err(e) => last_err = Some(e),
         }
     }
