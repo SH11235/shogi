@@ -1912,7 +1912,7 @@ mod tests {
             vec!["lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 40".to_string()],
         ]);
         let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
 
         app.start_sfen_scan(HIRATE_SFEN);
         drain_scan(&mut app);
@@ -1930,7 +1930,7 @@ mod tests {
             vec!["lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 7".to_string()];
         let source = fake_source(games);
         let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
 
         app.start_sfen_scan(HIRATE_SFEN);
         let mut ticks = 0;
@@ -1958,7 +1958,7 @@ mod tests {
         }
         let source = fake_source(games);
         let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
         app.filter_input = "len:3".to_string();
         app.apply_filter();
         let filtered_before = app.filtered.clone();
@@ -1986,7 +1986,7 @@ mod tests {
             error_ordinals: vec![1],
         };
         let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
         app.start_sfen_scan(HIRATE_SFEN);
         drain_scan(&mut app);
         assert_eq!(app.filtered, vec![2], "load 失敗の対局は一致に含めない");
@@ -2004,7 +2004,7 @@ mod tests {
             vec!["lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 40".to_string()],
         ]);
         let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
         // Enter 経由と同じく filter_input を残したままスキャン（`s` の再フィルタ源）。
         app.filter_input = format!("sfen:{HIRATE_SFEN}");
         app.start_sfen_scan(HIRATE_SFEN);
@@ -2021,7 +2021,7 @@ mod tests {
     fn invalid_sfen_query_does_not_start_scan() {
         let source = fake_source(vec![vec!["9/9/9/9/9/9/9/9/9 b - 1".to_string()]]);
         let index = source.build_index().expect("build_index");
-        let mut app = App::new(Box::new(source), index);
+        let mut app = App::new(Box::new(source), index, BTreeMap::new(), None);
         app.start_sfen_scan("   "); // 空
         assert!(app.scan.is_none(), "空クエリではスキャンを開始しない");
         assert!(app.status.contains("不正"), "不正入力はエラー表示: {}", app.status);
