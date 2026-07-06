@@ -991,7 +991,16 @@ fn draw_game_list(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::
                     None => "",
                 }
             };
-            ListItem::new(format!("{label}{marker}{}", rate_suffix(app, entry)))
+            // 終局が記録されていない対局（live では進行中）を左端の `>` + 緑で区別する。
+            // 曖昧幅の記号（▶ 等）は端末設定次第で列ずれするため ASCII を使う。
+            let in_progress = !entry.error && entry.outcome.is_none();
+            let prefix = if in_progress { "> " } else { "  " };
+            let item = ListItem::new(format!("{prefix}{label}{marker}{}", rate_suffix(app, entry)));
+            if in_progress {
+                item.style(Style::default().fg(RColor::Green))
+            } else {
+                item
+            }
         })
         .collect();
 
