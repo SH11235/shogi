@@ -1,6 +1,7 @@
 [package]
 name = "rshogi-book"
 version = "0.1.0"
+publish = false
 edition = "2024"
 authors = ["SH11235"]
 description = "Opening book (YANEURAOU-DB2016 .db) reader and probe for rshogi"
