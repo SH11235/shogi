@@ -110,7 +110,7 @@ impl GameSource for CsaSource {
 
             // 評価値コメントは元々先手視点なので、そのまま指標へ流す。
             let mut acc = EvalAccumulator::default();
-            for cp in parse_move_annotations(&text).iter().filter_map(|n| n.score_cp) {
+            for cp in parse_eval_comments(&text).into_iter().flatten() {
                 acc.push(cp);
             }
 
@@ -159,8 +159,8 @@ impl GameSource for CsaSource {
         let (mut pos, parsed, _info) = parse_csa_full(&text)
             .with_context(|| format!("failed to parse {}", meta.path.display()))?;
         // 先手視点で書かれたコメントを手番相対へ戻す前段として、通常手ごとの
-        // 先手視点スコアと消費時間を読み出しておく（PV は無視、無い手は None）。
-        let notes = parse_move_annotations(&text);
+        // 先手視点スコアを読み出しておく（PV は無視、無い手は None）。
+        let scores = parse_eval_comments(&text);
 
         let mut moves = Vec::new();
         let mut normal_idx = 0usize;
@@ -212,8 +212,7 @@ impl GameSource for CsaSource {
                 None => (Move::NONE, format!("{:>4} {}", abs_ply, cm.mv)),
             };
 
-            let note = notes.get(normal_idx).copied().unwrap_or_default();
-            let score_cp = note.score_cp.map(|black_pov| {
+            let score_cp = scores.get(normal_idx).copied().flatten().map(|black_pov| {
                 // 先手視点 → 手番相対（後手手番は符号反転）。グラフ側の `black_pov_cp` が
                 // 再度 手番相対 → 先手視点 に戻すので、全ソースで格納形式を揃える。
                 match side {
@@ -230,7 +229,9 @@ impl GameSource for CsaSource {
                 kif_label,
                 annotation: MoveAnnotation {
                     score_cp,
-                    elapsed_ms: note.elapsed_ms,
+                    // 消費時間は parse_csa_full が独立 T 行・インライン `,T` の両方から
+                    // 格納済みの値を使う（%TORYO 等に付く T は Normal でないため混入しない）。
+                    elapsed_ms: cm.time_sec.map(|s| u64::from(s) * 1000),
                     ..Default::default()
                 },
             });
@@ -297,52 +298,33 @@ fn derive_outcome(
     }
 }
 
-/// 通常手 1 手ぶんの注釈（評価値・消費時間）。
-#[derive(Debug, Clone, Copy, Default)]
-struct CsaMoveNote {
-    /// 先手視点の評価値（cp）。
-    score_cp: Option<i32>,
-    elapsed_ms: Option<u64>,
-}
-
-/// コメント・`T` 行を走査し、通常手（`[+-]NNNN..` 行）の出現順に対応する注釈を返す。
-/// 記録の系統でコメントの帰属が異なる（module doc 参照）:
+/// 評価値コメントを走査し、通常手（`[+-]NNNN..` 行）の出現順に対応する先手視点スコアを
+/// 返す。記録の系統でコメントの帰属が異なる（module doc 参照）:
 /// - `'*`（csa_client 自前記録）は**直後**の手のスコア
 /// - `'**`（wdoor / shogi-server 記録）は**直前**の手のスコア
-/// - `T<秒>` は**直前**の手の消費時間（設定済みなら上書きしない = `%TORYO` 等の
-///   終局手に付く `T` を最終手へ誤帰属させない）
 ///
+/// 消費時間はここでは扱わない（独立 `T` 行・インライン `,T` とも `parse_csa_full` が
+/// `CsaMove::time_sec` へ格納済みで、`%TORYO` 等の終局手に付く `T` も型で除外される）。
 /// PV は使わない。コメントの無い手は `None`。
-fn parse_move_annotations(text: &str) -> Vec<CsaMoveNote> {
+fn parse_eval_comments(text: &str) -> Vec<Option<i32>> {
     fn leading_score(rest: &str) -> Option<i32> {
         rest.split_whitespace().next().and_then(|t| t.parse::<i32>().ok())
     }
-    let mut notes: Vec<CsaMoveNote> = Vec::new();
+    let mut scores: Vec<Option<i32>> = Vec::new();
     let mut pending: Option<i32> = None;
     for raw in text.lines() {
         let s = raw.trim();
         if let Some(rest) = s.strip_prefix("'**") {
-            if let (Some(last), Some(cp)) = (notes.last_mut(), leading_score(rest)) {
-                last.score_cp = Some(cp);
+            if let (Some(last), Some(cp)) = (scores.last_mut(), leading_score(rest)) {
+                *last = Some(cp);
             }
         } else if let Some(rest) = s.strip_prefix("'*") {
             pending = leading_score(rest);
-        } else if let Some(rest) = s.strip_prefix('T') {
-            if !rest.is_empty()
-                && rest.bytes().all(|b| b.is_ascii_digit())
-                && let Some(last) = notes.last_mut()
-                && last.elapsed_ms.is_none()
-            {
-                last.elapsed_ms = rest.parse::<u64>().ok().map(|sec| sec * 1000);
-            }
         } else if is_csa_move_line(s) {
-            notes.push(CsaMoveNote {
-                score_cp: pending.take(),
-                elapsed_ms: None,
-            });
+            scores.push(pending.take());
         }
     }
-    notes
+    scores
 }
 
 /// `+7776FU` / `-0055FU` 形式の指し手行か（`%`/`T`/`P`/`N`/`'` などのメタ行を除外する）。
@@ -445,6 +427,20 @@ mod tests {
         let game = source.load_game(&index, &index.entries[0]).expect("load_game");
         assert_eq!(game.moves[0].annotation.elapsed_ms, Some(10_000));
         assert_eq!(game.moves[1].annotation.elapsed_ms, Some(12_000));
+    }
+
+    #[test]
+    fn parses_inline_time_suffix_on_move_line() {
+        // CSA 標準のインライン形式 `+7776FU,T3` からも消費時間を拾う
+        // (parse_csa_full が time_sec に格納する経路)。
+        let text = "V2.2\nN+S\nN-G\nPI\n+7776FU,T3\n-3334FU,T4\n%TORYO\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csa(dir.path(), "a.csa", text);
+        let source = CsaSource::new(dir.path());
+        let index = source.build_index().expect("build_index");
+        let game = source.load_game(&index, &index.entries[0]).expect("load_game");
+        assert_eq!(game.moves[0].annotation.elapsed_ms, Some(3_000));
+        assert_eq!(game.moves[1].annotation.elapsed_ms, Some(4_000));
     }
 
     #[test]
