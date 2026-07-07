@@ -19,6 +19,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
+/// 送信バッファの初期 capacity。通常の CSA 行はこの範囲に収まる。
+const SEND_BUF_INIT_CAPACITY: usize = 256;
+
+/// 送信後も保持を許す capacity の上限。巨大な行（長い `%%CHAT` の broadcast 等）で
+/// 一時的に伸びた capacity を長寿命接続が持ち続けないよう、超過時は縮める。
+const SEND_BUF_MAX_RETAIN: usize = 4096;
+
 /// TCP 接続 1 本分の行 I/O アダプタ。
 pub struct TcpTransport {
     reader: BufReader<OwnedReadHalf>,
@@ -50,7 +57,7 @@ impl TcpTransport {
             writer: write_half,
             peer,
             line_buf: Vec::with_capacity(256),
-            send_buf: Vec::with_capacity(256),
+            send_buf: Vec::with_capacity(SEND_BUF_INIT_CAPACITY),
         }
     }
 
@@ -119,8 +126,15 @@ impl ClientTransport for TcpTransport {
 
     async fn send_line(&mut self, line: &CsaLine) -> Result<(), TransportError> {
         // CSA 1.2.1 は CR+LF を要求する。本文 + CRLF を 1 バッファに組んで
-        // `write_all` 1 回で送る（分割送信だと受信側が本文だけを先に観測しうる）。
+        // `write_all` 1 回で送り、アプリ層起因の分割送信を排除する。
+        // なお TCP はストリームなので 1 write でも受信側の read が複数回に
+        // 分かれることはあり得る（受信側は行確定・期待長まで読む前提）。
         self.send_buf.clear();
+        // 巨大な行（%%CHAT broadcast 等）で伸びた capacity を接続に残さない。
+        // clear 直後（= 空）に縮めるので、直前送信の内容量に関わらず安全。
+        if self.send_buf.capacity() > SEND_BUF_MAX_RETAIN {
+            self.send_buf.shrink_to(SEND_BUF_INIT_CAPACITY);
+        }
         self.send_buf.extend_from_slice(line.as_str().as_bytes());
         self.send_buf.extend_from_slice(b"\r\n");
         self.writer
@@ -207,12 +221,24 @@ mod tests {
         // 期待バイト数に達するまで読む `read_exact` を使う。
         // CRLF 欠落の退行時に read_exact がハングしないよう timeout で包む。
         use tokio::io::AsyncReadExt;
-        let mut buf = [0u8; 10];
+        const EXPECTED: &[u8; 10] = b"START:g1\r\n";
+        let mut buf = [0u8; EXPECTED.len()];
         tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut buf))
             .await
             .expect("read_exact timed out")
             .unwrap();
-        assert_eq!(&buf, b"START:g1\r\n");
+        assert_eq!(&buf, EXPECTED);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_line_shrinks_oversized_buffer() {
+        // 巨大な行で伸びた send_buf の capacity が、次の送信時に上限まで縮むこと。
+        let (mut transport, _client) = loopback_pair().await;
+        let big = "X".repeat(SEND_BUF_MAX_RETAIN * 2);
+        transport.send_line(&CsaLine::new(&big)).await.unwrap();
+        assert!(transport.send_buf.capacity() > SEND_BUF_MAX_RETAIN);
+        transport.send_line(&CsaLine::new("PING")).await.unwrap();
+        assert!(transport.send_buf.capacity() <= SEND_BUF_MAX_RETAIN);
     }
 
     #[tokio::test(flavor = "current_thread")]
