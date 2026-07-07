@@ -15,6 +15,7 @@
 | `floodgate_pipeline` | Floodgate棋譜のダウンロード・変換・`live-mirror`リアルタイムミラー（[詳細](docs/floodgate_pipeline.md)） |
 | `book_from_csa` | CSA 棋譜群から YANEURAOU-DB2016 テキスト定跡 `.db` を生成（消費時間による定跡手判定・レート/勝敗フィルタ、[詳細](docs/book_from_csa.md)） |
 | `book_rescore` | YANEURAOU-DB2016 テキスト定跡の候補手に USI 探索または ONNX 静的評価値を付与、実行中は進捗/ETA を stderr 表示（[詳細](docs/book_rescore.md)） |
+| `book_extend` | YANEURAOU-DB2016 テキスト定跡の候補集合へ USI エンジン bestmove を `count=0` で追加（[詳細](docs/book_extend.md)） |
 | `book_backprop` | YANEURAOU-DB2016 テキスト定跡 `.db` の候補手評価値を book 内の子局面から negamax 逆伝播（[詳細](docs/book_backprop.md)） |
 
 ### 棋譜閲覧
@@ -97,6 +98,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 - [rescore_hcpe](docs/rescore_hcpe.md) - hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（共有コアで yardstick とラベル bit 一致、分散ラベリング・チャンク単位 + 途中 resume 対応）
 - [psv_to_hcpe3](docs/psv_to_hcpe3.md) - PSV → dlshogi 学習用 hcpe3 / hcpe 変換（cshogi 互換、streaming、`--evalfix-a` で eval 焼き込み）
 - [book_rescore](docs/book_rescore.md) - YANEURAOU-DB2016 テキスト定跡の候補手に USI 探索または ONNX 静的評価値を付与（実行中は進捗/ETA を stderr 表示）
+- [book_extend](docs/book_extend.md) - YANEURAOU-DB2016 テキスト定跡の候補集合へ USI エンジン bestmove を `count=0` で追加
 - [book_backprop](docs/book_backprop.md) - YANEURAOU-DB2016 テキスト定跡 `.db` の候補手評価値を book 内の子局面から negamax 逆伝播
 
 各ツールのオプション一覧は `--help` で確認できます。
