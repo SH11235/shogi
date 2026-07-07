@@ -145,20 +145,24 @@ exit 1
 // ───────────────────────────────────────────────
 #[test]
 fn dying_engine_during_go_includes_stderr_tail() {
+    // 行順固定でなくコマンド駆動で応答する (isready の回数や順序に依存しない)。
     let script = r#"#!/usr/bin/env bash
-read line  # usi
-echo "id name mock"
-echo "usiok"
-read line  # isready (initialize)
-echo "readyok"
-read line  # usinewgame
-read line  # isready (new_game)
-echo "readyok"
-read line  # position
-read line  # go
-printf 'info string about to die\n' >&2
-exec 2>&-
-exit 1
+while IFS= read -r line; do
+    case "$line" in
+        usi)
+            echo "id name mock"
+            echo "usiok"
+            ;;
+        isready)
+            echo "readyok"
+            ;;
+        go*)
+            printf 'info string about to die\n' >&2
+            exec 2>&-
+            exit 1
+            ;;
+    esac
+done
 "#;
     let path = write_mock_script("dying_during_go", script);
     let opts: HashMap<String, toml::Value> = HashMap::new();

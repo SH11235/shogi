@@ -567,6 +567,7 @@ struct BestThreadResult {
     ponder_move: Move,
     score: Value,
     completed_depth: Depth,
+    sel_depth: i32,
     nodes: u64,
     best_previous_score: Option<Value>,
     best_previous_average_score: Option<Value>,
@@ -596,6 +597,7 @@ fn collect_best_thread_result(
             ponder_move: Move::NONE,
             score: Value::ZERO,
             completed_depth,
+            sel_depth: worker.state.sel_depth,
             nodes,
             best_previous_score,
             best_previous_average_score,
@@ -634,6 +636,7 @@ fn collect_best_thread_result(
         .map(|rm| rm.score)
         .unwrap_or(worker.state.root_moves.get(0).map(|rm| rm.score).unwrap_or(Value::ZERO));
 
+    let sel_depth = best_rm.map(|rm| rm.sel_depth).unwrap_or(worker.state.sel_depth);
     let pv = best_rm.map(|rm| rm.pv.clone()).unwrap_or_default();
 
     BestThreadResult {
@@ -641,6 +644,7 @@ fn collect_best_thread_result(
         ponder_move,
         score,
         completed_depth,
+        sel_depth,
         nodes,
         best_previous_score,
         best_previous_average_score,
@@ -985,7 +989,7 @@ impl Search {
         &mut self,
         pos: &mut Position,
         limits: LimitsType,
-        on_info: Option<F>,
+        mut on_info: Option<F>,
     ) -> SearchResult
     where
         F: FnMut(&SearchInfo),
@@ -1063,7 +1067,7 @@ impl Search {
         }
 
         // 探索実行（コールバックなしの場合はダミーを渡す）
-        let _effective_multi_pv = match on_info {
+        let _effective_multi_pv = match on_info.as_mut() {
             Some(callback) => self.search_with_callback(
                 pos,
                 &limits,
@@ -1153,6 +1157,7 @@ impl Search {
                         ponder_move: Move::NONE, // Cannot get ponder from helper in Wasm
                         score,
                         completed_depth: r.completed_depth,
+                        sel_depth: self.worker.as_ref().map(|w| w.state.sel_depth).unwrap_or(0),
                         nodes: r.nodes,
                         // Use the actual best score (not skill-weakened) for time management
                         // and aspiration window initialization, matching native behavior.
@@ -1181,6 +1186,7 @@ impl Search {
             ponder_move,
             score,
             completed_depth,
+            sel_depth,
             nodes: _best_nodes,
             best_previous_score,
             best_previous_average_score,
@@ -1206,6 +1212,39 @@ impl Search {
 
             main_nodes.saturating_add(helper_nodes)
         };
+
+        // YO yaneuraou-search.cpp 1303-1333相当:
+        // Lazy SMPで採択したbestThreadのPVをbestmove直前の最終infoとして再出力する。
+        // YO は「未送信 or 採択スレッドが main 以外 or 投了スコア」のときのみ MultiPV
+        // 全ラインを再出力するが、ここでは「最後の info の pv 先頭 == bestmove」を
+        // 全経路で保証する目的なので、採択ライン (multipv 1) の 1 行を常に出す。
+        // score が番兵 (±INFINITE) のまま = depth 1 の初手完了前に中断した場合は
+        // 出さない (YO の previousScore フォールバック相当のガード)。
+        // Wasm helper 採択で PV を取得できない場合も bestmove 1 手の PV で保証を保つ。
+        if let Some(callback) = on_info.as_mut()
+            && best_move != Move::NONE
+            && root_score_is_initialized(score)
+        {
+            let final_pv = if pv.is_empty() {
+                vec![best_move]
+            } else {
+                pv.clone()
+            };
+            let time_ms = time_manager.elapsed() as u64;
+            let nps = total_nodes.saturating_mul(1000) / time_ms.max(1);
+            let info = SearchInfo {
+                depth: completed_depth,
+                sel_depth,
+                score,
+                nodes: total_nodes,
+                time_ms,
+                nps,
+                hashfull: self.tt.hashfull(3) as u32,
+                pv: final_pv,
+                multi_pv: 1,
+            };
+            callback(&info);
+        }
 
         // 次の手番のために timeReduction を持ち回る
         self.previous_time_reduction = time_manager.previous_time_reduction();
@@ -1503,6 +1542,7 @@ where
 
         // MultiPVループ
         let mut processed_pv = 0;
+        let mut depth_aborted = false;
         for pv_idx in 0..effective_multi_pv {
             if worker.state.abort {
                 break;
@@ -1515,6 +1555,7 @@ where
                 &worker.search_tune_params,
             );
             let mut failed_high_cnt = 0;
+            let mut pv_aborted = false;
 
             // Aspiration Windowループ
             loop {
@@ -1547,6 +1588,8 @@ where
                     || time_manager.stop_requested()
                 {
                     worker.state.abort = true;
+                    pv_aborted = true;
+                    depth_aborted = true;
                     break;
                 }
 
@@ -1580,8 +1623,12 @@ where
             // 安定ソート [pv_idx..]
             worker.state.root_moves.stable_sort_range(pv_idx, worker.state.root_moves.len());
             // 📝 YaneuraOu行1539: 探索済みのPVライン全体も安定ソートして順位を保つ
+            // abortしたdepthは前の完了depthのinfoを最終出力とするため、このdepthのinfoは出さない。
+            // 完了済みラインの取りこぼしはMultiPV>1のみで許容し、探索状態のsortはYO準拠で維持する。
             worker.state.root_moves.stable_sort_range(0, pv_idx + 1);
-            processed_pv = pv_idx + 1;
+            if !pv_aborted {
+                processed_pv = pv_idx + 1;
+            }
         }
 
         // MultiPVループ完了後の最終ソート（YaneuraOu行1499）
@@ -1592,6 +1639,7 @@ where
         // メインのみ: info出力（GUI詰まり防止のYO仕様）
         if let Some(ref ms) = main_state
             && processed_pv > 0
+            && !depth_aborted
         {
             let elapsed = ms.start_time.elapsed();
             let time_ms = elapsed.as_millis() as u64;
@@ -1616,15 +1664,19 @@ where
             let nps = total_nodes.saturating_mul(1000).checked_div(time_ms).unwrap_or(0);
 
             for pv_idx in 0..processed_pv {
+                let root_move = &worker.state.root_moves[pv_idx];
+                if !root_score_is_initialized(root_move.score) {
+                    continue;
+                }
                 let info = SearchInfo {
                     depth,
-                    sel_depth: worker.state.root_moves[pv_idx].sel_depth,
-                    score: worker.state.root_moves[pv_idx].score,
+                    sel_depth: root_move.sel_depth,
+                    score: root_move.score,
                     nodes: total_nodes,
                     time_ms,
                     nps,
                     hashfull: ms.tt.hashfull(3) as u32,
-                    pv: worker.state.root_moves[pv_idx].pv.clone(),
+                    pv: root_move.pv.clone(),
                     multi_pv: pv_idx + 1, // 1-indexed
                 };
                 on_info(&info);
@@ -1811,6 +1863,11 @@ where
     }
 
     effective_multi_pv
+}
+
+fn root_score_is_initialized(score: Value) -> bool {
+    let raw = score.raw();
+    -Value::INFINITE.raw() < raw && raw < Value::INFINITE.raw()
 }
 
 // search_helper_impl is a thin wrapper that calls iterative_deepening with main_state=None.
@@ -2273,6 +2330,43 @@ mod tests {
     }
 
     #[test]
+    fn test_search_with_callback_last_info_matches_best_move() {
+        // スタックサイズを増やした別スレッドで実行
+        std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                let mut search = Search::new(16);
+                let mut pos = Position::new();
+                pos.set_hirate();
+
+                let limits = LimitsType {
+                    depth: 2,
+                    ..Default::default()
+                };
+
+                let mut last_info_pv_head = Move::NONE;
+                let result = search.go(
+                    &mut pos,
+                    limits,
+                    Some(|info: &SearchInfo| {
+                        if let Some(&mv) = info.pv.first() {
+                            last_info_pv_head = mv;
+                        }
+                    }),
+                );
+
+                assert_ne!(result.best_move, Move::NONE, "Should find a best move");
+                assert_eq!(
+                    last_info_pv_head, result.best_move,
+                    "Last info PV head should match the returned best move"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn test_search_info_to_usi() {
         let info = SearchInfo {
             depth: 5,
@@ -2329,6 +2423,15 @@ mod tests {
 
         let usi = info.to_usi_string();
         assert!(usi.contains("score mate -4"));
+    }
+
+    #[test]
+    fn root_score_is_initialized_rejects_infinite_sentinel() {
+        assert!(!root_score_is_initialized(Value::new(-Value::INFINITE.raw())));
+        assert!(!root_score_is_initialized(Value::INFINITE));
+        assert!(root_score_is_initialized(Value::new(0)));
+        assert!(root_score_is_initialized(Value::mate_in(1)));
+        assert!(root_score_is_initialized(Value::mated_in(1)));
     }
 
     #[test]

@@ -270,6 +270,25 @@ pub struct SearchInfo {
     pub pv: Vec<String>,
 }
 
+impl SearchInfo {
+    /// その `go` / `ponderhit` で記録対象になる info を観測済みなら `true`。
+    pub fn has_observation(&self) -> bool {
+        self.depth.is_some()
+            || self.seldepth.is_some()
+            || self.score_cp.is_some()
+            || self.score_mate.is_some()
+            || self.nodes.is_some()
+            || self.time_ms.is_some()
+            || self.nps.is_some()
+            || !self.pv.is_empty()
+    }
+
+    /// floodgate の評価値コメントとして送れる score を持つなら `true`。
+    pub fn has_score(&self) -> bool {
+        self.score_cp.is_some() || self.score_mate.is_some()
+    }
+}
+
 impl UsiEngine {
     /// USIエンジンを起動し、初期化する。
     ///
@@ -477,6 +496,7 @@ impl UsiEngine {
         shutdown: &AtomicBool,
         server_rx: &Receiver<Event>,
     ) -> Result<SearchOutcome> {
+        self.drain_pending_engine_lines("go");
         self.send(position_cmd)?;
         self.send(go_cmd)?;
         self.wait_bestmove(shutdown, server_rx, None)
@@ -493,6 +513,7 @@ impl UsiEngine {
         server_rx: &Receiver<Event>,
         info_callback: &mut InfoCallback<'_>,
     ) -> Result<SearchOutcome> {
+        self.drain_pending_engine_lines("go_with_info");
         self.send(position_cmd)?;
         self.send(go_cmd)?;
         self.wait_bestmove(shutdown, server_rx, Some(info_callback))
@@ -500,6 +521,7 @@ impl UsiEngine {
 
     /// ponder 探索を開始（bestmove を待たない）
     pub fn go_ponder(&mut self, position_cmd: &str, go_cmd: &str) -> Result<()> {
+        self.drain_pending_engine_lines("go_ponder");
         self.send(position_cmd)?;
         self.send(go_cmd)?;
         Ok(())
@@ -556,6 +578,29 @@ impl UsiEngine {
             if line.starts_with("bestmove") {
                 break;
             }
+        }
+    }
+
+    /// 探索開始前に、前の探索が残した pending 出力をチャネルから読み捨てる。
+    ///
+    /// isready/readyok による同期バリアは使わない: 将棋エンジンの慣例 (rshogi・
+    /// YaneuraOu とも) では isready は「対局準備」であり毎回 TT クリア等の重い
+    /// 初期化が走るため、毎手送ると置換表の持ち越しが消えて棋力を毀損する。
+    /// 代わりに「エンジンは info → bestmove の順に単一スレッドで書き、bestmove が
+    /// その go の最終出力」という不変条件に依拠する: 呼び出し元は直前の探索の
+    /// bestmove を消費済みなので、それ以前の行はチャネル到着済みで try_recv で
+    /// 全て捨てられる (bestmove 後に出力するエンジンはこの前提の対象外)。
+    fn drain_pending_engine_lines(&mut self, context: &str) {
+        while let Ok(line) = self.rx.try_recv() {
+            Self::log_discarded_pending_line(context, &line);
+        }
+    }
+
+    fn log_discarded_pending_line(context: &str, line: &str) {
+        if line.starts_with("bestmove") {
+            log::warn!("[USI] discard pending bestmove before {context}: {line}");
+        } else {
+            log::debug!("[USI] discard pending line before {context}: {line}");
         }
     }
 
