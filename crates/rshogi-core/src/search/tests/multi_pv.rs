@@ -475,7 +475,7 @@ fn test_aspiration_window_defaults_to_full_window_when_unseeded() {
     assert_eq!(beta, Value::INFINITE);
 }
 
-/// depthごとにinfoが一度だけ出る（過剰出力しない）
+/// depthごとにMultiPV本数分のinfoが出て、最後に採択ラインが再出力される
 #[test]
 fn test_multi_pv_outputs_once_per_depth() {
     use crate::position::Position;
@@ -507,14 +507,12 @@ fn test_multi_pv_outputs_once_per_depth() {
 
         assert_eq!(
             depth1_infos.len(),
-            expected_multipv,
-            "depthごとにMultiPV本数分だけinfoを出力する"
+            expected_multipv + 1,
+            "depthごとのMultiPV出力に加えて採択ラインを最後に再出力する"
         );
 
-        let mut multipv: Vec<_> = depth1_infos.iter().map(|info| info.multi_pv).collect();
-        multipv.sort();
-        multipv.dedup();
-        assert_eq!(multipv, vec![1, 2], "multipv値が1,2のみに収まる");
+        let multipv: Vec<_> = depth1_infos.iter().map(|info| info.multi_pv).collect();
+        assert_eq!(multipv, vec![1, 2, 1], "最後は採択ラインのmultipv 1を再出力する");
     });
 }
 
