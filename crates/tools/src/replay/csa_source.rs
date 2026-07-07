@@ -5,8 +5,12 @@
 //!
 //! 指し手・盤面の復元は `rshogi_csa::parse_csa_full`（独自の軽量 Position/Move 型）に
 //! 委譲し、`sfen_before` 経由で `rshogi_core` 側へ橋渡しして棋譜ラベルを組み立てる。
-//! 評価値は floodgate 形式コメント `'* <score> [pv...]` から拾う（`<score>` は
-//! rshogi csa_client が先手視点に正規化して書くため、手番相対へ戻して格納する）。
+//! 評価値は floodgate 形式コメントから拾う。2 系統の記録に対応する:
+//! - rshogi csa_client の自前記録: `'* <score> [pv...]` を**手の直前**に書く
+//! - wdoor (shogi-server) の公開棋譜: `'** <score> [pv...]` を**手の直後** (T 行の後) に書く
+//!
+//! `<score>` はどちらも先手視点 (csa_client は送信時に正規化、floodgate 規約も先手視点)
+//! なので、手番相対へ戻して格納する。`T<秒>` 行は直前の手の消費時間として拾う。
 
 use std::fs;
 use std::path::PathBuf;
@@ -106,7 +110,7 @@ impl GameSource for CsaSource {
 
             // 評価値コメントは元々先手視点なので、そのまま指標へ流す。
             let mut acc = EvalAccumulator::default();
-            for cp in parse_eval_comments(&text).into_iter().flatten() {
+            for cp in parse_move_annotations(&text).iter().filter_map(|n| n.score_cp) {
                 acc.push(cp);
             }
 
@@ -154,9 +158,9 @@ impl GameSource for CsaSource {
             .with_context(|| format!("failed to read {}", meta.path.display()))?;
         let (mut pos, parsed, _info) = parse_csa_full(&text)
             .with_context(|| format!("failed to parse {}", meta.path.display()))?;
-        // 先手視点で書かれた `'* <score>` を手番相対へ戻す前段として、通常手ごとの
-        // 先手視点スコアを読み出しておく（PV は無視、無い手は None）。
-        let scores = parse_eval_comments(&text);
+        // 先手視点で書かれたコメントを手番相対へ戻す前段として、通常手ごとの
+        // 先手視点スコアと消費時間を読み出しておく（PV は無視、無い手は None）。
+        let notes = parse_move_annotations(&text);
 
         let mut moves = Vec::new();
         let mut normal_idx = 0usize;
@@ -208,7 +212,8 @@ impl GameSource for CsaSource {
                 None => (Move::NONE, format!("{:>4} {}", abs_ply, cm.mv)),
             };
 
-            let score_cp = scores.get(normal_idx).copied().flatten().map(|black_pov| {
+            let note = notes.get(normal_idx).copied().unwrap_or_default();
+            let score_cp = note.score_cp.map(|black_pov| {
                 // 先手視点 → 手番相対（後手手番は符号反転）。グラフ側の `black_pov_cp` が
                 // 再度 手番相対 → 先手視点 に戻すので、全ソースで格納形式を揃える。
                 match side {
@@ -225,6 +230,7 @@ impl GameSource for CsaSource {
                 kif_label,
                 annotation: MoveAnnotation {
                     score_cp,
+                    elapsed_ms: note.elapsed_ms,
                     ..Default::default()
                 },
             });
@@ -291,20 +297,52 @@ fn derive_outcome(
     }
 }
 
-/// `'* <score> [pv...]` コメントを走査し、通常手（`[+-]NNNN..` 行）の出現順に対応する
-/// 先手視点スコアを返す。コメントの無い手は `None`。PV は使わない。
-fn parse_eval_comments(text: &str) -> Vec<Option<i32>> {
-    let mut scores = Vec::new();
+/// 通常手 1 手ぶんの注釈（評価値・消費時間）。
+#[derive(Debug, Clone, Copy, Default)]
+struct CsaMoveNote {
+    /// 先手視点の評価値（cp）。
+    score_cp: Option<i32>,
+    elapsed_ms: Option<u64>,
+}
+
+/// コメント・`T` 行を走査し、通常手（`[+-]NNNN..` 行）の出現順に対応する注釈を返す。
+/// 記録の系統でコメントの帰属が異なる（module doc 参照）:
+/// - `'*`（csa_client 自前記録）は**直後**の手のスコア
+/// - `'**`（wdoor / shogi-server 記録）は**直前**の手のスコア
+/// - `T<秒>` は**直前**の手の消費時間（設定済みなら上書きしない = `%TORYO` 等の
+///   終局手に付く `T` を最終手へ誤帰属させない）
+///
+/// PV は使わない。コメントの無い手は `None`。
+fn parse_move_annotations(text: &str) -> Vec<CsaMoveNote> {
+    fn leading_score(rest: &str) -> Option<i32> {
+        rest.split_whitespace().next().and_then(|t| t.parse::<i32>().ok())
+    }
+    let mut notes: Vec<CsaMoveNote> = Vec::new();
     let mut pending: Option<i32> = None;
     for raw in text.lines() {
         let s = raw.trim();
-        if let Some(rest) = s.strip_prefix("'*") {
-            pending = rest.split_whitespace().next().and_then(|t| t.parse::<i32>().ok());
+        if let Some(rest) = s.strip_prefix("'**") {
+            if let (Some(last), Some(cp)) = (notes.last_mut(), leading_score(rest)) {
+                last.score_cp = Some(cp);
+            }
+        } else if let Some(rest) = s.strip_prefix("'*") {
+            pending = leading_score(rest);
+        } else if let Some(rest) = s.strip_prefix('T') {
+            if !rest.is_empty()
+                && rest.bytes().all(|b| b.is_ascii_digit())
+                && let Some(last) = notes.last_mut()
+                && last.elapsed_ms.is_none()
+            {
+                last.elapsed_ms = rest.parse::<u64>().ok().map(|sec| sec * 1000);
+            }
         } else if is_csa_move_line(s) {
-            scores.push(pending.take());
+            notes.push(CsaMoveNote {
+                score_cp: pending.take(),
+                elapsed_ms: None,
+            });
         }
     }
-    scores
+    notes
 }
 
 /// `+7776FU` / `-0055FU` 形式の指し手行か（`%`/`T`/`P`/`N`/`'` などのメタ行を除外する）。
@@ -373,6 +411,40 @@ mod tests {
         let game = source.load_game(&index, &index.entries[0]).expect("load_game");
         assert_eq!(game.moves[1].side, Color::White);
         assert_eq!(game.moves[1].annotation.score_cp, Some(30));
+    }
+
+    #[test]
+    fn parses_wdoor_style_comments_after_move_and_times() {
+        // wdoor (shogi-server) 記録: 手 → T秒 → '** コメント の順。コメントは直前の手に
+        // 帰属し、T は消費時間として拾う。%TORYO 後の T は最終手の時間を上書きしない。
+        let text = "V2\nN+A\nN-B\nPI\n+7776FU\nT2\n'** 54 -3334FU +2726FU\n-3334FU\nT0\n'** -10\n%TORYO\nT9\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csa(dir.path(), "a.csa", text);
+        let source = CsaSource::new(dir.path());
+        let index = source.build_index().expect("build_index");
+        let game = source.load_game(&index, &index.entries[0]).expect("load_game");
+
+        assert_eq!(game.moves.len(), 2);
+        // 先手手: 先手視点 +54 → 手番相対 +54、T2 → 2000ms。
+        assert_eq!(game.moves[0].annotation.score_cp, Some(54));
+        assert_eq!(game.moves[0].annotation.elapsed_ms, Some(2000));
+        // 後手手: 先手視点 -10 → 手番相対 +10、T0 → 0ms (%TORYO 後の T9 に上書きされない)。
+        assert_eq!(game.moves[1].annotation.score_cp, Some(10));
+        assert_eq!(game.moves[1].annotation.elapsed_ms, Some(0));
+        // 索引側の評価値指標にも両方流れる (グラフ「表示できる評価値がありません」の回帰防止)。
+        assert!(index.entries[0].metrics.final_cp.is_some());
+    }
+
+    #[test]
+    fn parses_own_record_times_from_t_lines() {
+        // csa_client 自前記録: '* コメント → 手 → T秒 の順。T は直前の手に帰属する。
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csa(dir.path(), "a.csa", RESIGN_GAME);
+        let source = CsaSource::new(dir.path());
+        let index = source.build_index().expect("build_index");
+        let game = source.load_game(&index, &index.entries[0]).expect("load_game");
+        assert_eq!(game.moves[0].annotation.elapsed_ms, Some(10_000));
+        assert_eq!(game.moves[1].annotation.elapsed_ms, Some(12_000));
     }
 
     #[test]
