@@ -105,7 +105,7 @@ fn flip_sfen_raw(sfen: &str) -> Option<String> {
 ///
 /// 生反転 SFEN を `Position::set_sfen` で再パースし `to_sfen()` で正準化することで、
 /// 持ち駒の並び順まで含めて元定跡ファイルのキー空間と一致させる。
-pub(crate) fn flipped_key(sfen: &str) -> Option<String> {
+pub fn flipped_key(sfen: &str) -> Option<String> {
     let raw = flip_sfen_raw(sfen)?;
     let mut pos = Position::new();
     pos.set_sfen(&raw).ok()?;
@@ -134,7 +134,7 @@ fn flip_square(sq: &str) -> Option<String> {
 /// - 通常手 `7g7f` / 成り `7g7f+`: from/to を回転、成りフラグは保持。
 ///
 /// パースできない入力は `None`。
-pub(crate) fn flip_usi_move(usi: &str) -> Option<String> {
+pub fn flip_usi_move(usi: &str) -> Option<String> {
     if let Some((piece, dst)) = usi.split_once('*') {
         // 駒打ち。
         if piece.len() != 1 {
