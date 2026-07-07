@@ -21,6 +21,8 @@ user-invocable: true
 - **threat-profile**: Threat 次元削減プロファイル。bullet/rshogi 両方のビルドに同一 feature を指定する必要がある
   - `threat-profile-same-class` (profile 1): 同種ペア全除外 (192,640 dims)
   - `threat-profile-same-class-major-pawn` (profile 2): 同種 + 大駒→歩除外 (173,568 dims)
+  - `threat-profile-step-attacker` (profile 3): occupancy 依存 slider を attacker から除外 (33,408 dims)
+  - `threat-profile-full-symdedup` (profile 4): pair 除外なし、canonical-dead な対称 edge を emit で drop (216,720 dims — full と同一。dims 不変のため net 一致は profile id で照合)
   - `threat-profile-cross-side` (profile 10): 同 side / 同種除外、敵味方跨ぎ異種のみ (96,320 dims)
 
 ### デフォルト値（変更不要なら省略可）
