@@ -606,8 +606,15 @@ static ATTACK_ORDER_TABLE: LazyLock<AttackOrderTable> = LazyLock::new(AttackOrde
 ///
 /// necessarily-mutual は「逆向き駒が空盤面で `from_sq` に届くか」= index 算出用
 /// `ATTACK_ORDER_TABLE` の逆引き（O(1)、active edge は from→to 区間が空なので実盤面
-/// 到達と一致）。tie-break は class 大 / 同 class なら raw マス番号大を attacker に
-/// 残す（mutual pair のちょうど片方だけが dead）。
+/// 到達と一致）。
+///
+/// tie-break は perspective swap と HM (Half-Mirror) file 反転のどちらでも不変な量で
+/// なければならない（正規化後の index を両視点で突き合わせるため）。`ThreatClass`
+/// discriminant の大小はミラー・回転・視点反転いずれにも不変なので、class が違う pair
+/// は大きい class を attacker とする側を残し小さい側 (`ac < dc`) を dead にする。同
+/// class pair は raw マス番号でしか順序付けできず、raw file 順は HM ミラーで反転する
+/// （ミラー等価な 2 局面で残す側が逆転し正規化 index 空間の HM 等価性・dead 保証が
+/// 壊れる）ため dedup せず両側を emit する。
 #[cfg(all(feature = "nnue-threat", feature = "threat-profile-full-symdedup"))]
 #[inline]
 fn is_canonical_dead(
@@ -619,16 +626,7 @@ fn is_canonical_dead(
 ) -> bool {
     let rev_pattern = attack_pattern_id(attacked_class, target_color);
     let mutual = ATTACK_ORDER_TABLE.get(rev_pattern, to_sq, from_sq) != AttackOrderTable::INVALID;
-    if !mutual {
-        return false;
-    }
-    let ac = attacker_class as u8;
-    let dc = attacked_class as u8;
-    if ac != dc {
-        ac < dc
-    } else {
-        from_sq.raw() < to_sq.raw()
-    }
+    mutual && (attacker_class as u8) < (attacked_class as u8)
 }
 
 /// Threat index を計算する（Stockfish 準拠: perspective 基準 + 色別 LUT）
