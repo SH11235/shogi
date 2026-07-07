@@ -79,6 +79,7 @@ search-no-pass-rules = []
 threat-profile-same-class = []               # profile 1: 同種ペア全除外
 threat-profile-same-class-major-pawn = []   # profile 2: 同種 + 大駒→歩除外
 threat-profile-step-attacker = []           # profile 3: occupancy 依存 slider (香角飛馬竜) を attacker 除外
+threat-profile-full-symdedup = []           # profile 4: pair 除外なし、emit で canonical-dead 対称 edge を drop (dims は profile 0 と同一)
 threat-profile-cross-side = []               # profile 10: 同 side / 同種を除外、敵味方跨ぎ異種のみ
 
 # === Edition 軸 atomic feature 群 ===
@@ -205,6 +206,14 @@ edition-layerstacks-halfka_hm_merged-1536x16x32-threat = [
 edition-layerstacks-halfka_hm_merged-1536x16x32-psqt_threat = [
   "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1536x16x32",
   "nnue-psqt", "nnue-threat",
+  "nnue-progress-diff",
+]
+# threat 版に full-symdedup profile を束ねた変種 (dims は -threat と同一、canonical-dead
+# 対称 edge を列挙時に drop)。engine と net の profile 一致は EvalFile load 時の
+# THREAT_PROFILE_ID 照合で reject される。
+edition-layerstacks-halfka_hm_merged-1536x16x32-threat_symdedup = [
+  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1536x16x32", "nnue-threat",
+  "threat-profile-full-symdedup",
   "nnue-progress-diff",
 ]
 
