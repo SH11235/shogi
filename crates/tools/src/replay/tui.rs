@@ -1450,12 +1450,24 @@ fn annotation_inline(mv: &MoveView) -> String {
         parts.push(format!("nps={v}"));
     }
     if let Some(v) = a.elapsed_ms {
-        parts.push(format!("経過{v}ms"));
+        parts.push(format_elapsed(v));
     }
     if a.timed_out == Some(true) {
         parts.push("TIMEOUT".to_string());
     }
     parts.join(" ")
+}
+
+/// 消費時間の表示。秒単位で書く（CSA の `T` 行は元々秒粒度で、ms 表記だと常に 000 が
+/// 付くだけの冗長表示になる）。ms 精度の値（JSONL 由来）は 0.1 秒単位へ整数演算で
+/// 四捨五入する（浮動小数だと 0.05 秒境界の丸めが 2 進表現に依存するため）。
+fn format_elapsed(ms: u64) -> String {
+    if ms.is_multiple_of(1000) {
+        format!("{}s", ms / 1000)
+    } else {
+        let ds = (ms + 50) / 100;
+        format!("{}.{}s", ds / 10, ds % 10)
+    }
 }
 
 /// `mv` の着手元・着手先マス。駒打ちは着手元を持たない。パス等の通常手ではない
@@ -1668,6 +1680,19 @@ fn hand_text(pos: &Position, color: Color) -> String {
 mod tests {
     use super::super::model::{EvalMetrics, MoveAnnotation};
     use super::*;
+
+    #[test]
+    fn format_elapsed_prefers_whole_seconds() {
+        // CSA の T 行由来 (秒粒度) は整数秒、JSONL 由来の ms 精度は小数 1 桁。
+        assert_eq!(format_elapsed(6000), "6s");
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(1234), "1.2s");
+        // 0.05 秒境界は整数演算の四捨五入で決定的に丸める。
+        assert_eq!(format_elapsed(949), "0.9s");
+        assert_eq!(format_elapsed(950), "1.0s");
+        assert_eq!(format_elapsed(1050), "1.1s");
+        assert_eq!(format_elapsed(1949), "1.9s");
+    }
 
     fn mv(side: Color, score_cp: Option<i32>, score_mate: Option<i32>) -> MoveView {
         mv_with_ply(1, side, score_cp, score_mate)
