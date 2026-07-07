@@ -30,6 +30,12 @@ pub struct TcpTransport {
     /// 2 チャンクにまたがったときにチャンク単位で `from_utf8` すると誤った `Io` エラーに
     /// 落ちる。改行バイトで 1 行が確定した時点でだけ UTF-8 検証する。
     line_buf: Vec<u8>,
+    /// 送信 1 回分（本文 + CRLF）を組み立てるバッファ。
+    ///
+    /// 本文と CRLF を別々の `write_all` で送ると 2 syscall / 2 セグメントに
+    /// 分かれ、受信側が本文だけを先に観測しうる。1 バッファにまとめて
+    /// `write_all` 1 回で送るために接続ごとに保持し、使い回す。
+    send_buf: Vec<u8>,
 }
 
 impl TcpTransport {
@@ -44,6 +50,7 @@ impl TcpTransport {
             writer: write_half,
             peer,
             line_buf: Vec::with_capacity(256),
+            send_buf: Vec::with_capacity(256),
         }
     }
 
@@ -111,16 +118,15 @@ impl ClientTransport for TcpTransport {
     }
 
     async fn send_line(&mut self, line: &CsaLine) -> Result<(), TransportError> {
-        // CSA 1.2.1 は CR+LF を要求する。
-        let bytes = line.as_str().as_bytes();
+        // CSA 1.2.1 は CR+LF を要求する。本文 + CRLF を 1 バッファに組んで
+        // `write_all` 1 回で送る（分割送信だと受信側が本文だけを先に観測しうる）。
+        self.send_buf.clear();
+        self.send_buf.extend_from_slice(line.as_str().as_bytes());
+        self.send_buf.extend_from_slice(b"\r\n");
         self.writer
-            .write_all(bytes)
+            .write_all(&self.send_buf)
             .await
-            .map_err(|e| TransportError::Io(format!("write_all(body): {e}")))?;
-        self.writer
-            .write_all(b"\r\n")
-            .await
-            .map_err(|e| TransportError::Io(format!("write_all(crlf): {e}")))?;
+            .map_err(|e| TransportError::Io(format!("write_all: {e}")))?;
         self.writer
             .flush()
             .await
@@ -197,10 +203,16 @@ mod tests {
         let (mut transport, mut client) = loopback_pair().await;
         transport.send_line(&CsaLine::new("START:g1")).await.unwrap();
         // クライアント側は生 TcpStream で読むので CRLF 込みで比較。
+        // 単発 read は TCP 分割で本文だけ返る short read がありうるため、
+        // 期待バイト数に達するまで読む `read_exact` を使う。
+        // CRLF 欠落の退行時に read_exact がハングしないよう timeout で包む。
         use tokio::io::AsyncReadExt;
-        let mut buf = [0u8; 32];
-        let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"START:g1\r\n");
+        let mut buf = [0u8; 10];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut buf))
+            .await
+            .expect("read_exact timed out")
+            .unwrap();
+        assert_eq!(&buf, b"START:g1\r\n");
     }
 
     #[tokio::test(flavor = "current_thread")]
