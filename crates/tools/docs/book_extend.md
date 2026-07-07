@@ -39,6 +39,12 @@ cargo run -p tools --release --bin book_extend -- \
 | `--parent-journal <path.jsonl>` | 親局面 bestmove 検出用に再利用する既存 journal |
 | `--report <path.md>` | Markdown レポート出力 |
 
+## パス検証
+
+`--book` / `--out` / `--journal` / `--report` は全ペアで正準パス（シンボリックリンク解決後。未作成ファイルは親ディレクトリを解決して比較）の一致を検査し、同じファイルを指す組があれば起動時にエラーで拒否します。`--journal` は実行中に追記され、`--out` / `--report` は完了時に書き出されるため、どの組が衝突しても入力 book・再開用 journal・出力のいずれかを破壊するためです。
+
+`--parent-journal` は読み取り専用のためこの検査対象外です。前回実行の `--journal` をそのまま `--parent-journal` に渡す使い方は問題ありません。
+
 ## 処理内容
 
 1. 各局面の親局面 bestmove を決めます。
@@ -53,11 +59,13 @@ cargo run -p tools --release --bin book_extend -- \
 
 ## journal と決定性
 
-`--journal` は JSON Lines 形式です。親探索は `kind:"parent"`、子局面探索は `kind:"child"` として追記します。各行には `go` と `engine_fingerprint` を記録します。
+`--journal` は JSON Lines 形式です。親探索は `kind:"parent"`、子局面探索は `kind:"child"` として追記します。各行には `go` と `engine_fingerprint` を記録します。`engine_fingerprint` は `--engine` パスの basename、エンジンバイナリ内容の SHA-256、`--engine-option` を key 昇順に正規化した文字列から作ります。同名パスでもバイナリ内容が変わると fingerprint が変わるため、エンジン差し替え後に古い journal 行を誤って再利用することはありません。
 
 `--resume` は `go` と `engine_fingerprint` が現在の実行設定に一致する `--journal` の行だけを再利用します。`--parent-journal` は別予算の親探索結果を検出シグナルとして使うため、`kind:"parent"` と SFEN 3 フィールドだけを見ます。
 
 出力 `.db` は入力探索順や worker 完了順に依存しません。局面は SFEN 昇順、指し手は `count` 降順から USI 昇順で書き出します。同じ journal から生成する `.db` と report は決定的です。
+
+出力 `.db` と report は、同じディレクトリの一時ファイルへ書き切ってから rename する atomic 書き込みです。書き出し途中で中断しても、既存の出力ファイルが中途半端な内容で残ることはありません。
 
 ## report
 
