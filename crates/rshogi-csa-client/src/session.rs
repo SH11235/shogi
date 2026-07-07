@@ -403,21 +403,10 @@ where
         if s.pos.side_to_move == s.my_color {
             let turn_start = Instant::now();
             let sfen_before = s.pos.to_sfen();
-            // 遅い readyok の待ち時間はサーバー上では自分の消費時間になるため、
-            // ここで同期を済ませて実測所要を margin に上乗せし、エンジンへ渡す
-            // 予算 (think_limit / btime/wtime) から差し引く。engine 側の go 内
-            // バリアは呼び出し規律に依存しない安全網として残す (待機直後の
-            // 2 回目は 1 往復で即応)。
-            if let Err(err) = s.engine.sync_before_search("pre_go") {
-                return LoopOutcome::Error(map_anyhow_to_session_error(err));
-            }
-            let sync_ms = turn_start.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            // i64 減算に使うため i64::MAX でクランプ (負値への wrap 防止)。
-            let effective_margin_msec =
-                s.config.time.margin_msec.saturating_add(sync_ms).min(i64::MAX as u64);
-            let think_limit_ms = s.clock.think_limit_ms(effective_margin_msec, s.my_color);
+            let think_limit_ms = s.clock.think_limit_ms(s.config.time.margin_msec, s.my_color);
             let position_cmd = build_position_cmd(&s.initial_sfen, &s.usi_moves);
-            let go_cmd = format!("go {}", s.clock.build_go_args(effective_margin_msec, s.my_color));
+            let go_cmd =
+                format!("go {}", s.clock.build_go_args(s.config.time.margin_msec, s.my_color));
 
             let outcome = {
                 let mut emitter = SearchInfoEmitter::new(&mut s.info_throttle, s.sink);

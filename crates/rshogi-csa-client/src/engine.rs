@@ -154,11 +154,6 @@ pub trait UsiEngineDriver {
     /// USI `usinewgame` 相当を実装する。対局開始前に 1 度呼ばれる。
     fn new_game(&mut self) -> Result<()>;
 
-    /// 探索開始前に engine の pending 出力を掃除し、`isready` バリアで待機状態を同期する。
-    fn sync_before_search(&mut self, _context: &str) -> Result<()> {
-        Ok(())
-    }
-
     /// `position` + `go` を送信し、bestmove または server interrupt まで block する。
     ///
     /// 実装の責任:
@@ -223,10 +218,6 @@ pub trait UsiEngineDriver {
 impl UsiEngineDriver for UsiEngine {
     fn new_game(&mut self) -> Result<()> {
         UsiEngine::new_game(self)
-    }
-
-    fn sync_before_search(&mut self, context: &str) -> Result<()> {
-        UsiEngine::sync_before_search(self, context)
     }
 
     fn go_with_info(
@@ -505,7 +496,7 @@ impl UsiEngine {
         shutdown: &AtomicBool,
         server_rx: &Receiver<Event>,
     ) -> Result<SearchOutcome> {
-        self.sync_before_search("go")?;
+        self.drain_pending_engine_lines("go");
         self.send(position_cmd)?;
         self.send(go_cmd)?;
         self.wait_bestmove(shutdown, server_rx, None)
@@ -522,7 +513,7 @@ impl UsiEngine {
         server_rx: &Receiver<Event>,
         info_callback: &mut InfoCallback<'_>,
     ) -> Result<SearchOutcome> {
-        self.sync_before_search("go_with_info")?;
+        self.drain_pending_engine_lines("go_with_info");
         self.send(position_cmd)?;
         self.send(go_cmd)?;
         self.wait_bestmove(shutdown, server_rx, Some(info_callback))
@@ -530,7 +521,7 @@ impl UsiEngine {
 
     /// ponder 探索を開始（bestmove を待たない）
     pub fn go_ponder(&mut self, position_cmd: &str, go_cmd: &str) -> Result<()> {
-        self.sync_before_search("go_ponder")?;
+        self.drain_pending_engine_lines("go_ponder");
         self.send(position_cmd)?;
         self.send(go_cmd)?;
         Ok(())
@@ -590,22 +581,19 @@ impl UsiEngine {
         }
     }
 
-    /// 探索開始前に engine の pending 出力を掃除し、`isready` バリアで待機状態を同期する。
-    pub fn sync_before_search(&mut self, context: &str) -> Result<()> {
+    /// 探索開始前に、前の探索が残した pending 出力をチャネルから読み捨てる。
+    ///
+    /// isready/readyok による同期バリアは使わない: 将棋エンジンの慣例 (rshogi・
+    /// YaneuraOu とも) では isready は「対局準備」であり毎回 TT クリア等の重い
+    /// 初期化が走るため、毎手送ると置換表の持ち越しが消えて棋力を毀損する。
+    /// 代わりに「エンジンは info → bestmove の順に単一スレッドで書き、bestmove が
+    /// その go の最終出力」という不変条件に依拠する: 呼び出し元は直前の探索の
+    /// bestmove を消費済みなので、それ以前の行はチャネル到着済みで try_recv で
+    /// 全て捨てられる (bestmove 後に出力するエンジンはこの前提の対象外)。
+    fn drain_pending_engine_lines(&mut self, context: &str) {
         while let Ok(line) = self.rx.try_recv() {
             Self::log_discarded_pending_line(context, &line);
         }
-        self.send("isready")?;
-        loop {
-            let line = self
-                .recv(READY_TIMEOUT)
-                .with_context(|| format!("{context} 前の isready バリアで readyok を待機中"))?;
-            if line == "readyok" {
-                break;
-            }
-            Self::log_discarded_pending_line(context, &line);
-        }
-        Ok(())
     }
 
     fn log_discarded_pending_line(context: &str, line: &str) {

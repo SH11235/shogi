@@ -145,7 +145,7 @@ exit 1
 // ───────────────────────────────────────────────
 #[test]
 fn dying_engine_during_go_includes_stderr_tail() {
-    // go 前の isready バリアが挟まっても動くよう、行順固定でなくコマンド駆動で応答する。
+    // 行順固定でなくコマンド駆動で応答する (isready の回数や順序に依存しない)。
     let script = r#"#!/usr/bin/env bash
 while IFS= read -r line; do
     case "$line" in
