@@ -1711,8 +1711,12 @@ mod tests {
             }
         }
         assert!(non_excluded_count > 0, "should have some non-excluded pairs");
-        // Profile 0 では除外なし、他の profile では除外あり
-        if threat_exclusion::THREAT_PROFILE_ID == 0 {
+        // profile 0 と full-symdedup (id 4) は pair 除外なし (index 空間が同一) なので
+        // threat_index 段階の excluded は 0。full-symdedup の active 間引きは列挙時の
+        // canonical-dead drop が担い、index 算出には現れない。他 profile は pair 除外あり。
+        if threat_exclusion::THREAT_PROFILE_ID == 0
+            || cfg!(feature = "threat-profile-full-symdedup")
+        {
             assert_eq!(excluded_count, 0);
         } else {
             assert!(

@@ -163,6 +163,7 @@ mod tests {
             feature = "threat-profile-same-class",
             feature = "threat-profile-same-class-major-pawn",
             feature = "threat-profile-step-attacker",
+            feature = "threat-profile-full-symdedup",
             feature = "threat-profile-cross-side",
         )))]
         assert_eq!(THREAT_PROFILE_ID, 0);
