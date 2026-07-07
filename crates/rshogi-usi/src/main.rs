@@ -302,6 +302,7 @@ impl UsiEngine {
         println!("option name BookEvalWhiteLimit type spin default -140 min -30000 max 30000");
         println!("option name BookDepthLimit type spin default 0 min 0 max 256");
         println!("option name NarrowBook type check default false");
+        println!("option name BookSelectValue type check default false");
         println!("option name ConsiderBookMoveCount type check default false");
         println!("option name IgnoreBookPly type check default false");
         println!("option name FlippedBook type check default true");
@@ -978,6 +979,9 @@ impl UsiEngine {
             }
             "NarrowBook" => {
                 self.book_options.narrow_book = value == "true" || value == "1";
+            }
+            "BookSelectValue" => {
+                self.book_options.select_value = value == "true" || value == "1";
             }
             "ConsiderBookMoveCount" => {
                 self.book_options.consider_move_count = value == "true" || value == "1";

@@ -8,10 +8,11 @@
 //! 4. `to_move` + pseudo-legal + legal で合法性検証、非合法は info string 警告して除去
 //! 5. `BookDepthLimit`(0 で無効): 筆頭手 depth 不足なら局面ごと不採用
 //! 6. `BookEvalDiff` / `BookEvalBlackLimit` / `BookEvalWhiteLimit`: 下限未満を除去
-//! 7. `NarrowBook`: count 情報がある場合のみ出現率 10% 未満を除去
-//! 8. 選択: `ConsiderBookMoveCount` なら count 比例抽選(全 0 は等確率)、false は等確率
-//! 9. ponder 補完: book の ponder が none なら 1 手進めて再 find し筆頭候補を採用
-//! 10. bestmove(+ ponder)を返す
+//! 7. `BookSelectValue`: true なら value 最大手を決定的に選ぶ(同値は count 降順 → USI 昇順)
+//! 8. `NarrowBook`: count 情報がある場合のみ出現率 10% 未満を除去
+//! 9. 選択: `ConsiderBookMoveCount` なら count 比例抽選(全 0 は等確率)、false は等確率
+//! 10. ponder 補完: book の ponder が none なら 1 手進めて再 find し筆頭候補を採用
+//! 11. bestmove(+ ponder)を返す
 
 use rshogi_core::position::Position;
 use rshogi_core::types::{Color, Move};
@@ -91,6 +92,8 @@ pub struct BookOptions {
     pub depth_limit: i32,
     /// `NarrowBook`: 出現率 10% 未満の手を除外するか。
     pub narrow_book: bool,
+    /// `BookSelectValue`: value 最大手を決定的に選ぶか。
+    pub select_value: bool,
     /// `ConsiderBookMoveCount`: 採択回数比例で抽選するか。
     pub consider_move_count: bool,
     /// `FlippedBook`: miss 時に先後反転局面で再検索するか。
@@ -107,6 +110,7 @@ impl Default for BookOptions {
             eval_white_limit: -140,
             depth_limit: 0,
             narrow_book: false,
+            select_value: false,
             consider_move_count: false,
             flipped_book: true,
         }
@@ -126,6 +130,8 @@ pub struct BookProbeResult {
 struct Candidate {
     /// この局面の座標系での合法手(32bit 化済み)。
     mv: Move,
+    /// この局面の座標系での USI 文字列。
+    move_usi: String,
     /// この局面の座標系での ponder(USI 文字列)。book に none なら `None`。
     ponder_usi: Option<String>,
     value: i32,
@@ -198,6 +204,7 @@ fn find_candidates(
 
         candidates.push(Candidate {
             mv,
+            move_usi: move_str,
             ponder_usi,
             value: raw.value,
             depth: raw.depth,
@@ -242,6 +249,21 @@ fn select_index(
     }
 
     idx
+}
+
+/// value 最大手を決定的に選ぶ。同値は count 降順 → USI 昇順。
+fn select_value_index(candidates: &[Candidate]) -> usize {
+    candidates
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            a.value
+                .cmp(&b.value)
+                .then_with(|| a.move_count.cmp(&b.move_count))
+                .then_with(|| b.move_usi.cmp(&a.move_usi))
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
 }
 
 /// ponder を解決する。book に ponder があれば検証して採用、無ければ 1 手進めて筆頭手を拾う。
@@ -324,7 +346,21 @@ pub fn probe(
         }
     }
 
-    // 7. NarrowBook: count 情報がある場合のみ出現率 10% 未満を除去。
+    // 7. BookSelectValue: 評価値フィルタ後の生存候補から value 最大手を決定的に選ぶ。
+    if options.select_value {
+        let idx = select_value_index(&candidates);
+        let chosen = &candidates[idx];
+        let best_move = chosen.mv;
+        let book_ponder = chosen.ponder_usi.clone();
+        let ponder_move = resolve_ponder(book, position, options, best_move, &book_ponder);
+
+        return Some(BookProbeResult {
+            best_move,
+            ponder_move,
+        });
+    }
+
+    // 8. NarrowBook: count 情報がある場合のみ出現率 10% 未満を除去。
     if options.narrow_book {
         let total: u64 = candidates.iter().map(|c| c.move_count).sum();
         if total > 0 {
@@ -341,13 +377,13 @@ pub fn probe(
         return None;
     }
 
-    // 8. 選択。
+    // 9. 選択。
     let idx = select_index(&candidates, options.consider_move_count, rng);
     let chosen = &candidates[idx];
     let best_move = chosen.mv;
     let book_ponder = chosen.ponder_usi.clone();
 
-    // 9. ponder 解決。
+    // 10. ponder 解決。
     let ponder_move = resolve_ponder(book, position, options, best_move, &book_ponder);
 
     Some(BookProbeResult {
@@ -579,6 +615,74 @@ mod tests {
         };
         let mut rng = SeqRng::new(vec![0]);
         let result = probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).unwrap();
+        assert_eq!(result.best_move.to_usi(), "7g7f");
+    }
+
+    #[test]
+    fn book_select_value_chooses_highest_value_move() {
+        // value 最大の 2g2f は count が低く NarrowBook なら除去対象だが、
+        // BookSelectValue=true では NarrowBook / count 抽選をスキップして採用する。
+        let data = format!(
+            "{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 10 16 100\n2g2f 8c8d 80 16 1\n6g6f 4c4d 20 16 50\n"
+        );
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            select_value: true,
+            narrow_book: true,
+            consider_move_count: true,
+            eval_black_limit: -30000,
+            eval_diff: 30000,
+            ..Default::default()
+        };
+        let mut rng = SeqRng::new(vec![0, 0, 0]);
+
+        let result = probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).unwrap();
+
+        assert_eq!(result.best_move.to_usi(), "2g2f");
+    }
+
+    #[test]
+    fn book_select_value_tiebreaks_by_count_then_usi() {
+        // value 同値なら count 最大、count も同値なら USI 昇順。
+        let data = format!(
+            "{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 80 16 40\n2g2f 8c8d 80 16 50\n1g1f 9c9d 80 16 50\n"
+        );
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            select_value: true,
+            eval_black_limit: -30000,
+            eval_diff: 30000,
+            ..Default::default()
+        };
+        let mut rng = SeqRng::new(vec![2, 2, 2]);
+
+        let result = probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).unwrap();
+
+        assert_eq!(result.best_move.to_usi(), "1g1f");
+    }
+
+    #[test]
+    fn book_select_value_false_keeps_existing_selection_pipeline() {
+        // BookSelectValue=false では value 最大の 2g2f を貪欲選択せず、
+        // 既存どおり NarrowBook 後に count 比例抽選する。
+        let data = format!(
+            "{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 10 16 100\n2g2f 8c8d 80 16 1\n6g6f 4c4d 20 16 50\n"
+        );
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            select_value: false,
+            narrow_book: true,
+            consider_move_count: true,
+            eval_black_limit: -30000,
+            eval_diff: 30000,
+            ..Default::default()
+        };
+        // NarrowBook 後の並びは [7g7f(100), 6g6f(50)]。
+        // i=0: 0<100 で idx=0、i=1: 149<50? false なので 7g7f のまま。
+        let mut rng = SeqRng::new(vec![0, 149]);
+
+        let result = probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).unwrap();
+
         assert_eq!(result.best_move.to_usi(), "7g7f");
     }
 
