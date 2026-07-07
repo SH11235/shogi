@@ -658,8 +658,10 @@ where
         Err(err) => return MoveAction::sink_or_error(err),
     };
 
+    let observed_info = info.has_observation().then_some(info);
+
     // BestMoveSelected 発火 (CSA サーバ送信前)
-    let snapshot = search_info_to_snapshot(info);
+    let snapshot = observed_info.map(search_info_to_snapshot);
     let best_event = BestMoveEvent {
         usi_move: result.bestmove.clone(),
         csa_move_candidate: Some(csa_move.clone()),
@@ -667,7 +669,7 @@ where
         side: Side::from(s.my_color),
         ply: s.pos.ply,
         search_origin: origin,
-        search: Some(snapshot.clone()),
+        search: snapshot.clone(),
     };
     if let Err(err) = s.sink.on_event(SessionProgress::BestMoveSelected(best_event))
         && let Some(action) = handle_loop_sink_err_action(err, false)
@@ -675,7 +677,7 @@ where
         return action;
     }
 
-    let comment = if s.config.server.floodgate {
+    let comment = if s.config.server.floodgate && info.has_score() {
         Some(build_floodgate_comment(info, s.my_color, &s.pos, &result.bestmove))
     } else {
         None
@@ -690,7 +692,7 @@ where
     }
     let sfen_after = s.pos.to_sfen();
     s.usi_moves.push(result.bestmove.clone());
-    s.record.add_move(&csa_move, 0, Some(info), s.my_color);
+    s.record.add_move(&csa_move, 0, observed_info, s.my_color);
     let elapsed_ms = turn_start.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let engine_label = label_for_color(&s.record, s.my_color);
     s.record.add_jsonl_move(JsonlMoveExtra {
@@ -699,10 +701,10 @@ where
         engine_label,
         elapsed_ms,
         think_limit_ms,
-        seldepth: info.seldepth,
-        nodes: info.nodes,
-        time_ms: info.time_ms,
-        nps: info.nps,
+        seldepth: observed_info.and_then(|i| i.seldepth),
+        nodes: observed_info.and_then(|i| i.nodes),
+        time_ms: observed_info.and_then(|i| i.time_ms),
+        nps: observed_info.and_then(|i| i.nps),
     });
     live_append(&mut s.live_jsonl, &s.record);
 
@@ -717,7 +719,7 @@ where
         sfen_before: sfen_before.clone(),
         sfen_after: sfen_after.clone(),
         search_origin: Some(origin),
-        search: Some(snapshot.clone()),
+        search: snapshot.clone(),
     };
     let move_sent_ply = move_sent_event.ply;
     if let Err(err) = s.sink.on_event(SessionProgress::MoveSent(move_sent_event))
@@ -765,7 +767,7 @@ where
                         sfen_before: sfen_before.clone(),
                         sfen_after: sfen_after.clone(),
                         search_origin: Some(origin),
-                        search: Some(snapshot.clone()),
+                        search: snapshot.clone(),
                     };
                     if let Err(err) =
                         s.sink.on_event(SessionProgress::MoveConfirmed(confirmed_event))
@@ -1697,12 +1699,10 @@ fn build_floodgate_comment(
     let mut comment = format!("* {score}");
     if !info.pv.is_empty() {
         let mut pv_pos = pos.clone();
-        let pv_start = if info.pv.first().map(|s| s.as_str()) == Some(last_bestmove) {
-            1
-        } else {
-            0
-        };
-        for usi_mv in &info.pv[pv_start..] {
+        if info.pv.first().map(|s| s.as_str()) != Some(last_bestmove) {
+            return comment;
+        }
+        for usi_mv in &info.pv {
             if let Ok(csa) = usi_move_to_csa(usi_mv, &pv_pos) {
                 write!(comment, " {csa}").unwrap();
                 if pv_pos.apply_csa_move(&csa).is_err() {
@@ -1851,6 +1851,44 @@ mod tests {
             nps: Some(20000),
             pv: vec!["7g7f".to_owned()],
         }
+    }
+
+    fn floodgate_info(pv: &[&str]) -> SearchInfo {
+        SearchInfo {
+            score_cp: Some(123),
+            pv: pv.iter().map(|mv| (*mv).to_owned()).collect(),
+            ..SearchInfo::default()
+        }
+    }
+
+    #[test]
+    fn floodgate_comment_includes_bestmove_itself() {
+        let pos = rshogi_csa::initial_position();
+        let info = floodgate_info(&["7g7f", "3c3d", "2g2f", "8c8d"]);
+
+        let comment = build_floodgate_comment(&info, Color::Black, &pos, "7g7f");
+
+        assert_eq!(comment, "* 123 +7776FU -3334FU +2726FU -8384FU");
+    }
+
+    #[test]
+    fn floodgate_comment_omits_pv_when_root_move_differs_from_bestmove() {
+        let pos = rshogi_csa::initial_position();
+        let info = floodgate_info(&["2g2f", "8c8d"]);
+
+        let comment = build_floodgate_comment(&info, Color::Black, &pos, "7g7f");
+
+        assert_eq!(comment, "* 123");
+    }
+
+    #[test]
+    fn floodgate_comment_stops_at_unconvertible_pv_move() {
+        let pos = rshogi_csa::initial_position();
+        let info = floodgate_info(&["7g7f", "3c3d", "5e5f", "2g2f"]);
+
+        let comment = build_floodgate_comment(&info, Color::Black, &pos, "7g7f");
+
+        assert_eq!(comment, "* 123 +7776FU -3334FU");
     }
 
     #[test]

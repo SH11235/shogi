@@ -1515,6 +1515,7 @@ where
                 &worker.search_tune_params,
             );
             let mut failed_high_cnt = 0;
+            let mut pv_aborted = false;
 
             // Aspiration Windowループ
             loop {
@@ -1547,6 +1548,7 @@ where
                     || time_manager.stop_requested()
                 {
                     worker.state.abort = true;
+                    pv_aborted = true;
                     break;
                 }
 
@@ -1580,8 +1582,12 @@ where
             // 安定ソート [pv_idx..]
             worker.state.root_moves.stable_sort_range(pv_idx, worker.state.root_moves.len());
             // 📝 YaneuraOu行1539: 探索済みのPVライン全体も安定ソートして順位を保つ
+            // MultiPV>1 で abort した pv_idx の部分探索スコアも sort 対象になるため、
+            // 完了済みラインより上位に入り、processed_pv 窓へ残る場合がある。
             worker.state.root_moves.stable_sort_range(0, pv_idx + 1);
-            processed_pv = pv_idx + 1;
+            if !pv_aborted {
+                processed_pv = pv_idx + 1;
+            }
         }
 
         // MultiPVループ完了後の最終ソート（YaneuraOu行1499）
@@ -1616,15 +1622,19 @@ where
             let nps = total_nodes.saturating_mul(1000).checked_div(time_ms).unwrap_or(0);
 
             for pv_idx in 0..processed_pv {
+                let root_move = &worker.state.root_moves[pv_idx];
+                if !root_score_is_initialized(root_move.score) {
+                    continue;
+                }
                 let info = SearchInfo {
                     depth,
-                    sel_depth: worker.state.root_moves[pv_idx].sel_depth,
-                    score: worker.state.root_moves[pv_idx].score,
+                    sel_depth: root_move.sel_depth,
+                    score: root_move.score,
                     nodes: total_nodes,
                     time_ms,
                     nps,
                     hashfull: ms.tt.hashfull(3) as u32,
-                    pv: worker.state.root_moves[pv_idx].pv.clone(),
+                    pv: root_move.pv.clone(),
                     multi_pv: pv_idx + 1, // 1-indexed
                 };
                 on_info(&info);
@@ -1811,6 +1821,11 @@ where
     }
 
     effective_multi_pv
+}
+
+fn root_score_is_initialized(score: Value) -> bool {
+    let raw = score.raw();
+    -Value::INFINITE.raw() < raw && raw < Value::INFINITE.raw()
 }
 
 // search_helper_impl is a thin wrapper that calls iterative_deepening with main_state=None.
@@ -2329,6 +2344,15 @@ mod tests {
 
         let usi = info.to_usi_string();
         assert!(usi.contains("score mate -4"));
+    }
+
+    #[test]
+    fn root_score_is_initialized_rejects_infinite_sentinel() {
+        assert!(!root_score_is_initialized(Value::new(-Value::INFINITE.raw())));
+        assert!(!root_score_is_initialized(Value::INFINITE));
+        assert!(root_score_is_initialized(Value::new(0)));
+        assert!(root_score_is_initialized(Value::mate_in(1)));
+        assert!(root_score_is_initialized(Value::mated_in(1)));
     }
 
     #[test]

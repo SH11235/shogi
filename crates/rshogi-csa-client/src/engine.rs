@@ -270,6 +270,25 @@ pub struct SearchInfo {
     pub pv: Vec<String>,
 }
 
+impl SearchInfo {
+    /// その `go` / `ponderhit` で記録対象になる info を観測済みなら `true`。
+    pub fn has_observation(&self) -> bool {
+        self.depth.is_some()
+            || self.seldepth.is_some()
+            || self.score_cp.is_some()
+            || self.score_mate.is_some()
+            || self.nodes.is_some()
+            || self.time_ms.is_some()
+            || self.nps.is_some()
+            || !self.pv.is_empty()
+    }
+
+    /// floodgate の評価値コメントとして送れる score を持つなら `true`。
+    pub fn has_score(&self) -> bool {
+        self.score_cp.is_some() || self.score_mate.is_some()
+    }
+}
+
 impl UsiEngine {
     /// USIエンジンを起動し、初期化する。
     ///
@@ -477,6 +496,7 @@ impl UsiEngine {
         shutdown: &AtomicBool,
         server_rx: &Receiver<Event>,
     ) -> Result<SearchOutcome> {
+        self.drain_pending_engine_lines("go")?;
         self.send(position_cmd)?;
         self.send(go_cmd)?;
         self.wait_bestmove(shutdown, server_rx, None)
@@ -493,6 +513,7 @@ impl UsiEngine {
         server_rx: &Receiver<Event>,
         info_callback: &mut InfoCallback<'_>,
     ) -> Result<SearchOutcome> {
+        self.drain_pending_engine_lines("go_with_info")?;
         self.send(position_cmd)?;
         self.send(go_cmd)?;
         self.wait_bestmove(shutdown, server_rx, Some(info_callback))
@@ -500,6 +521,7 @@ impl UsiEngine {
 
     /// ponder 探索を開始（bestmove を待たない）
     pub fn go_ponder(&mut self, position_cmd: &str, go_cmd: &str) -> Result<()> {
+        self.drain_pending_engine_lines("go_ponder")?;
         self.send(position_cmd)?;
         self.send(go_cmd)?;
         Ok(())
@@ -556,6 +578,31 @@ impl UsiEngine {
             if line.starts_with("bestmove") {
                 break;
             }
+        }
+    }
+
+    fn drain_pending_engine_lines(&mut self, context: &str) -> Result<()> {
+        while let Ok(line) = self.rx.try_recv() {
+            Self::log_discarded_pending_line(context, &line);
+        }
+        self.send("isready")?;
+        loop {
+            let line = self
+                .recv(READY_TIMEOUT)
+                .with_context(|| format!("{context} 前の isready バリアで readyok を待機中"))?;
+            if line == "readyok" {
+                break;
+            }
+            Self::log_discarded_pending_line(context, &line);
+        }
+        Ok(())
+    }
+
+    fn log_discarded_pending_line(context: &str, line: &str) {
+        if line.starts_with("bestmove") {
+            log::warn!("[USI] discard pending bestmove before {context}: {line}");
+        } else {
+            log::debug!("[USI] discard pending line before {context}: {line}");
         }
     }
 

@@ -125,6 +125,64 @@ done
     path
 }
 
+/// ponder miss 後の次 go で info を出さず即 bestmove を返す mock。
+/// stop で返す bestmove の直後に stale info を出し、次 go に漏れないことを検証する。
+/// ponderhit はこのシナリオでは到達しない想定（到達したら exit 1 でテストを落とす）。
+fn mock_usi_engine_stale_ponder_info_script() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = tempfile_root();
+    let seq = SEQ.fetch_add(1, AtomicOrdering::SeqCst);
+    let path =
+        dir.join(format!("mock_usi_engine_stale_ponder_info_{}_{}.sh", std::process::id(), seq));
+    let script = r#"#!/usr/bin/env bash
+go_count=0
+while IFS= read -r line; do
+    case "$line" in
+        usi)
+            echo "id name mock-stale-ponder-info"
+            echo "usiok"
+            ;;
+        isready)
+            echo "readyok"
+            ;;
+        usinewgame)
+            ;;
+        position*)
+            ;;
+        "go ponder"*)
+            ;;
+        gameover*)
+            ;;
+        go*)
+            go_count=$((go_count + 1))
+            if [ "$go_count" -eq 1 ]; then
+                echo "info depth 5 score cp 100 nodes 1234 nps 5000 time 200 pv 7g7f"
+                echo "bestmove 7g7f ponder 3c3d"
+            else
+                echo "bestmove 2g2f"
+            fi
+            ;;
+        ponderhit)
+            exit 1
+            ;;
+        stop)
+            echo "bestmove 3c3d"
+            echo "info depth 1 score cp -32001 nodes 0 pv 1c1d"
+            ;;
+        quit)
+            exit 0
+            ;;
+    esac
+done
+"#;
+    std::fs::write(&path, script).expect("write mock engine script");
+    let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).expect("set perms");
+    path
+}
+
 fn tempfile_root() -> PathBuf {
     std::env::temp_dir()
 }
@@ -317,6 +375,82 @@ fn fresh_session_emits_expected_event_sequence() {
     ];
     assert_eq!(filtered, expected_prefix, "event 順が不一致");
     assert_eq!(outcome.summary.as_ref().unwrap().game_id, "g-1");
+}
+
+#[test]
+fn ponder_miss_stale_info_does_not_attach_to_next_instant_bestmove() {
+    let second_move_line = Arc::new(Mutex::new(String::new()));
+    let observed_second_move = Arc::clone(&second_move_line);
+    let port = spawn_mock_tcp_server(move |reader, writer| {
+        let _ = read_line(reader);
+        write_lines(writer, &["LOGIN:alice OK"]);
+        let lines = game_summary_lines("g-stale-ponder-info");
+        let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_lines(writer, &line_refs);
+        let agree = read_line(reader);
+        assert!(agree.starts_with("AGREE"), "expected AGREE, got: {agree}");
+        write_lines(writer, &["START:g-stale-ponder-info"]);
+
+        let first = read_line(reader);
+        assert!(first.starts_with("+7776FU"), "expected first client move +7776FU, got: {first}");
+        write_lines(writer, &["+7776FU,T1"]);
+
+        // ponder 予測 (3c3d) と異なる手を指して ponder miss を起こす
+        write_lines(writer, &["-8384FU,T1"]);
+        let second = read_line(reader);
+        *observed_second_move.lock().unwrap() = second.clone();
+        assert!(
+            second.starts_with("+2726FU"),
+            "expected second client move +2726FU, got: {second}"
+        );
+        assert!(
+            !second.contains(",'"),
+            "book-like instant move must not include floodgate eval comment: {second}"
+        );
+        write_lines(writer, &["+2726FU,T1"]);
+        write_lines(writer, &["#WIN"]);
+        let _ = read_line(reader);
+    });
+
+    let engine_path = mock_usi_engine_stale_ponder_info_script();
+    let mut config = mock_config(engine_path, SearchInfoEmitPolicy::EveryLine);
+    config.game.ponder = true;
+    config.server.floodgate = true;
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let mut conn = CsaConnection::connect("127.0.0.1", port, false).expect("connect");
+    conn.login("alice", "pw").expect("login");
+    let mut engine = UsiEngine::spawn(
+        &config.engine.path,
+        &config.engine.options,
+        SpawnOptions {
+            ponder: config.game.ponder,
+            startup_timeout: Duration::from_secs(5),
+            stderr_passthrough: false,
+        },
+    )
+    .expect("spawn engine");
+
+    let (sink, _) = CapturingSink::new();
+    let mut sink = sink;
+    let outcome = run_game_session_with_events(
+        &config,
+        &mut conn,
+        &mut engine,
+        Arc::clone(&shutdown),
+        &mut sink,
+    );
+    engine.quit();
+    let outcome = outcome.expect("session ok");
+
+    let moves = &outcome.record.moves;
+    assert_eq!(moves.len(), 3);
+    assert_eq!(moves[2].csa_move, "+2726FU");
+    assert_eq!(moves[2].eval_cp, None);
+    assert_eq!(moves[2].eval_mate, None);
+    assert_eq!(moves[2].depth, None);
+    assert!(moves[2].pv.is_empty());
+    assert!(!second_move_line.lock().unwrap().contains(",'"));
 }
 
 // ────────────────────────────────────────────
