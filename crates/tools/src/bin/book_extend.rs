@@ -229,9 +229,20 @@ fn validate_cli(cli: &Cli) -> Result<()> {
     if cli.parallel == 0 {
         bail!("--parallel は 1 以上を指定してください");
     }
-    reject_same_canonical_path(&cli.book, &cli.out, "--book", "--out")?;
+    // --journal は実行中に追記され、--out/--report は完了時に書き出される。
+    // どれか同士が衝突しても入出力を破壊するため、全ペアで正準パス一致を拒否する。
+    let mut paths: Vec<(&str, &Path)> = vec![
+        ("--book", cli.book.as_path()),
+        ("--out", cli.out.as_path()),
+        ("--journal", cli.journal.as_path()),
+    ];
     if let Some(report) = &cli.report {
-        reject_same_canonical_path(&cli.book, report, "--book", "--report")?;
+        paths.push(("--report", report.as_path()));
+    }
+    for (i, (a_name, a)) in paths.iter().enumerate() {
+        for (b_name, b) in &paths[i + 1..] {
+            reject_same_canonical_path(a, b, a_name, b_name)?;
+        }
     }
     Ok(())
 }
@@ -1203,6 +1214,51 @@ mod tests {
             report: Some(book),
             ..cli
         };
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_output_path_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let book = dir.path().join("book.db");
+        let engine = dir.path().join("engine");
+        std::fs::write(&book, BOOK_HEADER).unwrap();
+        std::fs::write(&engine, b"engine").unwrap();
+
+        let make_cli = |out: PathBuf, journal: PathBuf, report: Option<PathBuf>| Cli {
+            book: book.clone(),
+            out,
+            engine: engine.clone(),
+            engine_options: Vec::new(),
+            go: "nodes 1".to_string(),
+            parallel: 1,
+            journal,
+            resume: false,
+            parent_journal: None,
+            report,
+        };
+        let out = dir.path().join("out.db");
+        let journal = dir.path().join("journal.jsonl");
+        let report = dir.path().join("report.md");
+
+        // 衝突なしは通る。
+        let cli = make_cli(out.clone(), journal.clone(), Some(report.clone()));
+        assert!(validate_cli(&cli).is_ok());
+
+        // --out == --report: 拡張 .db を report が上書きしてしまうため拒否する。
+        let cli = make_cli(out.clone(), journal.clone(), Some(out.clone()));
+        assert!(validate_cli(&cli).is_err());
+
+        // --journal == --out: 再開用 journal を出力 book が破壊するため拒否する。
+        let cli = make_cli(out.clone(), out.clone(), None);
+        assert!(validate_cli(&cli).is_err());
+
+        // --journal == --book: 入力 book へ journal が追記されるため拒否する。
+        let cli = make_cli(out.clone(), book.clone(), None);
+        assert!(validate_cli(&cli).is_err());
+
+        // --journal == --report: 実行中の journal を report が上書きするため拒否する。
+        let cli = make_cli(out, journal.clone(), Some(journal));
         assert!(validate_cli(&cli).is_err());
     }
 }
