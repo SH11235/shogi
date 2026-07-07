@@ -9,6 +9,16 @@
 set -euo pipefail
 REPO="${RSHOGI_REPO:-$HOME/development/rshogi}"
 
+# 非ログインシェル (ssh host 'cmd' 等) では rustup の PATH が通っておらず、
+# git pull だけ成功してビルドで落ちる。~/.cargo/env をフォールバックで読む。
+if ! command -v cargo >/dev/null 2>&1; then
+  [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "error: cargo が見つかりません (rustup 未導入か PATH 未設定)。" >&2
+  exit 1
+fi
+
 assume_yes=0
 if [ "${1:-}" = "-y" ] || [ "${1:-}" = "--yes" ]; then
   assume_yes=1
