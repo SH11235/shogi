@@ -21,10 +21,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use rshogi_csa::parse_csa;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use tools::common::dedup::DedupSet;
 use tools::common::floodgate as fg;
 use tools::common::io::{open_writer, write_atomic};
@@ -112,6 +116,12 @@ enum Cmd {
         /// 1 パスだけ実行して終了 (動作確認用)
         #[arg(long)]
         once: bool,
+        /// wdoor MONITOR2 を着手通知として使い、通知ごとに HTTP 正本 CSA を取得する
+        #[arg(long)]
+        push: bool,
+        /// MONITOR2 観戦ログイン名 (`--push` 時のみ使用)
+        #[arg(long, default_value = "rshogi-mirror")]
+        login_name: String,
     },
     /// ローカルのCSAファイルからSFENを抽出
     Extract {
@@ -205,7 +215,9 @@ fn main() -> Result<()> {
             watch,
             root,
             once,
-        } => run_live_mirror(&out_dir, interval, &watch, &root, once),
+            push,
+            login_name,
+        } => run_live_mirror(&out_dir, interval, &watch, &root, once, push, &login_name),
         Cmd::Extract {
             root,
             out,
@@ -239,16 +251,33 @@ struct MirrorState {
     local: PathBuf,
     /// 直近取得の本文サイズ。CSA は追記のみで単調増加するため「同サイズ = 変化なし」。
     size: u64,
+    /// 直近で本文サイズが変化した時刻。変化が長時間ない進行中対局は放棄する。
+    last_changed_at: Instant,
     /// 終局検出済み(または放棄)。以後は取得しない。
     finished: bool,
-    /// 内容が変わらなかった連続パス数。閾値超過で放棄する(回線断等で中断された
-    /// 対局を永遠にポーリングしない)。
-    unchanged_polls: u32,
+    /// MONITOR2ON を送信済みか。TCP 再接続時は main loop 側で false に戻す。
+    push_subscribed: bool,
 }
 
 /// 対局一覧 (日次 autoindex) の確認間隔。ペアリングは毎時 :00/:30 なので秒単位で追う
 /// 意味が薄く、wdoor への負荷を抑えるため進行中ファイルの再取得とは別に長めへ固定する。
 const INDEX_POLL_SECS: u64 = 60;
+/// MONITOR2 接続中に `%%LIST` を再送する間隔。LIST は新規対局発見だけに使い、棋譜本文は
+/// 常に HTTP 公開 CSA から取得する。
+const PUSH_LIST_SECS: u64 = 30;
+/// MONITOR2 接続中も HTTP ポーリングを完全には止めず、通知欠落時の安全網として使う間隔。
+const PUSH_POLL_SECS: u64 = 60;
+/// MONITOR2 着手通知から HTTP 取得までの遅延。短時間に複数通知が来た場合は `insert` の
+/// 上書きで期限を後ろへずらし、書きかけ公開ファイルを避ける。
+const PUSH_DEBOUNCE_MS: u64 = 200;
+/// wdoor の CSA TCP サーバ。
+const WDOOR_MONITOR_ADDR: &str = "wdoor.c.u-tokyo.ac.jp:4081";
+/// MONITOR2 観戦ログインではパスワード値は認証に使われず、任意文字列でよい。
+const WDOOR_MONITOR_PASSWORD: &str = "rshogi";
+/// LOGIN 応答を待つ上限。タイムアウト付き read_line の WouldBlock はこの期限まで継続する。
+const MONITOR2_LOGIN_TIMEOUT_SECS: u64 = 15;
+/// 進行中のまま内容変化が止まった対局を放棄するまでの時間。
+const STALE_GAME_SECS: u64 = 3600;
 
 fn run_live_mirror(
     out_dir: &Path,
@@ -256,112 +285,568 @@ fn run_live_mirror(
     watch: &[String],
     root: &str,
     once: bool,
+    push: bool,
+    login_name: &str,
 ) -> Result<()> {
-    use std::time::{Duration, Instant};
-
     anyhow::ensure!(interval >= 1, "--interval は 1 秒以上を指定してください");
     fs::create_dir_all(out_dir).with_context(|| format!("create dir {}", out_dir.display()))?;
     // 無人常駐が前提なので、応答しないピアで単一スレッドのループ全体が
     // 止まらないようリクエストにタイムアウトを付ける。
     let client = Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
-    // 変化なしがこのパス数続いた進行中ファイルは放棄する(interval=10s で約 1 時間)。
-    let stale_limit: u32 = (3600 / interval).max(10) as u32;
-
     let mut states: std::collections::HashMap<String, MirrorState> =
         std::collections::HashMap::new();
     let mut last_index_poll: Option<Instant> = None;
+    let (mut push_rx, mut push_tx) = if push && !once {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        start_monitor2_thread(login_name.to_string(), event_tx, cmd_rx);
+        (Some(event_rx), Some(cmd_tx))
+    } else {
+        if push && once {
+            eprintln!("live-mirror: --once では --push を無視して 1 パスだけ実行します");
+        }
+        (None, None)
+    };
+    let mut push_connected = false;
+    let mut pending_push_fetches: HashMap<String, Instant> = HashMap::new();
+    let mut last_file_poll: Option<Instant> = None;
     loop {
         // 1) 日次 index から対局を発見(INDEX_POLL_SECS ごと)。
         if last_index_poll.is_none_or(|t| t.elapsed().as_secs() >= INDEX_POLL_SECS) {
             last_index_poll = Some(Instant::now());
-            let day_url_and_html = fg::day_dir_url(root, fg::jst_today())
-                .and_then(|u| fg::http_get_text(&client, &u).map(|h| (u, h)));
-            match day_url_and_html {
-                Ok((day_url, html)) => {
-                    let mut added = 0usize;
-                    for name in fg::parse_autoindex_csa_names(&html) {
-                        if !watch.is_empty() && !watch.iter().any(|w| name.contains(w.as_str())) {
-                            continue;
-                        }
-                        if states.contains_key(&name) {
-                            continue;
-                        }
-                        // 過去の実行で完全な棋譜をミラー済みなら取得しない。
-                        let local = out_dir.join(&name);
-                        let finished = fs::read_to_string(&local)
-                            .map(|t| fg::csa_is_finished(&t))
-                            .unwrap_or(false);
-                        states.insert(
-                            name.clone(),
-                            MirrorState {
-                                url: format!("{day_url}{name}"),
-                                local,
-                                size: 0,
-                                finished,
-                                unchanged_polls: 0,
-                            },
-                        );
-                        added += 1;
-                    }
+            match discover_from_autoindex(&client, out_dir, watch, root, &mut states) {
+                Ok(added) => {
                     if added > 0 {
                         eprintln!("live-mirror: 対局発見 +{added} (追跡 {} 局)", states.len());
                     }
-                    // 終局済みで前日以前の対局は追跡から外す(常駐時のメモリじわ増防止)。
-                    // 当日 index には現れないので再発見されず、仮に再発見されても
-                    // ローカルの完全棋譜チェックが再取得を防ぐ。
-                    let today = fg::jst_today().format("%Y%m%d").to_string();
-                    states.retain(|name, st| {
-                        !(st.finished && csa_name_date(name).is_some_and(|d| d < today.as_str()))
-                    });
+                    prune_old_finished(&mut states);
                 }
                 Err(e) => eprintln!("⚠ 対局一覧の取得失敗(次回再試行): {e:#}"),
             }
         }
 
+        if let Some(rx) = &push_rx {
+            while let Ok(event) = rx.try_recv() {
+                handle_push_event(
+                    event,
+                    &client,
+                    out_dir,
+                    watch,
+                    root,
+                    &mut states,
+                    &push_tx,
+                    &mut push_connected,
+                    &mut pending_push_fetches,
+                );
+            }
+            if push_connected {
+                subscribe_push_targets(&mut states, &push_tx);
+            }
+            flush_due_push_fetches(
+                &client,
+                &mut states,
+                &push_tx,
+                &mut pending_push_fetches,
+                Instant::now(),
+            );
+        }
+
         // 2) 進行中ファイルの再取得。
         let mut updated = 0usize;
         let mut in_progress = 0usize;
-        for st in states.values_mut().filter(|s| !s.finished) {
-            match mirror_one(&client, st) {
-                Ok(true) => {
-                    updated += 1;
-                    if st.finished {
-                        eprintln!("live-mirror: 終局 {}", st.local.display());
+        let safety_interval = if push_connected {
+            interval.max(PUSH_POLL_SECS)
+        } else {
+            interval
+        };
+        let should_poll_files =
+            last_file_poll.is_none_or(|t| t.elapsed().as_secs() >= safety_interval);
+        if should_poll_files {
+            last_file_poll = Some(Instant::now());
+            for (name, st) in states.iter_mut().filter(|(_, s)| !s.finished) {
+                match mirror_one(&client, st) {
+                    Ok(true) => {
+                        updated += 1;
+                        if st.finished {
+                            eprintln!("live-mirror: 終局 {}", st.local.display());
+                            unsubscribe_finished_game(name, st, &push_tx);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!("⚠ 取得失敗(次回再試行) {}: {e:#}", st.url);
                     }
                 }
-                Ok(false) => {}
-                Err(e) => {
-                    // 恒久的な失敗 (404 等) も放棄カウントに含める。一時的な障害は
-                    // 閾値まで至らず、回復すれば成功時にリセットされる。
-                    st.unchanged_polls += 1;
-                    eprintln!("⚠ 取得失敗(次回再試行) {}: {e:#}", st.url);
+                if !st.finished {
+                    if st.last_changed_at.elapsed() >= Duration::from_secs(STALE_GAME_SECS) {
+                        // 追跡だけ止める(ローカルの部分棋譜は勝敗不明として残る)。
+                        st.finished = true;
+                        eprintln!(
+                            "⚠ {} は約 1 時間変化なし。中断対局とみなし追跡を止める",
+                            st.local.display()
+                        );
+                        unsubscribe_finished_game(name, st, &push_tx);
+                    } else {
+                        in_progress += 1;
+                    }
                 }
             }
-            if !st.finished {
-                if st.unchanged_polls > stale_limit {
-                    // 追跡だけ止める(ローカルの部分棋譜は勝敗不明として残る)。
-                    st.finished = true;
-                    eprintln!(
-                        "⚠ {} は {stale_limit} パス変化なし(または取得失敗)。中断対局とみなし追跡を止める",
-                        st.local.display()
-                    );
-                } else {
-                    in_progress += 1;
-                }
+            if updated > 0 {
+                eprintln!(
+                    "live-mirror: 更新 {updated} 局 (進行中 {in_progress} / 追跡 {} 局)",
+                    states.len()
+                );
             }
-        }
-        if updated > 0 {
-            eprintln!(
-                "live-mirror: 更新 {updated} 局 (進行中 {in_progress} / 追跡 {} 局)",
-                states.len()
-            );
+            if push_connected {
+                subscribe_push_targets(&mut states, &push_tx);
+            }
         }
         if once {
             break;
         }
-        std::thread::sleep(Duration::from_secs(interval));
+        let file_poll_wait = last_file_poll
+            .map(|t| Duration::from_secs(safety_interval).saturating_sub(t.elapsed()))
+            .unwrap_or_default();
+        let push_wait = pending_push_fetches
+            .values()
+            .min()
+            .map(|due| due.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|| Duration::from_secs(safety_interval));
+        let wait = file_poll_wait.min(push_wait);
+        if let Some(rx) = &push_rx {
+            match rx.recv_timeout(wait) {
+                Ok(event) => {
+                    handle_push_event(
+                        event,
+                        &client,
+                        out_dir,
+                        watch,
+                        root,
+                        &mut states,
+                        &push_tx,
+                        &mut push_connected,
+                        &mut pending_push_fetches,
+                    );
+                    while let Ok(event) = rx.try_recv() {
+                        handle_push_event(
+                            event,
+                            &client,
+                            out_dir,
+                            watch,
+                            root,
+                            &mut states,
+                            &push_tx,
+                            &mut push_connected,
+                            &mut pending_push_fetches,
+                        );
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    push_connected = false;
+                    push_rx = None;
+                    push_tx = None;
+                }
+            }
+        } else {
+            std::thread::sleep(Duration::from_secs(interval));
+        }
     }
     Ok(())
+}
+
+fn discover_from_autoindex(
+    client: &Client,
+    out_dir: &Path,
+    watch: &[String],
+    root: &str,
+    states: &mut HashMap<String, MirrorState>,
+) -> Result<usize> {
+    let day_url = fg::day_dir_url(root, fg::jst_today())?;
+    let html = fg::http_get_text(client, &day_url)?;
+    let mut added = 0usize;
+    for name in fg::parse_autoindex_csa_names(&html) {
+        let url = format!("{day_url}{name}");
+        if add_mirror_state(out_dir, watch, states, name, url) {
+            added += 1;
+        }
+    }
+    Ok(added)
+}
+
+fn add_mirror_state(
+    out_dir: &Path,
+    watch: &[String],
+    states: &mut HashMap<String, MirrorState>,
+    name: String,
+    url: String,
+) -> bool {
+    if !watch.is_empty() && !watch.iter().any(|w| name.contains(w.as_str())) {
+        return false;
+    }
+    if states.contains_key(&name) {
+        return false;
+    }
+    // 過去の実行で完全な棋譜をミラー済みなら取得しない。
+    let local = out_dir.join(&name);
+    let finished = fs::read_to_string(&local).map(|t| fg::csa_is_finished(&t)).unwrap_or(false);
+    let size = fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+    states.insert(
+        name,
+        MirrorState {
+            url,
+            local,
+            size,
+            last_changed_at: Instant::now(),
+            finished,
+            push_subscribed: false,
+        },
+    );
+    true
+}
+
+fn prune_old_finished(states: &mut HashMap<String, MirrorState>) {
+    // 終局済みで前日以前の対局は追跡から外す(常駐時のメモリじわ増防止)。
+    // 当日 index には現れないので再発見されず、仮に再発見されても
+    // ローカルの完全棋譜チェックが再取得を防ぐ。
+    let today = fg::jst_today().format("%Y%m%d").to_string();
+    states.retain(|name, st| {
+        !(st.finished && csa_name_date(name).is_some_and(|d| d < today.as_str()))
+    });
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Monitor2Payload {
+    Move,
+    SpecialMove,
+    Result,
+    Comment,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Monitor2Line {
+    game_id: String,
+    kind: Monitor2Payload,
+}
+
+#[derive(Debug)]
+enum PushEvent {
+    Connected,
+    Disconnected(String),
+    ListGame(String),
+    Monitor2(Monitor2Line),
+}
+
+#[derive(Debug)]
+enum PushCommand {
+    MonitorOn(String),
+    MonitorOff(String),
+}
+
+fn handle_push_event(
+    event: PushEvent,
+    client: &Client,
+    out_dir: &Path,
+    watch: &[String],
+    root: &str,
+    states: &mut HashMap<String, MirrorState>,
+    push_tx: &Option<mpsc::Sender<PushCommand>>,
+    push_connected: &mut bool,
+    pending_fetches: &mut HashMap<String, Instant>,
+) {
+    match event {
+        PushEvent::Connected => {
+            *push_connected = true;
+            for st in states.values_mut() {
+                st.push_subscribed = false;
+            }
+            eprintln!("live-mirror: MONITOR2 接続完了");
+        }
+        PushEvent::Disconnected(reason) => {
+            *push_connected = false;
+            pending_fetches.clear();
+            for st in states.values_mut() {
+                st.push_subscribed = false;
+            }
+            eprintln!("⚠ MONITOR2 接続断。ポーリングへフォールバックします: {reason}");
+        }
+        PushEvent::ListGame(game_id) => match csa_url_from_game_id(root, &game_id) {
+            Ok(url) => {
+                let name = format!("{game_id}.csa");
+                if add_mirror_state(out_dir, watch, states, name.clone(), url) {
+                    pending_fetches.insert(name, Instant::now());
+                    eprintln!("live-mirror: MONITOR2 LIST 対局発見 +1 (追跡 {} 局)", states.len());
+                }
+            }
+            Err(e) => eprintln!("⚠ MONITOR2 LIST の game_id を URL 化できません: {game_id}: {e:#}"),
+        },
+        PushEvent::Monitor2(line) => match line.kind {
+            Monitor2Payload::Move | Monitor2Payload::SpecialMove | Monitor2Payload::Result => {
+                let name = format!("{}.csa", line.game_id);
+                pending_fetches
+                    .insert(name, Instant::now() + Duration::from_millis(PUSH_DEBOUNCE_MS));
+            }
+            Monitor2Payload::Comment | Monitor2Payload::Other => {}
+        },
+    }
+    if *push_connected {
+        subscribe_push_targets(states, push_tx);
+    }
+    flush_due_push_fetches(client, states, push_tx, pending_fetches, Instant::now());
+}
+
+fn subscribe_push_targets(
+    states: &mut HashMap<String, MirrorState>,
+    push_tx: &Option<mpsc::Sender<PushCommand>>,
+) {
+    let Some(tx) = push_tx else { return };
+    for (name, st) in states
+        .iter_mut()
+        .filter(|(_, st)| st.size > 0 && !st.finished && !st.push_subscribed)
+    {
+        let game_id = name.strip_suffix(".csa").unwrap_or(name).to_string();
+        if tx.send(PushCommand::MonitorOn(game_id)).is_ok() {
+            st.push_subscribed = true;
+        }
+    }
+}
+
+fn unsubscribe_finished_game(
+    name: &str,
+    st: &mut MirrorState,
+    push_tx: &Option<mpsc::Sender<PushCommand>>,
+) {
+    if !st.push_subscribed {
+        return;
+    }
+    st.push_subscribed = false;
+    if let Some(tx) = push_tx {
+        let game_id = name.strip_suffix(".csa").unwrap_or(name).to_string();
+        let _ = tx.send(PushCommand::MonitorOff(game_id));
+    }
+}
+
+fn flush_due_push_fetches(
+    client: &Client,
+    states: &mut HashMap<String, MirrorState>,
+    push_tx: &Option<mpsc::Sender<PushCommand>>,
+    pending_fetches: &mut HashMap<String, Instant>,
+    now: Instant,
+) {
+    let due_names: Vec<String> = pending_fetches
+        .iter()
+        .filter(|(_, due)| **due <= now)
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in due_names {
+        pending_fetches.remove(&name);
+        let Some(st) = states.get_mut(&name) else {
+            continue;
+        };
+        if st.finished {
+            continue;
+        }
+        match mirror_one(client, st) {
+            Ok(true) => {
+                eprintln!("live-mirror: push 更新 {}", st.local.display());
+                if st.finished {
+                    eprintln!("live-mirror: 終局 {}", st.local.display());
+                    unsubscribe_finished_game(&name, st, push_tx);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("⚠ push 通知後の取得失敗(次回再試行) {}: {e:#}", st.url),
+        }
+    }
+}
+
+fn start_monitor2_thread(
+    login_name: String,
+    event_tx: mpsc::Sender<PushEvent>,
+    cmd_rx: mpsc::Receiver<PushCommand>,
+) {
+    std::thread::spawn(move || {
+        let mut backoff = Duration::from_secs(5);
+        let mut subscribed = HashSet::new();
+        loop {
+            match run_monitor2_session(
+                &login_name,
+                &event_tx,
+                &cmd_rx,
+                &mut subscribed,
+                &mut backoff,
+            ) {
+                Ok(()) => {
+                    let _ = event_tx.send(PushEvent::Disconnected(
+                        "MONITOR2 セッションが正常終了しました".to_string(),
+                    ));
+                }
+                Err(e) => {
+                    let _ = event_tx.send(PushEvent::Disconnected(format!("{e:#}")));
+                }
+            }
+            subscribed.clear();
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_secs(60));
+        }
+    });
+}
+
+fn run_monitor2_session(
+    login_name: &str,
+    event_tx: &mpsc::Sender<PushEvent>,
+    cmd_rx: &mpsc::Receiver<PushCommand>,
+    subscribed: &mut HashSet<String>,
+    backoff: &mut Duration,
+) -> Result<()> {
+    let stream = TcpStream::connect(WDOOR_MONITOR_ADDR)
+        .with_context(|| format!("connect {WDOOR_MONITOR_ADDR}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut writer = stream.try_clone().context("MONITOR2 writer clone")?;
+    writeln!(writer, "LOGIN {login_name} {WDOOR_MONITOR_PASSWORD} x1")?;
+    writer.flush()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let login_deadline = Instant::now() + Duration::from_secs(MONITOR2_LOGIN_TIMEOUT_SECS);
+    loop {
+        let n = match reader.read_line(&mut line) {
+            Ok(n) => n,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                anyhow::ensure!(Instant::now() < login_deadline, "MONITOR2 login timeout");
+                continue;
+            }
+            Err(e) => return Err(e).context("MONITOR2 login read"),
+        };
+        anyhow::ensure!(n > 0, "login 中に接続が閉じました");
+        if !line.ends_with('\n') {
+            anyhow::ensure!(Instant::now() < login_deadline, "MONITOR2 login timeout");
+            continue;
+        }
+        let s = line.trim_end_matches(['\r', '\n']);
+        if s == format!("LOGIN:{login_name} OK") || s == "##[LOGIN] +OK x1" {
+            break;
+        }
+        anyhow::ensure!(!is_monitor2_login_failure(s), "MONITOR2 ログイン失敗: {s}");
+        line.clear();
+    }
+    *backoff = Duration::from_secs(5);
+    let _ = event_tx.send(PushEvent::Connected);
+    line.clear();
+    writeln!(writer, "%%LIST")?;
+    writer.flush()?;
+    let mut next_list = Instant::now() + Duration::from_secs(PUSH_LIST_SECS);
+    loop {
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            send_push_command(&mut writer, cmd, subscribed)?;
+        }
+        if Instant::now() >= next_list {
+            writeln!(writer, "%%LIST")?;
+            writer.flush()?;
+            next_list = Instant::now() + Duration::from_secs(PUSH_LIST_SECS);
+        }
+        match reader.read_line(&mut line) {
+            Ok(0) => anyhow::bail!("MONITOR2 peer closed"),
+            Ok(_) => {
+                if !line.ends_with('\n') {
+                    continue;
+                }
+                let s = line.trim_end_matches(['\r', '\n']);
+                if let Some(game_id) = parse_list_line(s) {
+                    let _ = event_tx.send(PushEvent::ListGame(game_id));
+                } else if let Some(mon) = parse_monitor2_line(s) {
+                    let _ = event_tx.send(PushEvent::Monitor2(mon));
+                }
+                line.clear();
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(e).context("MONITOR2 read"),
+        }
+    }
+}
+
+fn send_push_command(
+    writer: &mut TcpStream,
+    cmd: PushCommand,
+    subscribed: &mut HashSet<String>,
+) -> Result<()> {
+    match cmd {
+        PushCommand::MonitorOn(game_id) => {
+            if subscribed.insert(game_id.clone()) {
+                writeln!(writer, "%%MONITOR2ON {game_id}")?;
+                writer.flush()?;
+            }
+        }
+        PushCommand::MonitorOff(game_id) => {
+            subscribed.remove(&game_id);
+            writeln!(writer, "%%MONITOR2OFF {game_id}")?;
+            writer.flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn is_monitor2_login_failure(line: &str) -> bool {
+    line.starts_with("LOGIN:incorrect")
+        || line.starts_with("##[LOGIN] -NG")
+        || line.starts_with("##[LOGIN] -ERR")
+}
+
+fn parse_list_line(line: &str) -> Option<String> {
+    line.strip_prefix("##[LIST] ")
+        .filter(|payload| *payload != "+OK")
+        .map(str::to_string)
+}
+
+fn parse_monitor2_line(line: &str) -> Option<Monitor2Line> {
+    let rest = line.strip_prefix("##[MONITOR2][")?;
+    let (game_id, payload) = rest.split_once("] ")?;
+    let kind = classify_monitor2_payload(payload);
+    Some(Monitor2Line {
+        game_id: game_id.to_string(),
+        kind,
+    })
+}
+
+fn classify_monitor2_payload(payload: &str) -> Monitor2Payload {
+    if payload.starts_with('\'') {
+        return Monitor2Payload::Comment;
+    }
+    if payload.starts_with('#') {
+        return Monitor2Payload::Result;
+    }
+    if payload.starts_with('%') {
+        return Monitor2Payload::SpecialMove;
+    }
+    if is_csa_move(payload) {
+        return Monitor2Payload::Move;
+    }
+    Monitor2Payload::Other
+}
+
+fn is_csa_move(payload: &str) -> bool {
+    let bytes = payload.as_bytes();
+    bytes.len() == 7
+        && matches!(bytes[0], b'+' | b'-')
+        && bytes[1..5].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_uppercase)
+}
+
+fn csa_url_from_game_id(root: &str, game_id: &str) -> Result<String> {
+    let timestamp = game_id.rsplit('+').next().context("game_id にタイムスタンプがありません")?;
+    anyhow::ensure!(
+        timestamp.len() == 14 && timestamp.bytes().all(|b| b.is_ascii_digit()),
+        "game_id 末尾が YYYYMMDDhhmmss ではありません: {game_id}"
+    );
+    let rel =
+        format!("{}/{}/{}/{}.csa", &timestamp[0..4], &timestamp[4..6], &timestamp[6..8], game_id);
+    fg::join_url(root, &rel)
 }
 
 /// wdoor ファイル名 (`...+YYYYMMDDHHMMSS.csa`) から日付部 (`YYYYMMDD`) を取り出す。
@@ -379,13 +864,12 @@ fn csa_name_date(name: &str) -> Option<&str> {
 fn mirror_one(client: &Client, st: &mut MirrorState) -> Result<bool> {
     let body = fg::http_get_text(client, &st.url)?;
     if body.len() as u64 == st.size {
-        st.unchanged_polls += 1;
         return Ok(false);
     }
     write_atomic(&st.local, &body)?;
     st.size = body.len() as u64;
+    st.last_changed_at = Instant::now();
     st.finished = fg::csa_is_finished(&body);
-    st.unchanged_polls = 0;
     Ok(true)
 }
 
@@ -789,5 +1273,131 @@ mod tests {
         );
         assert_eq!(csa_name_date("wdoor+floodgate-300-10F+A+B+2026070701.csa"), None);
         assert_eq!(csa_name_date("no_date.csa"), None);
+    }
+
+    #[test]
+    fn monitor2_line_parses_move_like_payloads() {
+        let game_id = "wdoor+floodgate-300-10F+A+B+20260708000000";
+        let mv = parse_monitor2_line(&format!("##[MONITOR2][{game_id}] +7776FU")).unwrap();
+        assert_eq!(mv.game_id, game_id);
+        assert_eq!(mv.kind, Monitor2Payload::Move);
+
+        let drop = parse_monitor2_line(&format!("##[MONITOR2][{game_id}] -0055KA")).unwrap();
+        assert_eq!(drop.kind, Monitor2Payload::Move);
+
+        let special = parse_monitor2_line(&format!("##[MONITOR2][{game_id}] %TORYO")).unwrap();
+        assert_eq!(special.kind, Monitor2Payload::SpecialMove);
+    }
+
+    #[test]
+    fn monitor2_line_parses_result_comment_and_other() {
+        let game_id = "wdoor+floodgate-300-10F+A+B+20260708000000";
+        let result = parse_monitor2_line(&format!("##[MONITOR2][{game_id}] #RESIGN")).unwrap();
+        assert_eq!(result.kind, Monitor2Payload::Result);
+
+        let comment = parse_monitor2_line(&format!("##[MONITOR2][{game_id}] '** 123")).unwrap();
+        assert_eq!(comment.kind, Monitor2Payload::Comment);
+
+        let ok = parse_monitor2_line(&format!("##[MONITOR2][{game_id}] +OK")).unwrap();
+        assert_eq!(ok.kind, Monitor2Payload::Other);
+
+        let time = parse_monitor2_line(&format!("##[MONITOR2][{game_id}] T12")).unwrap();
+        assert_eq!(time.kind, Monitor2Payload::Other);
+    }
+
+    #[test]
+    fn monitor2_list_and_game_id_url_parse() {
+        assert_eq!(
+            parse_list_line("##[LIST] wdoor+floodgate-300-10F+A+B+20260708000000").unwrap(),
+            "wdoor+floodgate-300-10F+A+B+20260708000000"
+        );
+        assert_eq!(parse_list_line("##[LIST] +OK"), None);
+
+        let url =
+            csa_url_from_game_id(fg::DEFAULT_ROOT, "wdoor+floodgate-300-10F+A+B+20260708000000")
+                .unwrap();
+        assert_eq!(
+            url,
+            "https://wdoor.c.u-tokyo.ac.jp/shogi/x/2026/07/08/wdoor+floodgate-300-10F+A+B+20260708000000.csa"
+        );
+    }
+
+    #[test]
+    fn monitor2_login_failure_uses_response_prefix() {
+        assert!(is_monitor2_login_failure("LOGIN:incorrect password"));
+        assert!(is_monitor2_login_failure("##[LOGIN] -NG x1"));
+        assert!(!is_monitor2_login_failure("banner LOGIN NG is not a login response"));
+    }
+
+    #[test]
+    fn push_subscribe_requires_fetched_unfinished_game() {
+        let (tx, rx) = mpsc::channel();
+        let mut states = HashMap::new();
+        states.insert(
+            "unfetched.csa".to_string(),
+            MirrorState {
+                url: "https://example.invalid/unfetched.csa".to_string(),
+                local: PathBuf::from("unfetched.csa"),
+                size: 0,
+                last_changed_at: Instant::now(),
+                finished: false,
+                push_subscribed: false,
+            },
+        );
+        states.insert(
+            "finished.csa".to_string(),
+            MirrorState {
+                url: "https://example.invalid/finished.csa".to_string(),
+                local: PathBuf::from("finished.csa"),
+                size: 10,
+                last_changed_at: Instant::now(),
+                finished: true,
+                push_subscribed: false,
+            },
+        );
+        states.insert(
+            "active.csa".to_string(),
+            MirrorState {
+                url: "https://example.invalid/active.csa".to_string(),
+                local: PathBuf::from("active.csa"),
+                size: 10,
+                last_changed_at: Instant::now(),
+                finished: false,
+                push_subscribed: false,
+            },
+        );
+
+        subscribe_push_targets(&mut states, &Some(tx));
+
+        match rx.try_recv().unwrap() {
+            PushCommand::MonitorOn(game_id) => assert_eq!(game_id, "active"),
+            cmd => panic!("unexpected command: {cmd:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(!states["unfetched.csa"].push_subscribed);
+        assert!(!states["finished.csa"].push_subscribed);
+        assert!(states["active.csa"].push_subscribed);
+    }
+
+    #[test]
+    fn unsubscribe_finished_game_sends_monitor_off_once() {
+        let (tx, rx) = mpsc::channel();
+        let mut st = MirrorState {
+            url: "https://example.invalid/active.csa".to_string(),
+            local: PathBuf::from("active.csa"),
+            size: 10,
+            last_changed_at: Instant::now(),
+            finished: true,
+            push_subscribed: true,
+        };
+
+        unsubscribe_finished_game("active.csa", &mut st, &Some(tx));
+
+        match rx.try_recv().unwrap() {
+            PushCommand::MonitorOff(game_id) => assert_eq!(game_id, "active"),
+            cmd => panic!("unexpected command: {cmd:?}"),
+        }
+        assert!(!st.push_subscribed);
+        assert!(rx.try_recv().is_err());
     }
 }

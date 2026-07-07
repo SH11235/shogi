@@ -82,7 +82,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 
 | ツール | 説明 |
 |--------|------|
-| `floodgate_pipeline` | Floodgate 棋譜の取得・変換パイプライン（CSA → SFEN → mirror → dedup、`live-mirror` で当日対局のリアルタイムミラー）。[詳細](floodgate_pipeline.md) |
+| `floodgate_pipeline` | Floodgate 棋譜の取得・変換パイプライン（CSA → SFEN → mirror → dedup、`live-mirror --push` で MONITOR2 着手通知を使う当日対局のリアルタイムミラー）。[詳細](floodgate_pipeline.md) |
 | `shogitest_sprt_log_to_csv` | shogitest SPRT ログを Elo・LLR・対局結果の CSV に変換 |
 
 ## パイプライン例
