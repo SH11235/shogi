@@ -597,6 +597,38 @@ static ATTACK_ORDER_TABLE: LazyLock<AttackOrderTable> = LazyLock::new(AttackOrde
 // Threat index 計算
 // =============================================================================
 
+/// full-symdedup profile: この edge が canonical-dead か（emit 時に落とす対象）。
+///
+/// 逆向き edge (`attacked_class @ to_sq, target_color` が `from_sq` を攻撃) がこの
+/// edge の active な全局面で必ず active な「相互含意」edge のうち、視点非依存の
+/// canonical 規則で落とす側だけを true とする。判定は raw 座標・実色で行い、両
+/// perspective で同一 edge を落とすので STM/NSTM 対称性は保たれる。
+///
+/// necessarily-mutual は「逆向き駒が空盤面で `from_sq` に届くか」= index 算出用
+/// `ATTACK_ORDER_TABLE` の逆引き（O(1)、active edge は from→to 区間が空なので実盤面
+/// 到達と一致）。
+///
+/// tie-break は perspective swap と HM (Half-Mirror) file 反転のどちらでも不変な量で
+/// なければならない（正規化後の index を両視点で突き合わせるため）。`ThreatClass`
+/// discriminant の大小はミラー・回転・視点反転いずれにも不変なので、class が違う pair
+/// は大きい class を attacker とする側を残し小さい側 (`ac < dc`) を dead にする。同
+/// class pair は raw マス番号でしか順序付けできず、raw file 順は HM ミラーで反転する
+/// （ミラー等価な 2 局面で残す側が逆転し正規化 index 空間の HM 等価性・dead 保証が
+/// 壊れる）ため dedup せず両側を emit する。
+#[cfg(all(feature = "nnue-threat", feature = "threat-profile-full-symdedup"))]
+#[inline]
+fn is_canonical_dead(
+    attacker_class: ThreatClass,
+    from_sq: Square,
+    attacked_class: ThreatClass,
+    target_color: Color,
+    to_sq: Square,
+) -> bool {
+    let rev_pattern = attack_pattern_id(attacked_class, target_color);
+    let mutual = ATTACK_ORDER_TABLE.get(rev_pattern, to_sq, from_sq) != AttackOrderTable::INVALID;
+    mutual && (attacker_class as u8) < (attacked_class as u8)
+}
+
 /// Threat index を計算する（Stockfish 準拠: perspective 基準 + 色別 LUT）
 ///
 /// 除外された pair の場合は `None` を返す。
@@ -705,6 +737,11 @@ pub fn append_active_threat_indices(
                 };
 
                 let attacked_side = if target_color == friend_color { 0 } else { 1 };
+
+                #[cfg(feature = "threat-profile-full-symdedup")]
+                if is_canonical_dead(attacker_class, from_sq, attacked_class, target_color, to_sq) {
+                    continue;
+                }
 
                 // Perspective 基準で正規化（Stockfish 準拠）
                 let from_sq_n = normalize_sq(from_sq, perspective, hm);
@@ -831,6 +868,12 @@ pub fn for_each_active_threat_index<F: FnMut(usize)>(
 
                 let target_color = target_pc.color();
                 let attacked_side = if target_color == friend_color { 0 } else { 1 };
+
+                #[cfg(feature = "threat-profile-full-symdedup")]
+                if is_canonical_dead(attacker_class, from_sq, attacked_class, target_color, to_sq) {
+                    continue;
+                }
+
                 let from_sq_n = normalize_sq(from_sq, perspective, hm);
                 let to_sq_n = normalize_sq(to_sq, perspective, hm);
                 let oriented_color = if perspective == Color::Black {
@@ -1143,6 +1186,10 @@ pub fn append_changed_threat_indices(
                         pos,
                     ) {
                         let attacked_side = if t.color == friend_color { 0 } else { 1 };
+                        #[cfg(feature = "threat-profile-full-symdedup")]
+                        if is_canonical_dead(class, sq_s, t.class, t.color, to_sq) {
+                            continue;
+                        }
                         let to_sq_n = normalize_sq(to_sq, perspective, hm);
                         if let Some(idx) = threat_index(
                             attacker_side,
@@ -1179,6 +1226,10 @@ pub fn append_changed_threat_indices(
                     if let Some(target_class) = ThreatClass::from_piece_type(target_pt) {
                         let target_color = target_pc.color();
                         let attacked_side = if target_color == friend_color { 0 } else { 1 };
+                        #[cfg(feature = "threat-profile-full-symdedup")]
+                        if is_canonical_dead(class, sq_s, target_class, target_color, to_sq) {
+                            continue;
+                        }
                         let to_sq_n = normalize_sq(to_sq, perspective, hm);
                         if let Some(idx) = threat_index(
                             attacker_side,
@@ -1231,6 +1282,10 @@ pub fn append_changed_threat_indices(
                     pos,
                 ) {
                     let attacked_side = if t.color == friend_color { 0 } else { 1 };
+                    #[cfg(feature = "threat-profile-full-symdedup")]
+                    if is_canonical_dead(info.class, sq_s, t.class, t.color, to_sq) {
+                        continue;
+                    }
                     let from_sq_n = normalize_sq(sq_s, perspective, hm);
                     let to_sq_n = normalize_sq(to_sq, perspective, hm);
                     if let Some(idx) = threat_index(
@@ -1281,6 +1336,10 @@ pub fn append_changed_threat_indices(
                     if let Some(target_class) = ThreatClass::from_piece_type(target_pt) {
                         let target_color = target_pc.color();
                         let attacked_side = if target_color == friend_color { 0 } else { 1 };
+                        #[cfg(feature = "threat-profile-full-symdedup")]
+                        if is_canonical_dead(class, sq_s, target_class, target_color, to_sq) {
+                            continue;
+                        }
                         let from_sq_n = normalize_sq(sq_s, perspective, hm);
                         let to_sq_n = normalize_sq(to_sq, perspective, hm);
                         if let Some(idx) = threat_index(
@@ -1650,8 +1709,12 @@ mod tests {
             }
         }
         assert!(non_excluded_count > 0, "should have some non-excluded pairs");
-        // Profile 0 では除外なし、他の profile では除外あり
-        if threat_exclusion::THREAT_PROFILE_ID == 0 {
+        // profile 0 と full-symdedup (id 4) は pair 除外なし (index 空間が同一) なので
+        // threat_index 段階の excluded は 0。full-symdedup の active 間引きは列挙時の
+        // canonical-dead drop が担い、index 算出には現れない。他 profile は pair 除外あり。
+        if threat_exclusion::THREAT_PROFILE_ID == 0
+            || cfg!(feature = "threat-profile-full-symdedup")
+        {
             assert_eq!(excluded_count, 0);
         } else {
             assert!(
@@ -1708,6 +1771,7 @@ mod tests {
         feature = "threat-profile-same-class",
         feature = "threat-profile-same-class-major-pawn",
         feature = "threat-profile-step-attacker",
+        feature = "threat-profile-full-symdedup",
         feature = "threat-profile-cross-side",
     )))]
     fn test_canonical_startpos_threat_indices() {
@@ -1738,6 +1802,44 @@ mod tests {
 
         assert_eq!(indices_b, expected, "Black perspective canonical mismatch");
         assert_eq!(indices_w, expected, "White perspective canonical mismatch (symmetric pos)");
+    }
+
+    /// full-symdedup (profile 4) の startpos canonical。tatara
+    /// (`shogi-features` `ThreatIndexer::new(ThreatProfile::FullSymDedup)`) で生成した
+    /// 同 startpos の sorted index と一致することを固定し、tatara ↔ rshogi の index
+    /// layout 一致を機械的に保証する。full の 34 値から canonical-dead な対称 edge 2 個
+    /// (11047 / 122160) を落とした 32 値。
+    #[test]
+    #[cfg(feature = "threat-profile-full-symdedup")]
+    fn test_canonical_startpos_threat_indices_symdedup() {
+        let mut pos = Position::new();
+        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
+            .expect("Failed to parse startpos");
+
+        let king_sq_b = pos.king_square(Color::Black);
+        let mut indices_b = Vec::new();
+        append_active_threat_indices(&pos, Color::Black, king_sq_b, &mut indices_b);
+        indices_b.sort();
+
+        let king_sq_w = pos.king_square(Color::White);
+        let mut indices_w = Vec::new();
+        append_active_threat_indices(&pos, Color::White, king_sq_w, &mut indices_w);
+        indices_w.sort();
+
+        // tatara `ThreatProfile::FullSymDedup` で生成。両 repo 同時更新のこと。
+        #[rustfmt::skip]
+        let expected: &[usize] = &[
+            1330, 1618, 7147, 7148, 7231, 7232, 11213, 16475, 16578, 23268,
+            23270, 24087, 25717, 37487, 40080, 43974, 112573, 112861, 116503,
+            116504, 116587, 116588, 122650, 128533, 128636, 138321, 138323,
+            139136, 140770, 158280, 160871, 164753,
+        ];
+
+        assert_eq!(indices_b, expected, "Black perspective symdedup canonical mismatch");
+        assert_eq!(
+            indices_w, expected,
+            "White perspective symdedup canonical mismatch (symmetric pos)"
+        );
     }
 
     /// step-attacker (profile 3) の startpos canonical。tatara

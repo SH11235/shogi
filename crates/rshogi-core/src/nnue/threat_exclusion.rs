@@ -21,7 +21,13 @@
 //! | 1  | `threat-profile-same-class` | 同種ペア全除外 (9 クラス × 4 side = 36 pair) | 192,640 |
 //! | 2  | `threat-profile-same-class-major-pawn` | profile 1 + 大駒 attacker → Pawn attacked (4 大駒 × 4 side = 16 pair 追加) | 173,568 |
 //! | 3  | `threat-profile-step-attacker` | occupancy 依存 slider (香角飛馬竜) を attacker から除外 (`ac==1 \|\| ac>=5`)、単発利き駒 (歩桂銀金) のみ attacker | 33,408 |
+//! | 4  | `threat-profile-full-symdedup` | pair 除外なし。emit 時に canonical-dead な対称 edge を drop (dims は profile 0 と同一) | 216,720 |
 //! | 10 | `threat-profile-cross-side` | 同 side (`as==ds`) と同種 (`ac==dc`) を除外、敵味方跨ぎの異種 pair のみ残す | 96,320 |
+//!
+//! profile 4 (`full-symdedup`) は `is_excluded` を使わない特殊 profile。index 空間は
+//! profile 0 と同一で、逆向き edge が全局面で共 active な canonical-dead edge のみを
+//! 列挙時に間引く ([`super::threat_features`] の `is_canonical_dead`)。dims が profile 0
+//! と一致するため、net との一致は `THREAT_PROFILE_ID` (=4) の照合が担保する。
 //!
 //! # 設計: pair_base の sentinel
 //!
@@ -79,6 +85,7 @@ const _PROFILE_EXCLUSIVITY: () = {
     let count = cfg!(feature = "threat-profile-same-class") as usize
         + cfg!(feature = "threat-profile-same-class-major-pawn") as usize
         + cfg!(feature = "threat-profile-step-attacker") as usize
+        + cfg!(feature = "threat-profile-full-symdedup") as usize
         + cfg!(feature = "threat-profile-cross-side") as usize;
     assert!(count <= 1, "Multiple threat profiles selected. Choose at most one.");
 };
@@ -90,6 +97,8 @@ const _PROFILE_EXCLUSIVITY: () = {
 pub const THREAT_PROFILE_ID: u32 = {
     if cfg!(feature = "threat-profile-cross-side") {
         10
+    } else if cfg!(feature = "threat-profile-full-symdedup") {
+        4
     } else if cfg!(feature = "threat-profile-step-attacker") {
         3
     } else if cfg!(feature = "threat-profile-same-class-major-pawn") {
@@ -154,6 +163,7 @@ mod tests {
             feature = "threat-profile-same-class",
             feature = "threat-profile-same-class-major-pawn",
             feature = "threat-profile-step-attacker",
+            feature = "threat-profile-full-symdedup",
             feature = "threat-profile-cross-side",
         )))]
         assert_eq!(THREAT_PROFILE_ID, 0);
@@ -187,6 +197,19 @@ mod tests {
             assert!(!is_excluded(0, 0, 0, 0)); // Pawn attacker
             assert!(!is_excluded(0, 2, 0, 6)); // Knight attacker → Rook attacked
             assert!(!is_excluded(0, 4, 1, 8)); // GoldLike attacker → Dragon attacked
+        }
+    }
+
+    #[test]
+    fn test_block_full_symdedup() {
+        #[cfg(feature = "threat-profile-full-symdedup")]
+        {
+            assert_eq!(THREAT_PROFILE_ID, 4);
+            // pair 除外はしない (index 空間は profile 0 と同一)。active edge の間引きは
+            // threat_features 側の canonical-dead drop が担う。
+            assert!(!is_excluded(0, 0, 0, 0));
+            assert!(!is_excluded(0, 8, 1, 8));
+            assert!(!is_excluded(0, 6, 0, 3));
         }
     }
 
