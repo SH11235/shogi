@@ -32,6 +32,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `yardstick_label` | ラベル品質「物差し」ステージ 1。held-out hcpe を labeler（NNUE + 固定 depth）の決定的探索でラベル付けし採点用 jsonl（手番側視点 `wdl`/`eval_ref`/`eval_label` + class）を出す |
 | `yardstick_score` | ラベル品質「物差し」ステージ 2。`yardstick_label` 出力を engine ごとに勝率スケール較正し per-class の WDL logloss / 参照天井（符号一致）/ リファレンス一致（win-prob MAE・Spearman）を出す |
 | `book_rescore` | YANEURAOU-DB2016 テキスト定跡の候補手に USI 探索または ONNX 静的評価値を付与し、journal/resume と集計 report を出力（実行中は進捗/ETA を stderr 表示） |
+| `book_backprop` | YANEURAOU-DB2016 テキスト定跡 `.db` の候補手評価値を book 内の子局面から negamax 逆伝播し、SCC 循環と flip 合流に対応（[詳細](book_backprop.md)） |
 
 ## NNUE 学習
 
