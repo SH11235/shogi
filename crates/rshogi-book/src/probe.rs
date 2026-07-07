@@ -302,7 +302,7 @@ pub fn probe(
 
     // 6. 評価値フィルタ。
     {
-        let top_value = candidates[0].value;
+        let top_value = candidates.iter().map(|c| c.value).max().unwrap_or(0);
         let side_limit = if position.side_to_move() == Color::Black {
             options.eval_black_limit
         } else {
@@ -499,6 +499,56 @@ mod tests {
         let mut rng = SeqRng::new(vec![0, 0, 0]);
         let result = probe(&book, &pos(HIRATE), &opts, &mut rng, no_info).unwrap();
         assert_eq!(result.best_move.to_usi(), "7g7f");
+    }
+
+    #[test]
+    fn eval_diff_anchors_on_max_value_not_highest_count_move() {
+        // count 降順の筆頭手 value=-52 ではなく、候補中の最大 value=-41 を基準にする。
+        // eval_diff=30 なので正しい下限は -71、value=-81 の手は除去される。
+        let data = format!(
+            "{HEADER}\nsfen {HIRATE}\n7g7f 3c3d -52 16 100\n2g2f 8c8d -41 16 10\n6g6f 4c4d -81 16 1\n"
+        );
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            eval_diff: 30,
+            eval_black_limit: -30000,
+            consider_move_count: false,
+            ..Default::default()
+        };
+
+        let old_anchor_limit = (-52_i32 - opts.eval_diff).max(opts.eval_black_limit);
+        assert_eq!(old_anchor_limit, -82);
+        assert!(-81 >= old_anchor_limit);
+
+        let mut warnings = Vec::new();
+        let mut rng = SeqRng::new(vec![2]);
+        let result =
+            probe(&book, &pos(HIRATE), &opts, &mut rng, |m| warnings.push(m.to_string())).unwrap();
+
+        assert_ne!(result.best_move.to_usi(), "6g6f");
+        assert!(warnings.iter().any(|w| w == "BookEvalDiff = 30 : 3 moves to 2 moves."));
+    }
+
+    #[test]
+    fn eval_diff_keeps_count_only_zero_value_moves() {
+        let data = format!(
+            "{HEADER}\nsfen {HIRATE}\n7g7f 3c3d 0 16 30\n2g2f 8c8d 0 16 20\n6g6f 4c4d 0 16 10\n"
+        );
+        let book = Book::from_reader(data.as_bytes(), false).unwrap();
+        let opts = BookOptions {
+            eval_diff: 30,
+            eval_black_limit: -30000,
+            consider_move_count: false,
+            ..Default::default()
+        };
+
+        let mut warnings = Vec::new();
+        let mut rng = SeqRng::new(vec![2]);
+        let result =
+            probe(&book, &pos(HIRATE), &opts, &mut rng, |m| warnings.push(m.to_string())).unwrap();
+
+        assert_eq!(result.best_move.to_usi(), "6g6f");
+        assert!(!warnings.iter().any(|w| w.starts_with("BookEvalDiff = ")));
     }
 
     #[test]
