@@ -93,6 +93,17 @@ pub struct Position {
     pub(super) piece_list: PieceList,
 }
 
+/// 入玉宣言の点数計算に必要な局面メタデータ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnteringKingPointInfo {
+    /// CSA 27点法と同じ駒点。敵陣三段内の自駒と持ち駒を数え、玉は除外する。
+    pub points: u32,
+    /// 自玉が敵陣三段内にいるか。
+    pub king_in_enemy: bool,
+    /// 敵陣三段内にある自駒の枚数。玉は除外する。
+    pub enemy_zone_pieces: u32,
+}
+
 impl Position {
     /// 部分ハッシュを更新（XOR）
     #[inline]
@@ -1714,11 +1725,10 @@ impl Position {
 
         // --- 24/27 点法の宣言勝ち判定 ---
 
-        let ksq = self.king_square(us);
-        let ef = Self::enemy_field(us);
+        let info = self.entering_king_point_info(us);
 
         // (b) 宣言側の玉が敵陣三段目以内に入っている
-        if !ef.contains(ksq) {
+        if !info.king_in_enemy {
             return Move::NONE;
         }
 
@@ -1728,27 +1738,9 @@ impl Position {
         }
 
         // (d) 宣言側の敵陣三段目以内の駒は、玉を除いて10枚以上存在する
-        let our_in_enemy = self.pieces_c(us) & ef;
-        // our_in_enemy には玉も含まれるので 11枚以上必要
-        if our_in_enemy.count() < 11 {
+        if info.enemy_zone_pieces < 10 {
             return Move::NONE;
         }
-
-        // (c) 駒点計算
-        // 大駒（角・馬・飛・龍）= 5点、小駒 = 1点
-        let big_set = PieceTypeSet::bishop_horse() | PieceTypeSet::rook_dragon();
-        let big_in_enemy = (self.pieces_c_by_types(us, big_set) & ef).count();
-
-        // 小駒1点、大駒5点、玉除く
-        // = 敵陣の自駒数 + 敵陣の自駒の大駒×4 - 1(玉)
-        let h = self.hand(us);
-        let score = our_in_enemy.count() + big_in_enemy * 4 - 1
-            + h.count(PieceType::Pawn)
-            + h.count(PieceType::Lance)
-            + h.count(PieceType::Knight)
-            + h.count(PieceType::Silver)
-            + h.count(PieceType::Gold)
-            + (h.count(PieceType::Bishop) + h.count(PieceType::Rook)) * 5;
 
         // 必要点を計算（None / TryRule は上部で除外済み）
         let mut required = match rule {
@@ -1772,10 +1764,42 @@ impl Position {
             }
         }
 
-        if score >= required {
+        if info.points >= required {
             Move::WIN
         } else {
             Move::NONE
+        }
+    }
+
+    /// 入玉宣言で使う点数・自玉侵入・敵陣内駒数を返す。
+    ///
+    /// 点数は大駒（角・馬・飛・龍）を5点、それ以外の玉以外の駒を1点として数える。
+    /// 盤上は `color` から見た敵陣三段内の自駒だけを対象にし、持ち駒は全て対象にする。
+    pub fn entering_king_point_info(&self, color: Color) -> EnteringKingPointInfo {
+        let enemy_field = Self::enemy_field(color);
+        let king_in_enemy = enemy_field.contains(self.king_square(color));
+        let our_in_enemy = self.pieces_c(color) & enemy_field;
+        let enemy_zone_pieces = our_in_enemy
+            .iter()
+            .filter(|&sq| self.piece_on(sq).piece_type() != PieceType::King)
+            .count() as u32;
+
+        let big_set = PieceTypeSet::bishop_horse() | PieceTypeSet::rook_dragon();
+        let big_in_enemy = (self.pieces_c_by_types(color, big_set) & enemy_field).count();
+        let h = self.hand(color);
+        let points = enemy_zone_pieces
+            + big_in_enemy * 4
+            + h.count(PieceType::Pawn)
+            + h.count(PieceType::Lance)
+            + h.count(PieceType::Knight)
+            + h.count(PieceType::Silver)
+            + h.count(PieceType::Gold)
+            + (h.count(PieceType::Bishop) + h.count(PieceType::Rook)) * 5;
+
+        EnteringKingPointInfo {
+            points,
+            king_in_enemy,
+            enemy_zone_pieces,
         }
     }
 

@@ -29,8 +29,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::{Value as JsonValue, json};
 
 use rshogi_core::nnue::{
-    LayerStackBucketMode, SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, get_layer_stack_bucket_mode,
-    init_nnue, is_layer_stacks_loaded, parse_layer_stack_bucket_mode, set_fv_scale_override,
+    LayerStackBucketMode, get_layer_stack_bucket_mode, init_nnue, is_layer_stacks_loaded,
+    load_progress_coeff_kpabs, parse_layer_stack_bucket_mode, set_fv_scale_override,
     set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::Position;
@@ -413,7 +413,7 @@ fn configure_eval(cli: &Cli) -> Result<()> {
 
     let mut coeff_loaded = false;
     if let Some(path) = &cli.ls_progress_coeff {
-        let weights = load_progress_coeff_kpabs(path)?;
+        let weights = load_progress_coeff_kpabs(path).map_err(anyhow::Error::msg)?;
         set_layer_stack_progress_kpabs_weights(weights)
             .map_err(|e| anyhow::anyhow!("failed to set progress coeff weights: {e}"))?;
         coeff_loaded = true;
@@ -436,22 +436,6 @@ fn configure_eval(cli: &Cli) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// progress8kpabs 用の進行度係数ファイル（f64 配列）を読み f32 重みへ変換する。
-/// USI エンジンの `LS_PROGRESS_COEFF` ハンドラと同じ検証・変換を行う。
-fn load_progress_coeff_kpabs(path: &Path) -> Result<Box<[f32]>> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed to read --ls-progress-coeff {}", path.display()))?;
-    let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * std::mem::size_of::<f64>();
-    if bytes.len() != expected {
-        bail!("progress coeff size mismatch: got {} bytes, expected {}", bytes.len(), expected);
-    }
-    let weights: Vec<f32> = bytes
-        .chunks_exact(std::mem::size_of::<f64>())
-        .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("chunk size is checked")) as f32)
-        .collect();
-    Ok(weights.into_boxed_slice())
 }
 
 fn validate_paths(input: &Path, output: &Path) -> Result<()> {

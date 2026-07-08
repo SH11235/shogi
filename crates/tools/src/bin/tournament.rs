@@ -809,6 +809,7 @@ fn spawn_worker(
                 startpos: p.startpos,
                 sfen: p.sfen.clone(),
                 moves: p.moves.clone(),
+                source_line: p.source_line,
             })
             .collect(),
     };

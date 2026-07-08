@@ -12,7 +12,11 @@ use crossbeam_channel as chan;
 use rand::Rng;
 use rand::seq::SliceRandom;
 use rshogi_core::movegen::{MoveList, generate_legal, is_legal_with_pass};
-use rshogi_core::position::Position;
+use rshogi_core::nnue::{
+    compute_layer_stack_progress8kpabs_bucket_index, get_layer_stack_progress_kpabs_weights,
+    get_network, load_progress_coeff_kpabs, set_layer_stack_progress_kpabs_weights,
+};
+use rshogi_core::position::{EnteringKingPointInfo, Position};
 use rshogi_core::types::{Color, Move};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -267,6 +271,10 @@ struct Cli {
     #[arg(long)]
     eval_file: Option<PathBuf>,
 
+    /// progress8kpabs 用の進行度係数ファイル（NativeBackend の LayerStacks ネットで使用）
+    #[arg(long)]
+    progress_file: Option<PathBuf>,
+
     /// 置換表を対局間で保持する（TT をクリアしない）。
     /// tanuki- は毎対局クリアするため、デフォルト false。実験用。
     /// --keep-tt=true で有効化、--keep-tt=false で明示的に無効化。
@@ -376,6 +384,9 @@ struct MetaSettings {
     /// 開始局面シャッフルの乱数シード（--startpos-no-repeat 用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     shuffle_seed: Option<u64>,
+    /// NativeBackend の progress8kpabs 進行度係数ファイル
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    progress_file: Option<String>,
 }
 
 fn default_skip_in_check() -> bool {
@@ -417,9 +428,40 @@ struct ResultLog<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     game_id: u32,
+    start_pos_index: usize,
+    start_sfen: &'a str,
     outcome: &'a str,
     reason: &'a str,
     plies: u32,
+    final_points_black: u32,
+    final_points_white: u32,
+    king_in_enemy_black: bool,
+    king_in_enemy_white: bool,
+    enemy_zone_pieces_black: u32,
+    enemy_zone_pieces_white: u32,
+    diversions: &'a [DiversionLog],
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct DiversionLog {
+    ply: u32,
+    kind: &'static str,
+    chosen_move: String,
+    best_move: Option<String>,
+    score_gap_cp: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FinalEnteringKingMeta {
+    black: EnteringKingPointInfo,
+    white: EnteringKingPointInfo,
+}
+
+fn final_entering_king_meta(pos: &Position) -> FinalEnteringKingMeta {
+    FinalEnteringKingMeta {
+        black: pos.entering_king_point_info(Color::Black),
+        white: pos.entering_king_point_info(Color::White),
+    }
 }
 
 #[derive(Serialize)]
@@ -1041,6 +1083,12 @@ fn multipv_to_policy(candidates: &[MultiPvCandidate], total: u16, temp: f64) -> 
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedMultiPvMove {
+    mv: Move,
+    score_gap_cp: i32,
+}
+
 /// MultiPV 候補からランダムに1手を選択する
 ///
 /// PV1 のスコアとの差が `diff_threshold` 以内の候補からランダムに選択する。
@@ -1049,7 +1097,7 @@ fn select_multipv_random(
     candidates: &[tools::selfplay::MultiPvCandidate],
     diff_threshold: i32,
     rng: &mut impl Rng,
-) -> Option<Move> {
+) -> Option<SelectedMultiPvMove> {
     if candidates.is_empty() {
         return None;
     }
@@ -1061,7 +1109,10 @@ fn select_multipv_random(
         .collect();
     debug_assert!(!eligible.is_empty(), "eligible must contain at least PV1 (diff_threshold >= 0)");
     let selected = eligible[rng.random_range(0..eligible.len())];
-    Some(selected.first_move)
+    Some(SelectedMultiPvMove {
+        mv: selected.first_move,
+        score_gap_cp: best_score - selected.score_cp,
+    })
 }
 
 /// 指定範囲から N 個の手数をサンプリングする（重複なし）
@@ -1221,6 +1272,7 @@ struct WorkerConfig {
     /// --for-train 時のみ有効（棋力評価用途では使用しない）。
     usi_single: bool,
     eval_hash_size_mb: usize,
+    layer_stack_num_buckets: Option<usize>,
     // gensfen: 重複回避
     keep_tt: bool,
     dedup_hash: Option<Arc<SharedDedupHash>>,
@@ -1338,6 +1390,12 @@ fn worker_main(
         let mut interval_games = 0u32;
         let mut interval_dedup_hits = 0u64;
         let mut interval_positions_checked = 0u64;
+        let progress_weights =
+            cfg.layer_stack_num_buckets.map(|_| get_layer_stack_progress_kpabs_weights());
+        let mut progress_bucket_counts = cfg
+            .layer_stack_num_buckets
+            .map(|num_buckets| vec![0u64; num_buckets])
+            .unwrap_or_default();
 
         // Game loop
         while let Ok(Some(ticket)) = rx.recv() {
@@ -1350,12 +1408,15 @@ fn worker_main(
 
             let parsed = &cfg.start_defs[ticket.startpos_idx];
             let mut pos = build_position(parsed, None, None)?;
+            let start_sfen = pos.to_sfen();
+            let start_pos_index = parsed.source_line.unwrap_or(ticket.startpos_idx + 1);
             let mut tc = TimeControl::new(cfg.btime, cfg.wtime, cfg.binc, cfg.winc, cfg.byoyomi);
             let mut outcome = GameOutcome::InProgress;
             let mut outcome_reason = "max_moves";
             let mut plies_played = 0u32;
             let mut move_list: Vec<String> = Vec::new();
             let mut eval_list: Vec<String> = Vec::new();
+            let mut diversions: Vec<DiversionLog> = Vec::new();
             let mut metrics = MetricsCollector::default();
 
             if let Some(ref mut collector) = training_data_collector {
@@ -1382,6 +1443,17 @@ fn worker_main(
                 } else {
                     "white"
                 };
+                if let (Some(weights), Some(num_buckets)) =
+                    (progress_weights, cfg.layer_stack_num_buckets)
+                {
+                    let bucket = compute_layer_stack_progress8kpabs_bucket_index(
+                        &pos,
+                        side,
+                        weights,
+                        num_buckets,
+                    );
+                    progress_bucket_counts[bucket] += 1;
+                }
                 let sfen_before = pos.to_sfen();
 
                 // --- gensfen: ランダムムーブ ---
@@ -1398,6 +1470,14 @@ fn worker_main(
                         break;
                     }
                     let mv = legal_moves[rng.random_range(0..legal_moves.len())];
+                    let rm_usi = mv.to_usi();
+                    diversions.push(DiversionLog {
+                        ply: plies_played,
+                        kind: "random",
+                        chosen_move: rm_usi.clone(),
+                        best_move: None,
+                        score_gap_cp: None,
+                    });
                     // ランダムムーブ前のエントリをクリア（tanuki- 方式）
                     if let Some(ref mut collector) = training_data_collector {
                         collector.start_game();
@@ -1409,7 +1489,6 @@ fn worker_main(
                         pos.gives_check(mv)
                     };
                     pos.do_move(mv, gives_check);
-                    let rm_usi = mv.to_usi();
                     if eval_writer.is_some() {
                         eval_list.push("R".to_string());
                         move_list.push(rm_usi.clone());
@@ -1529,10 +1608,17 @@ fn worker_main(
                                             cfg.random_multi_pv_diff,
                                             &mut rng,
                                         ) {
-                                            if selected != mv {
+                                            if selected.mv != mv {
                                                 multipv_diversions += 1;
+                                                diversions.push(DiversionLog {
+                                                    ply: plies_played,
+                                                    kind: "multipv",
+                                                    chosen_move: selected.mv.to_usi(),
+                                                    best_move: Some(mv.to_usi()),
+                                                    score_gap_cp: Some(selected.score_gap_cp),
+                                                });
                                             }
-                                            selected
+                                            selected.mv
                                         } else {
                                             mv
                                         }
@@ -1616,12 +1702,22 @@ fn worker_main(
                 outcome = GameOutcome::Draw;
                 outcome_reason = "max_moves";
             }
+            let final_meta = final_entering_king_meta(&pos);
             let result = ResultLog {
                 kind: "result",
                 game_id: game_idx + 1,
+                start_pos_index,
+                start_sfen: &start_sfen,
                 outcome: outcome.label(),
                 reason: outcome_reason,
                 plies: plies_played,
+                final_points_black: final_meta.black.points,
+                final_points_white: final_meta.white.points,
+                king_in_enemy_black: final_meta.black.king_in_enemy,
+                king_in_enemy_white: final_meta.white.king_in_enemy,
+                enemy_zone_pieces_black: final_meta.black.enemy_zone_pieces,
+                enemy_zone_pieces_white: final_meta.white.enemy_zone_pieces,
+                diversions: &diversions,
             };
             serde_json::to_writer(&mut writer, &result)?;
             writer.write_all(b"\n")?;
@@ -1728,6 +1824,13 @@ fn worker_main(
                 cfg.worker_id, dedup_hits, dedup_discarded, multipv_diversions, random_moves_played
             );
         }
+        if let Some(num_buckets) = cfg.layer_stack_num_buckets {
+            let used = progress_bucket_counts.iter().filter(|&&count| count > 0).count();
+            eprintln!(
+                "worker {}: progress bucket distribution: {:?} (used {}/{})",
+                cfg.worker_id, progress_bucket_counts, used, num_buckets
+            );
+        }
 
         let training_stats = if let Some(ref mut collector) = training_data_collector {
             collector.flush()?;
@@ -1764,6 +1867,8 @@ struct ResumeState {
     draws: u32,
     /// meta 行に保存された shuffle_seed（存在しない場合は None）
     shuffle_seed: Option<u64>,
+    /// meta 行に保存された progress_file（存在しない場合は None）
+    progress_file: Option<String>,
 }
 
 /// 既存の JSONL 出力ファイルを解析し、完了済み対局数と勝敗を取得する。
@@ -1779,6 +1884,7 @@ fn parse_resume_state(path: &Path) -> Result<ResumeState> {
     let mut white_wins: u32 = 0;
     let mut draws: u32 = 0;
     let mut shuffle_seed: Option<u64> = None;
+    let mut progress_file: Option<String> = None;
     let mut last_parse_error = false;
 
     for line in reader.lines() {
@@ -1800,11 +1906,14 @@ fn parse_resume_state(path: &Path) -> Result<ResumeState> {
         };
         match value.get("type").and_then(|v| v.as_str()) {
             Some("meta") => {
-                // meta 行から shuffle_seed を復元
-                shuffle_seed = value
-                    .get("settings")
-                    .and_then(|s| s.get("shuffle_seed"))
-                    .and_then(|v| v.as_u64());
+                // meta 行から resume に必要な設定を復元
+                if let Some(settings) = value.get("settings") {
+                    shuffle_seed = settings.get("shuffle_seed").and_then(|v| v.as_u64());
+                    progress_file = settings
+                        .get("progress_file")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                }
             }
             Some("result") => {
                 if let Some(gid) = value.get("game_id").and_then(|v| v.as_u64()) {
@@ -1830,7 +1939,24 @@ fn parse_resume_state(path: &Path) -> Result<ResumeState> {
         white_wins,
         draws,
         shuffle_seed,
+        progress_file,
     })
+}
+
+fn validate_resume_progress_file(
+    meta_progress_file: Option<&str>,
+    cli_progress_file: Option<&Path>,
+) -> Result<()> {
+    let cli_progress_file = cli_progress_file.map(|p| p.display().to_string());
+    if meta_progress_file != cli_progress_file.as_deref() {
+        bail!(
+            "--resume: --progress-file does not match meta settings.progress_file \
+             (meta={}, cli={})",
+            meta_progress_file.unwrap_or("<none>"),
+            cli_progress_file.as_deref().unwrap_or("<none>"),
+        );
+    }
+    Ok(())
 }
 
 /// Concatenate worker temp files.
@@ -1929,6 +2055,10 @@ fn main() -> Result<()> {
             bail!("--resume: 出力ファイルが見つかりません: {}", output_path.display());
         }
         let state = parse_resume_state(&output_path)?;
+        validate_resume_progress_file(
+            state.progress_file.as_deref(),
+            cli.progress_file.as_deref(),
+        )?;
         if state.completed_games >= cli.games {
             println!(
                 "全{}局が完了済みです（black {} / white {} / draw {}）。再開は不要です。",
@@ -2018,6 +2148,12 @@ fn main() -> Result<()> {
     let white_usi_opts = cli.usi_options_white.clone().unwrap_or_else(|| common_usi_opts.clone());
 
     let native_mode = cli.native.unwrap_or(true);
+    if !native_mode && cli.progress_file.is_some() {
+        bail!(
+            "--progress-file is only supported with --native=true. \
+             In USI mode, pass the engine option directly with --usi-option LS_PROGRESS_COEFF=<path>."
+        );
+    }
 
     // USI モードかつ先後同一エンジンなら 1 プロセスで兼用する最適化。
     // TT/履歴が先後で共有されるため棋力評価対局（tournament）では不可だが、
@@ -2129,6 +2265,7 @@ fn main() -> Result<()> {
                 skip_initial_ply: cli.skip_initial_ply,
                 skip_in_check: cli.skip_in_check,
                 shuffle_seed: shuffle_seed_resolved,
+                progress_file: cli.progress_file.as_ref().map(|p| p.display().to_string()),
             },
             engine_cmd: EngineCommandMeta {
                 path_black: engine_paths.black.path.display().to_string(),
@@ -2169,11 +2306,31 @@ fn main() -> Result<()> {
     let dedup_warn_emitted = Arc::new(AtomicBool::new(false));
 
     // NativeBackend 使用時に NNUE 評価関数の初期化
+    let mut native_layer_stack_buckets = None;
     if native_mode {
         let eval_file =
             cli.eval_file.as_ref().ok_or_else(|| anyhow!("--native requires --eval-file"))?;
         rshogi_core::nnue::init_nnue(eval_file).map_err(|e| anyhow!("NNUE init failed: {e}"))?;
         eprintln!("NativeBackend: NNUE loaded from {}", eval_file.display());
+        let layer_stack_buckets =
+            get_network().as_deref().and_then(|network| network.layer_stack_num_buckets());
+        native_layer_stack_buckets = layer_stack_buckets;
+        if native_progress_file_required(layer_stack_buckets) && cli.progress_file.is_none() {
+            bail!(
+                "--native LayerStacks NNUE with num_buckets={} requires --progress-file",
+                layer_stack_buckets.unwrap_or_default()
+            );
+        }
+        if let Some(path) = &cli.progress_file {
+            let weights = load_progress_coeff_kpabs(path)
+                .map_err(|e| anyhow!("failed to load --progress-file {}: {e}", path.display()))?;
+            set_layer_stack_progress_kpabs_weights(weights)
+                .map_err(|e| anyhow!("failed to set --progress-file weights: {e}"))?;
+            eprintln!("NativeBackend: progress file loaded from {}", path.display());
+        }
+        if let Some(num_buckets) = native_layer_stack_buckets {
+            eprintln!("NativeBackend: LayerStacks num_buckets={num_buckets}");
+        }
     }
 
     // ゲームチケットは逐次生成する。
@@ -2295,6 +2452,7 @@ fn main() -> Result<()> {
             native_mode,
             usi_single,
             eval_hash_size_mb: DEFAULT_EVAL_HASH_SIZE_MB,
+            layer_stack_num_buckets: native_layer_stack_buckets,
             keep_tt: keep_tt_resolved,
             dedup_hash: shared_dedup_hash.clone(),
             random_multi_pv: random_multi_pv_resolved,
@@ -2567,6 +2725,10 @@ fn default_training_data_path(jsonl: &Path, ext: &str) -> PathBuf {
     parent.join(format!("{stem}.{ext}"))
 }
 
+fn native_progress_file_required(layer_stack_num_buckets: Option<usize>) -> bool {
+    layer_stack_num_buckets.is_some_and(|n| n > 1)
+}
+
 fn resolve_engine_paths(cli: &Cli) -> ResolvedEnginePaths {
     let shared = resolve_engine_path(cli);
     let black = cli
@@ -2722,6 +2884,35 @@ mod tests {
     }
 
     #[test]
+    fn final_entering_king_meta_startpos_has_no_points() {
+        let mut pos = Position::new();
+        pos.set_hirate();
+        let meta = final_entering_king_meta(&pos);
+
+        assert_eq!(meta.black.points, 0);
+        assert_eq!(meta.white.points, 0);
+        assert!(!meta.black.king_in_enemy);
+        assert!(!meta.white.king_in_enemy);
+        assert_eq!(meta.black.enemy_zone_pieces, 0);
+        assert_eq!(meta.white.enemy_zone_pieces, 0);
+    }
+
+    #[test]
+    fn final_entering_king_meta_counts_enemy_zone_and_hand() {
+        let mut pos = Position::new();
+        pos.set_sfen("KGG6/SS7/PPPPPP3/9/9/9/2pppppp1/1ss1gg1nl/4k2nl b 2R2B3p 1")
+            .expect("sfen");
+        let meta = final_entering_king_meta(&pos);
+
+        assert_eq!(meta.black.points, 30);
+        assert!(meta.black.king_in_enemy);
+        assert_eq!(meta.black.enemy_zone_pieces, 10);
+        assert_eq!(meta.white.points, 17);
+        assert!(meta.white.king_in_enemy);
+        assert_eq!(meta.white.enemy_zone_pieces, 14);
+    }
+
+    #[test]
     fn shared_dedup_hash_detects_duplicates() {
         let dh = SharedDedupHash::new(1024);
         // 初回挿入は false
@@ -2806,7 +2997,6 @@ mod tests {
     #[test]
     fn select_multipv_random_filters_by_threshold() {
         use rshogi_core::types::Move;
-        use tools::selfplay::MultiPvCandidate;
 
         let mv1 = Move::from_usi("7g7f").unwrap();
         let mv2 = Move::from_usi("2g2f").unwrap();
@@ -2838,7 +3028,7 @@ mod tests {
         for _ in 0..20 {
             let selected = select_multipv_random(&candidates, 50, &mut rng);
             assert!(selected.is_some());
-            let mv = selected.unwrap();
+            let mv = selected.unwrap().mv;
             assert!(mv == mv1 || mv == mv2);
         }
     }
@@ -2847,6 +3037,114 @@ mod tests {
     fn select_multipv_random_returns_none_for_empty() {
         let mut rng = StdRng::seed_from_u64(42);
         assert!(select_multipv_random(&[], 100, &mut rng).is_none());
+    }
+
+    #[test]
+    fn select_multipv_random_reports_score_gap() {
+        let candidates = vec![
+            legal_candidate(1, 100, "7g7f"),
+            legal_candidate(2, 75, "2g2f"),
+        ];
+        let mut rng = StdRng::seed_from_u64(0);
+        let mut saw_gap = false;
+        for _ in 0..64 {
+            let selected = select_multipv_random(&candidates, 100, &mut rng).unwrap();
+            if selected.mv == candidates[1].first_move {
+                assert_eq!(selected.score_gap_cp, 25);
+                saw_gap = true;
+                break;
+            }
+        }
+        assert!(saw_gap);
+    }
+
+    #[test]
+    fn native_progress_file_required_only_for_multi_bucket_layerstacks() {
+        assert!(!native_progress_file_required(None));
+        assert!(!native_progress_file_required(Some(1)));
+        assert!(native_progress_file_required(Some(2)));
+        assert!(native_progress_file_required(Some(9)));
+    }
+
+    #[test]
+    fn validate_resume_progress_file_requires_exact_match() {
+        assert!(validate_resume_progress_file(None, None).is_ok());
+        assert!(
+            validate_resume_progress_file(
+                Some("/tmp/progress.bin"),
+                Some(Path::new("/tmp/progress.bin"))
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_resume_progress_file(
+                Some("/tmp/progress.bin"),
+                Some(Path::new("/tmp/./progress.bin"))
+            )
+            .is_err()
+        );
+        assert!(validate_resume_progress_file(Some("/tmp/progress.bin"), None).is_err());
+        assert!(validate_resume_progress_file(None, Some(Path::new("/tmp/progress.bin"))).is_err());
+    }
+
+    #[test]
+    fn parse_resume_state_restores_progress_file_from_meta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gensfen.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"meta","settings":{"shuffle_seed":7,"progress_file":"/tmp/progress.bin"}}"#,
+                "\n",
+                r#"{"type":"result","game_id":3,"outcome":"black_win"}"#,
+                "\n"
+            ),
+        )
+        .expect("write resume jsonl");
+
+        let state = parse_resume_state(&path).expect("parse resume state");
+        assert_eq!(state.completed_games, 3);
+        assert_eq!(state.shuffle_seed, Some(7));
+        assert_eq!(state.progress_file.as_deref(), Some("/tmp/progress.bin"));
+    }
+
+    #[test]
+    fn result_log_serializes_empty_diversions() {
+        let result = ResultLog {
+            kind: "result",
+            game_id: 1,
+            start_pos_index: 1,
+            start_sfen: "lnsgkgsnl/1r5b1/p1ppppppp/9/1p7/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL b - 1",
+            outcome: "draw",
+            reason: "max_moves",
+            plies: 1,
+            final_points_black: 0,
+            final_points_white: 0,
+            king_in_enemy_black: false,
+            king_in_enemy_white: false,
+            enemy_zone_pieces_black: 0,
+            enemy_zone_pieces_white: 0,
+            diversions: &[],
+        };
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["diversions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn diversion_log_serializes_score_gap() {
+        let diversion = DiversionLog {
+            ply: 7,
+            kind: "multipv",
+            chosen_move: "2g2f".to_string(),
+            best_move: Some("7g7f".to_string()),
+            score_gap_cp: Some(25),
+        };
+        let value = serde_json::to_value(diversion).unwrap();
+        assert_eq!(value["ply"], 7);
+        assert_eq!(value["kind"], "multipv");
+        assert_eq!(value["chosen_move"], "2g2f");
+        assert_eq!(value["best_move"], "7g7f");
+        assert_eq!(value["score_gap_cp"], 25);
     }
 
     #[test]

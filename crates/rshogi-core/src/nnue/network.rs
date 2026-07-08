@@ -45,6 +45,7 @@ use crate::types::{Color, PieceType, Value};
 use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
@@ -140,6 +141,30 @@ impl LayerStackBucketMode {
 
 /// progress8kpabs で使用する重み数（81 king squares x FE_OLD_END BonaPiece）
 pub const SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS: usize = 81 * FE_OLD_END;
+
+/// progress8kpabs 用の進行度係数ファイルを読み込む。
+///
+/// ファイルは `f64` little-endian の生配列として読み、評価器で使う `f32` 重みへ変換する。
+/// サイズは [`SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS`] 個ぶんの `f64` と厳密一致する必要がある。
+pub fn load_progress_coeff_kpabs(path: impl AsRef<Path>) -> Result<Box<[f32]>, String> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("failed to read progress coeff '{}': {e}", path.display()))?;
+    let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * size_of::<f64>();
+    if bytes.len() != expected {
+        return Err(format!(
+            "progress coeff size mismatch: got {} bytes, expected {}",
+            bytes.len(),
+            expected
+        ));
+    }
+
+    let weights: Vec<f32> = bytes
+        .chunks_exact(size_of::<f64>())
+        .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("chunk size is checked")) as f32)
+        .collect();
+    Ok(weights.into_boxed_slice())
+}
 
 /// `sigmoid(x) * N = k` となる x の閾値 (k = 1..N-1) を N ごとに保持するテーブル。
 ///
@@ -546,6 +571,23 @@ impl NNUENetwork {
         #[cfg(not(feature = "layerstack-arch"))]
         {
             false
+        }
+    }
+
+    /// LayerStacks ネットの bucket 数を返す。
+    ///
+    /// LayerStacks 以外、または LayerStacks feature 無効ビルドでは `None` を返す。
+    pub fn layer_stack_num_buckets(&self) -> Option<usize> {
+        #[cfg(feature = "layerstack-arch")]
+        {
+            match self {
+                Self::LayerStacks(network) => Some(network.num_buckets()),
+                _ => None,
+            }
+        }
+        #[cfg(not(feature = "layerstack-arch"))]
+        {
+            None
         }
     }
 
