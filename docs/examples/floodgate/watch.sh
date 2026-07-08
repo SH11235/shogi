@@ -5,6 +5,7 @@
 #   watch.sh                     → 当日の全対局
 #   watch.sh 名前[,名前...]      → 指定 AI の対局のみ (対局者名の部分一致)
 # ミラー dir は既定 ~/floodgate-mirror/<対象>/ に残る (後から見返せる)。
+# 既定は MONITOR2 push 観戦。従来ポーリングへ戻す場合は FLOODGATE_WATCH_PUSH=0。
 set -euo pipefail
 REPO="${RSHOGI_REPO:-$HOME/development/rshogi}"
 PIPELINE="${FLOODGATE_PIPELINE:-$REPO/target/release/floodgate_pipeline}"
@@ -33,6 +34,10 @@ else
   mirror_args=()
 fi
 mkdir -p "$dir"
+
+if [ "${FLOODGATE_WATCH_PUSH:-1}" != "0" ]; then
+  mirror_args+=(--push)
+fi
 
 # レート表キャッシュがあれば併記 (floodgate 運用機で stats.sh を回していれば存在する)
 player_args=()

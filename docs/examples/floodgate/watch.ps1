@@ -5,6 +5,7 @@
 #   .\watch.ps1 名前[,名前...]  → 指定 AI の対局のみ (対局者名の部分一致)
 # ミラー dir は既定 ~\floodgate-mirror\<対象>\ に残る (後から見返せる)。
 # 複数指定は `名前,名前` のままでよい (PowerShell がカンマ区切りを配列として渡す)。
+# 既定は MONITOR2 push 観戦。従来ポーリングへ戻す場合は FLOODGATE_WATCH_PUSH=0。
 param([string[]]$Watch = @())
 
 $ErrorActionPreference = "Stop"
@@ -33,6 +34,7 @@ if ($watchJoined) {
     $dir = Join-Path $base "all"
     $mirrorArgs = @("live-mirror", "--out-dir", $dir)
 }
+if ($env:FLOODGATE_WATCH_PUSH -ne "0") { $mirrorArgs += "--push" }
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
 # レート表キャッシュがあれば併記 (floodgate 運用機で stats.sh を回していれば存在する)
