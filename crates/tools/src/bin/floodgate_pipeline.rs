@@ -824,7 +824,11 @@ fn classify_monitor2_payload(payload: &str) -> Monitor2Payload {
     if payload.starts_with('%') {
         return Monitor2Payload::SpecialMove;
     }
-    if is_csa_move(payload) {
+    // wdoor は着手と消費時間を別行 (`+7776FU` / `T22`) で流すが、CSA 一般には
+    // `+7776FU,T0` の 1 行形式もある (本リポジトリの CSA サーバー broadcast がこの形式)。
+    // どちらでも着手と判定できるよう、先頭カンマ以降は無視する。
+    let head = payload.split(',').next().unwrap_or(payload);
+    if is_csa_move(head) {
         return Monitor2Payload::Move;
     }
     Monitor2Payload::Other
@@ -1285,8 +1289,16 @@ mod tests {
         let drop = parse_monitor2_line(&format!("##[MONITOR2][{game_id}] -0055KA")).unwrap();
         assert_eq!(drop.kind, Monitor2Payload::Move);
 
+        // 消費時間サフィックス付きの 1 行形式 (`+7776FU,T0`) も着手として扱う。
+        let timed = parse_monitor2_line(&format!("##[MONITOR2][{game_id}] +7776FU,T0")).unwrap();
+        assert_eq!(timed.kind, Monitor2Payload::Move);
+
         let special = parse_monitor2_line(&format!("##[MONITOR2][{game_id}] %TORYO")).unwrap();
         assert_eq!(special.kind, Monitor2Payload::SpecialMove);
+
+        let timed_special =
+            parse_monitor2_line(&format!("##[MONITOR2][{game_id}] %TORYO,T5")).unwrap();
+        assert_eq!(timed_special.kind, Monitor2Payload::SpecialMove);
     }
 
     #[test]
