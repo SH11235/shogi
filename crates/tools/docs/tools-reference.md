@@ -14,6 +14,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `jsonl_to_kif` | tournament 等の JSONL 対局ログから KIF 棋譜を生成（id/skip/limit でフィルタ可） |
 | `kifu_player` | PSV / tournament JSONL / CSA を同じ TUI で再生・閲覧（評価値グラフ・検索/絞り込み（SFEN 局面検索含む）・`--live` 追記監視 (live-mirror と組で wdoor 観戦、csa_client の `live_jsonl` と組で自局の手単位リアルタイム観戦)・`--ratings` レート併記付き。[詳細](kifu_player.md)） |
 | `book_from_csa` | CSA 棋譜群から YANEURAOU-DB2016 テキスト定跡 `.db` を生成。消費時間による定跡手判定（手番側ごとの即指しプレフィックス）・レート/勝敗/手数フィルタ・最小 ply 集約・ponder 集計。決定的（[詳細](book_from_csa.md)） |
+| `book_kachi_label` | YANEURAOU-DB2016 テキスト定跡のノード×候補手ごとに CSA corpus から `%KACHI` 決着率を集計し、sidecar JSONL と report を出力（flip 合流対応、[詳細](book_kachi_label.md)） |
 
 ## ベンチマーク・評価
 
