@@ -111,6 +111,7 @@ edition-layerstacks-halfka_hm_merged-768x8x32-none          = ["rshogi-core/edit
 edition-layerstacks-halfka_hm_merged-512x16x32-none         = ["rshogi-core/edition-layerstacks-halfka_hm_merged-512x16x32-none"]
 edition-layerstacks-halfka_hm_merged_effect_bucket-512x16x32-2x2_kingfixed       = ["rshogi-core/edition-layerstacks-halfka_hm_merged_effect_bucket-512x16x32-2x2_kingfixed"]
 edition-layerstacks-halfka_hm_merged_effect_bucket-1024x16x32-2x2_kingfixed      = ["rshogi-core/edition-layerstacks-halfka_hm_merged_effect_bucket-1024x16x32-2x2_kingfixed"]
+edition-layerstacks-halfka_hm_merged_effect_bucket-1024x16x32-3x3_kingfixed      = ["rshogi-core/edition-layerstacks-halfka_hm_merged_effect_bucket-1024x16x32-3x3_kingfixed"]
 edition-layerstacks-halfka_hm_merged-3072x16x32-none        = ["rshogi-core/edition-layerstacks-halfka_hm_merged-3072x16x32-none"]
 # LS specific preset (halfka_hm_merged 以外の 4 FT、1536x16x32-none で代表整備)。
 edition-layerstacks-halfka_hm_split-1536x16x32-none = ["rshogi-core/edition-layerstacks-halfka_hm_split-1536x16x32-none"]

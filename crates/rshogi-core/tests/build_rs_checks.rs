@@ -315,6 +315,19 @@ fn halfka_effect_bucket_specific_ok() {
 }
 
 #[test]
+fn halfka_effect_bucket_1024_3x3_kingfixed_specific_ok() {
+    let has = lookup(&[
+        "mode-specific",
+        "layerstack-arch",
+        "layerstacks-1024x16x32",
+        "ft-halfka_hm_merged",
+        "nnue-effect-bucket",
+        "effect-bucket-3x3-kingfixed",
+    ]);
+    assert!(validate_feature_combination(&has).is_ok());
+}
+
+#[test]
 fn halfka_effect_bucket_without_mode_rejected() {
     let has = lookup(&[
         "layerstack-arch",
