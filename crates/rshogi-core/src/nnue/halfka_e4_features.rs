@@ -239,6 +239,23 @@ fn decode_board_color_fb(bp: BonaPiece) -> Option<Color> {
     None
 }
 
+/// SFEN 局面の E4 active index を sorted で返す (cross-repo golden 用)。
+/// board_effects を再計算してから full recompute 列挙する。
+pub fn e4_active_indices_for_sfen(
+    sfen: &str,
+    config: E4Config,
+    perspective: Color,
+) -> Result<Vec<usize>, crate::position::SfenError> {
+    let mut pos = Position::new();
+    pos.set_sfen(sfen)?;
+    pos.recompute_board_effects();
+    let mut list = IndexList::<MAX_ACTIVE_FEATURES>::new();
+    append_active_e4(&pos, config, perspective, &mut list);
+    let mut v: Vec<usize> = list.iter().collect();
+    v.sort_unstable();
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
