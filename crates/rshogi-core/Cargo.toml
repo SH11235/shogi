@@ -268,6 +268,10 @@ edition-layerstacks-halfka_e4-512x16x32-2x2_kingfixed = [
   "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-512x16x32",
   "nnue-halfka_e4", "e4-config-2x2-kingfixed",
 ]
+edition-layerstacks-halfka_e4-1024x16x32-2x2_kingfixed = [
+  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1024x16x32",
+  "nnue-halfka_e4", "e4-config-2x2-kingfixed",
+]
 # LayerStack specific (3072x16x32、none のみ)。FT_OUT=3072 の大型 FT。
 # L0=3072 も progress-diff の NPS 改善を実測で確認済みのため 1536 系と同様に同梱する。
 edition-layerstacks-halfka_hm_merged-3072x16x32-none = [
