@@ -2016,6 +2016,9 @@ fn peek_layer_stacks_feature_set<R: Read + Seek>(
 #[cfg(feature = "layerstack-arch")]
 fn detect_layer_stacks_feature_set(arch_str: &str) -> super::spec::FeatureSet {
     use super::spec::FeatureSet as Fs;
+    if arch_str.contains("EffectBucket=") {
+        return Fs::HalfKaHmMergedEffectBucket;
+    }
     if let Some(name) = super::spec::parse_feature_set_keyword(arch_str) {
         match name {
             "HalfKP" => return Fs::HalfKP,
@@ -2026,9 +2029,6 @@ fn detect_layer_stacks_feature_set(arch_str: &str) -> super::spec::FeatureSet {
             "HalfKaHmMerged" => return Fs::HalfKaHmMerged,
             _ => {}
         }
-    }
-    if arch_str.contains("EffectBucket=") {
-        return Fs::HalfKaHmMergedEffectBucket;
     }
     super::spec::parse_feature_set_from_arch(arch_str).unwrap_or(Fs::LayerStacks)
 }
@@ -2315,6 +2315,10 @@ mod tests {
             (
                 "Features=HalfKaHmMerged(Friend)[73305->1536x2],PSQT=9,Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
                 Fs::HalfKaHmMerged,
+            ),
+            (
+                "Features=HalfKaHmMerged(Friend)[73305->1536x2],EffectBucket=2x2fixed,Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
+                Fs::HalfKaHmMergedEffectBucket,
             ),
         ];
 

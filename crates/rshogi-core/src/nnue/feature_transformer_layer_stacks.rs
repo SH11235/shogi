@@ -729,8 +729,6 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         prev_acc: &AccumulatorLayerStacks<L1>,
     ) {
         if cfg!(feature = "nnue-effect-bucket") {
-            let _ = dirty_piece;
-            let _ = prev_acc;
             self.refresh_accumulator(pos, acc);
             return;
         }
@@ -877,9 +875,6 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
         if cfg!(feature = "nnue-effect-bucket") {
-            let _ = dirty_piece;
-            let _ = prev_acc;
-            let _ = cache;
             self.refresh_accumulator(pos, acc);
             return;
         }
@@ -1172,9 +1167,6 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         source_idx: usize,
     ) -> bool {
         if cfg!(feature = "nnue-effect-bucket") {
-            let _ = pos;
-            let _ = stack;
-            let _ = source_idx;
             return false;
         }
 
@@ -1452,10 +1444,6 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         king_sq: crate::types::Square,
     ) -> bool {
         if cfg!(feature = "nnue-effect-bucket") {
-            let _ = accumulation;
-            let _ = dirty_piece;
-            let _ = perspective;
-            let _ = king_sq;
             return false;
         }
 
@@ -1995,7 +1983,8 @@ mod tests {
         }
     }
 
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // feature transformer の寸法 test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_feature_transformer_dimensions() {
@@ -2004,7 +1993,8 @@ mod tests {
         assert_eq!(TestSpec::DIMENSIONS, 73305);
     }
 
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // fast-diff test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_single_move() {
@@ -2044,7 +2034,8 @@ mod tests {
         assert_eq!(generic.0, fast.0);
     }
 
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // fast-diff test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_capture() {
@@ -2105,7 +2096,8 @@ mod tests {
         assert_eq!(generic.0, fast.0);
     }
 
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // refresh smoke test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_single_move_white() {
@@ -2146,7 +2138,8 @@ mod tests {
         assert_eq!(generic.0, fast.0);
     }
 
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // refresh smoke test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_capture_white() {
@@ -2376,28 +2369,32 @@ mod tests {
         smoke_refresh_for_spec::<HalfKaHmMergedSpec>();
     }
 
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // refresh smoke test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn smoke_refresh_halfka_hm_split() {
         smoke_refresh_for_spec::<HalfKaHmSplitSpec>();
     }
 
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // refresh smoke test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn smoke_refresh_halfka_merged() {
         smoke_refresh_for_spec::<HalfKaMergedSpec>();
     }
 
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // refresh smoke test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn smoke_refresh_halfka_split() {
         smoke_refresh_for_spec::<HalfKaSplitSpec>();
     }
 
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // refresh smoke test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn smoke_refresh_halfkp() {
@@ -2406,7 +2403,8 @@ mod tests {
 
     /// HalfKp + cache 経由 refresh で玉 BonaPiece (`>= FE_END`) を `idx_fn` に渡さない
     /// ことを ply32 局面 (駒成り + 駒台手駒あり) と相手玉位置違い派生局面で保証する。
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // cache refresh test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn refresh_with_cache_halfkp_complex_position() {
@@ -2463,7 +2461,8 @@ mod tests {
     /// HalfKp で `refresh_accumulator` (slow path) と `refresh_accumulator_with_cache`
     /// (fast cache path、玉スロット ZERO マスク経由) の accumulation が
     /// 非ゼロ weights 下で bit 一致することを保証する。
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // cache refresh test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn refresh_with_cache_halfkp_matches_slow_path() {
@@ -2526,7 +2525,8 @@ mod tests {
     /// HalfKp の `try_apply_dirty_piece_fast` が玉 BonaPiece (`>= FE_END`) を含む
     /// `DirtyPiece` を受け取ったとき `false` を返して slow path にフォールバック
     /// することを直接検証する。
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // fast-diff test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn try_apply_dirty_piece_fast_halfkp_rejects_king_bp() {

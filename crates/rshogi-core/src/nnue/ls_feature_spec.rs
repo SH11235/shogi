@@ -163,7 +163,8 @@ mod tests {
     use crate::nnue::accumulator::{IndexList, MAX_ACTIVE_FEATURES};
     use crate::position::{Position, SFEN_HIRATE};
 
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // feature spec との寸法一致はこのテスト対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_dimensions_match_feature_set() {

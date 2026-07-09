@@ -73,9 +73,9 @@ fn validate_feature_combination(
                 "nnue-effect-bucket では effect-bucket-* を 1 個だけ指定してください (現在 {effect_bucket_config_count} 個有効)。"
             ));
         }
-        if !has_feature("layerstack-arch") || !has_feature("ft-halfka_hm_merged") {
+        if !has_feature("layerstack-arch") {
             return Err(
-                "nnue-effect-bucket は layerstack-arch + ft-halfka_hm_merged と一緒に指定してください。"
+                "nnue-effect-bucket は layerstack-arch と一緒に指定してください。"
                     .to_string(),
             );
         }

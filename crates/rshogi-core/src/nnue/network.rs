@@ -2261,7 +2261,8 @@ mod tests {
 
     /// num_buckets-header layout で `num_buckets = 0` / 上限超過の値は
     /// `InvalidData` で reject される
-    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    // effect bucket build の LayerStacks reader は `EffectBucket=` token を要求するため、
+    // 非 EffectBucket arch の num_buckets header はこのテスト対象外。
     #[cfg(all(feature = "layerstack-arch", not(feature = "nnue-effect-bucket")))]
     #[test]
     fn test_layer_stack_num_buckets_out_of_range_rejected() {

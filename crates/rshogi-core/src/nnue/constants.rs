@@ -90,6 +90,7 @@ pub const BASE_INPUTS_HALFKA: usize = KING_BUCKETS * PIECE_INPUTS_HALFKA; // 73,
 pub const HALFKA_HM_DIMENSIONS: usize = BASE_INPUTS_HALFKA; // 73,305
 
 #[cfg(feature = "nnue-effect-bucket")]
+/// HalfKaHmMerged + EffectBucket の総入力次元数。
 pub const HALFKA_EFFECT_BUCKET_DIMENSIONS: usize =
     HALFKA_HM_DIMENSIONS * super::bona_piece_effect_bucket::EFFECT_BUCKET_NB;
 

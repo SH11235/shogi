@@ -5,8 +5,7 @@
 //! bucket は `pos.board_effect` の per-square count から求めるため、base の Feature
 //! trait (pos 非受領) でなく pos を取る専用関数として実装する (threat と同型)。
 //!
-//! 差分更新 `append_changed_effect_bucket_indices` は本モジュールに後続で追加する。full recompute
-//! (本関数) は差分の正当性検証 (決定論 verify) の ground truth。
+//! full recompute と差分更新 `append_changed_effect_bucket_indices` の両方を提供する。
 
 use super::accumulator::{DirtyPiece, IndexList, MAX_ACTIVE_FEATURES, MAX_CHANGED_FEATURES};
 use super::bona_piece::BonaPiece;
