@@ -1,14 +1,14 @@
-//! E4 active index の cross-repo golden dumper (rshogi 側)。
+//! E4 active index の golden dumper。
 //!
 //! 共有 SFEN 群について各 (perspective, config) の E4 active index を sorted 出力する。
-//! tatara 側 dumper と同一 SFEN・同一形式で出力し、diff が空になることが Golden Forward
-//! (index bit 一致) ゲート。形式: `<sfen_no> <B|W> <config_name> : <idx> <idx> ...`
+//! net の学習/export 側 dumper と同一 SFEN・同一形式で出力し、diff が空になることが
+//! Golden Forward (index bit 一致) ゲート。形式: `<sfen_no> <B|W> <config_name> : <idx> <idx> ...`
 
 use rshogi_core::nnue::{E4Config, e4_active_indices_for_sfen};
 use rshogi_core::types::Color;
 
 fn main() {
-    // 玉隣接・成駒・slider 遮蔽・near-king を含む固定局面 (順序固定、tatara 側と一致必須)。
+    // 玉隣接・成駒・slider 遮蔽・near-king を含む固定局面 (順序固定、対向 dumper と一致必須)。
     let sfens = [
         "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
         "l4S2l/4g1gs1/5p1p1/pr2N1pkp/4Gn3/PP3PPPP/2GPP4/1K7/L3r+s2L w BS2N5Pb 1",

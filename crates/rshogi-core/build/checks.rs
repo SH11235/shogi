@@ -16,6 +16,71 @@ fn validate_feature_combination(
     let mode_count =
         (mode_universal as u8) + (mode_family as u8) + (mode_specific as u8);
 
+    let layerstacks_features: &[&str] = &[
+        "layerstacks-1536x16x32",
+        "layerstacks-1536x32x32",
+        "layerstacks-768x16x32",
+        "layerstacks-768x8x32",
+        "layerstacks-512x16x32",
+        "layerstacks-1024x16x32",
+        "layerstacks-3072x16x32",
+    ];
+    let layerstacks_count = layerstacks_features
+        .iter()
+        .filter(|f| has_feature(f))
+        .count();
+
+    let ft_features: &[&str] = &[
+        "ft-halfkp",
+        "ft-halfka_split",
+        "ft-halfka_merged",
+        "ft-halfka_hm_split",
+        "ft-halfka_hm_merged",
+    ];
+    let ft_count = ft_features.iter().filter(|f| has_feature(f)).count();
+
+    if has_feature("nnue-halfka_e4") {
+        if !mode_specific {
+            return Err(
+                "nnue-halfka_e4 は mode-specific の E4 専用 edition でのみ有効です。\
+                 universal / family / atomic feature 直指定では使えません。"
+                    .to_string(),
+            );
+        }
+        if has_feature("nnue-threat") || has_feature("nnue-psqt") {
+            return Err(
+                "nnue-halfka_e4 は LayerStacks の base index を E4 用に差し替えるため、\
+                 nnue-threat / nnue-psqt と同時指定できません。"
+                    .to_string(),
+            );
+        }
+        if ft_count != 1 || !has_feature("ft-halfka_hm_merged") {
+            return Err(format!(
+                "nnue-halfka_e4 では ft-* は ft-halfka_hm_merged だけを指定してください \
+                 (現在 {ft_count} 個有効)。"
+            ));
+        }
+
+        let e4_configs: &[&str] = &[
+            "e4-config-2x2-kingfixed",
+            "e4-config-2x2-kingbucketed",
+            "e4-config-kpe9-kingfixed",
+            "e4-config-kpe9-kingbucketed",
+        ];
+        let e4_config_count = e4_configs.iter().filter(|f| has_feature(f)).count();
+        if e4_config_count != 1 {
+            return Err(format!(
+                "nnue-halfka_e4 では e4-config-* を 1 個だけ指定してください (現在 {e4_config_count} 個有効)。"
+            ));
+        }
+        if !has_feature("layerstack-arch") || !has_feature("ft-halfka_hm_merged") {
+            return Err(
+                "nnue-halfka_e4 は layerstack-arch + ft-halfka_hm_merged と一緒に指定してください。"
+                    .to_string(),
+            );
+        }
+    }
+
     // mode sentinel 未指定の build は旧 atomic feature 直指定の従来運用と見なし、
     // 以降の mode 依存 check を緩和する (組合せ妥当性は user 責任)。
     if mode_count == 0 {
@@ -36,56 +101,14 @@ fn validate_feature_combination(
         ));
     }
 
-    let layerstacks_features: &[&str] = &[
-        "layerstacks-1536x16x32",
-        "layerstacks-1536x32x32",
-        "layerstacks-768x16x32",
-        "layerstacks-768x8x32",
-        "layerstacks-512x16x32",
-        "layerstacks-1024x16x32",
-        "layerstacks-3072x16x32",
-    ];
-    let layerstacks_count = layerstacks_features
-        .iter()
-        .filter(|f| has_feature(f))
-        .count();
     if layerstack_arch && layerstacks_count == 0 {
         return Err(
             "layerstack-arch を有効化するには layerstacks-* を 1 個以上必要です。".to_string(),
         );
     }
 
-    let ft_features: &[&str] = &[
-        "ft-halfkp",
-        "ft-halfka_split",
-        "ft-halfka_merged",
-        "ft-halfka_hm_split",
-        "ft-halfka_hm_merged",
-    ];
-    let ft_count = ft_features.iter().filter(|f| has_feature(f)).count();
     if layerstack_arch && ft_count == 0 {
         return Err("layerstack-arch を有効化するには ft-* を 1 個以上必要です。".to_string());
-    }
-
-    if has_feature("nnue-halfka_e4") {
-        let e4_configs: &[&str] = &[
-            "e4-config-2x2-kingfixed",
-            "e4-config-2x2-kingbucketed",
-            "e4-config-kpe9-kingfixed",
-            "e4-config-kpe9-kingbucketed",
-        ];
-        let e4_config_count = e4_configs.iter().filter(|f| has_feature(f)).count();
-        if e4_config_count != 1 {
-            return Err(format!(
-                "nnue-halfka_e4 では e4-config-* を 1 個だけ指定してください (現在 {e4_config_count} 個有効)。"
-            ));
-        }
-        if !has_feature("layerstack-arch") || !has_feature("ft-halfka_hm_merged") {
-            return Err(
-                "nnue-halfka_e4 は layerstack-arch + ft-halfka_hm_merged と一緒に指定してください。"
-                    .to_string(),
-            );
-        }
     }
 
     if mode_specific {

@@ -5,13 +5,10 @@
 //! [`super::bona_piece_halfka_hm_merged`] と共有し、本モジュールは bucket 量子化と
 //! index 合成のみを担う。
 //!
-//! # クロスリポジトリ契約
-//!
-//! bucket 量子化・index 合成・bucketed 判定は学習側 (rshogi-nnue/shogi-features) と
-//! bit 一致させる必要がある。契約は ADR `2026-07-09-halfka-e4-feature-set.md`。
-//! - `NB` と量子化の clip 段数
-//! - `packed_is_bucketed`: どの packed BonaPiece 域がバケット化されるか
-//! - `e4_index = base_index * NB + bucket`
+//! bucket 量子化・index 合成・bucketed 判定は net の学習/export 形式と bit 一致
+//! させる契約であり、`NB`・量子化の clip 段数・`packed_is_bucketed` の域・
+//! `e4_index = base_index * NB + bucket` を変えると既存 net の load が壊れる。
+//! 変更時は golden (`dump_e4_golden`) を再生成して形式側と揃える。
 
 use super::bona_piece_halfka_hm_merged::PIECE_INPUTS;
 
