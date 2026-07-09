@@ -89,6 +89,11 @@ pub const BASE_INPUTS_HALFKA: usize = KING_BUCKETS * PIECE_INPUTS_HALFKA; // 73,
 /// nnue-pytorch serialize.py でエクスポートすると自動的にcoalesceされる。
 pub const HALFKA_HM_DIMENSIONS: usize = BASE_INPUTS_HALFKA; // 73,305
 
+#[cfg(feature = "nnue-effect-bucket")]
+/// HalfKaHmMerged + EffectBucket の総入力次元数。
+pub const HALFKA_EFFECT_BUCKET_DIMENSIONS: usize =
+    HALFKA_HM_DIMENSIONS * super::bona_piece_effect_bucket::EFFECT_BUCKET_NB;
+
 /// HalfKaHmMerged^のFactorization込み入力次元数（未coalesce）
 ///
 /// 訓練時のみ使用。推論用モデルは serialize.py で自動的に coalesce される。

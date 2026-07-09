@@ -102,7 +102,10 @@ pub fn read_compressed_tensor_i16_all<R: Read>(reader: &mut R) -> io::Result<Vec
     reader.read_exact(&mut size_buf)?;
     let compressed_size = u32::from_le_bytes(size_buf) as usize;
 
-    const MAX_COMPRESSED_SIZE: usize = 256 * 1024 * 1024;
+    // 不正ファイルの巨大 alloc を防ぐ sanity 上限。HalfKaHmMerged + EffectBucket は base 特徴を NB 倍に
+    // 拡張するため FT block が大きく (2x2×1024=600MB 生 / ~300MB 圧縮、3x3 系はさらに大)、
+    // 旧 256MB では正当な effect bucket net を弾く。size field は u32 なので上限は 4GiB 未満。
+    const MAX_COMPRESSED_SIZE: usize = 2 * 1024 * 1024 * 1024;
     if compressed_size == 0 || compressed_size > MAX_COMPRESSED_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
