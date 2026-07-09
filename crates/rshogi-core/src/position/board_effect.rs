@@ -28,7 +28,7 @@ const ROOK_DIR: u8 = (1u8 << Direct::R as u8)
     | (1u8 << Direct::D as u8);
 
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct BoardEffects {
+pub struct BoardEffects {
     counts: [[u8; Square::NUM]; Color::NUM],
 }
 

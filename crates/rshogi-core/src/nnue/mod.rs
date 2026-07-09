@@ -88,7 +88,7 @@ pub use features::{
     Feature, FeatureSet, HalfKP, HalfKPFeatureSet, HalfKaHmMerged, HalfKaHmMergedFeatureSet,
     HalfKaSplit, HalfKaSplitFeatureSet, TriggerEvent,
 };
-pub use halfka_e4_features::append_active_e4;
+pub use halfka_e4_features::{append_active_e4, append_changed_e4_indices};
 pub use layer_stacks::{
     LayerStackBucket, LayerStacks, compute_bucket_index, compute_king_ranks,
     sqr_clipped_relu_transform,
