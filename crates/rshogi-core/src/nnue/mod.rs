@@ -75,6 +75,8 @@ pub use accumulator_layer_stacks::{
 };
 pub use accumulator_stack_variant::AccumulatorStackVariant;
 pub use bona_piece::{BonaPiece, ExtBonaPiece, FE_END, halfkp_index};
+#[cfg(feature = "nnue-halfka_e4")]
+pub use bona_piece_halfka_e4::{E4_CONFIG, E4_KING_BUCKETED, E4_NB};
 pub use bona_piece_halfka_e4::{E4Config, e4_bucket, e4_index, packed_is_bucketed};
 pub use bona_piece_halfka_hm_merged::{
     BonaPieceHalfKaHmMerged, E_KING, F_KING, FE_HAND_END, FE_OLD_END, PIECE_INPUTS, halfka_index,

@@ -67,6 +67,27 @@ fn validate_feature_combination(
         return Err("layerstack-arch を有効化するには ft-* を 1 個以上必要です。".to_string());
     }
 
+    if has_feature("nnue-halfka_e4") {
+        let e4_configs: &[&str] = &[
+            "e4-config-2x2-kingfixed",
+            "e4-config-2x2-kingbucketed",
+            "e4-config-kpe9-kingfixed",
+            "e4-config-kpe9-kingbucketed",
+        ];
+        let e4_config_count = e4_configs.iter().filter(|f| has_feature(f)).count();
+        if e4_config_count != 1 {
+            return Err(format!(
+                "nnue-halfka_e4 では e4-config-* を 1 個だけ指定してください (現在 {e4_config_count} 個有効)。"
+            ));
+        }
+        if !has_feature("layerstack-arch") || !has_feature("ft-halfka_hm_merged") {
+            return Err(
+                "nnue-halfka_e4 は layerstack-arch + ft-halfka_hm_merged と一緒に指定してください。"
+                    .to_string(),
+            );
+        }
+    }
+
     if mode_specific {
         if layerstacks_count > 1 {
             return Err(format!(

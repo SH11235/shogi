@@ -89,6 +89,36 @@ pub fn e4_index(base_index: usize, bucket: usize, nb: usize) -> usize {
     base_index * nb + bucket
 }
 
+#[cfg(feature = "nnue-halfka_e4")]
+const fn selected_e4_config_count() -> usize {
+    (cfg!(feature = "e4-config-2x2-kingfixed") as usize)
+        + (cfg!(feature = "e4-config-2x2-kingbucketed") as usize)
+        + (cfg!(feature = "e4-config-kpe9-kingfixed") as usize)
+        + (cfg!(feature = "e4-config-kpe9-kingbucketed") as usize)
+}
+
+#[cfg(feature = "nnue-halfka_e4")]
+const _: () = assert!(selected_e4_config_count() == 1);
+
+#[cfg(feature = "nnue-halfka_e4")]
+pub const E4_NB: usize = E4_CONFIG.nb;
+
+#[cfg(feature = "nnue-halfka_e4")]
+pub const E4_KING_BUCKETED: bool = E4_CONFIG.king_bucketed;
+
+#[cfg(feature = "nnue-halfka_e4")]
+pub const E4_CONFIG: E4Config = {
+    if cfg!(feature = "e4-config-2x2-kingfixed") {
+        E4Config::E4_2X2_KINGFIXED
+    } else if cfg!(feature = "e4-config-2x2-kingbucketed") {
+        E4Config::E4_2X2_KINGBUCKETED
+    } else if cfg!(feature = "e4-config-kpe9-kingfixed") {
+        E4Config::KPE9_KINGFIXED
+    } else {
+        E4Config::KPE9_KINGBUCKETED
+    }
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

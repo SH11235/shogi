@@ -518,6 +518,10 @@ impl NNUENetwork {
                         // 上で処理済みなのでここには来ない
                         unreachable!()
                     }
+                    FeatureSet::HalfKaE4 => {
+                        // E4 は LayerStacks reader で処理される。
+                        unreachable!()
+                    }
                 }
             }
             _ => Err(io::Error::new(
@@ -1221,6 +1225,7 @@ pub fn detect_format(bytes: &[u8], file_size: u64) -> io::Result<NnueFormatInfo>
                 FeatureSet::HalfKaSplit => format!("HalfKaSplit{}", l1),
                 FeatureSet::HalfKaMerged => format!("HalfKaMerged{}", l1),
                 FeatureSet::HalfKaHmSplit => format!("HalfKaHmSplit{}", l1),
+                FeatureSet::HalfKaE4 => format!("HalfKaE4{}", l1),
                 FeatureSet::HalfKP => format!("HalfKP{}", l1),
             };
 

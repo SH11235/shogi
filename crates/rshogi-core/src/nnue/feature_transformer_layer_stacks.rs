@@ -22,6 +22,8 @@ use super::stats::count_threat_multiply;
 use super::stats::{count_refresh, count_update};
 #[cfg(feature = "nnue-threat")]
 use super::threat_features::{self, MAX_CHANGED_THREAT_FEATURES, THREAT_DIMENSIONS};
+#[cfg(feature = "nnue-halfka_e4")]
+use super::{E4_CONFIG, append_active_e4};
 use crate::position::Position;
 use crate::types::Color;
 use std::io::{self, Read};
@@ -57,6 +59,11 @@ fn append_active_indices<FT: LsFeatureSpec>(
     perspective: Color,
     active: &mut IndexList<MAX_ACTIVE_FEATURES>,
 ) {
+    #[cfg(feature = "nnue-halfka_e4")]
+    {
+        append_active_e4(pos, E4_CONFIG, perspective, active);
+    }
+    #[cfg(not(feature = "nnue-halfka_e4"))]
     <FT::Feature as Feature>::append_active_indices(pos, perspective, active);
 }
 
@@ -721,6 +728,13 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         acc: &mut AccumulatorLayerStacks<L1>,
         prev_acc: &AccumulatorLayerStacks<L1>,
     ) {
+        if cfg!(feature = "nnue-halfka_e4") {
+            let _ = dirty_piece;
+            let _ = prev_acc;
+            self.refresh_accumulator(pos, acc);
+            return;
+        }
+
         for perspective in [Color::Black, Color::White] {
             let p = perspective as usize;
             let reset = <FT::Set as FeatureSet>::needs_refresh(dirty_piece, perspective);
@@ -862,6 +876,14 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         prev_acc: &AccumulatorLayerStacks<L1>,
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
+        if cfg!(feature = "nnue-halfka_e4") {
+            let _ = dirty_piece;
+            let _ = prev_acc;
+            let _ = cache;
+            self.refresh_accumulator(pos, acc);
+            return;
+        }
+
         for perspective in [Color::Black, Color::White] {
             let p = perspective as usize;
             let reset = <FT::Set as FeatureSet>::needs_refresh(dirty_piece, perspective);
@@ -1002,6 +1024,12 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         acc: &mut AccumulatorLayerStacks<L1>,
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
+        if cfg!(feature = "nnue-halfka_e4") {
+            let _ = cache;
+            self.refresh_accumulator(pos, acc);
+            return;
+        }
+
         for perspective in [Color::Black, Color::White] {
             count_refresh!();
             let p = perspective as usize;
@@ -1063,6 +1091,21 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         #[cfg(feature = "nnue-psqt")] psqt_acc: &mut [i32; MAX_LAYER_STACK_BUCKETS],
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
+        if cfg!(feature = "nnue-halfka_e4") {
+            let _ = cache;
+            accumulation.copy_from_slice(&self.biases.0);
+            let mut active_indices = IndexList::new();
+            append_active_indices::<FT>(pos, perspective, &mut active_indices);
+            for index in active_indices.iter() {
+                self.add_weights(accumulation, index);
+            }
+            #[cfg(feature = "nnue-psqt")]
+            if self.has_psqt {
+                self.refresh_psqt(&active_indices, psqt_acc);
+            }
+            return;
+        }
+
         let king_sq = pos.king_square(perspective);
 
         let raw_piece_list = if perspective == Color::Black {
@@ -1128,6 +1171,13 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         stack: &mut AccumulatorStackLayerStacks<L1>,
         source_idx: usize,
     ) -> bool {
+        if cfg!(feature = "nnue-halfka_e4") {
+            let _ = pos;
+            let _ = stack;
+            let _ = source_idx;
+            return false;
+        }
+
         let Some(path) = stack.collect_path(source_idx) else {
             // パスが途切れた場合、または MAX_PATH_LENGTH を超えた場合
             return false;
@@ -1401,6 +1451,14 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         perspective: Color,
         king_sq: crate::types::Square,
     ) -> bool {
+        if cfg!(feature = "nnue-halfka_e4") {
+            let _ = accumulation;
+            let _ = dirty_piece;
+            let _ = perspective;
+            let _ = king_sq;
+            return false;
+        }
+
         let changed = &dirty_piece.changed_piece;
         let old_new = |idx: usize| {
             let entry = &changed[idx];
@@ -1868,7 +1926,9 @@ mod tests {
     use super::*;
     use crate::nnue::accumulator::ChangedBonaPiece;
     use crate::nnue::bona_piece::ExtBonaPiece;
-    use crate::nnue::constants::{DEFAULT_NUM_BUCKETS, HALFKA_HM_DIMENSIONS, NNUE_PYTORCH_L1};
+    #[cfg(feature = "nnue-psqt")]
+    use crate::nnue::constants::DEFAULT_NUM_BUCKETS;
+    use crate::nnue::constants::{HALFKA_HM_DIMENSIONS, NNUE_PYTORCH_L1};
     use crate::nnue::ls_feature_spec::HalfKaHmMergedSpec;
     use crate::nnue::piece_list::PieceNumber;
     use crate::types::{File, Piece, PieceType, Rank, Square};

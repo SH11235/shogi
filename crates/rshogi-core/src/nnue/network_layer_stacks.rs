@@ -26,6 +26,8 @@
 
 use super::accumulator::Aligned;
 use super::accumulator_layer_stacks::{AccumulatorLayerStacks, AccumulatorStackLayerStacks};
+#[cfg(feature = "nnue-halfka_e4")]
+use super::constants::HALFKA_E4_DIMENSIONS;
 use super::constants::{
     DEFAULT_NUM_BUCKETS, FV_SCALE_HALFKA, MAX_ARCH_LEN, MAX_LAYER_STACK_BUCKETS,
     NNUE_VERSION_HALFKA, NNUE_VERSION_LAYERSTACK_NUM_BUCKETS,
@@ -59,6 +61,8 @@ use super::network::{
     LayerStackBucketMode, compute_layer_stack_progress8kpabs_bucket_index, get_fv_scale_override,
     get_layer_stack_bucket_mode, get_layer_stack_progress_kpabs_weights, parse_fv_scale_from_arch,
 };
+#[cfg(feature = "nnue-halfka_e4")]
+use super::{E4_KING_BUCKETED, E4_NB};
 use crate::position::Position;
 use crate::types::{Color, Value};
 #[cfg(feature = "diagnostics")]
@@ -249,6 +253,57 @@ impl<
         } else {
             DEFAULT_NUM_BUCKETS
         };
+
+        #[cfg(feature = "nnue-halfka_e4")]
+        {
+            let model_config = parse_e4_config_from_arch(&arch_str).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("E4 build requires E4= token in arch string: {arch_str}"),
+                )
+            })?;
+            if model_config != (E4_NB, E4_KING_BUCKETED) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "E4 config mismatch: model=({}x{}), engine=({}x{}). \
+                         Use a model trained with the matching E4 config.",
+                        model_config.0,
+                        if model_config.1 { "bucketed" } else { "fixed" },
+                        E4_NB,
+                        if E4_KING_BUCKETED {
+                            "bucketed"
+                        } else {
+                            "fixed"
+                        },
+                    ),
+                ));
+            }
+            let model_dims =
+                super::spec::parse_feature_input_dimensions(&arch_str).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "E4 model is missing feature dimensions in arch string: {arch_str}"
+                        ),
+                    )
+                })?;
+            if model_dims != HALFKA_E4_DIMENSIONS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "E4 input dimensions mismatch: model={model_dims}, engine={HALFKA_E4_DIMENSIONS}"
+                    ),
+                ));
+            }
+        }
+        #[cfg(not(feature = "nnue-halfka_e4"))]
+        if arch_str.contains("E4=") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "E4 model requires nnue-halfka_e4 feature",
+            ));
+        }
 
         // FV_SCALE 検出
         let fv_scale = parse_fv_scale_from_arch(&arch_str).unwrap_or(FV_SCALE_HALFKA);
@@ -1206,9 +1261,11 @@ impl<FT: LsFeatureSpec + 'static> LsNetByFt<FT> {
                     // path>=2 の forward update が threat accumulator を full 再列挙する(Finny 非対象)
                     // ため refresh(piece は Finny)に落ちる深さ 1 が速い(1 は YaneuraOu 方式相当)。
                     // edition-universal は threat 非対応モデルも同一バイナリで動くので runtime 判定。
-                    #[cfg(feature = "nnue-threat")]
+                    #[cfg(feature = "nnue-halfka_e4")]
+                    let max_depth = 0;
+                    #[cfg(all(feature = "nnue-threat", not(feature = "nnue-halfka_e4")))]
                     let max_depth = if $net.feature_transformer.has_threat { 1 } else { 4 };
-                    #[cfg(not(feature = "nnue-threat"))]
+                    #[cfg(not(any(feature = "nnue-threat", feature = "nnue-halfka_e4")))]
                     let max_depth = 4;
                     if let Some((source_idx, _depth)) =
                         $stack.find_usable_accumulator(max_depth)
@@ -1493,6 +1550,8 @@ impl<FT: LsFeatureSpec + 'static> LsNetByFt<FT> {
 /// active な FT variant は `ft-*` feature で、active な L1 variant は `layerstacks-*` feature で
 /// 制御される。
 pub enum LayerStacksNetwork {
+    #[cfg(feature = "nnue-halfka_e4")]
+    HalfKaE4(LsNetByFt<HalfKaHmMergedSpec>),
     #[cfg(feature = "ft-halfka_hm_merged")]
     HalfKaHmMerged(LsNetByFt<HalfKaHmMergedSpec>),
     #[cfg(feature = "ft-halfka_hm_split")]
@@ -1529,6 +1588,34 @@ pub enum LayerStacksNetwork {
 macro_rules! ls_dispatch_ft_size {
     ($net:expr, |$inner:ident| $body:expr, _ => $fallback:expr $(,)?) => {
         match $net {
+            #[cfg(all(feature = "nnue-halfka_e4", feature = "layerstacks-1536x16x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaE4($crate::nnue::LsNetByFt::L1536x16x32(
+                $inner,
+            )) => $body,
+            #[cfg(all(feature = "nnue-halfka_e4", feature = "layerstacks-1536x32x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaE4($crate::nnue::LsNetByFt::L1536x32x32(
+                $inner,
+            )) => $body,
+            #[cfg(all(feature = "nnue-halfka_e4", feature = "layerstacks-768x16x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaE4($crate::nnue::LsNetByFt::L768x16x32(
+                $inner,
+            )) => $body,
+            #[cfg(all(feature = "nnue-halfka_e4", feature = "layerstacks-768x8x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaE4($crate::nnue::LsNetByFt::L768x8x32(
+                $inner,
+            )) => $body,
+            #[cfg(all(feature = "nnue-halfka_e4", feature = "layerstacks-512x16x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaE4($crate::nnue::LsNetByFt::L512x16x32(
+                $inner,
+            )) => $body,
+            #[cfg(all(feature = "nnue-halfka_e4", feature = "layerstacks-1024x16x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaE4($crate::nnue::LsNetByFt::L1024x16x32(
+                $inner,
+            )) => $body,
+            #[cfg(all(feature = "nnue-halfka_e4", feature = "layerstacks-3072x16x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaE4($crate::nnue::LsNetByFt::L3072x16x32(
+                $inner,
+            )) => $body,
             #[cfg(all(feature = "ft-halfka_hm_merged", feature = "layerstacks-1536x16x32"))]
             $crate::nnue::LayerStacksNetwork::HalfKaHmMerged(
                 $crate::nnue::LsNetByFt::L1536x16x32($inner),
@@ -1698,6 +1785,8 @@ macro_rules! ls_dispatch_ft_size {
 macro_rules! ls_match_ft {
     ($val:expr, $pat:ident => $body:expr) => {
         match $val {
+            #[cfg(feature = "nnue-halfka_e4")]
+            LayerStacksNetwork::HalfKaE4($pat) => $body,
             #[cfg(feature = "ft-halfka_hm_merged")]
             LayerStacksNetwork::HalfKaHmMerged($pat) => $body,
             #[cfg(feature = "ft-halfka_hm_split")]
@@ -1714,6 +1803,7 @@ macro_rules! ls_match_ft {
                 feature = "ft-halfka_merged",
                 feature = "ft-halfka_split",
                 feature = "ft-halfkp",
+                feature = "nnue-halfka_e4",
             )))]
             _ => unreachable!("no LayerStacks FT variant enabled"),
         }
@@ -1801,6 +1891,9 @@ impl LayerStacksNetwork {
         }
         use super::spec::FeatureSet as Fs;
         match feature_set {
+            Fs::HalfKaE4 => {
+                read_into_variant!("nnue-halfka_e4", HalfKaHmMergedSpec, HalfKaE4, "HalfKaE4")
+            }
             Fs::HalfKaHmMerged | Fs::LayerStacks => {
                 read_into_variant!(
                     "ft-halfka_hm_merged",
@@ -1924,11 +2017,27 @@ fn detect_layer_stacks_feature_set(arch_str: &str) -> super::spec::FeatureSet {
             "HalfKaSplit" => return Fs::HalfKaSplit,
             "HalfKaMerged" => return Fs::HalfKaMerged,
             "HalfKaHmSplit" => return Fs::HalfKaHmSplit,
+            "HalfKaE4" => return Fs::HalfKaE4,
             "HalfKaHmMerged" => return Fs::HalfKaHmMerged,
             _ => {}
         }
     }
+    if arch_str.contains("E4=") {
+        return Fs::HalfKaE4;
+    }
     super::spec::parse_feature_set_from_arch(arch_str).unwrap_or(Fs::LayerStacks)
+}
+
+#[cfg(feature = "nnue-halfka_e4")]
+fn parse_e4_config_from_arch(arch_str: &str) -> Option<(usize, bool)> {
+    let token = arch_str.split(',').find_map(|part| part.strip_prefix("E4="))?;
+    match token {
+        "4xfixed" => Some((4, false)),
+        "4xbucketed" => Some((4, true)),
+        "9xfixed" => Some((9, false)),
+        "9xbucketed" => Some((9, true)),
+        _ => None,
+    }
 }
 
 /// arch_str の `Threat=<dims>` トークンから次元数を取り出す。
@@ -1946,7 +2055,7 @@ fn parse_threat_dims_from_arch(arch_str: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(feature = "layerstacks-1536x16x32", feature = "ft-halfka_hm_merged"))]
+    #[cfg(feature = "layerstack-arch")]
     use super::*;
     use crate::nnue::constants::{FV_SCALE_HALFKA, NNUE_PYTORCH_L1};
     #[cfg(all(feature = "layerstacks-1536x16x32", feature = "ft-halfka_hm_merged"))]

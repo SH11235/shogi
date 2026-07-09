@@ -106,8 +106,15 @@ layerstacks-3072x16x32 = []
 # LayerStack 拡張 slot (psqt / threat)
 # - nnue-psqt:   AccumulatorLayerStacks に psqt_accumulation を含める。PSQT モデル読み込み可。
 # - nnue-threat: AccumulatorLayerStacks に threat_accumulation を含める (+6KB/entry)。Threat モデル読み込み可。
+# - nnue-halfka_e4: HalfKaHmMerged の FT 入力を E4 bucket 拡張に差し替える。
 nnue-psqt   = []
 nnue-threat = []
+nnue-halfka_e4 = []
+
+e4-config-2x2-kingfixed = []
+e4-config-2x2-kingbucketed = []
+e4-config-kpe9-kingfixed = []
+e4-config-kpe9-kingbucketed = []
 
 # FT (Feature Transformer) 種別 slot (5 variant)。
 # LS / HalfKX どちらの family でも 5 variant 全対応。mode-specific では 1 個固定、
@@ -256,6 +263,10 @@ edition-layerstacks-halfka_hm_merged-768x8x32-none = [
 ]
 edition-layerstacks-halfka_hm_merged-512x16x32-none = [
   "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-512x16x32",
+]
+edition-layerstacks-halfka_e4-512x16x32-2x2_kingfixed = [
+  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-512x16x32",
+  "nnue-halfka_e4", "e4-config-2x2-kingfixed",
 ]
 # LayerStack specific (3072x16x32、none のみ)。FT_OUT=3072 の大型 FT。
 # L0=3072 も progress-diff の NPS 改善を実測で確認済みのため 1536 系と同様に同梱する。

@@ -18,6 +18,8 @@ pub enum FeatureSet {
     HalfKaMerged,
     /// Half-Mirror + SplitPlane
     HalfKaHmSplit,
+    /// Half-Mirror + MergedPlane with E4 bucket extension
+    HalfKaE4,
     /// LayerStacks (実験的)
     LayerStacks,
 }
@@ -31,6 +33,7 @@ impl FeatureSet {
             Self::HalfKaSplit => "HalfKaSplit",
             Self::HalfKaMerged => "HalfKaMerged",
             Self::HalfKaHmSplit => "HalfKaHmSplit",
+            Self::HalfKaE4 => "HalfKaE4",
             Self::LayerStacks => "LayerStacks",
         }
     }
@@ -195,6 +198,9 @@ pub fn parse_feature_set_from_arch(arch_str: &str) -> Result<FeatureSet, String>
     if arch_str.contains("LayerStacks") {
         return Ok(FeatureSet::LayerStacks);
     }
+    if arch_str.contains("E4=") {
+        return Ok(FeatureSet::HalfKaE4);
+    }
     // Threat= は LayerStacks 専用マーカ
     if arch_str.contains("Threat=") {
         return Ok(FeatureSet::LayerStacks);
@@ -228,6 +234,7 @@ pub fn parse_feature_set_from_arch(arch_str: &str) -> Result<FeatureSet, String>
             // plane を明示する綴り (両表記)。
             "HalfKA_merged" | "HalfKaMerged" => return Ok(FeatureSet::HalfKaMerged),
             "HalfKA_hm_split" | "HalfKaHmSplit" => return Ok(FeatureSet::HalfKaHmSplit),
+            "HalfKaE4" => return Ok(FeatureSet::HalfKaE4),
 
             // mirror + merged: underscore / PascalCase の同義綴り。
             "HalfKA_hm" | "HalfKaHmMerged" => return Ok(FeatureSet::HalfKaHmMerged),
