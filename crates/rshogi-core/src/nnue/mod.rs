@@ -28,6 +28,7 @@ mod accumulator_stack_variant;
 pub mod activation;
 pub mod aliases;
 mod bona_piece;
+mod bona_piece_halfka_e4;
 mod bona_piece_halfka_hm_merged;
 mod bona_piece_halfka_hm_split;
 mod bona_piece_halfka_merged;
