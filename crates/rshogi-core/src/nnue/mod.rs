@@ -39,6 +39,7 @@ mod evaluator;
 mod feature_transformer;
 mod feature_transformer_layer_stacks;
 pub mod features;
+mod halfka_e4_features;
 pub(crate) mod halfka_hm_merged;
 pub(crate) mod halfka_hm_split;
 pub(crate) mod halfka_merged;
@@ -74,6 +75,7 @@ pub use accumulator_layer_stacks::{
 };
 pub use accumulator_stack_variant::AccumulatorStackVariant;
 pub use bona_piece::{BonaPiece, ExtBonaPiece, FE_END, halfkp_index};
+pub use bona_piece_halfka_e4::{E4Config, e4_bucket, e4_index, packed_is_bucketed};
 pub use bona_piece_halfka_hm_merged::{
     BonaPieceHalfKaHmMerged, E_KING, F_KING, FE_HAND_END, FE_OLD_END, PIECE_INPUTS, halfka_index,
     is_hm_mirror, king_bucket, pack_bonapiece,
@@ -86,6 +88,7 @@ pub use features::{
     Feature, FeatureSet, HalfKP, HalfKPFeatureSet, HalfKaHmMerged, HalfKaHmMergedFeatureSet,
     HalfKaSplit, HalfKaSplitFeatureSet, TriggerEvent,
 };
+pub use halfka_e4_features::append_active_e4;
 pub use layer_stacks::{
     LayerStackBucket, LayerStacks, compute_bucket_index, compute_king_ranks,
     sqr_clipped_relu_transform,
