@@ -2259,7 +2259,8 @@ mod tests {
 
     /// num_buckets-header layout で `num_buckets = 0` / 上限超過の値は
     /// `InvalidData` で reject される
-    #[cfg(feature = "layerstack-arch")]
+    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(all(feature = "layerstack-arch", not(feature = "nnue-halfka_e4")))]
     #[test]
     fn test_layer_stack_num_buckets_out_of_range_rejected() {
         for &n in &[0u32, (MAX_LAYER_STACK_BUCKETS as u32) + 1, 100, 1024] {

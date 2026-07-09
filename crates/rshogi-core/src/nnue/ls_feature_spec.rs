@@ -163,6 +163,8 @@ mod tests {
     use crate::nnue::accumulator::{IndexList, MAX_ACTIVE_FEATURES};
     use crate::position::{Position, SFEN_HIRATE};
 
+    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-halfka_e4"))]
     #[test]
     fn test_dimensions_match_feature_set() {
         assert_eq!(HalfKpSpec::DIMENSIONS, <HalfKPFeatureSet as FeatureSet>::DIMENSIONS);

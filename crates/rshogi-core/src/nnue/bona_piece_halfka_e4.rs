@@ -16,7 +16,7 @@
 use super::bona_piece_halfka_hm_merged::PIECE_INPUTS;
 
 /// E4 バケット構成。`nb` はバケット数 (2×2=4 / 3×3=9)、`king_bucketed` は玉の
-/// base index をバケット化するか (D2)。学習 net と engine で一致必須。
+/// base index をバケット化するかを表す。学習 net と engine で一致必須。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct E4Config {
     /// バケット数。4 (2×2: attacked/defended を各 {0,≥1}) または 9 (3×3: 各 {0,1,2})。
@@ -26,12 +26,12 @@ pub struct E4Config {
 }
 
 impl E4Config {
-    /// 2×2 (NB=4)、玉バケット化なし (D2b) — MVP 既定。
+    /// 2×2 (NB=4)、玉バケット化なし。
     pub const E4_2X2_KINGFIXED: E4Config = E4Config {
         nb: 4,
         king_bucketed: false,
     };
-    /// 2×2 (NB=4)、玉バケット化あり (D2a)。
+    /// 2×2 (NB=4)、玉バケット化あり。
     pub const E4_2X2_KINGBUCKETED: E4Config = E4Config {
         nb: 4,
         king_bucketed: true,
@@ -60,7 +60,7 @@ const PACKED_HAND_END: usize = 90;
 const PACKED_BOARD_END: usize = 1548;
 
 /// この packed BonaPiece をバケット化するか。手駒は常に false、盤上非王駒は常に true、
-/// 玉は config 依存。両 repo が pack_bonapiece 後の同一域判定で一致させる (D4)。
+/// 玉は config 依存。両 repo が pack_bonapiece 後の同一域判定で一致させる。
 #[inline]
 pub fn packed_is_bucketed(packed_bp: usize, king_bucketed: bool) -> bool {
     if packed_bp < PACKED_HAND_END {

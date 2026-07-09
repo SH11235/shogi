@@ -48,6 +48,7 @@
 |--------|------|
 | `benchmark` | エンジン性能ベンチマーク |
 | `compare_eval_nnue` | NNUE評価値の比較 |
+| `dump_e4_golden` | cross-repo golden 用に E4 active index を config 別に dump（[詳細](docs/dump_e4_golden.md)） |
 | `extract_bench_positions` | floodgate CSA / selfplay JSONL から教師ラベル品質測定用のベンチ局面を抽出 |
 | `label_bench_positions` | ベンチ局面 jsonl を深い探索でラベル付けし `eval_deep` を追記（ground truth） |
 | `label_bench_dl` | `label_bench` jsonl の各局面を DL水匠 (標準 dlshogi ONNX) で静的評価し `eval_dl` を追記（`dlshogi-onnx` feature、default 有効） |
@@ -89,6 +90,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 - [kifu_player](docs/kifu_player.md) - PSV / tournament JSONL / CSA 共通の棋譜プレイヤー TUI（評価値グラフ・検索/絞り込み（SFEN 局面検索含む）・`--live` 追記監視 (live-mirror と組で wdoor 観戦、csa_client の `live_jsonl` と組で自局の手単位リアルタイム観戦)・`--ratings` レート併記付き）
 - [gensfen](docs/gensfen.md) - 教師局面生成ツールの詳細
 - [benchmark](docs/benchmark.md) - ベンチマークツールの詳細
+- [dump_e4_golden](docs/dump_e4_golden.md) - cross-repo golden 用 E4 active index dump
 - [pack_tools](docs/pack_tools.md) - 学習データ処理ツール群
 - [extract_bench_positions](docs/extract_bench_positions.md) - 教師ラベル品質測定用ベンチ局面の抽出
 - [label_bench_positions](docs/label_bench_positions.md) - ベンチ局面の深い探索ラベリング（ground truth）
