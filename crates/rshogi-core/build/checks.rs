@@ -39,43 +39,43 @@ fn validate_feature_combination(
     ];
     let ft_count = ft_features.iter().filter(|f| has_feature(f)).count();
 
-    if has_feature("nnue-halfka_e4") {
+    if has_feature("nnue-effect-bucket") {
         if !mode_specific {
             return Err(
-                "nnue-halfka_e4 は mode-specific の E4 専用 edition でのみ有効です。\
+                "nnue-effect-bucket は mode-specific の effect bucket 専用 edition でのみ有効です。\
                  universal / family / atomic feature 直指定では使えません。"
                     .to_string(),
             );
         }
         if has_feature("nnue-threat") || has_feature("nnue-psqt") {
             return Err(
-                "nnue-halfka_e4 は LayerStacks の base index を E4 用に差し替えるため、\
+                "nnue-effect-bucket は LayerStacks の base index を effect bucket 用に差し替えるため、\
                  nnue-threat / nnue-psqt と同時指定できません。"
                     .to_string(),
             );
         }
         if ft_count != 1 || !has_feature("ft-halfka_hm_merged") {
             return Err(format!(
-                "nnue-halfka_e4 では ft-* は ft-halfka_hm_merged だけを指定してください \
+                "nnue-effect-bucket では ft-* は ft-halfka_hm_merged だけを指定してください \
                  (現在 {ft_count} 個有効)。"
             ));
         }
 
-        let e4_configs: &[&str] = &[
-            "e4-config-2x2-kingfixed",
-            "e4-config-2x2-kingbucketed",
-            "e4-config-kpe9-kingfixed",
-            "e4-config-kpe9-kingbucketed",
+        let effect_bucket_configs: &[&str] = &[
+            "effect-bucket-2x2-kingfixed",
+            "effect-bucket-2x2-kingbucketed",
+            "effect-bucket-3x3-kingfixed",
+            "effect-bucket-3x3-kingbucketed",
         ];
-        let e4_config_count = e4_configs.iter().filter(|f| has_feature(f)).count();
-        if e4_config_count != 1 {
+        let effect_bucket_config_count = effect_bucket_configs.iter().filter(|f| has_feature(f)).count();
+        if effect_bucket_config_count != 1 {
             return Err(format!(
-                "nnue-halfka_e4 では e4-config-* を 1 個だけ指定してください (現在 {e4_config_count} 個有効)。"
+                "nnue-effect-bucket では effect-bucket-* を 1 個だけ指定してください (現在 {effect_bucket_config_count} 個有効)。"
             ));
         }
         if !has_feature("layerstack-arch") || !has_feature("ft-halfka_hm_merged") {
             return Err(
-                "nnue-halfka_e4 は layerstack-arch + ft-halfka_hm_merged と一緒に指定してください。"
+                "nnue-effect-bucket は layerstack-arch + ft-halfka_hm_merged と一緒に指定してください。"
                     .to_string(),
             );
         }

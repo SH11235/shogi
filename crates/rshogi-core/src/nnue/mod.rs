@@ -28,18 +28,18 @@ mod accumulator_stack_variant;
 pub mod activation;
 pub mod aliases;
 mod bona_piece;
-mod bona_piece_halfka_e4;
+mod bona_piece_effect_bucket;
 mod bona_piece_halfka_hm_merged;
 mod bona_piece_halfka_hm_split;
 mod bona_piece_halfka_merged;
 mod bona_piece_halfka_split;
 mod constants;
 mod diff;
+mod effect_bucket_features;
 mod evaluator;
 mod feature_transformer;
 mod feature_transformer_layer_stacks;
 pub mod features;
-mod halfka_e4_features;
 pub(crate) mod halfka_hm_merged;
 pub(crate) mod halfka_hm_split;
 pub(crate) mod halfka_merged;
@@ -75,23 +75,28 @@ pub use accumulator_layer_stacks::{
 };
 pub use accumulator_stack_variant::AccumulatorStackVariant;
 pub use bona_piece::{BonaPiece, ExtBonaPiece, FE_END, halfkp_index};
-#[cfg(feature = "nnue-halfka_e4")]
-pub use bona_piece_halfka_e4::{E4_CONFIG, E4_KING_BUCKETED, E4_NB};
-pub use bona_piece_halfka_e4::{E4Config, e4_bucket, e4_index, packed_is_bucketed};
+#[cfg(feature = "nnue-effect-bucket")]
+pub use bona_piece_effect_bucket::{
+    EFFECT_BUCKET_CONFIG, EFFECT_BUCKET_KING_BUCKETED, EFFECT_BUCKET_NB,
+};
+pub use bona_piece_effect_bucket::{
+    EffectBucketConfig, effect_bucket, effect_bucket_index, packed_is_bucketed,
+};
 pub use bona_piece_halfka_hm_merged::{
     BonaPieceHalfKaHmMerged, E_KING, F_KING, FE_HAND_END, FE_OLD_END, PIECE_INPUTS, halfka_index,
     is_hm_mirror, king_bucket, pack_bonapiece,
 };
 pub use constants::*;
 pub use diff::get_changed_features;
+pub use effect_bucket_features::{
+    append_active_effect_bucket, append_changed_effect_bucket_indices,
+    effect_bucket_active_indices_for_sfen,
+};
 pub use feature_transformer::FeatureTransformer;
 pub use feature_transformer_layer_stacks::FeatureTransformerLayerStacks;
 pub use features::{
     Feature, FeatureSet, HalfKP, HalfKPFeatureSet, HalfKaHmMerged, HalfKaHmMergedFeatureSet,
     HalfKaSplit, HalfKaSplitFeatureSet, TriggerEvent,
-};
-pub use halfka_e4_features::{
-    append_active_e4, append_changed_e4_indices, e4_active_indices_for_sfen,
 };
 pub use layer_stacks::{
     LayerStackBucket, LayerStacks, compute_bucket_index, compute_king_ranks,

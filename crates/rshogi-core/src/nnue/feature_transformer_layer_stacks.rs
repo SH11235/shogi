@@ -22,8 +22,8 @@ use super::stats::count_threat_multiply;
 use super::stats::{count_refresh, count_update};
 #[cfg(feature = "nnue-threat")]
 use super::threat_features::{self, MAX_CHANGED_THREAT_FEATURES, THREAT_DIMENSIONS};
-#[cfg(feature = "nnue-halfka_e4")]
-use super::{E4_CONFIG, append_active_e4};
+#[cfg(feature = "nnue-effect-bucket")]
+use super::{EFFECT_BUCKET_CONFIG, append_active_effect_bucket};
 use crate::position::Position;
 use crate::types::Color;
 use std::io::{self, Read};
@@ -59,11 +59,11 @@ fn append_active_indices<FT: LsFeatureSpec>(
     perspective: Color,
     active: &mut IndexList<MAX_ACTIVE_FEATURES>,
 ) {
-    #[cfg(feature = "nnue-halfka_e4")]
+    #[cfg(feature = "nnue-effect-bucket")]
     {
-        append_active_e4(pos, E4_CONFIG, perspective, active);
+        append_active_effect_bucket(pos, EFFECT_BUCKET_CONFIG, perspective, active);
     }
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     <FT::Feature as Feature>::append_active_indices(pos, perspective, active);
 }
 
@@ -728,7 +728,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         acc: &mut AccumulatorLayerStacks<L1>,
         prev_acc: &AccumulatorLayerStacks<L1>,
     ) {
-        if cfg!(feature = "nnue-halfka_e4") {
+        if cfg!(feature = "nnue-effect-bucket") {
             let _ = dirty_piece;
             let _ = prev_acc;
             self.refresh_accumulator(pos, acc);
@@ -876,7 +876,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         prev_acc: &AccumulatorLayerStacks<L1>,
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
-        if cfg!(feature = "nnue-halfka_e4") {
+        if cfg!(feature = "nnue-effect-bucket") {
             let _ = dirty_piece;
             let _ = prev_acc;
             let _ = cache;
@@ -1024,7 +1024,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         acc: &mut AccumulatorLayerStacks<L1>,
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
-        if cfg!(feature = "nnue-halfka_e4") {
+        if cfg!(feature = "nnue-effect-bucket") {
             let _ = cache;
             self.refresh_accumulator(pos, acc);
             return;
@@ -1091,7 +1091,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         #[cfg(feature = "nnue-psqt")] psqt_acc: &mut [i32; MAX_LAYER_STACK_BUCKETS],
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
-        if cfg!(feature = "nnue-halfka_e4") {
+        if cfg!(feature = "nnue-effect-bucket") {
             let _ = cache;
             accumulation.copy_from_slice(&self.biases.0);
             let mut active_indices = IndexList::new();
@@ -1171,7 +1171,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         stack: &mut AccumulatorStackLayerStacks<L1>,
         source_idx: usize,
     ) -> bool {
-        if cfg!(feature = "nnue-halfka_e4") {
+        if cfg!(feature = "nnue-effect-bucket") {
             let _ = pos;
             let _ = stack;
             let _ = source_idx;
@@ -1451,7 +1451,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         perspective: Color,
         king_sq: crate::types::Square,
     ) -> bool {
-        if cfg!(feature = "nnue-halfka_e4") {
+        if cfg!(feature = "nnue-effect-bucket") {
             let _ = accumulation;
             let _ = dirty_piece;
             let _ = perspective;
@@ -1928,12 +1928,12 @@ mod tests {
     use crate::nnue::bona_piece::ExtBonaPiece;
     #[cfg(feature = "nnue-psqt")]
     use crate::nnue::constants::DEFAULT_NUM_BUCKETS;
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     use crate::nnue::constants::HALFKA_HM_DIMENSIONS;
     use crate::nnue::constants::NNUE_PYTORCH_L1;
     use crate::nnue::ls_feature_spec::HalfKaHmMergedSpec;
     use crate::nnue::piece_list::PieceNumber;
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     use crate::types::Piece;
     use crate::types::{File, PieceType, Rank, Square};
 
@@ -1962,7 +1962,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     fn fill_weight_row(ft: &mut TestFt, index: usize, seed: i16) {
         let start = index * TEST_L1;
         for (i, slot) in ft.weights[start..start + TEST_L1].iter_mut().enumerate() {
@@ -1970,7 +1970,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     fn apply_generic(
         ft: &TestFt,
         accumulation: &mut [i16; TEST_L1],
@@ -1995,8 +1995,8 @@ mod tests {
         }
     }
 
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_feature_transformer_dimensions() {
         assert_eq!(TEST_L1, 1536);
@@ -2004,8 +2004,8 @@ mod tests {
         assert_eq!(TestSpec::DIMENSIONS, 73305);
     }
 
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_single_move() {
         let king_sq = Square::new(File::File5, Rank::Rank9);
@@ -2044,8 +2044,8 @@ mod tests {
         assert_eq!(generic.0, fast.0);
     }
 
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_capture() {
         let king_sq = Square::new(File::File5, Rank::Rank9);
@@ -2105,8 +2105,8 @@ mod tests {
         assert_eq!(generic.0, fast.0);
     }
 
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_single_move_white() {
         // 後手視点: fw / king_sq.inverse() の分岐をカバー
@@ -2146,8 +2146,8 @@ mod tests {
         assert_eq!(generic.0, fast.0);
     }
 
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_capture_white() {
         // 後手視点: dirty_num==2 の fw 分岐をカバー
@@ -2334,7 +2334,7 @@ mod tests {
     // =========================================================================
 
     use crate::nnue::ls_feature_spec::LsFeatureSpec;
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     use crate::nnue::ls_feature_spec::{
         HalfKaHmSplitSpec, HalfKaMergedSpec, HalfKaSplitSpec, HalfKpSpec,
     };
@@ -2376,29 +2376,29 @@ mod tests {
         smoke_refresh_for_spec::<HalfKaHmMergedSpec>();
     }
 
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn smoke_refresh_halfka_hm_split() {
         smoke_refresh_for_spec::<HalfKaHmSplitSpec>();
     }
 
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn smoke_refresh_halfka_merged() {
         smoke_refresh_for_spec::<HalfKaMergedSpec>();
     }
 
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn smoke_refresh_halfka_split() {
         smoke_refresh_for_spec::<HalfKaSplitSpec>();
     }
 
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn smoke_refresh_halfkp() {
         smoke_refresh_for_spec::<HalfKpSpec>();
@@ -2406,8 +2406,8 @@ mod tests {
 
     /// HalfKp + cache 経由 refresh で玉 BonaPiece (`>= FE_END`) を `idx_fn` に渡さない
     /// ことを ply32 局面 (駒成り + 駒台手駒あり) と相手玉位置違い派生局面で保証する。
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn refresh_with_cache_halfkp_complex_position() {
         let weights = AlignedBox::<i16>::new_zeroed(HalfKpSpec::DIMENSIONS * TEST_L1);
@@ -2463,8 +2463,8 @@ mod tests {
     /// HalfKp で `refresh_accumulator` (slow path) と `refresh_accumulator_with_cache`
     /// (fast cache path、玉スロット ZERO マスク経由) の accumulation が
     /// 非ゼロ weights 下で bit 一致することを保証する。
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn refresh_with_cache_halfkp_matches_slow_path() {
         let mut weights = AlignedBox::<i16>::new_zeroed(HalfKpSpec::DIMENSIONS * TEST_L1);
@@ -2526,8 +2526,8 @@ mod tests {
     /// HalfKp の `try_apply_dirty_piece_fast` が玉 BonaPiece (`>= FE_END`) を含む
     /// `DirtyPiece` を受け取ったとき `false` を返して slow path にフォールバック
     /// することを直接検証する。
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn try_apply_dirty_piece_fast_halfkp_rejects_king_bp() {
         let weights = AlignedBox::<i16>::new_zeroed(HalfKpSpec::DIMENSIONS * TEST_L1);

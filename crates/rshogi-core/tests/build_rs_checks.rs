@@ -302,33 +302,33 @@ fn ls_specific_with_ft_halfka_hm_merged_ok() {
 }
 
 #[test]
-fn halfka_e4_specific_ok() {
+fn halfka_effect_bucket_specific_ok() {
     let has = lookup(&[
         "mode-specific",
         "layerstack-arch",
         "layerstacks-512x16x32",
         "ft-halfka_hm_merged",
-        "nnue-halfka_e4",
-        "e4-config-2x2-kingfixed",
+        "nnue-effect-bucket",
+        "effect-bucket-2x2-kingfixed",
     ]);
     assert!(validate_feature_combination(&has).is_ok());
 }
 
 #[test]
-fn halfka_e4_without_mode_rejected() {
+fn halfka_effect_bucket_without_mode_rejected() {
     let has = lookup(&[
         "layerstack-arch",
         "layerstacks-512x16x32",
         "ft-halfka_hm_merged",
-        "nnue-halfka_e4",
-        "e4-config-2x2-kingfixed",
+        "nnue-effect-bucket",
+        "effect-bucket-2x2-kingfixed",
     ]);
     let err = validate_feature_combination(&has).unwrap_err();
     assert!(err.contains("mode-specific"));
 }
 
 #[test]
-fn halfka_e4_in_universal_rejected() {
+fn halfka_effect_bucket_in_universal_rejected() {
     let has = lookup(&[
         "mode-universal",
         "layerstack-arch",
@@ -336,53 +336,53 @@ fn halfka_e4_in_universal_rejected() {
         "layerstacks-1024x16x32",
         "ft-halfkp",
         "ft-halfka_hm_merged",
-        "nnue-halfka_e4",
-        "e4-config-2x2-kingfixed",
+        "nnue-effect-bucket",
+        "effect-bucket-2x2-kingfixed",
     ]);
     let err = validate_feature_combination(&has).unwrap_err();
     assert!(err.contains("mode-specific"));
 }
 
 #[test]
-fn halfka_e4_with_extra_ft_rejected() {
+fn halfka_effect_bucket_with_extra_ft_rejected() {
     let has = lookup(&[
         "mode-specific",
         "layerstack-arch",
         "layerstacks-512x16x32",
         "ft-halfka_hm_merged",
         "ft-halfka_split",
-        "nnue-halfka_e4",
-        "e4-config-2x2-kingfixed",
+        "nnue-effect-bucket",
+        "effect-bucket-2x2-kingfixed",
     ]);
     let err = validate_feature_combination(&has).unwrap_err();
     assert!(err.contains("ft-halfka_hm_merged だけ"));
 }
 
 #[test]
-fn halfka_e4_with_threat_rejected() {
+fn halfka_effect_bucket_with_threat_rejected() {
     let has = lookup(&[
         "mode-specific",
         "layerstack-arch",
         "layerstacks-512x16x32",
         "ft-halfka_hm_merged",
         "nnue-threat",
-        "nnue-halfka_e4",
-        "e4-config-2x2-kingfixed",
+        "nnue-effect-bucket",
+        "effect-bucket-2x2-kingfixed",
     ]);
     let err = validate_feature_combination(&has).unwrap_err();
     assert!(err.contains("nnue-threat"));
 }
 
 #[test]
-fn halfka_e4_with_psqt_rejected() {
+fn halfka_effect_bucket_with_psqt_rejected() {
     let has = lookup(&[
         "mode-specific",
         "layerstack-arch",
         "layerstacks-512x16x32",
         "ft-halfka_hm_merged",
         "nnue-psqt",
-        "nnue-halfka_e4",
-        "e4-config-2x2-kingfixed",
+        "nnue-effect-bucket",
+        "effect-bucket-2x2-kingfixed",
     ]);
     let err = validate_feature_combination(&has).unwrap_err();
     assert!(err.contains("nnue-psqt"));

@@ -1,16 +1,18 @@
-//! HalfKa-E4 特徴列挙 (full recompute)
+//! HalfKaHmMerged + EffectBucket 特徴列挙 (full recompute)
 //!
 //! base HalfKaHmMerged の active index 列挙を、各駒マスの被攻撃×被防御バケットで
-//! 拡張する。`e4_index = base_index * NB + bucket` (`bona_piece_halfka_e4`)。
+//! 拡張する。`effect_bucket_index = base_index * NB + bucket` (`bona_piece_effect_bucket`)。
 //! bucket は `pos.board_effect` の per-square count から求めるため、base の Feature
 //! trait (pos 非受領) でなく pos を取る専用関数として実装する (threat と同型)。
 //!
-//! 差分更新 `append_changed_e4_indices` は本モジュールに後続で追加する。full recompute
+//! 差分更新 `append_changed_effect_bucket_indices` は本モジュールに後続で追加する。full recompute
 //! (本関数) は差分の正当性検証 (決定論 verify) の ground truth。
 
 use super::accumulator::{DirtyPiece, IndexList, MAX_ACTIVE_FEATURES, MAX_CHANGED_FEATURES};
 use super::bona_piece::BonaPiece;
-use super::bona_piece_halfka_e4::{E4Config, e4_bucket, e4_index, packed_is_bucketed};
+use super::bona_piece_effect_bucket::{
+    EffectBucketConfig, effect_bucket, effect_bucket_index, packed_is_bucketed,
+};
 use super::bona_piece_halfka_hm_merged::{
     E_KING, F_KING, FE_HAND_END, FE_OLD_END, halfka_index, is_hm_mirror, king_bucket,
     pack_bonapiece,
@@ -19,15 +21,15 @@ use super::piece_list::PieceNumber;
 use crate::position::{BoardEffects, Position};
 use crate::types::{Color, Square};
 
-/// perspective 視点の E4 active index を全て列挙する (full recompute)。
+/// perspective 視点の effect bucket active index を全て列挙する (full recompute)。
 ///
 /// 各 PieceList slot について base index を求め、bucketed な駒 (盤上非王駒 / 玉は
 /// config 依存) は物理マスの被攻撃×被防御 count からバケットを付ける。手駒と
 /// 非バケット駒は bucket 0。`pos.board_effect` を参照するため board_effects が
 /// 最新 (非 dirty) であることが前提。
-pub fn append_active_e4(
+pub fn append_active_effect_bucket(
     pos: &Position,
-    config: E4Config,
+    config: EffectBucketConfig,
     perspective: Color,
     active: &mut IndexList<MAX_ACTIVE_FEATURES>,
 ) {
@@ -57,24 +59,24 @@ pub fn append_active_e4(
             let c = pos.piece_on(sq).color();
             let attacked = pos.board_effect(!c, sq);
             let defended = pos.board_effect(c, sq);
-            e4_bucket(attacked, defended, config.nb)
+            effect_bucket(attacked, defended, config.nb)
         } else {
             0
         };
-        let _ = active.push(e4_index(base_index, bucket, config.nb));
+        let _ = active.push(effect_bucket_index(base_index, bucket, config.nb));
     }
 }
 
-/// do_move 後の局面と do_move 前の利きスナップショットから、E4 active index の差分を列挙する。
+/// do_move 後の局面と do_move 前の利きスナップショットから、effect bucket active index の差分を列挙する。
 ///
 /// `perspective` 側の玉が動いた場合、king bucket が変わって全 base index が移動し得るため
 /// `false` を返す。呼び出し側は full refresh にフォールバックすること。
 /// `pos.board_effects()` は do_move 後の状態で再計算済みであることが前提。
-pub fn append_changed_e4_indices(
+pub fn append_changed_effect_bucket_indices(
     pos: &Position,
     prev_effects: &BoardEffects,
     dirty_piece: &DirtyPiece,
-    config: E4Config,
+    config: EffectBucketConfig,
     perspective: Color,
     king_sq: Square,
     removed: &mut IndexList<MAX_CHANGED_FEATURES>,
@@ -102,7 +104,7 @@ pub fn append_changed_e4_indices(
         if old_bp != BonaPiece::ZERO {
             let packed = pack_bonapiece(old_bp, hm_mirror);
             let bucket = bucket_for_bonapiece_before(cp.old_piece.fb, packed, prev_effects, config);
-            if !removed.push(e4_index(halfka_index(kb, packed), bucket, config.nb)) {
+            if !removed.push(effect_bucket_index(halfka_index(kb, packed), bucket, config.nb)) {
                 return false;
             }
         }
@@ -115,7 +117,7 @@ pub fn append_changed_e4_indices(
         if new_bp != BonaPiece::ZERO {
             let packed = pack_bonapiece(new_bp, hm_mirror);
             let bucket = bucket_for_bonapiece_after(pos, cp.new_piece.fb, packed, config);
-            if !added.push(e4_index(halfka_index(kb, packed), bucket, config.nb)) {
+            if !added.push(effect_bucket_index(halfka_index(kb, packed), bucket, config.nb)) {
                 return false;
             }
         }
@@ -132,10 +134,13 @@ pub fn append_changed_e4_indices(
             continue;
         }
         let color = pc.color();
-        let old_bucket =
-            e4_bucket(prev_effects.effect(!color, sq), prev_effects.effect(color, sq), config.nb);
+        let old_bucket = effect_bucket(
+            prev_effects.effect(!color, sq),
+            prev_effects.effect(color, sq),
+            config.nb,
+        );
         let new_bucket =
-            e4_bucket(pos.board_effect(!color, sq), pos.board_effect(color, sq), config.nb);
+            effect_bucket(pos.board_effect(!color, sq), pos.board_effect(color, sq), config.nb);
         if old_bucket == new_bucket {
             continue;
         }
@@ -148,10 +153,10 @@ pub fn append_changed_e4_indices(
             continue;
         }
         let base = halfka_index(kb, packed);
-        if !removed.push(e4_index(base, old_bucket, config.nb)) {
+        if !removed.push(effect_bucket_index(base, old_bucket, config.nb)) {
             return false;
         }
-        if !added.push(e4_index(base, new_bucket, config.nb)) {
+        if !added.push(effect_bucket_index(base, new_bucket, config.nb)) {
             return false;
         }
     }
@@ -163,28 +168,28 @@ fn bucket_for_bonapiece_before(
     bp_fb: BonaPiece,
     packed: usize,
     prev_effects: &BoardEffects,
-    config: E4Config,
+    config: EffectBucketConfig,
 ) -> usize {
     if !packed_is_bucketed(packed, config.king_bucketed) {
         return 0;
     }
     let sq = decode_board_square_fb(bp_fb).expect("bucketed piece must have a board square");
     let color = decode_board_color_fb(bp_fb).expect("bucketed piece must have a color");
-    e4_bucket(prev_effects.effect(!color, sq), prev_effects.effect(color, sq), config.nb)
+    effect_bucket(prev_effects.effect(!color, sq), prev_effects.effect(color, sq), config.nb)
 }
 
 fn bucket_for_bonapiece_after(
     pos: &Position,
     bp_fb: BonaPiece,
     packed: usize,
-    config: E4Config,
+    config: EffectBucketConfig,
 ) -> usize {
     if !packed_is_bucketed(packed, config.king_bucketed) {
         return 0;
     }
     let sq = decode_board_square_fb(bp_fb).expect("bucketed piece must have a board square");
     let color = pos.piece_on(sq).color();
-    e4_bucket(pos.board_effect(!color, sq), pos.board_effect(color, sq), config.nb)
+    effect_bucket(pos.board_effect(!color, sq), pos.board_effect(color, sq), config.nb)
 }
 
 fn bonapiece_at_square(pos: &Position, perspective: Color, sq: Square) -> Option<BonaPiece> {
@@ -239,18 +244,18 @@ fn decode_board_color_fb(bp: BonaPiece) -> Option<Color> {
     None
 }
 
-/// SFEN 局面の E4 active index を sorted で返す (cross-repo golden 用)。
+/// SFEN 局面の effect bucket active index を sorted で返す (形式一致 golden 用)。
 /// board_effects を再計算してから full recompute 列挙する。
-pub fn e4_active_indices_for_sfen(
+pub fn effect_bucket_active_indices_for_sfen(
     sfen: &str,
-    config: E4Config,
+    config: EffectBucketConfig,
     perspective: Color,
 ) -> Result<Vec<usize>, crate::position::SfenError> {
     let mut pos = Position::new();
     pos.set_sfen(sfen)?;
     pos.recompute_board_effects();
     let mut list = IndexList::<MAX_ACTIVE_FEATURES>::new();
-    append_active_e4(&pos, config, perspective, &mut list);
+    append_active_effect_bucket(&pos, config, perspective, &mut list);
     let mut v: Vec<usize> = list.iter().collect();
     v.sort_unstable();
     Ok(v)
@@ -271,20 +276,20 @@ mod tests {
         v
     }
 
-    /// E4 の active index を base で割ると base HalfKaHmMerged の active 集合に一致し、
+    /// effect bucket の active index を base で割ると base HalfKaHmMerged の active 集合に一致し、
     /// 余りが有効な bucket に収まることを、検証済みの base 実装と突き合わせて確認する。
     #[test]
-    fn e4_active_divides_back_to_base_set() {
+    fn effect_bucket_active_divides_back_to_base_set() {
         let sfens = [
             "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
             "l4S2l/4g1gs1/5p1p1/pr2N1pkp/4Gn3/PP3PPPP/2GPP4/1K7/L3r+s2L w BS2N5Pb 1",
             "6n1l/2+S1k4/2lp4p/1np1B2b1/3PP4/1N1S3rP/1P2+pPP+p1/1p1G5/3KG2r1 b GSN2L4Pgs2p 1",
         ];
         for cfg in [
-            E4Config::E4_2X2_KINGFIXED,
-            E4Config::E4_2X2_KINGBUCKETED,
-            E4Config::KPE9_KINGFIXED,
-            E4Config::KPE9_KINGBUCKETED,
+            EffectBucketConfig::KINGFIXED_2X2,
+            EffectBucketConfig::KINGBUCKETED_2X2,
+            EffectBucketConfig::KINGFIXED_3X3,
+            EffectBucketConfig::KINGBUCKETED_3X3,
         ] {
             for sfen in sfens {
                 let mut pos = Position::new();
@@ -292,10 +297,14 @@ mod tests {
                 pos.recompute_board_effects();
                 for persp in [Color::Black, Color::White] {
                     let base = base_active(&pos, persp);
-                    let mut e4 = IndexList::<MAX_ACTIVE_FEATURES>::new();
-                    append_active_e4(&pos, cfg, persp, &mut e4);
-                    assert_eq!(e4.len(), base.len(), "active 数一致 {sfen} {persp:?}");
-                    let mut recovered: Vec<usize> = e4
+                    let mut effect_bucket_indices = IndexList::<MAX_ACTIVE_FEATURES>::new();
+                    append_active_effect_bucket(&pos, cfg, persp, &mut effect_bucket_indices);
+                    assert_eq!(
+                        effect_bucket_indices.len(),
+                        base.len(),
+                        "active 数一致 {sfen} {persp:?}"
+                    );
+                    let mut recovered: Vec<usize> = effect_bucket_indices
                         .iter()
                         .map(|idx| {
                             let bucket = idx % cfg.nb;
@@ -304,15 +313,18 @@ mod tests {
                         })
                         .collect();
                     recovered.sort_unstable();
-                    assert_eq!(recovered, base, "e4/NB == base 集合 {sfen} {persp:?} {cfg:?}");
+                    assert_eq!(
+                        recovered, base,
+                        "effect_bucket/NB == base 集合 {sfen} {persp:?} {cfg:?}"
+                    );
                 }
             }
         }
     }
 
-    fn e4_active(pos: &Position, cfg: E4Config, persp: Color) -> Vec<usize> {
+    fn effect_bucket_active(pos: &Position, cfg: EffectBucketConfig, persp: Color) -> Vec<usize> {
         let mut list = IndexList::<MAX_ACTIVE_FEATURES>::new();
-        append_active_e4(pos, cfg, persp, &mut list);
+        append_active_effect_bucket(pos, cfg, persp, &mut list);
         let mut v: Vec<usize> = list.iter().collect();
         v.sort_unstable();
         v
@@ -337,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn e4_changed_matches_active_all_legal_moves() {
+    fn effect_bucket_changed_matches_active_all_legal_moves() {
         let sfens = [
             "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
             "l4S2l/4g1gs1/5p1p1/pr2N1pkp/4Gn3/PP3PPPP/2GPP4/1K7/L3r+s2L w BS2N5Pb 1",
@@ -345,10 +357,10 @@ mod tests {
         ];
 
         for cfg in [
-            E4Config::E4_2X2_KINGFIXED,
-            E4Config::E4_2X2_KINGBUCKETED,
-            E4Config::KPE9_KINGFIXED,
-            E4Config::KPE9_KINGBUCKETED,
+            EffectBucketConfig::KINGFIXED_2X2,
+            EffectBucketConfig::KINGBUCKETED_2X2,
+            EffectBucketConfig::KINGFIXED_3X3,
+            EffectBucketConfig::KINGBUCKETED_3X3,
         ] {
             for sfen in sfens {
                 let mut pos = Position::new();
@@ -362,18 +374,18 @@ mod tests {
                 for m in moves {
                     let prev_effects = pos.board_effects().clone();
                     let active_before = [
-                        e4_active(&pos, cfg, Color::Black),
-                        e4_active(&pos, cfg, Color::White),
+                        effect_bucket_active(&pos, cfg, Color::Black),
+                        effect_bucket_active(&pos, cfg, Color::White),
                     ];
                     let gives_check = pos.gives_check(m);
                     let dirty_piece = pos.do_move(m, gives_check);
                     pos.recompute_board_effects();
 
                     for perspective in [Color::Black, Color::White] {
-                        let active_after = e4_active(&pos, cfg, perspective);
+                        let active_after = effect_bucket_active(&pos, cfg, perspective);
                         let mut removed = IndexList::<MAX_CHANGED_FEATURES>::new();
                         let mut added = IndexList::<MAX_CHANGED_FEATURES>::new();
-                        let ok = append_changed_e4_indices(
+                        let ok = append_changed_effect_bucket_indices(
                             &pos,
                             &prev_effects,
                             &dirty_piece,
@@ -387,7 +399,10 @@ mod tests {
                             assert!(!ok, "king moved must request refresh: {sfen} {m:?} {cfg:?}");
                             continue;
                         }
-                        assert!(ok, "changed E4 overflow: {sfen} {m:?} {perspective:?} {cfg:?}");
+                        assert!(
+                            ok,
+                            "changed effect bucket overflow: {sfen} {m:?} {perspective:?} {cfg:?}"
+                        );
                         let context = format!("{sfen} {m:?} {perspective:?} {cfg:?}");
                         let updated = apply_changed(
                             active_before[perspective.index()].clone(),

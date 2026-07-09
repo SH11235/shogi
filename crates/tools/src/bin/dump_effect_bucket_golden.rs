@@ -1,10 +1,10 @@
-//! E4 active index の golden dumper。
+//! effect bucket active index の golden dumper。
 //!
-//! 共有 SFEN 群について各 (perspective, config) の E4 active index を sorted 出力する。
+//! 共有 SFEN 群について各 (perspective, config) の effect bucket active index を sorted 出力する。
 //! net の学習/export 側 dumper と同一 SFEN・同一形式で出力し、diff が空になることが
 //! Golden Forward (index bit 一致) ゲート。形式: `<sfen_no> <B|W> <config_name> : <idx> <idx> ...`
 
-use rshogi_core::nnue::{E4Config, e4_active_indices_for_sfen};
+use rshogi_core::nnue::{EffectBucketConfig, effect_bucket_active_indices_for_sfen};
 use rshogi_core::types::Color;
 
 fn main() {
@@ -17,17 +17,17 @@ fn main() {
         "lnsgkgsnl/1r5b1/ppppppppp/9/4P4/9/PPPP1PPPP/1B5R1/LNSGKGSNL b - 1",
     ];
     let configs = [
-        ("e4_2x2_kingfixed", E4Config::E4_2X2_KINGFIXED),
-        ("e4_2x2_kingbucketed", E4Config::E4_2X2_KINGBUCKETED),
-        ("kpe9_kingfixed", E4Config::KPE9_KINGFIXED),
-        ("kpe9_kingbucketed", E4Config::KPE9_KINGBUCKETED),
+        ("effect_bucket_2x2_kingfixed", EffectBucketConfig::KINGFIXED_2X2),
+        ("effect_bucket_2x2_kingbucketed", EffectBucketConfig::KINGBUCKETED_2X2),
+        ("effect_bucket_3x3_kingfixed", EffectBucketConfig::KINGFIXED_3X3),
+        ("effect_bucket_3x3_kingbucketed", EffectBucketConfig::KINGBUCKETED_3X3),
     ];
 
     for (no, sfen) in sfens.iter().enumerate() {
         for persp in [Color::Black, Color::White] {
             let tag = if persp == Color::Black { "B" } else { "W" };
             for (name, cfg) in configs.iter() {
-                let idx = e4_active_indices_for_sfen(sfen, *cfg, persp)
+                let idx = effect_bucket_active_indices_for_sfen(sfen, *cfg, persp)
                     .unwrap_or_else(|e| panic!("sfen {no} decode failed: {e:?}"));
                 let joined = idx.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
                 println!("{no} {tag} {name} : {joined}");

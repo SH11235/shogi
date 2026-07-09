@@ -518,8 +518,8 @@ impl NNUENetwork {
                         // 上で処理済みなのでここには来ない
                         unreachable!()
                     }
-                    FeatureSet::HalfKaE4 => {
-                        // E4 は LayerStacks reader で処理される。
+                    FeatureSet::HalfKaHmMergedEffectBucket => {
+                        // effect bucket は LayerStacks reader で処理される。
                         unreachable!()
                     }
                 }
@@ -1225,7 +1225,9 @@ pub fn detect_format(bytes: &[u8], file_size: u64) -> io::Result<NnueFormatInfo>
                 FeatureSet::HalfKaSplit => format!("HalfKaSplit{}", l1),
                 FeatureSet::HalfKaMerged => format!("HalfKaMerged{}", l1),
                 FeatureSet::HalfKaHmSplit => format!("HalfKaHmSplit{}", l1),
-                FeatureSet::HalfKaE4 => format!("HalfKaE4{}", l1),
+                FeatureSet::HalfKaHmMergedEffectBucket => {
+                    format!("HalfKaHmMergedEffectBucket{}", l1)
+                }
                 FeatureSet::HalfKP => format!("HalfKP{}", l1),
             };
 
@@ -2259,8 +2261,8 @@ mod tests {
 
     /// num_buckets-header layout で `num_buckets = 0` / 上限超過の値は
     /// `InvalidData` で reject される
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(all(feature = "layerstack-arch", not(feature = "nnue-halfka_e4")))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(all(feature = "layerstack-arch", not(feature = "nnue-effect-bucket")))]
     #[test]
     fn test_layer_stack_num_buckets_out_of_range_rejected() {
         for &n in &[0u32, (MAX_LAYER_STACK_BUCKETS as u32) + 1, 100, 1024] {

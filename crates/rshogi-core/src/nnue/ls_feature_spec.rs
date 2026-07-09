@@ -7,9 +7,9 @@
 //! §「LS FT generic 化」を参照。
 
 use super::bona_piece::{BonaPiece, halfkp_index};
-#[cfg(feature = "nnue-halfka_e4")]
-use super::constants::HALFKA_E4_DIMENSIONS;
-#[cfg(not(feature = "nnue-halfka_e4"))]
+#[cfg(feature = "nnue-effect-bucket")]
+use super::constants::HALFKA_EFFECT_BUCKET_DIMENSIONS;
+#[cfg(not(feature = "nnue-effect-bucket"))]
 use super::constants::HALFKA_HM_DIMENSIONS;
 use super::constants::{
     HALFKA_DIMENSIONS, HALFKA_HM_SPLIT_DIMENSIONS, HALFKA_MERGED_DIMENSIONS, HALFKP_DIMENSIONS,
@@ -139,10 +139,10 @@ pub struct HalfKaHmMergedSpec;
 impl LsFeatureSpec for HalfKaHmMergedSpec {
     type Set = HalfKaHmMergedFeatureSet;
     type Feature = HalfKaHmMerged;
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     const DIMENSIONS: usize = HALFKA_HM_DIMENSIONS;
-    #[cfg(feature = "nnue-halfka_e4")]
-    const DIMENSIONS: usize = HALFKA_E4_DIMENSIONS;
+    #[cfg(feature = "nnue-effect-bucket")]
+    const DIMENSIONS: usize = HALFKA_EFFECT_BUCKET_DIMENSIONS;
     const INCLUDE_KING_IN_PIECE_LIST: bool = true;
 
     #[inline]
@@ -163,8 +163,8 @@ mod tests {
     use crate::nnue::accumulator::{IndexList, MAX_ACTIVE_FEATURES};
     use crate::position::{Position, SFEN_HIRATE};
 
-    // E4 edition は E4 net 専用で非 E4 refresh/fast-diff 経路は dead、dims も意図的に異なる。
-    #[cfg(not(feature = "nnue-halfka_e4"))]
+    // effect bucket edition は effect bucket net 専用で非 effect bucket refresh/fast-diff 経路は dead、dims も意図的に異なる。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_dimensions_match_feature_set() {
         assert_eq!(HalfKpSpec::DIMENSIONS, <HalfKPFeatureSet as FeatureSet>::DIMENSIONS);
