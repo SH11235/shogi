@@ -62,6 +62,8 @@ fn append_active_indices<FT: LsFeatureSpec>(
     #[cfg(feature = "nnue-effect-bucket")]
     {
         append_active_effect_bucket(pos, EFFECT_BUCKET_CONFIG, perspective, active);
+        // effect bucket の列挙は FT weight 行数の範囲内が前提 (add_weights の境界条件)。
+        debug_assert!(active.iter().all(|i| i < FT::DIMENSIONS));
     }
     #[cfg(not(feature = "nnue-effect-bucket"))]
     <FT::Feature as Feature>::append_active_indices(pos, perspective, active);
@@ -1020,7 +1022,6 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
         if cfg!(feature = "nnue-effect-bucket") {
-            let _ = cache;
             self.refresh_accumulator(pos, acc);
             return;
         }
@@ -1087,7 +1088,6 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
         if cfg!(feature = "nnue-effect-bucket") {
-            let _ = cache;
             accumulation.copy_from_slice(&self.biases.0);
             let mut active_indices = IndexList::new();
             append_active_indices::<FT>(pos, perspective, &mut active_indices);
