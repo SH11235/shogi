@@ -82,6 +82,12 @@ name = "kifu_player"
 path = "src/bin/kifu_player.rs"
 required-features = ["kifu-player"]
 
+# eval_sfens は LayerStacks NNUE 前提のため nnue-arch に gate する。
+[[bin]]
+name = "eval_sfens"
+path = "src/bin/eval_sfens.rs"
+required-features = ["nnue-arch"]
+
 # ek_testset は CSA replay に依存する（TUI は不要）ため csa-replay に gate する。
 [[bin]]
 name = "ek_testset"

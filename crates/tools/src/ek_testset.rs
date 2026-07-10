@@ -164,7 +164,8 @@ struct CalibrationBin {
     bin: usize,
     n: usize,
     avg_pred: f64,
-    win_rate: f64,
+    // 平均実スコア（win=1 / draw=0.5 / loss=0）。
+    score_rate: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -680,7 +681,7 @@ impl EvalMetricBuilder {
                 bin,
                 n,
                 avg_pred: self.oc_cal_pred_sum[bin] / n as f64,
-                win_rate: self.oc_cal_win_sum[bin] / n as f64,
+                score_rate: self.oc_cal_win_sum[bin] / n as f64,
             });
         }
         out
@@ -838,6 +839,26 @@ mod tests {
 
         let (moves, ply_count) = load_first_game(ILLEGAL_MOVE_CSA);
         assert!(!replay_is_complete(&moves, ply_count));
+    }
+
+    #[test]
+    fn all_draw_input_yields_no_sign_acc() {
+        let draw = TestsetRecord {
+            sfen: "4k4/9/9/9/9/9/9/9/4K4 b - 1".to_string(),
+            stm: 'b',
+            ply: 1,
+            source_csa: String::new(),
+            is_declarable: false,
+            dt_label: None,
+            oc_label: Label::Draw,
+            floodgate_eval_cp: None,
+        };
+        let records = vec![(draw.clone(), 100), (draw, -100)];
+        let (_, oc) = compute_metrics(&records, 600.0);
+        assert_eq!(oc.n, 2);
+        assert_eq!(oc.n_draw, 2);
+        assert_eq!(oc.sign_acc, None);
+        assert!(oc.wdl_cross_entropy.unwrap() > 0.0);
     }
 
     #[test]
