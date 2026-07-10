@@ -1691,14 +1691,14 @@ fn build_floodgate_comment(
 ) -> String {
     let score = if let Some(cp) = info.score_cp {
         match my_color {
-            Color::Black => cp,
-            Color::White => -cp,
+            Color::Black => i64::from(cp),
+            Color::White => -i64::from(cp),
         }
     } else if let Some(mate) = info.score_mate {
         let base = if mate > 0 { 100000 } else { -100000 };
         match my_color {
-            Color::Black => base,
-            Color::White => -base,
+            Color::Black => i64::from(base),
+            Color::White => -i64::from(base),
         }
     } else {
         0
@@ -1896,6 +1896,16 @@ mod tests {
         let comment = build_floodgate_comment(&info, Color::Black, &pos, "7g7f");
 
         assert_eq!(comment, "* 123 +7776FU -3334FU");
+    }
+
+    #[test]
+    fn floodgate_comment_widens_white_min_score_without_overflow() {
+        let pos = rshogi_csa::initial_position();
+        let info = SearchInfo {
+            score_cp: Some(i32::MIN),
+            ..SearchInfo::default()
+        };
+        assert_eq!(build_floodgate_comment(&info, Color::White, &pos, "7g7f"), "* 2147483648");
     }
 
     #[test]

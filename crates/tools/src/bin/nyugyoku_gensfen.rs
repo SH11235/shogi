@@ -16,7 +16,7 @@ use rshogi_core::types::{EnteringKingRule, Move};
 use rshogi_csa::{ParsedMove, parse_csa_full_with_evals};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tools::common::dedup::{fnv1a64, get_disk_available};
+use tools::common::dedup::{FNV1A64_OFFSET, fnv1a64, fnv1a64_update, get_disk_available};
 use tools::common::io::{
     path_entry_exists, rename_noreplace, sync_directory, write_atomic_durable,
 };
@@ -24,7 +24,7 @@ use tools::common::io::{
 const DEFAULT_PARTITIONS: usize = 128;
 const DEFAULT_CHECKPOINT_INTERVAL: usize = 10_000;
 const PARTITION_BUFFER_BYTES: usize = 64 * 1024;
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -107,10 +107,14 @@ struct RunState {
     candidates_written: u64,
     /// 最後のcheckpointでdurableだった各partitionのbyte長。
     partition_bytes: Vec<u64>,
+    /// 各partitionのcheckpoint prefixに対する継続可能なFNV-1a digest。
+    partition_hashes: Vec<u64>,
     next_partition: usize,
     unique_written: u64,
     startpos_bytes: u64,
     provenance_bytes: u64,
+    startpos_hash: u64,
+    provenance_hash: u64,
 }
 
 struct RunOptions {
@@ -188,7 +192,9 @@ fn run_with_options(manifest: &Path, out_dir: &Path, options: RunOptions) -> Res
         ))
         .with_context(|| format!("failed to parse {}", resume_path.display()))?;
         validate_resume_state(&state, &manifest, options.partitions)?;
-        verify_manifest_for_resume(&manifest, &state)?;
+        if state.phase != Phase::Partition {
+            verify_manifest_for_resume(&manifest, &state)?;
+        }
         eprintln!(
             "Resuming: phase={:?}, manifest_lines={}, next_partition={}, unique={}",
             state.phase, state.processed_manifest_lines, state.next_partition, state.unique_written
@@ -214,10 +220,13 @@ fn run_with_options(manifest: &Path, out_dir: &Path, options: RunOptions) -> Res
             processed_sources_sha256: empty_sha256(),
             candidates_written: 0,
             partition_bytes: vec![0; options.partitions],
+            partition_hashes: vec![FNV1A64_OFFSET; options.partitions],
             next_partition: 0,
             unique_written: 0,
             startpos_bytes: 0,
             provenance_bytes: 0,
+            startpos_hash: FNV1A64_OFFSET,
+            provenance_hash: FNV1A64_OFFSET,
         };
         save_state(&state_path, &state)?;
         state
@@ -264,6 +273,10 @@ fn validate_resume_state(state: &RunState, manifest: &Path, partitions: usize) -
         state.partition_bytes.len() == partitions,
         "partition checkpoint count does not match state"
     );
+    ensure!(
+        state.partition_hashes.len() == partitions,
+        "partition hash count does not match state"
+    );
     Ok(())
 }
 
@@ -280,6 +293,7 @@ fn verify_manifest_for_resume(manifest: &Path, state: &RunState) -> Result<()> {
             update_prefix_hash(&mut hasher, &line);
             if let Some(row) = resolved_manifest_row(&line, manifest_dir)
                 .with_context(|| format!("invalid processed manifest line {}", line_idx + 1))?
+                .filter(|row| !anchor_candidates(row).is_empty())
             {
                 update_source_hash(&mut sources_hasher, &row.csa_path)?;
             }
@@ -322,7 +336,7 @@ fn partition_manifest(
         )?;
     }
     sync_directory(partitions_dir)?;
-    let mut writers = PartitionWriters::new(partitions_dir, state.partitions)?;
+    let mut writers = PartitionWriters::new(partitions_dir, &state.partition_hashes)?;
     let file = File::open(manifest)
         .with_context(|| format!("failed to open manifest {}", manifest.display()))?;
     let manifest_dir = manifest.parent().unwrap_or(Path::new("."));
@@ -335,14 +349,15 @@ fn partition_manifest(
         update_prefix_hash(&mut prefix_hasher, &line);
         let row = resolved_manifest_row(&line, manifest_dir)
             .with_context(|| format!("invalid manifest line {}", line_idx + 1))?;
-        let csa_text = if let Some(row) = row.as_ref() {
-            let text = fs::read_to_string(&row.csa_path)
-                .with_context(|| format!("failed to read {}", row.csa_path.display()))?;
-            update_source_hash_bytes(&mut sources_hasher, text.as_bytes());
-            Some(text)
-        } else {
-            None
-        };
+        let csa_text =
+            if let Some(row) = row.as_ref().filter(|row| !anchor_candidates(row).is_empty()) {
+                let text = fs::read_to_string(&row.csa_path)
+                    .with_context(|| format!("failed to read {}", row.csa_path.display()))?;
+                update_source_hash_bytes(&mut sources_hasher, text.as_bytes());
+                Some(text)
+            } else {
+                None
+            };
         if line_idx < state.processed_manifest_lines {
             if line_idx + 1 == state.processed_manifest_lines {
                 let actual = hex_digest(prefix_hasher.clone().finalize());
@@ -375,6 +390,7 @@ fn partition_manifest(
         if lines_since_checkpoint >= checkpoint_interval {
             writers.checkpoint()?;
             update_partition_checkpoint(partitions_dir, state)?;
+            state.partition_hashes.clone_from(&writers.hashes);
             save_state(state_path, state)?;
             eprintln!(
                 "partition: {} manifest lines, {} candidates",
@@ -397,6 +413,7 @@ fn partition_manifest(
     }
     writers.checkpoint()?;
     update_partition_checkpoint(partitions_dir, state)?;
+    state.partition_hashes.clone_from(&writers.hashes);
     state.phase = Phase::Dedup;
     state.next_partition = 0;
     initialize_output_files(work_dir, state)?;
@@ -414,12 +431,24 @@ fn deduplicate_partitions(
     let provenance_path = work_dir.join("provenance.tsv.tmp");
     truncate_to_checkpoint(&startpos_path, state.startpos_bytes)?;
     truncate_to_checkpoint(&provenance_path, state.provenance_bytes)?;
+    ensure!(
+        hash_file_prefix(&startpos_path, Some(state.startpos_bytes))? == state.startpos_hash,
+        "startpos checkpoint content changed"
+    );
+    ensure!(
+        hash_file_prefix(&provenance_path, Some(state.provenance_bytes))? == state.provenance_hash,
+        "provenance checkpoint content changed"
+    );
     let mut startpos = BufWriter::new(OpenOptions::new().append(true).open(&startpos_path)?);
     let mut provenance = BufWriter::new(OpenOptions::new().append(true).open(&provenance_path)?);
 
     for partition in state.next_partition..state.partitions {
         let path = partition_path(partitions_dir, partition);
-        validate_partition_file(&path, state.partition_bytes[partition])?;
+        validate_partition_file(
+            &path,
+            state.partition_bytes[partition],
+            state.partition_hashes[partition],
+        )?;
         let file =
             File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
         let mut seen = HashSet::new();
@@ -435,9 +464,10 @@ fn deduplicate_partitions(
                 continue;
             }
             state.unique_written += 1;
-            writeln!(startpos, "position sfen {}", item.sfen)?;
-            writeln!(
-                provenance,
+            let startpos_line = format!("position sfen {}\n", item.sfen);
+            startpos.write_all(startpos_line.as_bytes())?;
+            state.startpos_hash = fnv1a64_update(state.startpos_hash, startpos_line.as_bytes());
+            let provenance_line = format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 state.unique_written,
                 state.unique_written,
@@ -448,7 +478,10 @@ fn deduplicate_partitions(
                 item.anchor_move_eval_cp_black.map_or_else(String::new, |v| v.to_string()),
                 item.total_plies,
                 item.source_year.map_or_else(String::new, |v| v.to_string()),
-            )?;
+            ) + "\n";
+            provenance.write_all(provenance_line.as_bytes())?;
+            state.provenance_hash =
+                fnv1a64_update(state.provenance_hash, provenance_line.as_bytes());
         }
         drop(seen);
         startpos.flush()?;
@@ -482,15 +515,15 @@ fn initialize_output_files(work_dir: &Path, state: &mut RunState) -> Result<()> 
     let startpos = File::create(&startpos_path)?;
     startpos.sync_data()?;
     let mut provenance = BufWriter::new(File::create(&provenance_path)?);
-    writeln!(
-        provenance,
-        "id\tstartpos_line\tsource_csa\tanchor_ply\tanchor_kind\tentry_side\tanchor_move_eval_cp_black\ttotal_plies\tsource_year"
-    )?;
+    let header = b"id\tstartpos_line\tsource_csa\tanchor_ply\tanchor_kind\tentry_side\tanchor_move_eval_cp_black\ttotal_plies\tsource_year\n";
+    provenance.write_all(header)?;
     provenance.flush()?;
     provenance.get_ref().sync_data()?;
     sync_directory(work_dir)?;
     state.startpos_bytes = 0;
     state.provenance_bytes = fs::metadata(provenance_path)?.len();
+    state.startpos_hash = FNV1A64_OFFSET;
+    state.provenance_hash = fnv1a64(header);
     Ok(())
 }
 
@@ -695,23 +728,31 @@ struct PartitionWriters {
     dir: PathBuf,
     buffers: Vec<Vec<u8>>,
     dirty: Vec<bool>,
+    hashes: Vec<u64>,
     #[cfg(test)]
     file_opens: usize,
 }
 
 impl PartitionWriters {
-    fn new(dir: &Path, count: usize) -> Result<Self> {
-        for partition in 0..count {
+    fn new(dir: &Path, expected_hashes: &[u64]) -> Result<Self> {
+        let count = expected_hashes.len();
+        for (partition, &expected_hash) in expected_hashes.iter().enumerate() {
             OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(partition_path(dir, partition))?;
+            ensure!(
+                hash_file_prefix(&partition_path(dir, partition), None)? == expected_hash,
+                "partition content changed: {}",
+                partition_path(dir, partition).display()
+            );
         }
         sync_directory(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             buffers: (0..count).map(|_| Vec::with_capacity(PARTITION_BUFFER_BYTES)).collect(),
             dirty: vec![false; count],
+            hashes: expected_hashes.to_vec(),
             #[cfg(test)]
             file_opens: 0,
         })
@@ -742,6 +783,7 @@ impl PartitionWriters {
             self.file_opens += 1;
         }
         file.write_all(&self.buffers[partition])?;
+        self.hashes[partition] = fnv1a64_update(self.hashes[partition], &self.buffers[partition]);
         self.buffers[partition].clear();
         Ok(())
     }
@@ -765,12 +807,17 @@ impl PartitionWriters {
     }
 }
 
-fn validate_partition_file(path: &Path, expected_len: u64) -> Result<()> {
+fn validate_partition_file(path: &Path, expected_len: u64, expected_hash: u64) -> Result<()> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
     ensure!(
         len == expected_len,
         "partition size changed: {} (expected {expected_len}, got {len})",
+        path.display()
+    );
+    ensure!(
+        hash_file_prefix(path, Some(expected_len))? == expected_hash,
+        "partition content digest changed: {}",
         path.display()
     );
     if len == 0 {
@@ -781,6 +828,24 @@ fn validate_partition_file(path: &Path, expected_len: u64) -> Result<()> {
     file.read_exact(&mut byte)?;
     ensure!(byte[0] == b'\n', "partition has an incomplete final record: {}", path.display());
     Ok(())
+}
+
+fn hash_file_prefix(path: &Path, len: Option<u64>) -> Result<u64> {
+    let file = File::open(path)?;
+    let mut reader: Box<dyn Read> = match len {
+        Some(len) => Box::new(file.take(len)),
+        None => Box::new(file),
+    };
+    let mut hash = FNV1A64_OFFSET;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash = fnv1a64_update(hash, &buffer[..n]);
+    }
+    Ok(hash)
 }
 
 fn truncate_to_checkpoint(path: &Path, len: u64) -> Result<()> {
@@ -1075,11 +1140,63 @@ mod tests {
     }
 
     #[test]
+    fn rows_without_anchor_candidates_do_not_open_csa() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("manifest.tsv");
+        fs::write(&manifest, "missing.csa\t-1\t-1\t100\n").unwrap();
+        let out = dir.path().join("out");
+        let err = run_with_options(&manifest, &out, test_options(false)).unwrap_err();
+        assert!(err.to_string().contains("no start positions extracted"));
+    }
+
+    #[test]
     fn partial_partition_record_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("p.jsonl");
         fs::write(&path, b"complete\npartial").unwrap();
-        assert!(validate_partition_file(&path, 16).is_err());
+        assert!(validate_partition_file(&path, 16, fnv1a64(b"complete\npartial")).is_err());
+    }
+
+    #[test]
+    fn same_length_partition_corruption_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.jsonl");
+        fs::write(&path, b"{}\n").unwrap();
+        let expected_hash = fnv1a64(b"{}\n");
+        fs::write(&path, b"[]\n").unwrap();
+        assert!(validate_partition_file(&path, 3, expected_hash).is_err());
+    }
+
+    #[test]
+    fn same_length_output_checkpoint_corruption_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path();
+        let partitions = work.join("partitions");
+        fs::create_dir(&partitions).unwrap();
+        fs::write(work.join("startpos.txt.tmp"), b"xbc\n").unwrap();
+        fs::write(work.join("provenance.tsv.tmp"), b"def\n").unwrap();
+        let mut state = RunState {
+            version: STATE_VERSION,
+            manifest: "manifest.tsv".to_string(),
+            partitions: 1,
+            phase: Phase::Dedup,
+            processed_manifest_lines: 0,
+            processed_prefix_sha256: empty_sha256(),
+            processed_sources_sha256: empty_sha256(),
+            candidates_written: 0,
+            partition_bytes: vec![0],
+            partition_hashes: vec![FNV1A64_OFFSET],
+            next_partition: 1,
+            unique_written: 0,
+            startpos_bytes: 4,
+            provenance_bytes: 4,
+            startpos_hash: fnv1a64(b"abc\n"),
+            provenance_hash: fnv1a64(b"def\n"),
+        };
+        assert!(
+            deduplicate_partitions(work, &partitions, &work.join("state.json"), &mut state,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1099,10 +1216,13 @@ mod tests {
             processed_sources_sha256: empty_sha256(),
             candidates_written: 0,
             partition_bytes: vec![0],
+            partition_hashes: vec![FNV1A64_OFFSET],
             next_partition: 0,
             unique_written: 0,
             startpos_bytes: 0,
             provenance_bytes: 0,
+            startpos_hash: FNV1A64_OFFSET,
+            provenance_hash: FNV1A64_OFFSET,
         };
 
         verify_manifest_for_resume(&manifest, &state).unwrap();
@@ -1115,7 +1235,7 @@ mod tests {
     #[test]
     fn partition_buffers_batch_uniform_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writers = PartitionWriters::new(dir.path(), 128).unwrap();
+        let mut writers = PartitionWriters::new(dir.path(), &vec![FNV1A64_OFFSET; 128]).unwrap();
         let item = ExtractedPosition {
             position_key: "board b -".to_string(),
             sfen: "board b - 1".to_string(),
@@ -1183,10 +1303,13 @@ mod tests {
             processed_sources_sha256: empty_sha256(),
             candidates_written: 1,
             partition_bytes: vec![0],
+            partition_hashes: vec![FNV1A64_OFFSET],
             next_partition: 1,
             unique_written: 1,
             startpos_bytes: 16,
             provenance_bytes: 7,
+            startpos_hash: FNV1A64_OFFSET,
+            provenance_hash: FNV1A64_OFFSET,
         };
         finalize_output(&work, &out, &state).unwrap();
         assert!(out.join("startpos.txt").is_file());
