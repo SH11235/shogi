@@ -369,9 +369,12 @@ fn partition_manifest(
     let mut sources_hasher = Sha256::new();
     let mut lines_since_checkpoint = 0usize;
     let mut last_checkpoint = Instant::now();
+    let resume_prefix_lines = state.processed_manifest_lines;
+    let mut total_lines = 0usize;
 
     for (line_idx, line) in BufReader::new(file).lines().enumerate() {
         let line = line?;
+        total_lines = line_idx + 1;
         update_prefix_hash(&mut prefix_hasher, &line);
         let row = resolved_manifest_row(&line, manifest_dir)
             .with_context(|| format!("invalid manifest line {}", line_idx + 1))?;
@@ -410,8 +413,6 @@ fn partition_manifest(
         }
 
         state.processed_manifest_lines = line_idx + 1;
-        state.processed_prefix_sha256 = hex_digest(prefix_hasher.clone().finalize());
-        state.processed_sources_sha256 = hex_digest(sources_hasher.clone().finalize());
         lines_since_checkpoint += 1;
         if lines_since_checkpoint >= checkpoint_interval
             || last_checkpoint.elapsed() >= DEFAULT_CHECKPOINT_MAX_ELAPSED
@@ -419,6 +420,7 @@ fn partition_manifest(
             writers.checkpoint()?;
             update_partition_checkpoint(partitions_dir, state)?;
             state.partition_hashes.clone_from(&writers.hashes);
+            update_state_input_digests(state, &prefix_hasher, &sources_hasher);
             save_state(state_path, state)?;
             eprintln!(
                 "partition: {} manifest lines, {} candidates",
@@ -429,17 +431,11 @@ fn partition_manifest(
         }
     }
 
-    if state.processed_manifest_lines > 0 {
-        let actual = hex_digest(prefix_hasher.finalize());
-        ensure!(
-            actual == state.processed_prefix_sha256,
-            "manifest is shorter than the processed prefix recorded in state"
-        );
-        ensure!(
-            hex_digest(sources_hasher.finalize()) == state.processed_sources_sha256,
-            "CSA content in processed prefix changed"
-        );
-    }
+    ensure!(
+        total_lines >= resume_prefix_lines,
+        "manifest is shorter than the processed prefix recorded in state"
+    );
+    update_state_input_digests(state, &prefix_hasher, &sources_hasher);
     writers.checkpoint()?;
     update_partition_checkpoint(partitions_dir, state)?;
     state.partition_hashes.clone_from(&writers.hashes);
@@ -971,6 +967,15 @@ fn update_prefix_hash(hasher: &mut Sha256, line: &str) {
     hasher.update(b"\n");
 }
 
+fn update_state_input_digests(
+    state: &mut RunState,
+    manifest_hasher: &Sha256,
+    sources_hasher: &Sha256,
+) {
+    state.processed_prefix_sha256 = hex_digest(manifest_hasher.clone().finalize());
+    state.processed_sources_sha256 = hex_digest(sources_hasher.clone().finalize());
+}
+
 fn update_source_hash(hasher: &mut Sha256, path: &Path) -> Result<()> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     update_source_hash_bytes(hasher, &bytes);
@@ -987,7 +992,14 @@ fn empty_sha256() -> String {
 }
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1090,6 +1102,11 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn hex_digest_encodes_without_per_byte_formatting() {
+        assert_eq!(hex_digest([0x00, 0x0f, 0x10, 0xff]), "000f10ff");
     }
 
     #[test]
