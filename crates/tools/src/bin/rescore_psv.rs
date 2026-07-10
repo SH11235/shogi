@@ -1071,7 +1071,10 @@ fn main() -> Result<()> {
             )?;
         }
         if !use_onnx && !use_dlshogi_onnx {
-            if !engines.is_empty() {
+            // engine モードの判定は engines.is_empty() ではなく CLI 指定で行う。
+            // 全エンジン死亡でプールが空になった場合に静的 NNUE モードへ
+            // fallback させない（engine モードでは NNUE をロードしていない）
+            if cli.engine.is_some() {
                 process_file_with_engine(
                     &cli,
                     &mut engines,
@@ -1812,6 +1815,11 @@ fn process_file_with_engine(
 ) -> Result<()> {
     const CHUNK_SIZE: usize = 1_000_000;
 
+    // 前の入力ファイルで全エンジンが死んでいると空プールで呼ばれうる
+    if engines.is_empty() {
+        anyhow::bail!("All engine processes have failed");
+    }
+
     let in_file = File::open(input_path)
         .with_context(|| format!("Failed to open {}", input_path.display()))?;
     let mut reader = BufReader::with_capacity(8 * 1024 * 1024, in_file);
@@ -1832,11 +1840,8 @@ fn process_file_with_engine(
         let _ = engine.send_command("usinewgame");
     }
 
-    // 死んだエンジンプロセスは以降のチャンクの割り当てから除外する
+    // 死んだエンジンプロセスは以降の割り当てから除外する
     let mut alive: Vec<bool> = vec![true; engines.len()];
-    // エンジン死亡でスライス途中に残った未評価レコードは、捨てずに
-    // 次チャンクで生存エンジンへ再割り当てする
-    let mut carry: Vec<(PackedSfenValue, String)> = Vec::new();
 
     let mut error_count = 0u64;
     let mut clipped_count = 0u64;
@@ -1854,8 +1859,7 @@ fn process_file_with_engine(
 
         // チャンク読み込み（パース + SFEN 展開 + 王手フィルタ）
         let want = (CHUNK_SIZE as u64).min(process_count.saturating_sub(total_read)) as usize;
-        let mut chunk: Vec<(PackedSfenValue, String)> = std::mem::take(&mut carry);
-        chunk.reserve(want);
+        let mut chunk: Vec<(PackedSfenValue, String)> = Vec::with_capacity(want);
         let mut buffer = [0u8; PackedSfenValue::SIZE];
         let mut read_this_chunk = 0usize;
         while read_this_chunk < want {
@@ -1885,7 +1889,7 @@ fn process_file_with_engine(
             }
             chunk.push((psv, sfen));
         }
-        if read_this_chunk == 0 && chunk.is_empty() {
+        if read_this_chunk == 0 {
             break;
         }
         total_read += read_this_chunk as u64;
@@ -1893,90 +1897,112 @@ fn process_file_with_engine(
             continue;
         }
 
-        // 生存エンジンにチャンクを連続分割して並列処理
-        let mut alive_engines: Vec<(usize, &mut UsiEngine)> =
-            engines.iter_mut().enumerate().filter(|(idx, _)| alive[*idx]).collect();
-        if alive_engines.is_empty() {
-            anyhow::bail!("All engine processes have failed");
-        }
-        let slice_size = chunk.len().div_ceil(alive_engines.len()).max(1);
+        // チャンク内の全レコードを評価してから入力順で書き出す。
+        // エンジン死亡でスライス途中に未評価が残った場合は、同一チャンク内で
+        // 生存エンジンに再割り当てして評価し切る（出力順を崩さないため、
+        // 次チャンクへは持ち越さない）。
+        // None = 未評価、Some(None) = 評価失敗、Some(Some(cp)) = 評価済み
+        let mut chunk_scores: Vec<Option<Option<i32>>> = vec![None; chunk.len()];
+        let mut pending: Vec<usize> = (0..chunk.len()).collect();
 
-        // (エンジン番号, スライス先頭からの評価値列, エンジン死亡フラグ)
-        let results: Vec<(usize, Vec<Option<i32>>, bool)> = thread::scope(|s| {
-            let handles: Vec<_> = alive_engines
-                .iter_mut()
-                .zip(chunk.chunks(slice_size))
-                .map(|((engine_idx, engine), slice)| {
-                    let engine_idx = *engine_idx;
-                    let progress = progress.clone();
-                    s.spawn(move || {
-                        let mut scores = Vec::with_capacity(slice.len());
-                        let mut died = false;
-                        for (_, sfen) in slice {
-                            if INTERRUPTED.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            match engine.evaluate_position(sfen, engine_nodes) {
-                                Ok(score) => {
-                                    if score.is_none() && verbose {
-                                        eprintln!("No score returned for: {sfen}");
-                                    }
-                                    scores.push(score);
-                                }
-                                Err(e) => {
-                                    if verbose {
-                                        eprintln!("Engine error for {sfen}: {e}");
-                                    }
-                                    scores.push(None);
-                                    died = true;
+        while !pending.is_empty() && !INTERRUPTED.load(Ordering::SeqCst) {
+            let mut alive_engines: Vec<(usize, &mut UsiEngine)> =
+                engines.iter_mut().enumerate().filter(|(idx, _)| alive[*idx]).collect();
+            if alive_engines.is_empty() {
+                anyhow::bail!("All engine processes have failed");
+            }
+            let slice_size = pending.len().div_ceil(alive_engines.len()).max(1);
+
+            // (エンジン番号, 担当 index 列先頭からの評価値列, エンジン死亡フラグ)
+            let chunk_ref = &chunk;
+            let results: Vec<(usize, Vec<Option<i32>>, bool)> = thread::scope(|s| {
+                let handles: Vec<_> = alive_engines
+                    .iter_mut()
+                    .zip(pending.chunks(slice_size))
+                    .map(|((engine_idx, engine), idx_slice)| {
+                        let engine_idx = *engine_idx;
+                        let progress = progress.clone();
+                        s.spawn(move || {
+                            let mut scores = Vec::with_capacity(idx_slice.len());
+                            let mut died = false;
+                            for &i in idx_slice {
+                                if INTERRUPTED.load(Ordering::SeqCst) {
                                     break;
                                 }
+                                let sfen = &chunk_ref[i].1;
+                                match engine.evaluate_position(sfen, engine_nodes) {
+                                    Ok(score) => {
+                                        if score.is_none() && verbose {
+                                            eprintln!("No score returned for: {sfen}");
+                                        }
+                                        scores.push(score);
+                                    }
+                                    Err(e) => {
+                                        if verbose {
+                                            eprintln!("Engine error for {sfen}: {e}");
+                                        }
+                                        scores.push(None);
+                                        died = true;
+                                        progress.inc(1);
+                                        break;
+                                    }
+                                }
+                                progress.inc(1);
                             }
-                            progress.inc(1);
-                        }
-                        (engine_idx, scores, died)
+                            (engine_idx, scores, died)
+                        })
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("Engine worker thread panicked"))
-                .collect()
-        });
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("Engine worker thread panicked"))
+                    .collect()
+            });
 
-        // 連続分割なのでワーカー順の連結がそのまま入力順になる
-        let mut slices = chunk.chunks(slice_size);
-        for (engine_idx, scores, died) in results {
-            let slice = slices.next().unwrap_or(&[]);
-            if died {
-                alive[engine_idx] = false;
-                // 未評価で残ったスライス後半は次チャンクで生存エンジンに再割り当てする
-                carry.extend(slice[scores.len()..].iter().cloned());
-                eprintln!(
-                    "Warning: engine process #{engine_idx} failed and is excluded from further processing"
-                );
-            }
-            // 中断時は scores がスライスより短く、zip で評価済みの先頭一致分のみ書く
-            for ((psv, _), score) in slice.iter().zip(&scores) {
-                let Some(raw_score) = *score else {
-                    error_count += 1;
-                    continue;
-                };
-                let clipped = raw_score.abs() > score_clip as i32;
-                if clipped {
-                    clipped_count += 1;
+            // 評価結果を chunk 添字へ反映し、死亡ワーカーの未評価分を再キューする
+            let mut next_pending: Vec<usize> = Vec::new();
+            let mut idx_slices = pending.chunks(slice_size);
+            for (engine_idx, scores, died) in results {
+                let idx_slice = idx_slices.next().unwrap_or(&[]);
+                for (&i, score) in idx_slice.iter().zip(&scores) {
+                    chunk_scores[i] = Some(*score);
                 }
-                let new_psv = PackedSfenValue {
-                    sfen: psv.sfen,
-                    score: raw_score.clamp(-(score_clip as i32), score_clip as i32) as i16,
-                    move16: 0,
-                    game_ply: psv.game_ply,
-                    game_result: psv.game_result,
-                    padding: 0,
-                };
-                writer.write_all(&new_psv.to_bytes())?;
-                total_written += 1;
+                if died {
+                    alive[engine_idx] = false;
+                    next_pending.extend_from_slice(&idx_slice[scores.len()..]);
+                    eprintln!(
+                        "Warning: engine process #{engine_idx} failed and is excluded from further processing"
+                    );
+                }
+                // 中断（died でない）で残った分は再キューしない: ループ条件の
+                // INTERRUPTED チェックで打ち切られ、部分出力になる
             }
+            pending = next_pending;
+        }
+
+        // 入力順で書き出し（未評価 = 中断分は出力しない）
+        for ((psv, _), score) in chunk.iter().zip(&chunk_scores) {
+            let Some(evaluated) = score else {
+                continue;
+            };
+            let Some(raw_score) = *evaluated else {
+                error_count += 1;
+                continue;
+            };
+            let clipped = raw_score.abs() > score_clip as i32;
+            if clipped {
+                clipped_count += 1;
+            }
+            let new_psv = PackedSfenValue {
+                sfen: psv.sfen,
+                score: raw_score.clamp(-(score_clip as i32), score_clip as i32) as i16,
+                move16: 0,
+                game_ply: psv.game_ply,
+                game_result: psv.game_result,
+                padding: 0,
+            };
+            writer.write_all(&new_psv.to_bytes())?;
+            total_written += 1;
         }
     }
 
@@ -2003,9 +2029,17 @@ fn process_file_with_engine(
     }
     eprintln!("Wrote {total_written} records");
 
-    // 死亡エンジンをプールから除去し、後続の入力ファイルに割り当てない
+    // 死亡エンジンをプールから除去し、後続の入力ファイルに割り当てない。
+    // quit() で child を wait し、run 終了までゾンビプロセスを残さない
     let mut alive_flags = alive.into_iter();
-    engines.retain(|_| alive_flags.next().expect("alive length matches engines"));
+    engines.retain_mut(|engine| {
+        if alive_flags.next().expect("alive length matches engines") {
+            true
+        } else {
+            let _ = engine.quit();
+            false
+        }
+    });
 
     Ok(())
 }
