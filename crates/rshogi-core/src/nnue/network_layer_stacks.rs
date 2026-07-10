@@ -26,6 +26,8 @@
 
 use super::accumulator::Aligned;
 use super::accumulator_layer_stacks::{AccumulatorLayerStacks, AccumulatorStackLayerStacks};
+#[cfg(feature = "nnue-effect-bucket")]
+use super::constants::HALFKA_EFFECT_BUCKET_DIMENSIONS;
 use super::constants::{
     DEFAULT_NUM_BUCKETS, FV_SCALE_HALFKA, MAX_ARCH_LEN, MAX_LAYER_STACK_BUCKETS,
     NNUE_VERSION_HALFKA, NNUE_VERSION_LAYERSTACK_NUM_BUCKETS,
@@ -59,6 +61,8 @@ use super::network::{
     LayerStackBucketMode, compute_layer_stack_progress8kpabs_bucket_index, get_fv_scale_override,
     get_layer_stack_bucket_mode, get_layer_stack_progress_kpabs_weights, parse_fv_scale_from_arch,
 };
+#[cfg(feature = "nnue-effect-bucket")]
+use super::{EFFECT_BUCKET_KING_BUCKETED, EFFECT_BUCKET_NB};
 use crate::position::Position;
 use crate::types::{Color, Value};
 #[cfg(feature = "diagnostics")]
@@ -249,6 +253,57 @@ impl<
         } else {
             DEFAULT_NUM_BUCKETS
         };
+
+        #[cfg(feature = "nnue-effect-bucket")]
+        {
+            let model_config = parse_effect_bucket_config_from_arch(&arch_str).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("effect bucket build requires EffectBucket= token in arch string: {arch_str}"),
+                )
+            })?;
+            if model_config != (EFFECT_BUCKET_NB, EFFECT_BUCKET_KING_BUCKETED) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "effect bucket config mismatch: model=({}x{}), engine=({}x{}). \
+                         Use a model trained with the matching effect bucket config.",
+                        model_config.0,
+                        if model_config.1 { "bucketed" } else { "fixed" },
+                        EFFECT_BUCKET_NB,
+                        if EFFECT_BUCKET_KING_BUCKETED {
+                            "bucketed"
+                        } else {
+                            "fixed"
+                        },
+                    ),
+                ));
+            }
+            let model_dims =
+                super::spec::parse_feature_input_dimensions(&arch_str).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "effect bucket model is missing feature dimensions in arch string: {arch_str}"
+                        ),
+                    )
+                })?;
+            if model_dims != HALFKA_EFFECT_BUCKET_DIMENSIONS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "effect bucket input dimensions mismatch: model={model_dims}, engine={HALFKA_EFFECT_BUCKET_DIMENSIONS}"
+                    ),
+                ));
+            }
+        }
+        #[cfg(not(feature = "nnue-effect-bucket"))]
+        if arch_str.contains("EffectBucket=") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "effect bucket model requires nnue-effect-bucket feature",
+            ));
+        }
 
         // FV_SCALE 検出
         let fv_scale = parse_fv_scale_from_arch(&arch_str).unwrap_or(FV_SCALE_HALFKA);
@@ -1206,9 +1261,11 @@ impl<FT: LsFeatureSpec + 'static> LsNetByFt<FT> {
                     // path>=2 の forward update が threat accumulator を full 再列挙する(Finny 非対象)
                     // ため refresh(piece は Finny)に落ちる深さ 1 が速い(1 は YaneuraOu 方式相当)。
                     // edition-universal は threat 非対応モデルも同一バイナリで動くので runtime 判定。
-                    #[cfg(feature = "nnue-threat")]
+                    #[cfg(feature = "nnue-effect-bucket")]
+                    let max_depth = 0;
+                    #[cfg(all(feature = "nnue-threat", not(feature = "nnue-effect-bucket")))]
                     let max_depth = if $net.feature_transformer.has_threat { 1 } else { 4 };
-                    #[cfg(not(feature = "nnue-threat"))]
+                    #[cfg(not(any(feature = "nnue-threat", feature = "nnue-effect-bucket")))]
                     let max_depth = 4;
                     if let Some((source_idx, _depth)) =
                         $stack.find_usable_accumulator(max_depth)
@@ -1493,6 +1550,8 @@ impl<FT: LsFeatureSpec + 'static> LsNetByFt<FT> {
 /// active な FT variant は `ft-*` feature で、active な L1 variant は `layerstacks-*` feature で
 /// 制御される。
 pub enum LayerStacksNetwork {
+    #[cfg(feature = "nnue-effect-bucket")]
+    HalfKaHmMergedEffectBucket(LsNetByFt<HalfKaHmMergedSpec>),
     #[cfg(feature = "ft-halfka_hm_merged")]
     HalfKaHmMerged(LsNetByFt<HalfKaHmMergedSpec>),
     #[cfg(feature = "ft-halfka_hm_split")]
@@ -1529,6 +1588,34 @@ pub enum LayerStacksNetwork {
 macro_rules! ls_dispatch_ft_size {
     ($net:expr, |$inner:ident| $body:expr, _ => $fallback:expr $(,)?) => {
         match $net {
+            #[cfg(all(feature = "nnue-effect-bucket", feature = "layerstacks-1536x16x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaHmMergedEffectBucket(
+                $crate::nnue::LsNetByFt::L1536x16x32($inner),
+            ) => $body,
+            #[cfg(all(feature = "nnue-effect-bucket", feature = "layerstacks-1536x32x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaHmMergedEffectBucket(
+                $crate::nnue::LsNetByFt::L1536x32x32($inner),
+            ) => $body,
+            #[cfg(all(feature = "nnue-effect-bucket", feature = "layerstacks-768x16x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaHmMergedEffectBucket(
+                $crate::nnue::LsNetByFt::L768x16x32($inner),
+            ) => $body,
+            #[cfg(all(feature = "nnue-effect-bucket", feature = "layerstacks-768x8x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaHmMergedEffectBucket(
+                $crate::nnue::LsNetByFt::L768x8x32($inner),
+            ) => $body,
+            #[cfg(all(feature = "nnue-effect-bucket", feature = "layerstacks-512x16x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaHmMergedEffectBucket(
+                $crate::nnue::LsNetByFt::L512x16x32($inner),
+            ) => $body,
+            #[cfg(all(feature = "nnue-effect-bucket", feature = "layerstacks-1024x16x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaHmMergedEffectBucket(
+                $crate::nnue::LsNetByFt::L1024x16x32($inner),
+            ) => $body,
+            #[cfg(all(feature = "nnue-effect-bucket", feature = "layerstacks-3072x16x32"))]
+            $crate::nnue::LayerStacksNetwork::HalfKaHmMergedEffectBucket(
+                $crate::nnue::LsNetByFt::L3072x16x32($inner),
+            ) => $body,
             #[cfg(all(feature = "ft-halfka_hm_merged", feature = "layerstacks-1536x16x32"))]
             $crate::nnue::LayerStacksNetwork::HalfKaHmMerged(
                 $crate::nnue::LsNetByFt::L1536x16x32($inner),
@@ -1698,6 +1785,8 @@ macro_rules! ls_dispatch_ft_size {
 macro_rules! ls_match_ft {
     ($val:expr, $pat:ident => $body:expr) => {
         match $val {
+            #[cfg(feature = "nnue-effect-bucket")]
+            LayerStacksNetwork::HalfKaHmMergedEffectBucket($pat) => $body,
             #[cfg(feature = "ft-halfka_hm_merged")]
             LayerStacksNetwork::HalfKaHmMerged($pat) => $body,
             #[cfg(feature = "ft-halfka_hm_split")]
@@ -1714,6 +1803,7 @@ macro_rules! ls_match_ft {
                 feature = "ft-halfka_merged",
                 feature = "ft-halfka_split",
                 feature = "ft-halfkp",
+                feature = "nnue-effect-bucket",
             )))]
             _ => unreachable!("no LayerStacks FT variant enabled"),
         }
@@ -1801,6 +1891,14 @@ impl LayerStacksNetwork {
         }
         use super::spec::FeatureSet as Fs;
         match feature_set {
+            Fs::HalfKaHmMergedEffectBucket => {
+                read_into_variant!(
+                    "nnue-effect-bucket",
+                    HalfKaHmMergedSpec,
+                    HalfKaHmMergedEffectBucket,
+                    "HalfKaHmMergedEffectBucket"
+                )
+            }
             Fs::HalfKaHmMerged | Fs::LayerStacks => {
                 read_into_variant!(
                     "ft-halfka_hm_merged",
@@ -1918,17 +2016,33 @@ fn peek_layer_stacks_feature_set<R: Read + Seek>(
 #[cfg(feature = "layerstack-arch")]
 fn detect_layer_stacks_feature_set(arch_str: &str) -> super::spec::FeatureSet {
     use super::spec::FeatureSet as Fs;
+    if arch_str.contains("EffectBucket=") {
+        return Fs::HalfKaHmMergedEffectBucket;
+    }
     if let Some(name) = super::spec::parse_feature_set_keyword(arch_str) {
         match name {
             "HalfKP" => return Fs::HalfKP,
             "HalfKaSplit" => return Fs::HalfKaSplit,
             "HalfKaMerged" => return Fs::HalfKaMerged,
             "HalfKaHmSplit" => return Fs::HalfKaHmSplit,
+            "HalfKaHmMergedEffectBucket" => return Fs::HalfKaHmMergedEffectBucket,
             "HalfKaHmMerged" => return Fs::HalfKaHmMerged,
             _ => {}
         }
     }
     super::spec::parse_feature_set_from_arch(arch_str).unwrap_or(Fs::LayerStacks)
+}
+
+#[cfg(feature = "nnue-effect-bucket")]
+fn parse_effect_bucket_config_from_arch(arch_str: &str) -> Option<(usize, bool)> {
+    let token = arch_str.split(',').find_map(|part| part.strip_prefix("EffectBucket="))?;
+    match token {
+        "2x2fixed" => Some((4, false)),
+        "2x2bucketed" => Some((4, true)),
+        "3x3fixed" => Some((9, false)),
+        "3x3bucketed" => Some((9, true)),
+        _ => None,
+    }
 }
 
 /// arch_str の `Threat=<dims>` トークンから次元数を取り出す。
@@ -1946,7 +2060,7 @@ fn parse_threat_dims_from_arch(arch_str: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(feature = "layerstacks-1536x16x32", feature = "ft-halfka_hm_merged"))]
+    #[cfg(feature = "layerstack-arch")]
     use super::*;
     use crate::nnue::constants::{FV_SCALE_HALFKA, NNUE_PYTORCH_L1};
     #[cfg(all(feature = "layerstacks-1536x16x32", feature = "ft-halfka_hm_merged"))]
@@ -2201,6 +2315,10 @@ mod tests {
             (
                 "Features=HalfKaHmMerged(Friend)[73305->1536x2],PSQT=9,Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
                 Fs::HalfKaHmMerged,
+            ),
+            (
+                "Features=HalfKaHmMerged(Friend)[73305->1536x2],EffectBucket=2x2fixed,Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
+                Fs::HalfKaHmMergedEffectBucket,
             ),
         ];
 

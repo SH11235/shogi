@@ -48,6 +48,11 @@ layerstacks-3072x16x32 = ["rshogi-core/layerstacks-3072x16x32"]
 # LS 拡張 slot
 nnue-psqt   = ["rshogi-core/nnue-psqt"]
 nnue-threat = ["rshogi-core/nnue-threat"]
+nnue-effect-bucket = ["rshogi-core/nnue-effect-bucket"]
+effect-bucket-2x2-kingfixed = ["rshogi-core/effect-bucket-2x2-kingfixed"]
+effect-bucket-2x2-kingbucketed = ["rshogi-core/effect-bucket-2x2-kingbucketed"]
+effect-bucket-3x3-kingfixed = ["rshogi-core/effect-bucket-3x3-kingfixed"]
+effect-bucket-3x3-kingbucketed = ["rshogi-core/effect-bucket-3x3-kingbucketed"]
 # FT slot (LS の Feature Transformer 軸、5 variants)
 ft-halfkp           = ["rshogi-core/ft-halfkp"]
 ft-halfka_split     = ["rshogi-core/ft-halfka_split"]
