@@ -121,6 +121,8 @@ startpos_line	source_csa	anchor_ply	anchor_kind	entry_side	anchor_move_eval_cp_b
   831,592 KiB / 8.31 秒に対し、128 分割して 1 partition ずつ処理すると 9,416 KiB /
   1.77 秒（dedup set 部分のみの比較で、CSA 解析や disk I/O は含まない）。数億〜十億
   候補の規模では `--partitions` を増やして 1 partition あたりのユニーク数を抑える。
+  partition ごとに 64 KiB の書込みバッファも確保するため、`--partitions` 増加分だけ
+  固定メモリも増える（上限 4096 で合計 256 MiB）。
 - **一時ディスク**: 候補数と source path を含む JSONL レコード長に比例し、1 億候補で
   数十 GiB 以上になり得る。本番投入前に小さい代表 manifest で `out.work/partitions` の
   1 候補あたり byte 数を測り、同一 filesystem へ十分な空きを確保する。

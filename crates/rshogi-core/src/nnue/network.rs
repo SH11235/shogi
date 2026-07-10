@@ -150,6 +150,14 @@ pub fn load_progress_coeff_kpabs(path: impl AsRef<Path>) -> Result<Box<[f32]>, S
     let path = path.as_ref();
     let bytes = std::fs::read(path)
         .map_err(|e| format!("failed to read progress coeff '{}': {e}", path.display()))?;
+    load_progress_coeff_kpabs_from_bytes(&bytes)
+}
+
+/// [`load_progress_coeff_kpabs`] のバイト列版。
+///
+/// 呼び出し側でファイル内容のハッシュ検証などを行う場合に、検証したバイト列と
+/// 同一の内容から重みを構築できる。
+pub fn load_progress_coeff_kpabs_from_bytes(bytes: &[u8]) -> Result<Box<[f32]>, String> {
     let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * size_of::<f64>();
     if bytes.len() != expected {
         return Err(format!(

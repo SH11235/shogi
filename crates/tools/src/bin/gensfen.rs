@@ -14,7 +14,7 @@ use rand::seq::SliceRandom;
 use rshogi_core::movegen::{MoveList, generate_legal, is_legal_with_pass};
 use rshogi_core::nnue::{
     compute_layer_stack_progress8kpabs_bucket_index, get_layer_stack_progress_kpabs_weights,
-    get_network, load_progress_coeff_kpabs, set_layer_stack_progress_kpabs_weights,
+    get_network, load_progress_coeff_kpabs_from_bytes, set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::{EnteringKingPointInfo, Position};
 use rshogi_core::types::{Color, Move};
@@ -1954,19 +1954,14 @@ fn parse_resume_state(path: &Path) -> Result<ResumeState> {
     })
 }
 
-/// progress 係数ファイル内容の SHA-256 (hex)。resume 時の同一性検証と meta 記録に使う。
-fn progress_file_sha256_hex(path: &Path) -> Result<String> {
+fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read --progress-file {}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn validate_resume_progress_file(
     meta_progress_file: Option<&str>,
-    meta_progress_sha256: Option<&str>,
     cli_progress_file: Option<&Path>,
-    cli_progress_sha256: Option<&str>,
 ) -> Result<()> {
     let cli_progress_file = cli_progress_file.map(|p| p.display().to_string());
     if meta_progress_file != cli_progress_file.as_deref() {
@@ -1977,16 +1972,30 @@ fn validate_resume_progress_file(
             cli_progress_file.as_deref().unwrap_or("<none>"),
         );
     }
-    // パス一致だけでは同一パスへの係数差し替えを検出できないため、内容も照合する
-    if meta_progress_sha256 != cli_progress_sha256 {
-        bail!(
-            "--resume: --progress-file content does not match meta settings.progress_file_sha256 \
-             (meta={}, cli={})",
-            meta_progress_sha256.unwrap_or("<none>"),
-            cli_progress_sha256.unwrap_or("<none>"),
-        );
-    }
     Ok(())
+}
+
+/// resume 時に、実際にロードした progress 係数の内容が meta 記録時と同一かを照合する。
+/// パス一致だけでは同一パスへの係数差し替えを検出できない。
+/// meta に SHA-256 が無い場合（記録前の run からの再開）は照合をスキップして警告する。
+fn validate_resume_progress_content(
+    meta_progress_sha256: Option<&str>,
+    loaded_sha256: &str,
+) -> Result<()> {
+    match meta_progress_sha256 {
+        Some(meta) if meta != loaded_sha256 => bail!(
+            "--resume: --progress-file content does not match meta settings.progress_file_sha256 \
+             (meta={meta}, loaded={loaded_sha256})",
+        ),
+        None => {
+            eprintln!(
+                "warning: meta has no settings.progress_file_sha256; \
+                 skipping --progress-file content verification"
+            );
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Concatenate worker temp files.
@@ -2085,13 +2094,9 @@ fn main() -> Result<()> {
             bail!("--resume: 出力ファイルが見つかりません: {}", output_path.display());
         }
         let state = parse_resume_state(&output_path)?;
-        let cli_progress_sha256 =
-            cli.progress_file.as_deref().map(progress_file_sha256_hex).transpose()?;
         validate_resume_progress_file(
             state.progress_file.as_deref(),
-            state.progress_file_sha256.as_deref(),
             cli.progress_file.as_deref(),
-            cli_progress_sha256.as_deref(),
         )?;
         if state.completed_games >= cli.games {
             println!(
@@ -2264,6 +2269,7 @@ fn main() -> Result<()> {
     // meta 行の書き込みより前に行い、--progress-file の必須検証や係数ロードの失敗時に
     // 出力 JSONL（progress_file を欠いた meta）が残って以後の --resume を壊さないようにする。
     let mut native_layer_stack_buckets = None;
+    let mut native_progress_file_sha256 = None;
     if native_mode {
         let eval_file =
             cli.eval_file.as_ref().ok_or_else(|| anyhow!("--native requires --eval-file"))?;
@@ -2279,10 +2285,22 @@ fn main() -> Result<()> {
             );
         }
         if let Some(path) = &cli.progress_file {
-            let weights = load_progress_coeff_kpabs(path)
+            // 一度読んだバイト列からハッシュと重みの両方を作り、
+            // 検証したものと異なる内容がロードされる読み直しの隙を作らない
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("failed to read --progress-file {}", path.display()))?;
+            let loaded_sha256 = sha256_hex(&bytes);
+            if let Some(state) = &resume_state {
+                validate_resume_progress_content(
+                    state.progress_file_sha256.as_deref(),
+                    &loaded_sha256,
+                )?;
+            }
+            let weights = load_progress_coeff_kpabs_from_bytes(&bytes)
                 .map_err(|e| anyhow!("failed to load --progress-file {}: {e}", path.display()))?;
             set_layer_stack_progress_kpabs_weights(weights)
                 .map_err(|e| anyhow!("failed to set --progress-file weights: {e}"))?;
+            native_progress_file_sha256 = Some(loaded_sha256);
             eprintln!("NativeBackend: progress file loaded from {}", path.display());
         }
         if let Some(num_buckets) = native_layer_stack_buckets {
@@ -2330,11 +2348,7 @@ fn main() -> Result<()> {
                 skip_in_check: cli.skip_in_check,
                 shuffle_seed: shuffle_seed_resolved,
                 progress_file: cli.progress_file.as_ref().map(|p| p.display().to_string()),
-                progress_file_sha256: cli
-                    .progress_file
-                    .as_deref()
-                    .map(progress_file_sha256_hex)
-                    .transpose()?,
+                progress_file_sha256: native_progress_file_sha256.clone(),
             },
             engine_cmd: EngineCommandMeta {
                 path_black: engine_paths.black.path.display().to_string(),
@@ -3108,36 +3122,33 @@ mod tests {
     }
 
     #[test]
-    fn validate_resume_progress_file_requires_exact_match() {
-        let path = Some(Path::new("/tmp/progress.bin"));
-        assert!(validate_resume_progress_file(None, None, None, None).is_ok());
+    fn validate_resume_progress_file_requires_exact_path_match() {
+        assert!(validate_resume_progress_file(None, None).is_ok());
         assert!(
-            validate_resume_progress_file(Some("/tmp/progress.bin"), Some("ab"), path, Some("ab"))
-                .is_ok()
+            validate_resume_progress_file(
+                Some("/tmp/progress.bin"),
+                Some(Path::new("/tmp/progress.bin"))
+            )
+            .is_ok()
         );
         assert!(
             validate_resume_progress_file(
                 Some("/tmp/progress.bin"),
-                Some("ab"),
-                Some(Path::new("/tmp/./progress.bin")),
-                Some("ab")
+                Some(Path::new("/tmp/./progress.bin"))
             )
             .is_err()
         );
+        assert!(validate_resume_progress_file(Some("/tmp/progress.bin"), None).is_err());
+        assert!(validate_resume_progress_file(None, Some(Path::new("/tmp/progress.bin"))).is_err());
+    }
+
+    #[test]
+    fn validate_resume_progress_content_checks_sha256() {
+        assert!(validate_resume_progress_content(Some("ab"), "ab").is_ok());
         // パスが同じでも内容 SHA-256 が異なる（係数差し替え）なら拒否する
-        assert!(
-            validate_resume_progress_file(Some("/tmp/progress.bin"), Some("ab"), path, Some("cd"))
-                .is_err()
-        );
-        assert!(
-            validate_resume_progress_file(Some("/tmp/progress.bin"), None, path, Some("ab"))
-                .is_err()
-        );
-        assert!(
-            validate_resume_progress_file(Some("/tmp/progress.bin"), Some("ab"), None, None)
-                .is_err()
-        );
-        assert!(validate_resume_progress_file(None, None, path, Some("ab")).is_err());
+        assert!(validate_resume_progress_content(Some("ab"), "cd").is_err());
+        // SHA-256 記録が無い meta からの再開は照合をスキップして許容する
+        assert!(validate_resume_progress_content(None, "ab").is_ok());
     }
 
     #[test]
