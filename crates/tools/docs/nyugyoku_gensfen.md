@@ -37,7 +37,8 @@ cargo run -p tools --release --bin gensfen -- \
 処理は manifest を先頭から流し、stderr に警告を出しながら進む。以下は異常終了ではなく、
 対象行を飛ばして続行している合図:
 
-- **CSA 読込・パース失敗**: その行を warn+skip して続行する
+- **CSA 読込・パース失敗**: その行を warn+skip して続行する（整合検証用の digest には
+  読めた内容だけを積むため、skip があっても resume 整合は保たれる）
 - **total_plies 食い違い**: manifest の手数と CSA 実手数がずれた棋譜。警告を出し、
   実手数を超えるアンカーを除外して続行する
 
@@ -59,7 +60,8 @@ cargo run -p tools --release --bin nyugyoku_gensfen -- \
 `--legacy-server-eval-comments` の変更があると再開は拒否される**（partition 処理中の
 manifest 末尾への追記だけは可。dedup 開始後は行数追加も拒否）。`--resume` 開始時は
 既処理 prefix と参照 CSA を先頭から再検証するため巨大 corpus の終盤では時間がかかるが、
-CSA 解析・局面再生・partition 書込みはやり直さない。公開直前に停止した場合も
+CSA 解析・局面再生・partition 書込みはやり直さない。この再検証自体は checkpoint の
+対象外で、再開のたびに先頭からやり直す。公開直前に停止した場合も
 `run-meta.json` を checkpoint として `--resume` できる。
 
 ## 入力（manifest）
@@ -130,7 +132,8 @@ startpos_line	source_csa	anchor_ply	anchor_kind	entry_side	anchor_move_eval_cp_b
 
 候補は position key の安定ハッシュで `out.work/partitions/` の各ファイルへ振り分け、
 partition 単位でだけ `HashSet` へロードして dedup する（partition ごとに 64 KiB の
-書込みバッファを持ち、file descriptor は partition 数に比例して保持しない）。
+書込みバッファを持ち — 既定 128 partition で合計 8 MiB — file descriptor は
+partition 数に比例して保持しない）。
 checkpoint では変更のあった partition と一時出力を flush・sync し、byte 位置と
 継続可能な FNV-1a 64bit checksum を `state.json` に保存する（checksum は偶発的破損の
 best-effort 検出用で、暗号学的 digest ではない）。resume 時は既処理 manifest prefix と
