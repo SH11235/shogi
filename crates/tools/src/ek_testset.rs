@@ -507,7 +507,9 @@ fn run_eval(args: &EvalArgs) -> Result<()> {
             format!("{}:{}: SFEN を読めません", args.testset.display(), line_no + 1)
         })?;
         stack.reset();
-        let eval_cp = evaluate_dispatch(&pos, &mut stack, &mut acc_cache).raw();
+        // 内部 Value スケール (歩=90) ではなく cp (歩=100) で採点する。DECISIVE_CP /
+        // --scale / floodgate_eval_cp と単位を揃えるため to_cp() で換算する。
+        let eval_cp = evaluate_dispatch(&pos, &mut stack, &mut acc_cache).to_cp();
         builder.push(&record, eval_cp, args.scale);
     }
 
