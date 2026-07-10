@@ -45,9 +45,8 @@ pub mod bench_nnue_eval_tool;
 pub mod common;
 pub mod config;
 pub mod dlshogi_features;
-// ek_testset は CSA replay (`replay` モジュール) に依存するため、同じ
-// `kifu-player` feature に gate する。`--no-default-features` 構成では対象外。
-#[cfg(feature = "kifu-player")]
+// ek_testset は CSA replay (`replay` モジュール) に依存するため csa-replay に gate する。
+#[cfg(feature = "csa-replay")]
 pub mod ek_testset;
 pub mod eval_sfens_tool;
 pub mod kif;
@@ -57,7 +56,7 @@ pub mod packed_sfen;
 pub mod positions;
 pub mod progress;
 pub mod qsearch_pv;
-#[cfg(feature = "kifu-player")]
+#[cfg(feature = "csa-replay")]
 pub mod replay;
 pub mod report;
 pub mod runner;

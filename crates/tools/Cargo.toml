@@ -65,23 +65,28 @@ aobazero-onnx = ["dep:ort", "dep:ndarray"]
 # 標準dlshogi ONNX直接推論（DL水匠等、ONNX Runtime + CUDA が必要）
 dlshogi-onnx = ["dep:ort", "dep:ndarray"]
 
+# 棋譜 replay（CSA/PSV/JSONL の parse・盤面再生・勝敗導出。`replay` モジュールの
+# TUI を除く部分）。教師・評価系ツールが TUI 依存 (ratatui/crossterm) なしで
+# 棋譜 replay を使うための軸。
+csa-replay = []
+
 # 棋譜プレイヤー TUI（PSV / tournament JSONL 共通の対局再生ビューア）。
 # default に含める: 素の `cargo build --release` で kifu_player だけ旧版のまま
 # 取り残されるのを防ぐ (required-features 付き bin は feature 無しだとビルド対象外)。
 # TUI 依存 (ratatui/crossterm) を持ち込みたくない学習パイプライン等は
 # `--no-default-features` でオプトアウトする。
-kifu-player = ["dep:ratatui", "dep:crossterm"]
+kifu-player = ["csa-replay", "dep:ratatui", "dep:crossterm"]
 
 [[bin]]
 name = "kifu_player"
 path = "src/bin/kifu_player.rs"
 required-features = ["kifu-player"]
 
-# ek_testset は CSA replay (kifu-player feature 配下) に依存するため gate する。
+# ek_testset は CSA replay に依存する（TUI は不要）ため csa-replay に gate する。
 [[bin]]
 name = "ek_testset"
 path = "src/bin/ek_testset.rs"
-required-features = ["kifu-player"]
+required-features = ["csa-replay"]
 
 [dependencies]
 # Workspace dependencies
