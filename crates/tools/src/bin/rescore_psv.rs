@@ -54,9 +54,10 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
-// Arc/Mutex/Instant は ONNX 直推論パイプライン専用（バッチ供給の Receiver 共有・
+// mpsc/Arc/Mutex/Instant は ONNX 直推論パイプライン専用（バッチ供給の Receiver 共有・
 // フェーズ計時）。ONNX 無効ビルドでの unused import を避けるため cfg で囲う。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+use std::sync::mpsc;
 #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1044,16 +1045,6 @@ fn main() -> Result<()> {
 
         eprintln!("Records: {record_count}, Processing: {process_count}");
 
-        // 必要メモリの概算と警告（入力バッファ + 出力バッファ）
-        let required_memory_mb =
-            (process_count as usize * PackedSfenValue::SIZE * 2) / (1024 * 1024);
-        if required_memory_mb > 1024 {
-            eprintln!(
-                "Warning: Estimated memory usage: {} GB. Ensure sufficient RAM is available.",
-                required_memory_mb / 1024
-            );
-        }
-
         // 処理実行
         let fprog = rprog.start_file(&file_name.to_string_lossy(), file_idx + 1, process_count);
         #[cfg(feature = "aobazero-onnx")]
@@ -1080,7 +1071,10 @@ fn main() -> Result<()> {
             )?;
         }
         if !use_onnx && !use_dlshogi_onnx {
-            if !engines.is_empty() {
+            // engine モードの判定は engines.is_empty() ではなく CLI 指定で行う。
+            // 全エンジン死亡でプールが空になった場合に静的 NNUE モードへ
+            // fallback させない（engine モードでは NNUE をロードしていない）
+            if cli.engine.is_some() {
                 process_file_with_engine(
                     &cli,
                     &mut engines,
@@ -1395,10 +1389,9 @@ fn process_record(
     ProcessResult::Ok(new_psv.to_bytes(), clipped)
 }
 
-/// 深さ指定探索でファイルを処理
-///
-/// 探索は重いため、rayon並列処理ではなく、複数のワーカースレッドが
-/// それぞれ独自のSearchインスタンスを持ってチャンク単位で処理する。
+/// 深さ指定探索でファイルを処理。チャンクストリーミング（読み込み → ワーカーへ
+/// 連続分割 → 入力順書き出し）でピークメモリを入力件数に非依存にする。探索は重い
+/// ため rayon ではなく、各ワーカーが独自の Search を持って自スライスを逐次処理する。
 fn process_file_with_search(
     cli: &Cli,
     input_path: &PathBuf,
@@ -1408,40 +1401,15 @@ fn process_file_with_search(
 ) -> Result<()> {
     let search_depth = cli.search_depth.expect("search_depth should be Some");
 
-    // 入力ファイルを読み込み
+    const CHUNK_SIZE: usize = 1_000_000;
+
     let in_file = File::open(input_path)
         .with_context(|| format!("Failed to open {}", input_path.display()))?;
-    let mut reader = BufReader::new(in_file);
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, in_file);
 
-    // 全レコードを読み込み
-    let mut records: Vec<[u8; PackedSfenValue::SIZE]> = Vec::with_capacity(process_count as usize);
-    let mut buffer = [0u8; PackedSfenValue::SIZE];
-
-    progress.set_message("Reading...");
-    for _ in 0..process_count {
-        if INTERRUPTED.load(Ordering::SeqCst) {
-            progress.abandon_with_message("Interrupted");
-            return Ok(());
-        }
-
-        match reader.read_exact(&mut buffer) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-
-        records.push(buffer);
-    }
-
-    let actual_count = records.len();
-    eprintln!("Read {actual_count} records");
-
-    // 空ファイルガード（chunks(0)でpanicを防ぐ）
-    if actual_count == 0 {
-        eprintln!("Warning: No records to process, creating empty output file");
-        File::create(output_path)?;
-        return Ok(());
-    }
+    let out_file = File::create(output_path)
+        .with_context(|| format!("Failed to create {}", output_path.display()))?;
+    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
 
     // スレッド数を決定（0なら利用可能なCPU数）
     let num_threads = if cli.threads > 0 {
@@ -1464,13 +1432,6 @@ fn process_file_with_search(
         );
     }
 
-    // レコードをチャンクに分割（chunk_sizeは最低1を保証）
-    let chunk_size = records.len().div_ceil(num_threads).max(1);
-    let chunks: Vec<Vec<[u8; PackedSfenValue::SIZE]>> =
-        records.chunks(chunk_size).map(|chunk| chunk.to_vec()).collect();
-
-    // 設定値をキャプチャ
-    let hash_mb = cli.hash_mb;
     let max_nodes = cli.max_nodes;
     let max_time = cli.max_time;
     let score_clip = cli.score_clip;
@@ -1479,140 +1440,137 @@ fn process_file_with_search(
     let target_fv_scale = cli.target_fv_scale;
     let verbose = cli.verbose;
 
-    // カウンタ
-    let error_count = AtomicU64::new(0);
-    let clipped_count = AtomicU64::new(0);
-    let skipped_count = AtomicU64::new(0);
-
-    // 結果収集用チャネル
-    let (tx, rx) = mpsc::channel::<SearchProcessResult>();
-
-    progress.set_message("Processing...");
-
-    // ワーカースレッドを起動
-    let handles: Vec<_> = chunks
-        .into_iter()
-        .enumerate()
-        .map(|(chunk_idx, chunk)| {
-            let tx = tx.clone();
-            let progress = progress.clone();
-
-            thread::Builder::new()
-                .stack_size(SEARCH_STACK_SIZE)
-                .spawn(move || {
-                    // 各ワーカースレッドで独自のSearchインスタンスを作成
-                    // 各ワーカーは1スレッドで探索（マルチスレッド探索を無効化）
-                    let mut search = Search::new(hash_mb);
-                    search.set_num_threads(1);
-
-                    for (record_idx, record) in chunk.iter().enumerate() {
-                        if INTERRUPTED.load(Ordering::SeqCst) {
-                            break;
-                        }
-
-                        let result = process_record_with_search(
-                            record,
-                            &mut search,
-                            search_depth,
-                            max_nodes,
-                            max_time,
-                            score_clip,
-                            skip_in_check,
-                            source_fv_scale,
-                            target_fv_scale,
-                        );
-
-                        let global_idx = chunk_idx * chunk_size + record_idx;
-                        let send_result = SearchProcessResult {
-                            index: global_idx,
-                            result,
-                        };
-
-                        if tx.send(send_result).is_err() {
-                            break;
-                        }
-
-                        progress.inc(1);
-                    }
-                })
-                .expect("Failed to spawn worker thread")
+    // 各ワーカー専用の Search をチャンクをまたいで持ち越す
+    // （Search::go は TT/履歴をクリアしないため、作り直すと探索結果が変わる）
+    let mut searches: Vec<Search> = (0..num_threads)
+        .map(|_| {
+            let mut search = Search::new(cli.hash_mb);
+            search.set_num_threads(1);
+            search
         })
         .collect();
 
-    // 送信側をドロップ（全ワーカーが終了したらチャネルがクローズされる）
-    drop(tx);
+    let mut error_count = 0u64;
+    let mut clipped_count = 0u64;
+    let mut skipped_count = 0u64;
+    let mut total_read = 0u64;
+    let mut total_written = 0u64;
 
-    // 結果を収集（順序を保持するためにインデックス付きで受け取る）
-    let mut results_with_index: Vec<(usize, ProcessResult)> = Vec::with_capacity(actual_count);
-    for search_result in rx {
-        results_with_index.push((search_result.index, search_result.result));
-    }
+    progress.set_message("Processing...");
 
-    // インデックスでソート
-    results_with_index.sort_by_key(|(idx, _)| *idx);
+    loop {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            progress.abandon_with_message("Interrupted");
+            break;
+        }
 
-    // rx のドレインが完了した時点でワーカーは既に終了しているため、join は即座に返る
-    for handle in handles {
-        let _ = handle.join();
-    }
-
-    progress.finish_with_message("Done");
-
-    // ソート済み結果から直接書き出し（中間 Vec を排除）
-    eprintln!("Writing output...");
-    let out_file = File::create(output_path)
-        .with_context(|| format!("Failed to create {}", output_path.display()))?;
-    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
-
-    let mut written = 0u64;
-    for (_, result) in results_with_index {
-        match result {
-            ProcessResult::Ok(record, clipped) => {
-                if clipped {
-                    clipped_count.fetch_add(1, Ordering::Relaxed);
-                }
-                writer.write_all(&record)?;
-                written += 1;
+        // チャンク読み込み
+        let want = (CHUNK_SIZE as u64).min(process_count.saturating_sub(total_read)) as usize;
+        let mut chunk: Vec<[u8; PackedSfenValue::SIZE]> = Vec::with_capacity(want);
+        let mut buffer = [0u8; PackedSfenValue::SIZE];
+        for _ in 0..want {
+            match reader.read_exact(&mut buffer) {
+                Ok(()) => chunk.push(buffer),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
             }
-            ProcessResult::Skip => {
-                skipped_count.fetch_add(1, Ordering::Relaxed);
-            }
-            ProcessResult::Error(e) => {
-                error_count.fetch_add(1, Ordering::Relaxed);
-                if verbose {
-                    eprintln!("Error processing record: {e}");
+        }
+        if chunk.is_empty() {
+            break;
+        }
+        total_read += chunk.len() as u64;
+
+        // チャンク内を連続分割し、ワーカー i がスライス i を先頭から逐次処理する。
+        // 割り当てが（チャンク長, スレッド数）だけで決まるため、同一設定での出力は決定的
+        let slice_size = chunk.len().div_ceil(num_threads).max(1);
+        let results: Vec<Vec<ProcessResult>> = thread::scope(|s| {
+            let handles: Vec<_> = searches
+                .iter_mut()
+                .zip(chunk.chunks(slice_size))
+                .map(|(search, slice)| {
+                    let progress = progress.clone();
+                    thread::Builder::new()
+                        .stack_size(SEARCH_STACK_SIZE)
+                        .spawn_scoped(s, move || {
+                            let mut results = Vec::with_capacity(slice.len());
+                            for record in slice {
+                                if INTERRUPTED.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                results.push(process_record_with_search(
+                                    record,
+                                    search,
+                                    search_depth,
+                                    max_nodes,
+                                    max_time,
+                                    score_clip,
+                                    skip_in_check,
+                                    source_fv_scale,
+                                    target_fv_scale,
+                                ));
+                                progress.inc(1);
+                            }
+                            results
+                        })
+                        .expect("Failed to spawn worker thread")
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("Worker thread panicked")).collect()
+        });
+
+        // 連続分割なのでワーカー順の連結がそのまま入力順になる。
+        // 中断でワーカーがスライス途中で止まった場合は、そこで書き出しを打ち切り
+        // 出力を入力の連続 prefix に保つ（歯抜けの部分出力を作らない）
+        for (worker_results, slice) in results.into_iter().zip(chunk.chunks(slice_size)) {
+            let truncated = worker_results.len() < slice.len();
+            for result in worker_results {
+                match result {
+                    ProcessResult::Ok(record, clipped) => {
+                        if clipped {
+                            clipped_count += 1;
+                        }
+                        writer.write_all(&record)?;
+                        total_written += 1;
+                    }
+                    ProcessResult::Skip => skipped_count += 1,
+                    ProcessResult::Error(e) => {
+                        error_count += 1;
+                        if verbose {
+                            eprintln!("Error processing record: {e}");
+                        }
+                    }
                 }
+            }
+            if truncated {
+                break;
             }
         }
     }
 
     writer.flush()?;
+    progress.finish_with_message("Done");
 
-    let final_errors = error_count.load(Ordering::SeqCst);
-    let final_clipped = clipped_count.load(Ordering::SeqCst);
-    let final_skipped = skipped_count.load(Ordering::SeqCst);
-    if final_errors > 0 {
-        eprintln!("Note: {final_errors} positions had errors");
+    if total_read == 0 {
+        eprintln!("Warning: No records to process, output file is empty");
     }
-    if final_skipped > 0 {
+    if error_count > 0 {
+        eprintln!("Note: {error_count} positions had errors");
+    }
+    if skipped_count > 0 && total_read > 0 {
         eprintln!(
-            "Skipped (in check): {final_skipped} ({:.2}%)",
-            final_skipped as f64 / actual_count as f64 * 100.0
+            "Skipped (in check): {skipped_count} ({:.2}%)",
+            skipped_count as f64 / total_read as f64 * 100.0
         );
     }
-    eprintln!(
-        "Clipped scores: {final_clipped} ({:.2}%)",
-        final_clipped as f64 / actual_count as f64 * 100.0
-    );
-    eprintln!("Wrote {written} records");
+    if total_read > 0 {
+        eprintln!(
+            "Clipped scores: {clipped_count} ({:.2}%)",
+            clipped_count as f64 / total_read as f64 * 100.0
+        );
+    }
+    eprintln!("Wrote {total_written} records");
 
     Ok(())
-}
-
-/// 探索結果（インデックス付き）
-struct SearchProcessResult {
-    index: usize,
-    result: ProcessResult,
 }
 
 /// 深さ指定探索で1レコードを処理
@@ -1852,223 +1810,254 @@ impl UsiEngine {
     }
 }
 
-/// エンジン処理結果（インデックス付き）
-struct EngineProcessResult {
-    index: usize,
-    score: Option<i32>,
-    psv: PackedSfenValue,
-}
-
-/// 外部USIエンジンでファイルを処理（複数エンジン並列対応）
+/// 外部USIエンジンでファイルを処理（複数エンジン並列対応）。チャンクストリーミング
+/// （読み込み → 生存エンジンへ連続分割 → 入力順書き出し）でピークメモリを入力件数に
+/// 非依存にする。
 fn process_file_with_engine(
     cli: &Cli,
-    engines: &mut [UsiEngine],
+    engines: &mut Vec<UsiEngine>,
     input_path: &PathBuf,
     output_path: &PathBuf,
     process_count: u64,
     progress: &FileProgress,
 ) -> Result<()> {
-    let num_engines = engines.len();
+    const CHUNK_SIZE: usize = 1_000_000;
 
-    // 入力ファイルを読み込み
+    // 前の入力ファイルで全エンジンが死んでいると空プールで呼ばれうる
+    if engines.is_empty() {
+        anyhow::bail!("All engine processes have failed");
+    }
+
     let in_file = File::open(input_path)
         .with_context(|| format!("Failed to open {}", input_path.display()))?;
-    let mut reader = BufReader::new(in_file);
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, in_file);
 
-    // 全レコードを読み込み（SFEN展開・フィルタリング含む）
-    progress.set_message("Reading...");
-    let mut records: Vec<(usize, PackedSfenValue, String)> = Vec::new(); // (global_index, psv, sfen)
-    let mut buffer = [0u8; PackedSfenValue::SIZE];
-    let mut skipped_count: u64 = 0;
-    let mut read_errors: u64 = 0;
+    let out_file = File::create(output_path)
+        .with_context(|| format!("Failed to create {}", output_path.display()))?;
+    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
 
-    for global_idx in 0..process_count as usize {
-        if INTERRUPTED.load(Ordering::SeqCst) {
-            break;
-        }
-        match reader.read_exact(&mut buffer) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-        let psv = match PackedSfenValue::from_bytes(&buffer) {
-            Some(p) => p,
-            None => {
-                read_errors += 1;
-                progress.inc(1);
-                continue;
-            }
-        };
-        let sfen = match unpack_sfen(&psv.sfen) {
-            Ok(s) => s,
-            Err(_) => {
-                read_errors += 1;
-                progress.inc(1);
-                continue;
-            }
-        };
-        if cli.skip_in_check {
-            let mut pos = Position::new();
-            if pos.set_sfen(&sfen).is_ok() && pos.in_check() {
-                skipped_count += 1;
-                progress.inc(1);
-                continue;
-            }
-        }
-        records.push((global_idx, psv, sfen));
-    }
-
-    let actual_count = records.len();
-    eprintln!(
-        "Read {} records ({} skipped, {} errors)",
-        actual_count, skipped_count, read_errors
-    );
-
-    if actual_count == 0 {
-        progress.finish_with_message("Done (empty)");
-        File::create(output_path)?;
-        return Ok(());
-    }
-
-    // レコードをチャンクに分割
-    let chunk_size = actual_count.div_ceil(num_engines).max(1);
-    let chunks: Vec<Vec<(usize, PackedSfenValue, String)>> =
-        records.chunks(chunk_size).map(|c| c.to_vec()).collect();
-
-    eprintln!("Using {} engine process(es), chunk_size={}", chunks.len(), chunk_size);
-
-    // 各チャンクをワーカースレッドで処理
     let score_clip = cli.score_clip;
     let engine_nodes = cli.engine_nodes;
     let verbose = cli.verbose;
 
-    let error_count = AtomicU64::new(read_errors);
-    let clipped_count = AtomicU64::new(0);
+    eprintln!("Using {} engine process(es)", engines.len());
 
-    let (tx, rx) = mpsc::channel::<EngineProcessResult>();
+    // usinewgame はファイル冒頭で 1 回だけ送る（チャンクごとに送るとエンジン内部の
+    // キャッシュ類がリセットされ、評価値が変わりうるため）
+    for engine in engines.iter_mut() {
+        let _ = engine.send_command("usinewgame");
+    }
+
+    // 死んだエンジンプロセスは以降の割り当てから除外する
+    let mut alive: Vec<bool> = vec![true; engines.len()];
+
+    let mut error_count = 0u64;
+    let mut clipped_count = 0u64;
+    let mut skipped_count = 0u64;
+    let mut total_read = 0u64;
+    let mut total_written = 0u64;
 
     progress.set_message("Processing...");
 
-    std::thread::scope(|s| {
-        let mut handles = Vec::new();
-
-        for (engine, chunk) in engines.iter_mut().zip(chunks) {
-            let tx = tx.clone();
-            let progress = progress.clone();
-            let error_count = &error_count;
-            let _clipped_count = &clipped_count;
-
-            handles.push(s.spawn(move || {
-                // usinewgame でリセット
-                let _ = engine.send_command("usinewgame");
-
-                for (global_idx, psv, sfen) in &chunk {
-                    if INTERRUPTED.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    match engine.evaluate_position(sfen, engine_nodes) {
-                        Ok(score) => {
-                            if score.is_none() {
-                                error_count.fetch_add(1, Ordering::Relaxed);
-                                if verbose {
-                                    eprintln!("No score returned for: {sfen}");
-                                }
-                            }
-                            let _ = tx.send(EngineProcessResult {
-                                index: *global_idx,
-                                score,
-                                psv: *psv,
-                            });
-                        }
-                        Err(e) => {
-                            error_count.fetch_add(1, Ordering::Relaxed);
-                            if verbose {
-                                eprintln!("Engine error for {sfen}: {e}");
-                            }
-                            // スコアなしで送信（エンジン死亡時はループを抜ける）
-                            let _ = tx.send(EngineProcessResult {
-                                index: *global_idx,
-                                score: None,
-                                psv: *psv,
-                            });
-                            break;
-                        }
-                    }
-
-                    progress.inc(1);
-                }
-            }));
+    loop {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            progress.abandon_with_message("Interrupted");
+            break;
         }
 
-        drop(tx); // 全ワーカーの送信側をドロップ
-
-        // 結果を収集
-        let mut results: Vec<EngineProcessResult> = rx.into_iter().collect();
-        results.sort_by_key(|r| r.index);
-
-        // 出力レコードを構築
-        let mut processed_records: Vec<[u8; PackedSfenValue::SIZE]> =
-            Vec::with_capacity(results.len());
-
-        for r in &results {
-            if let Some(raw_score) = r.score {
-                let clipped = raw_score.abs() > score_clip as i32;
-                let new_score = raw_score.clamp(-score_clip as i32, score_clip as i32) as i16;
-                if clipped {
-                    clipped_count.fetch_add(1, Ordering::Relaxed);
-                }
-                let new_psv = PackedSfenValue {
-                    sfen: r.psv.sfen,
-                    score: new_score,
-                    move16: 0,
-                    game_ply: r.psv.game_ply,
-                    game_result: r.psv.game_result,
-                    padding: 0,
-                };
-                processed_records.push(new_psv.to_bytes());
+        // チャンク読み込み（パース + SFEN 展開 + 王手フィルタ）
+        let want = (CHUNK_SIZE as u64).min(process_count.saturating_sub(total_read)) as usize;
+        let mut chunk: Vec<(PackedSfenValue, String)> = Vec::with_capacity(want);
+        let mut buffer = [0u8; PackedSfenValue::SIZE];
+        let mut read_this_chunk = 0usize;
+        while read_this_chunk < want {
+            match reader.read_exact(&mut buffer) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
             }
+            read_this_chunk += 1;
+            let Some(psv) = PackedSfenValue::from_bytes(&buffer) else {
+                error_count += 1;
+                progress.inc(1);
+                continue;
+            };
+            let Ok(sfen) = unpack_sfen(&psv.sfen) else {
+                error_count += 1;
+                progress.inc(1);
+                continue;
+            };
+            if cli.skip_in_check {
+                let mut pos = Position::new();
+                if pos.set_sfen(&sfen).is_ok() && pos.in_check() {
+                    skipped_count += 1;
+                    progress.inc(1);
+                    continue;
+                }
+            }
+            chunk.push((psv, sfen));
+        }
+        if read_this_chunk == 0 {
+            break;
+        }
+        total_read += read_this_chunk as u64;
+        if chunk.is_empty() {
+            continue;
         }
 
-        // ワーカースレッド完了待ち
-        for h in handles {
-            let _ = h.join();
+        // チャンク内の全レコードを評価してから入力順で書き出す。
+        // エンジン死亡でスライス途中に未評価が残った場合は、同一チャンク内で
+        // 生存エンジンに再割り当てして評価し切る（出力順を崩さないため、
+        // 次チャンクへは持ち越さない）。
+        // None = 未評価、Some(None) = 評価失敗、Some(Some(cp)) = 評価済み
+        let mut chunk_scores: Vec<Option<Option<i32>>> = vec![None; chunk.len()];
+        let mut pending: Vec<usize> = (0..chunk.len()).collect();
+
+        while !pending.is_empty() && !INTERRUPTED.load(Ordering::SeqCst) {
+            let mut alive_engines: Vec<(usize, &mut UsiEngine)> =
+                engines.iter_mut().enumerate().filter(|(idx, _)| alive[*idx]).collect();
+            if alive_engines.is_empty() {
+                // 全滅。評価済み prefix を書き出してからエラーにするため、
+                // ここでは抜けるだけにする（書き出し後の全滅チェックで bail）
+                break;
+            }
+            let slice_size = pending.len().div_ceil(alive_engines.len()).max(1);
+
+            // (エンジン番号, 担当 index 列先頭からの評価値列, エンジン死亡フラグ)
+            let chunk_ref = &chunk;
+            let results: Vec<(usize, Vec<Option<i32>>, bool)> = thread::scope(|s| {
+                let handles: Vec<_> = alive_engines
+                    .iter_mut()
+                    .zip(pending.chunks(slice_size))
+                    .map(|((engine_idx, engine), idx_slice)| {
+                        let engine_idx = *engine_idx;
+                        let progress = progress.clone();
+                        s.spawn(move || {
+                            let mut scores = Vec::with_capacity(idx_slice.len());
+                            let mut died = false;
+                            for &i in idx_slice {
+                                if INTERRUPTED.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                let sfen = &chunk_ref[i].1;
+                                match engine.evaluate_position(sfen, engine_nodes) {
+                                    Ok(score) => {
+                                        if score.is_none() && verbose {
+                                            eprintln!("No score returned for: {sfen}");
+                                        }
+                                        scores.push(score);
+                                    }
+                                    Err(e) => {
+                                        if verbose {
+                                            eprintln!("Engine error for {sfen}: {e}");
+                                        }
+                                        scores.push(None);
+                                        died = true;
+                                        progress.inc(1);
+                                        break;
+                                    }
+                                }
+                                progress.inc(1);
+                            }
+                            (engine_idx, scores, died)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("Engine worker thread panicked"))
+                    .collect()
+            });
+
+            // 評価結果を chunk 添字へ反映し、死亡ワーカーの未評価分を再キューする
+            let mut next_pending: Vec<usize> = Vec::new();
+            let mut idx_slices = pending.chunks(slice_size);
+            for (engine_idx, scores, died) in results {
+                let idx_slice = idx_slices.next().unwrap_or(&[]);
+                for (&i, score) in idx_slice.iter().zip(&scores) {
+                    chunk_scores[i] = Some(*score);
+                }
+                if died {
+                    alive[engine_idx] = false;
+                    next_pending.extend_from_slice(&idx_slice[scores.len()..]);
+                    eprintln!(
+                        "Warning: engine process #{engine_idx} failed and is excluded from further processing"
+                    );
+                }
+                // 中断（died でない）で残った分は再キューしない: ループ条件の
+                // INTERRUPTED チェックで打ち切られ、部分出力になる
+            }
+            pending = next_pending;
         }
 
-        progress.finish_with_message("Done");
-
-        let final_errors = error_count.load(Ordering::SeqCst);
-        let final_clipped = clipped_count.load(Ordering::SeqCst);
-        let total = actual_count as u64 + skipped_count + read_errors;
-        if final_errors > 0 {
-            eprintln!("Note: {final_errors} positions had errors");
-        }
-        if skipped_count > 0 {
-            eprintln!(
-                "Skipped (in check): {skipped_count} ({:.2}%)",
-                skipped_count as f64 / total as f64 * 100.0
-            );
-        }
-        if total > 0 {
-            eprintln!(
-                "Clipped scores: {final_clipped} ({:.2}%)",
-                final_clipped as f64 / total as f64 * 100.0
-            );
-        }
-
-        // 出力ファイルに書き込み
-        eprintln!("Writing output...");
-        let out_file = File::create(output_path)
-            .with_context(|| format!("Failed to create {}", output_path.display()))
-            .unwrap();
-        let mut writer = BufWriter::new(out_file);
-
-        for record in &processed_records {
-            writer.write_all(record).unwrap();
+        // 入力順で書き出し。未評価（None）は中断か全エンジン死亡時にのみ残り、
+        // そこで打ち切って出力を入力の連続 prefix に保つ（歯抜けの部分出力を作らない）
+        for ((psv, _), score) in chunk.iter().zip(&chunk_scores) {
+            let Some(evaluated) = score else {
+                break;
+            };
+            let Some(raw_score) = *evaluated else {
+                error_count += 1;
+                continue;
+            };
+            let clipped = raw_score.abs() > score_clip as i32;
+            if clipped {
+                clipped_count += 1;
+            }
+            let new_psv = PackedSfenValue {
+                sfen: psv.sfen,
+                score: raw_score.clamp(-(score_clip as i32), score_clip as i32) as i16,
+                move16: 0,
+                game_ply: psv.game_ply,
+                game_result: psv.game_result,
+                padding: 0,
+            };
+            writer.write_all(&new_psv.to_bytes())?;
+            total_written += 1;
         }
 
-        writer.flush().unwrap();
-        eprintln!("Wrote {} records", processed_records.len());
+        // 全エンジン死亡はファイル失敗として扱う（未評価が残らず正常にチャンクを
+        // 消化し切った場合も含む）。成功扱いにすると評価失敗レコードを欠いた出力の
+        // まま完了し、--delete-input が入力を削除しうる
+        if alive.iter().all(|a| !*a) {
+            writer.flush()?;
+            anyhow::bail!("All engine processes have failed");
+        }
+    }
+
+    writer.flush()?;
+    progress.finish_with_message("Done");
+
+    if total_read == 0 {
+        eprintln!("Warning: No records to process, output file is empty");
+    }
+    if error_count > 0 {
+        eprintln!("Note: {error_count} positions had errors");
+    }
+    if skipped_count > 0 && total_read > 0 {
+        eprintln!(
+            "Skipped (in check): {skipped_count} ({:.2}%)",
+            skipped_count as f64 / total_read as f64 * 100.0
+        );
+    }
+    if total_read > 0 {
+        eprintln!(
+            "Clipped scores: {clipped_count} ({:.2}%)",
+            clipped_count as f64 / total_read as f64 * 100.0
+        );
+    }
+    eprintln!("Wrote {total_written} records");
+
+    // 死亡エンジンをプールから除去し、後続の入力ファイルに割り当てない。
+    // quit() で child を wait し、run 終了までゾンビプロセスを残さない
+    let mut alive_flags = alive.into_iter();
+    engines.retain_mut(|engine| {
+        if alive_flags.next().expect("alive length matches engines") {
+            true
+        } else {
+            let _ = engine.quit();
+            false
+        }
     });
 
     Ok(())
