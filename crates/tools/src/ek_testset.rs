@@ -119,7 +119,7 @@ struct BuildMeta {
     records: usize,
     dt_records: usize,
     oc_records: usize,
-    sources: Vec<String>,
+    // 生成元 CSA の一覧は持たない（レコードごとの source_csa が生成元を記録する）。
     notes: Vec<String>,
 }
 
@@ -235,11 +235,9 @@ fn run_build(args: &BuildArgs) -> Result<()> {
     fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("出力ディレクトリを作成できません: {}", args.out_dir.display()))?;
 
-    let source = CsaSource::new(&args.input);
-    let index = source.build_index()?;
-    for warning in &index.warnings {
-        eprintln!("warning: {warning}");
-    }
+    // 対局ごとの index/メタをコーパス全体分保持しないよう、CSA を 1 ファイル = 1 対局ずつ
+    // 読み込んで処理する（パス一覧は file_idx を安定させるためソート収集が必要で保持する）。
+    let paths = CsaSource::new(&args.input).collect_paths()?;
 
     let testset_path = args.out_dir.join("testset.jsonl");
     let sfens_path = args.out_dir.join("sfens.txt");
@@ -250,46 +248,58 @@ fn run_build(args: &BuildArgs) -> Result<()> {
     let mut records = 0usize;
     let mut dt_records = 0usize;
     let mut oc_records = 0usize;
+    let mut games_indexed = 0usize;
     let mut games_used = 0usize;
     let mut games_skipped_broken = 0usize;
 
-    for entry in &index.entries {
-        let Some(outcome) = entry.outcome else {
-            continue;
-        };
-        if args.drop_draw && matches!(outcome, GameOutcomeView::Draw) {
-            continue;
+    for path in &paths {
+        let source = CsaSource::new(path);
+        let index = source.build_index()?;
+        for warning in &index.warnings {
+            eprintln!("warning: {warning}");
         }
+        games_indexed += index.entries.len();
 
-        let game = source.load_game(&index, entry)?;
-        let source_csa = source_path(&index, entry)?;
-        if !replay_is_complete(&game.moves, entry.ply_count) {
-            games_skipped_broken += 1;
-            eprintln!("warning: {source_csa}: 再生を末尾まで信頼できないため対局ごと除外します");
-            continue;
-        }
-        let built = build_records_for_game(
-            &game.moves,
-            outcome,
-            &source_csa,
-            args.min_ply_from_entry,
-            args.sample_stride,
-        )?;
-        if !built.is_empty() {
-            games_used += 1;
-        }
-        for record in built {
-            if record.dt_label == Some(Label::Win) {
-                dt_records += 1;
+        for entry in &index.entries {
+            let Some(outcome) = entry.outcome else {
+                continue;
+            };
+            if args.drop_draw && matches!(outcome, GameOutcomeView::Draw) {
+                continue;
             }
-            // eval 側の OC 採点は draw を除外するため、meta の oc_records も win/loss のみ数える。
-            if matches!(record.oc_label, Label::Win | Label::Loss) {
-                oc_records += 1;
+
+            let game = source.load_game(&index, entry)?;
+            let source_csa = source_path(&index, entry)?;
+            if !replay_is_complete(&game.moves, entry.ply_count) {
+                games_skipped_broken += 1;
+                eprintln!(
+                    "warning: {source_csa}: 再生を末尾まで信頼できないため対局ごと除外します"
+                );
+                continue;
             }
-            serde_json::to_writer(&mut testset, &record)?;
-            writeln!(testset)?;
-            writeln!(sfens, "{}", record.sfen)?;
-            records += 1;
+            let built = build_records_for_game(
+                &game.moves,
+                outcome,
+                &source_csa,
+                args.min_ply_from_entry,
+                args.sample_stride,
+            )?;
+            if !built.is_empty() {
+                games_used += 1;
+            }
+            for record in built {
+                if record.dt_label == Some(Label::Win) {
+                    dt_records += 1;
+                }
+                // eval 側の OC 採点は draw を除外するため、meta の oc_records も win/loss のみ数える。
+                if matches!(record.oc_label, Label::Win | Label::Loss) {
+                    oc_records += 1;
+                }
+                serde_json::to_writer(&mut testset, &record)?;
+                writeln!(testset)?;
+                writeln!(sfens, "{}", record.sfen)?;
+                records += 1;
+            }
         }
     }
     testset.flush()?;
@@ -300,13 +310,12 @@ fn run_build(args: &BuildArgs) -> Result<()> {
         min_ply_from_entry: args.min_ply_from_entry,
         sample_stride: args.sample_stride,
         drop_draw: args.drop_draw,
-        games_indexed: index.entries.len(),
+        games_indexed,
         games_used,
         games_skipped_broken,
         records,
         dt_records,
         oc_records,
-        sources: index.pair_files.iter().map(|m| m.path.display().to_string()).collect(),
         notes: vec![
             "core が entering_king_point_info を公開していないため points_stm / king_in_enemy_stm / enemy_zone_pieces_stm は省略".to_string(),
         ],
@@ -791,8 +800,8 @@ mod tests {
     #[test]
     fn dt_metrics_from_histogram_match_sorted_semantics() {
         let dt = |eval_cp: i32| {
-            let mut r = TestsetRecord {
-                sfen: String::new(),
+            let r = TestsetRecord {
+                sfen: "4k4/9/9/9/9/9/9/9/4K4 b - 1".to_string(),
                 stm: 'b',
                 ply: 1,
                 source_csa: String::new(),
@@ -801,7 +810,6 @@ mod tests {
                 oc_label: Label::Win,
                 floodgate_eval_cp: None,
             };
-            r.sfen = "4k4/9/9/9/9/9/9/9/4K4 b - 1".to_string();
             (r, eval_cp)
         };
         // -40000 は端 (-32000) に飽和する。ソート列は [-32000, 0, 100, 700]。

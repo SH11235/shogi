@@ -18,7 +18,7 @@ cargo run -p tools --release --bin ek_testset -- build \
 |---|---|
 | `testset.jsonl` | 1 行 1 局面。`sfen`, `stm`, `ply`, `source_csa`, `is_declarable`, `dt_label`, `oc_label`, `floodgate_eval_cp` |
 | `sfens.txt` | `testset.jsonl` と同順の SFEN |
-| `meta.json` | 入力、件数、パラメータ、生成元 CSA 一覧 |
+| `meta.json` | 入力、件数、パラメータ（生成元 CSA はレコードごとの `source_csa` に記録） |
 
 core が `entering_king_point_info` を公開していないため、点数系フィールド
 （`points_stm`, `king_in_enemy_stm`, `enemy_zone_pieces_stm`）は出力しません。DT ラベルは
