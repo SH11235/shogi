@@ -25,7 +25,9 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `bench_nnue_eval` | NNUE 推論単体の性能測定（cycles/eval, instructions/eval） |
 | `search_only_ab` | Linux perf ベースの search-only A/B ベンチマーク。起動・ロード時間を除外して正確計測 |
 | `eval_sfens` | SFEN 局面を LayerStacks NNUE で静的評価 |
+| `ek_testset` | held-out CSA から入玉評価テストセットを構築し、native NNUE 評価で DT/OC 指標を採点（[詳細](ek_testset.md)） |
 | `compare_eval_nnue` | 教師 NNUE と生徒 NNUE の評価値一致度を検証（MAE・相関係数・スコア帯別誤差） |
+| `dump_effect_bucket_golden` | 形式一致 golden 用に effect bucket active index を config 別に dump（[詳細](dump_effect_bucket_golden.md)） |
 | `compare_nodes` | 2つの USI エンジン間で探索ノード数を深度別に比較。alignment 調査用 |
 | `verify_nnue_accumulator` | NNUE accumulator の refresh vs differential update 一致テスト。PSQT・Threat・LayerStacks 対応 |
 | `extract_bench_positions` | floodgate CSA / selfplay JSONL から教師ラベル品質測定用のベンチ局面を抽出（層化サンプル + 入玉オーバーサンプル + 互角局面） |
@@ -51,7 +53,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `shuffle_psv` | PSV ファイル内のレコード（40バイト単位）をシャッフル |
 | `split_psv` | PSV ファイルを局面数または容量で複数ファイルへ分割 |
 | `merge_psv` | 複数の PSV ファイルを順序どおりストリーミング結合 |
-| `rescore_psv` | PSV 評価値を NNUE / 外部エンジン / ONNX (dlshogi・AobaZero) で再計算。qsearch-leaf ラベル付け（root 局面 + 葉評価）と置換/ラベルの dual-output に対応。GPU 推論は複数セッション in-flight 多重化（`--onnx-sessions`、出力はバッチ順再整列で bit 一致）に対応 |
+| `rescore_psv` | PSV 評価値を NNUE / 外部エンジン / ONNX (dlshogi・AobaZero, GPU/TensorRT) で再計算。qsearch-leaf ラベル・policy 展開・レジューム対応（[詳細](rescore_psv.md)） |
 | `rescore_hcpe` | hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（局面/結果は保持）。共有コア `teacher_labeler` 経由で `yardstick_label` とラベル bit 一致。fresh-per-position で分散ラベリング可、チャンク単位 + 途中（intra-chunk）resume 対応 |
 | `preprocess_psv` | PSV ファイルに qsearch leaf 置換を適用。チャンクストリーミング処理対応 |
 | `filter_teacher_data` | 王手除外・スコアフィルタ・クリップなどの前処理を適用 |

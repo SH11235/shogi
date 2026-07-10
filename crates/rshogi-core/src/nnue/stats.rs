@@ -478,40 +478,40 @@ macro_rules! count_refresh_diff {
 }
 
 /// threat full 列挙カウント（feature有効時のみ）
-#[cfg(feature = "nnue-stats")]
+#[cfg(all(feature = "nnue-threat", feature = "nnue-stats"))]
 macro_rules! count_threat_full {
     () => {
         $crate::nnue::stats::NNUE_STATS.count_threat_full()
     };
 }
 /// threat full 列挙カウント（no-op）
-#[cfg(not(feature = "nnue-stats"))]
+#[cfg(all(feature = "nnue-threat", not(feature = "nnue-stats")))]
 macro_rules! count_threat_full {
     () => {};
 }
 
 /// threat 差分カウント（feature有効時のみ）
-#[cfg(feature = "nnue-stats")]
+#[cfg(all(feature = "nnue-threat", feature = "nnue-stats"))]
 macro_rules! count_threat_diff {
     () => {
         $crate::nnue::stats::NNUE_STATS.count_threat_diff()
     };
 }
 /// threat 差分カウント（no-op）
-#[cfg(not(feature = "nnue-stats"))]
+#[cfg(all(feature = "nnue-threat", not(feature = "nnue-stats")))]
 macro_rules! count_threat_diff {
     () => {};
 }
 
 /// multi-ply threat full カウント（feature有効時のみ）
-#[cfg(feature = "nnue-stats")]
+#[cfg(all(feature = "nnue-threat", feature = "nnue-stats"))]
 macro_rules! count_threat_multiply {
     () => {
         $crate::nnue::stats::NNUE_STATS.count_threat_multiply()
     };
 }
 /// multi-ply threat full カウント（no-op）
-#[cfg(not(feature = "nnue-stats"))]
+#[cfg(all(feature = "nnue-threat", not(feature = "nnue-stats")))]
 macro_rules! count_threat_multiply {
     () => {};
 }
@@ -521,7 +521,10 @@ pub(crate) use count_cache_hit;
 pub(crate) use count_cache_miss;
 pub(crate) use count_refresh;
 pub(crate) use count_refresh_diff;
+#[cfg(feature = "nnue-threat")]
 pub(crate) use count_threat_diff;
+#[cfg(feature = "nnue-threat")]
 pub(crate) use count_threat_full;
+#[cfg(feature = "nnue-threat")]
 pub(crate) use count_threat_multiply;
 pub(crate) use count_update;

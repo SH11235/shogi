@@ -22,7 +22,7 @@ mod sfen;
 mod state;
 mod zobrist;
 
-pub(crate) use board_effect::BoardEffects;
+pub use board_effect::BoardEffects;
 #[cfg(feature = "move-features")]
 pub use move_features::MoveFeatures;
 pub use pos::{EnteringKingPointInfo, Position};

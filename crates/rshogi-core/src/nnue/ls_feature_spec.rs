@@ -7,9 +7,12 @@
 //! §「LS FT generic 化」を参照。
 
 use super::bona_piece::{BonaPiece, halfkp_index};
+#[cfg(feature = "nnue-effect-bucket")]
+use super::constants::HALFKA_EFFECT_BUCKET_DIMENSIONS;
+#[cfg(not(feature = "nnue-effect-bucket"))]
+use super::constants::HALFKA_HM_DIMENSIONS;
 use super::constants::{
-    HALFKA_DIMENSIONS, HALFKA_HM_DIMENSIONS, HALFKA_HM_SPLIT_DIMENSIONS, HALFKA_MERGED_DIMENSIONS,
-    HALFKP_DIMENSIONS,
+    HALFKA_DIMENSIONS, HALFKA_HM_SPLIT_DIMENSIONS, HALFKA_MERGED_DIMENSIONS, HALFKP_DIMENSIONS,
 };
 use super::features::{
     Feature, FeatureSet, HalfKP, HalfKPFeatureSet, HalfKaHmMerged, HalfKaHmMergedFeatureSet,
@@ -136,7 +139,10 @@ pub struct HalfKaHmMergedSpec;
 impl LsFeatureSpec for HalfKaHmMergedSpec {
     type Set = HalfKaHmMergedFeatureSet;
     type Feature = HalfKaHmMerged;
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     const DIMENSIONS: usize = HALFKA_HM_DIMENSIONS;
+    #[cfg(feature = "nnue-effect-bucket")]
+    const DIMENSIONS: usize = HALFKA_EFFECT_BUCKET_DIMENSIONS;
     const INCLUDE_KING_IN_PIECE_LIST: bool = true;
 
     #[inline]
@@ -157,6 +163,9 @@ mod tests {
     use crate::nnue::accumulator::{IndexList, MAX_ACTIVE_FEATURES};
     use crate::position::{Position, SFEN_HIRATE};
 
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // feature spec との寸法一致はこのテスト対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_dimensions_match_feature_set() {
         assert_eq!(HalfKpSpec::DIMENSIONS, <HalfKPFeatureSet as FeatureSet>::DIMENSIONS);

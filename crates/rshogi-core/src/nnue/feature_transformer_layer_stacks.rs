@@ -22,6 +22,8 @@ use super::stats::count_threat_multiply;
 use super::stats::{count_refresh, count_update};
 #[cfg(feature = "nnue-threat")]
 use super::threat_features::{self, MAX_CHANGED_THREAT_FEATURES, THREAT_DIMENSIONS};
+#[cfg(feature = "nnue-effect-bucket")]
+use super::{EFFECT_BUCKET_CONFIG, append_active_effect_bucket};
 use crate::position::Position;
 use crate::types::Color;
 use std::io::{self, Read};
@@ -57,6 +59,13 @@ fn append_active_indices<FT: LsFeatureSpec>(
     perspective: Color,
     active: &mut IndexList<MAX_ACTIVE_FEATURES>,
 ) {
+    #[cfg(feature = "nnue-effect-bucket")]
+    {
+        append_active_effect_bucket(pos, EFFECT_BUCKET_CONFIG, perspective, active);
+        // effect bucket の列挙は FT weight 行数の範囲内が前提 (add_weights の境界条件)。
+        debug_assert!(active.iter().all(|i| i < FT::DIMENSIONS));
+    }
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     <FT::Feature as Feature>::append_active_indices(pos, perspective, active);
 }
 
@@ -721,6 +730,11 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         acc: &mut AccumulatorLayerStacks<L1>,
         prev_acc: &AccumulatorLayerStacks<L1>,
     ) {
+        if cfg!(feature = "nnue-effect-bucket") {
+            self.refresh_accumulator(pos, acc);
+            return;
+        }
+
         for perspective in [Color::Black, Color::White] {
             let p = perspective as usize;
             let reset = <FT::Set as FeatureSet>::needs_refresh(dirty_piece, perspective);
@@ -862,6 +876,11 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         prev_acc: &AccumulatorLayerStacks<L1>,
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
+        if cfg!(feature = "nnue-effect-bucket") {
+            self.refresh_accumulator(pos, acc);
+            return;
+        }
+
         for perspective in [Color::Black, Color::White] {
             let p = perspective as usize;
             let reset = <FT::Set as FeatureSet>::needs_refresh(dirty_piece, perspective);
@@ -1002,6 +1021,11 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         acc: &mut AccumulatorLayerStacks<L1>,
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
+        if cfg!(feature = "nnue-effect-bucket") {
+            self.refresh_accumulator(pos, acc);
+            return;
+        }
+
         for perspective in [Color::Black, Color::White] {
             count_refresh!();
             let p = perspective as usize;
@@ -1063,6 +1087,20 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         #[cfg(feature = "nnue-psqt")] psqt_acc: &mut [i32; MAX_LAYER_STACK_BUCKETS],
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
+        if cfg!(feature = "nnue-effect-bucket") {
+            accumulation.copy_from_slice(&self.biases.0);
+            let mut active_indices = IndexList::new();
+            append_active_indices::<FT>(pos, perspective, &mut active_indices);
+            for index in active_indices.iter() {
+                self.add_weights(accumulation, index);
+            }
+            #[cfg(feature = "nnue-psqt")]
+            if self.has_psqt {
+                self.refresh_psqt(&active_indices, psqt_acc);
+            }
+            return;
+        }
+
         let king_sq = pos.king_square(perspective);
 
         let raw_piece_list = if perspective == Color::Black {
@@ -1128,6 +1166,10 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         stack: &mut AccumulatorStackLayerStacks<L1>,
         source_idx: usize,
     ) -> bool {
+        if cfg!(feature = "nnue-effect-bucket") {
+            return false;
+        }
+
         let Some(path) = stack.collect_path(source_idx) else {
             // パスが途切れた場合、または MAX_PATH_LENGTH を超えた場合
             return false;
@@ -1401,6 +1443,10 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         perspective: Color,
         king_sq: crate::types::Square,
     ) -> bool {
+        if cfg!(feature = "nnue-effect-bucket") {
+            return false;
+        }
+
         let changed = &dirty_piece.changed_piece;
         let old_new = |idx: usize| {
             let entry = &changed[idx];
@@ -1868,10 +1914,16 @@ mod tests {
     use super::*;
     use crate::nnue::accumulator::ChangedBonaPiece;
     use crate::nnue::bona_piece::ExtBonaPiece;
-    use crate::nnue::constants::{DEFAULT_NUM_BUCKETS, HALFKA_HM_DIMENSIONS, NNUE_PYTORCH_L1};
+    #[cfg(feature = "nnue-psqt")]
+    use crate::nnue::constants::DEFAULT_NUM_BUCKETS;
+    #[cfg(not(feature = "nnue-effect-bucket"))]
+    use crate::nnue::constants::HALFKA_HM_DIMENSIONS;
+    use crate::nnue::constants::NNUE_PYTORCH_L1;
     use crate::nnue::ls_feature_spec::HalfKaHmMergedSpec;
     use crate::nnue::piece_list::PieceNumber;
-    use crate::types::{File, Piece, PieceType, Rank, Square};
+    #[cfg(not(feature = "nnue-effect-bucket"))]
+    use crate::types::Piece;
+    use crate::types::{File, PieceType, Rank, Square};
 
     const TEST_L1: usize = NNUE_PYTORCH_L1;
 
@@ -1898,6 +1950,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     fn fill_weight_row(ft: &mut TestFt, index: usize, seed: i16) {
         let start = index * TEST_L1;
         for (i, slot) in ft.weights[start..start + TEST_L1].iter_mut().enumerate() {
@@ -1905,6 +1958,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     fn apply_generic(
         ft: &TestFt,
         accumulation: &mut [i16; TEST_L1],
@@ -1929,6 +1983,9 @@ mod tests {
         }
     }
 
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // feature transformer の寸法 test は対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_feature_transformer_dimensions() {
         assert_eq!(TEST_L1, 1536);
@@ -1936,6 +1993,9 @@ mod tests {
         assert_eq!(TestSpec::DIMENSIONS, 73305);
     }
 
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // fast-diff test は対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_single_move() {
         let king_sq = Square::new(File::File5, Rank::Rank9);
@@ -1974,6 +2034,9 @@ mod tests {
         assert_eq!(generic.0, fast.0);
     }
 
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // fast-diff test は対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_capture() {
         let king_sq = Square::new(File::File5, Rank::Rank9);
@@ -2033,6 +2096,9 @@ mod tests {
         assert_eq!(generic.0, fast.0);
     }
 
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // refresh smoke test は対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_single_move_white() {
         // 後手視点: fw / king_sq.inverse() の分岐をカバー
@@ -2072,6 +2138,9 @@ mod tests {
         assert_eq!(generic.0, fast.0);
     }
 
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // refresh smoke test は対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_capture_white() {
         // 後手視点: dirty_num==2 の fw 分岐をカバー
@@ -2257,8 +2326,10 @@ mod tests {
     // 5 FT smoke tests
     // =========================================================================
 
+    use crate::nnue::ls_feature_spec::LsFeatureSpec;
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     use crate::nnue::ls_feature_spec::{
-        HalfKaHmSplitSpec, HalfKaMergedSpec, HalfKaSplitSpec, HalfKpSpec, LsFeatureSpec,
+        HalfKaHmSplitSpec, HalfKaMergedSpec, HalfKaSplitSpec, HalfKpSpec,
     };
     use crate::position::{Position, SFEN_HIRATE};
 
@@ -2298,21 +2369,33 @@ mod tests {
         smoke_refresh_for_spec::<HalfKaHmMergedSpec>();
     }
 
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // refresh smoke test は対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn smoke_refresh_halfka_hm_split() {
         smoke_refresh_for_spec::<HalfKaHmSplitSpec>();
     }
 
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // refresh smoke test は対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn smoke_refresh_halfka_merged() {
         smoke_refresh_for_spec::<HalfKaMergedSpec>();
     }
 
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // refresh smoke test は対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn smoke_refresh_halfka_split() {
         smoke_refresh_for_spec::<HalfKaSplitSpec>();
     }
 
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // refresh smoke test は対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn smoke_refresh_halfkp() {
         smoke_refresh_for_spec::<HalfKpSpec>();
@@ -2320,6 +2403,9 @@ mod tests {
 
     /// HalfKp + cache 経由 refresh で玉 BonaPiece (`>= FE_END`) を `idx_fn` に渡さない
     /// ことを ply32 局面 (駒成り + 駒台手駒あり) と相手玉位置違い派生局面で保証する。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // cache refresh test は対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn refresh_with_cache_halfkp_complex_position() {
         let weights = AlignedBox::<i16>::new_zeroed(HalfKpSpec::DIMENSIONS * TEST_L1);
@@ -2375,6 +2461,9 @@ mod tests {
     /// HalfKp で `refresh_accumulator` (slow path) と `refresh_accumulator_with_cache`
     /// (fast cache path、玉スロット ZERO マスク経由) の accumulation が
     /// 非ゼロ weights 下で bit 一致することを保証する。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // cache refresh test は対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn refresh_with_cache_halfkp_matches_slow_path() {
         let mut weights = AlignedBox::<i16>::new_zeroed(HalfKpSpec::DIMENSIONS * TEST_L1);
@@ -2436,6 +2525,9 @@ mod tests {
     /// HalfKp の `try_apply_dirty_piece_fast` が玉 BonaPiece (`>= FE_END`) を含む
     /// `DirtyPiece` を受け取ったとき `false` を返して slow path にフォールバック
     /// することを直接検証する。
+    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
+    // fast-diff test は対象外。
+    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn try_apply_dirty_piece_fast_halfkp_rejects_king_bp() {
         let weights = AlignedBox::<i16>::new_zeroed(HalfKpSpec::DIMENSIONS * TEST_L1);

@@ -2,6 +2,10 @@ name: Rust CI
 
 on:
   push:
+    # PR ブランチへの push は pull_request イベント側で検証されるため、
+    # push トリガーは main のみに限定し同一コミットの二重 run を避ける。
+    branches:
+      - main
     paths:
       - 'crates/**'
       - 'Cargo.toml'
@@ -130,6 +134,16 @@ jobs:
         with:
           cache-on-failure: true
       - name: Run tests
+        # `[profile.release]` の `lto = "thin"` はテストバイナリ (~90 個) 各々の
+        # リンクに適用され、Test job のビルド時間の大半を占める。テスト実行自体は
+        # 全 workspace で ~20 秒なので、CI のテストビルドでは LTO を無効化し
+        # codegen-units を広げて並列コンパイルを優先する (フルビルド実測で 4.8 倍短縮)。
+        # overflow-checks 等の release 設定は維持される。本番配備物はそもそも
+        # `production` プロファイル (fat LTO) の別 codegen であり、本 job の目的は
+        # ロジック検証なので LTO の有無はカバレッジに影響しない。
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: cargo test --release --workspace -- --test-threads=2
       - name: sccache stats
         if: always()
