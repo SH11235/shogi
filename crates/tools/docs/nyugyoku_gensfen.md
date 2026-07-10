@@ -86,7 +86,12 @@ byte位置へ切り戻してから再処理する。dedup開始後はmanifest全
 `--checkpoint-interval`で変更できる。
 
 修正前のrshogi-csa-serverがinline `,T`付き指し手の直後へ`'*`評価コメントを書いた棋譜は、
-`--legacy-server-eval-comments`を指定する。通常のCSAでは指定しない。
+`--legacy-server-eval-comments`を指定する。通常のCSAでは指定しない。1回のmanifest内で
+Standardと旧server形式を混在させず、形式ごとに別runへ分ける。
+
+`--resume`開始時は、処理済みmanifest prefixと候補があったCSA本体を先頭から再検証する。
+この検証は成果物の混在を防ぐためのもので、10分checkpointの対象外である。巨大corpusの
+終盤では再検証自体に時間がかかるが、CSA解析・局面再生とpartition書込みはやり直さない。
 
 最終`out/`は全処理が成功した時だけ、`out.work/`の同一ファイルシステム内renameで
 公開される。Linuxでは`RENAME_NOREPLACE`を使い、並行して作られたものを含む既存の`out/`を

@@ -68,7 +68,8 @@ cargo run -p tools --release --bin kifu_player -- \
   異なる 2 形式に対応する: csa_client 自前記録の `'* <評価> [PV...]`（手の**直前**）と、
   wdoor floodgate (shogi-server) 公開棋譜の `'** <評価> [PV...]`（手の**直後**）。評価値は
   どちらも先手視点として解釈する。コメントの無い手・対局は評価値なし（グラフに打点しない）。
-  修正前のrshogi-csa-server棋譜では`--legacy-server-eval-comments`を併用する。
+  修正前のrshogi-csa-server棋譜では`--legacy-server-eval-comments`を併用する。1つのdirectoryに
+  Standard形式と旧server形式を混在させず、形式ごとに分けて開く。
   片方のエンジンしか評価値を書いていない対局では、その側の手だけが打点される。
 - **消費時間**は各手の `T<秒>` 行から読み取り、指し手一覧の注釈に秒表示（例 `6s`、ms 精度の値は `1.2s`）で併記する。
 

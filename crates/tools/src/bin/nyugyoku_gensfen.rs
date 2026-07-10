@@ -110,6 +110,7 @@ struct RunState {
     processed_prefix_sha256: String,
     /// 処理済み行が参照するCSA内容をmanifest順に加えたSHA-256。
     processed_sources_sha256: String,
+    #[serde(default)]
     legacy_server_eval_comments: bool,
     candidates_written: u64,
     /// 最後のcheckpointでdurableだった各partitionのbyte長。
@@ -1324,6 +1325,33 @@ mod tests {
         assert!(verify_manifest_for_resume(&manifest, &state).is_err());
         fs::write(&manifest, "# one\n# appended\n").unwrap();
         assert!(verify_manifest_for_resume(&manifest, &state).is_err());
+    }
+
+    #[test]
+    fn version3_state_without_legacy_flag_defaults_to_standard() {
+        let state = RunState {
+            version: STATE_VERSION,
+            manifest: "manifest.tsv".to_string(),
+            partitions: 1,
+            phase: Phase::Partition,
+            processed_manifest_lines: 0,
+            processed_prefix_sha256: empty_sha256(),
+            processed_sources_sha256: empty_sha256(),
+            legacy_server_eval_comments: false,
+            candidates_written: 0,
+            partition_bytes: vec![0],
+            partition_hashes: vec![FNV1A64_OFFSET],
+            next_partition: 0,
+            unique_written: 0,
+            startpos_bytes: 0,
+            provenance_bytes: 0,
+            startpos_hash: FNV1A64_OFFSET,
+            provenance_hash: FNV1A64_OFFSET,
+        };
+        let mut value = serde_json::to_value(state).unwrap();
+        value.as_object_mut().unwrap().remove("legacy_server_eval_comments");
+        let restored: RunState = serde_json::from_value(value).unwrap();
+        assert!(!restored.legacy_server_eval_comments);
     }
 
     #[test]

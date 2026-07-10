@@ -52,9 +52,11 @@ impl CsaSource {
     }
 
     pub fn with_legacy_server_eval_comments(mut self, enabled: bool) -> Self {
-        if enabled {
-            self.eval_comment_style = EvalCommentStyle::LegacyServerPost;
-        }
+        self.eval_comment_style = if enabled {
+            EvalCommentStyle::LegacyServerPost
+        } else {
+            EvalCommentStyle::Standard
+        };
         self
     }
 
