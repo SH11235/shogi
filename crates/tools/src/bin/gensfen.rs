@@ -2226,6 +2226,36 @@ fn main() -> Result<()> {
         None
     };
 
+    // NativeBackend 使用時に NNUE 評価関数の初期化。
+    // meta 行の書き込みより前に行い、--progress-file の必須検証や係数ロードの失敗時に
+    // 出力 JSONL（progress_file を欠いた meta）が残って以後の --resume を壊さないようにする。
+    let mut native_layer_stack_buckets = None;
+    if native_mode {
+        let eval_file =
+            cli.eval_file.as_ref().ok_or_else(|| anyhow!("--native requires --eval-file"))?;
+        rshogi_core::nnue::init_nnue(eval_file).map_err(|e| anyhow!("NNUE init failed: {e}"))?;
+        eprintln!("NativeBackend: NNUE loaded from {}", eval_file.display());
+        let layer_stack_buckets =
+            get_network().as_deref().and_then(|network| network.layer_stack_num_buckets());
+        native_layer_stack_buckets = layer_stack_buckets;
+        if native_progress_file_required(layer_stack_buckets) && cli.progress_file.is_none() {
+            bail!(
+                "--native LayerStacks NNUE with num_buckets={} requires --progress-file",
+                layer_stack_buckets.unwrap_or_default()
+            );
+        }
+        if let Some(path) = &cli.progress_file {
+            let weights = load_progress_coeff_kpabs(path)
+                .map_err(|e| anyhow!("failed to load --progress-file {}: {e}", path.display()))?;
+            set_layer_stack_progress_kpabs_weights(weights)
+                .map_err(|e| anyhow!("failed to set --progress-file weights: {e}"))?;
+            eprintln!("NativeBackend: progress file loaded from {}", path.display());
+        }
+        if let Some(num_buckets) = native_layer_stack_buckets {
+            eprintln!("NativeBackend: LayerStacks num_buckets={num_buckets}");
+        }
+    }
+
     // Write meta line to final JSONL (resume時はスキップ: 既にメタ行が存在する)
     if !cli.resume {
         let mut writer = BufWriter::new(
@@ -2304,34 +2334,6 @@ fn main() -> Result<()> {
 
     // dedup 警告の重複抑制フラグ（全ワーカー共有）
     let dedup_warn_emitted = Arc::new(AtomicBool::new(false));
-
-    // NativeBackend 使用時に NNUE 評価関数の初期化
-    let mut native_layer_stack_buckets = None;
-    if native_mode {
-        let eval_file =
-            cli.eval_file.as_ref().ok_or_else(|| anyhow!("--native requires --eval-file"))?;
-        rshogi_core::nnue::init_nnue(eval_file).map_err(|e| anyhow!("NNUE init failed: {e}"))?;
-        eprintln!("NativeBackend: NNUE loaded from {}", eval_file.display());
-        let layer_stack_buckets =
-            get_network().as_deref().and_then(|network| network.layer_stack_num_buckets());
-        native_layer_stack_buckets = layer_stack_buckets;
-        if native_progress_file_required(layer_stack_buckets) && cli.progress_file.is_none() {
-            bail!(
-                "--native LayerStacks NNUE with num_buckets={} requires --progress-file",
-                layer_stack_buckets.unwrap_or_default()
-            );
-        }
-        if let Some(path) = &cli.progress_file {
-            let weights = load_progress_coeff_kpabs(path)
-                .map_err(|e| anyhow!("failed to load --progress-file {}: {e}", path.display()))?;
-            set_layer_stack_progress_kpabs_weights(weights)
-                .map_err(|e| anyhow!("failed to set --progress-file weights: {e}"))?;
-            eprintln!("NativeBackend: progress file loaded from {}", path.display());
-        }
-        if let Some(num_buckets) = native_layer_stack_buckets {
-            eprintln!("NativeBackend: LayerStacks num_buckets={num_buckets}");
-        }
-    }
 
     // ゲームチケットは逐次生成する。
     // `--games` が極端に大きい場合でも O(1) メモリで dispatch できるようにする。

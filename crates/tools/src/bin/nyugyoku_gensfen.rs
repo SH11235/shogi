@@ -11,8 +11,8 @@
 //!    に渡し、`provenance.tsv` の `startpos_line` と gensfen result の `start_pos_index`
 //!    が対応することを確認する。
 
-use std::collections::HashSet;
 use std::fs::{self, File};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -36,6 +36,12 @@ struct Cli {
     /// startpos.txt と provenance.tsv の出力先
     #[arg(long)]
     out_dir: PathBuf,
+
+    /// SFEN dedup テーブルのエントリ数（2 冪へ切り上げてから確保、メモリ = entries x 8B）。
+    /// direct-mapped のため重複検出漏れは使用率に比例して増える。
+    /// 想定ユニーク局面数の数倍を指定する。
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    dedup_hash_entries: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -67,10 +73,10 @@ struct ExtractedPosition {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    run(&cli.manifest, &cli.out_dir)
+    run(&cli.manifest, &cli.out_dir, cli.dedup_hash_entries)
 }
 
-fn run(manifest: &Path, out_dir: &Path) -> Result<()> {
+fn run(manifest: &Path, out_dir: &Path, dedup_hash_entries: u64) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("failed to create {}", out_dir.display()))?;
     let startpos_path = out_dir.join("startpos.txt");
@@ -86,11 +92,12 @@ fn run(manifest: &Path, out_dir: &Path) -> Result<()> {
 
     writeln!(
         provenance,
-        "id\tstartpos_line\tsource_csa\tanchor_ply\tanchor_kind\tentry_side\teval_cp\ttotal_plies\tsource_year"
+        "startpos_line\tsource_csa\tanchor_ply\tanchor_kind\tentry_side\teval_cp\ttotal_plies\tsource_year"
     )?;
 
-    let mut seen = HashSet::new();
-    let mut next_id = 1usize;
+    let mut seen = FingerprintDedup::new(dedup_hash_entries)?;
+    let mut next_line = 1usize;
+    let mut skipped_rows = 0usize;
     let file = File::open(manifest)
         .with_context(|| format!("failed to open manifest {}", manifest.display()))?;
     for (line_idx, line) in BufReader::new(file).lines().enumerate() {
@@ -101,18 +108,25 @@ fn run(manifest: &Path, out_dir: &Path) -> Result<()> {
         }
         let row = parse_manifest_row(trimmed)
             .with_context(|| format!("invalid manifest line {}", line_idx + 1))?;
-        let extracted = extract_from_row(&row)?;
-        for item in extracted {
-            if !seen.insert(item.sfen.clone()) {
+        // CSA 側の問題（読込失敗・パース失敗）は 1 行の異常で全体を落とさず skip する。
+        // manifest 自体の形式異常は上の hard error のまま。
+        let extracted = match extract_from_row(&row) {
+            Ok(extracted) => extracted,
+            Err(e) => {
+                eprintln!("warning: skipping manifest line {}: {e:#}", line_idx + 1);
+                skipped_rows += 1;
                 continue;
             }
-            let startpos_line = next_id;
+        };
+        for item in extracted {
+            if seen.check_and_insert(sfen_fingerprint(&item.sfen)) {
+                continue;
+            }
             writeln!(startpos, "position sfen {}", item.sfen)?;
             writeln!(
                 provenance,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                next_id,
-                startpos_line,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                next_line,
                 item.source_csa.display(),
                 item.anchor_ply,
                 item.anchor_kind,
@@ -121,11 +135,11 @@ fn run(manifest: &Path, out_dir: &Path) -> Result<()> {
                 item.total_plies,
                 item.source_year.map_or_else(String::new, |v| v.to_string()),
             )?;
-            next_id += 1;
+            next_line += 1;
         }
     }
 
-    if next_id == 1 {
+    if next_line == 1 {
         drop(startpos);
         drop(provenance);
         let _ = fs::remove_file(&startpos_path);
@@ -135,7 +149,64 @@ fn run(manifest: &Path, out_dir: &Path) -> Result<()> {
 
     startpos.flush()?;
     provenance.flush()?;
+    eprintln!(
+        "extracted {} start positions ({} manifest rows skipped)",
+        next_line - 1,
+        skipped_rows
+    );
     Ok(())
+}
+
+/// dedup 用の SFEN 64bit 指紋（固定シード SipHash）。
+///
+/// 別局面が同一指紋になる確率は 10 億件でも実質ゼロ（期待衝突数 ~0.03 件）で、
+/// 衝突しても開始局面が 1 件落ちるだけなので許容する。
+fn sfen_fingerprint(sfen: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    sfen.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// gensfen の SharedDedupHash と同じ direct-mapped 固定サイズ dedup テーブル。
+///
+/// 数億局面規模の抽出で SFEN や指紋を全保持するとピークメモリが入力件数に比例するため、
+/// entries x 8B の固定メモリに抑える。direct-mapped なのでスロット上書きによる
+/// 重複検出漏れは使用率（挿入済みユニーク数 / entries）に比例して増える（使用率 1 で
+/// 新規挿入の約 37% が既存スロットに衝突）。漏れは重複開始局面が残るだけで実害は軽い。
+struct FingerprintDedup {
+    table: Vec<u64>,
+    mask: u64,
+}
+
+/// 8B/エントリで 1TB。これを超える指定は入力ミスとみなす
+const MAX_DEDUP_ENTRIES: u64 = 1 << 37;
+
+impl FingerprintDedup {
+    fn new(entries: u64) -> Result<Self> {
+        let size = entries
+            .max(1)
+            .checked_next_power_of_two()
+            .filter(|&s| s <= MAX_DEDUP_ENTRIES)
+            .ok_or_else(|| {
+            anyhow!("--dedup-hash-entries too large: {entries} (max {MAX_DEDUP_ENTRIES})")
+        })?;
+        Ok(Self {
+            table: vec![0; size as usize],
+            mask: size - 1,
+        })
+    }
+
+    /// 重複なら true を返し、新規なら挿入して false を返す
+    fn check_and_insert(&mut self, key: u64) -> bool {
+        // key=0 は未使用エントリと区別できないので特殊扱い
+        let effective_key = if key == 0 { 1 } else { key };
+        let idx = (effective_key & self.mask) as usize;
+        if self.table[idx] == effective_key {
+            return true;
+        }
+        self.table[idx] = effective_key;
+        false
+    }
 }
 
 fn parse_manifest_row(line: &str) -> Result<ManifestRow> {
@@ -195,7 +266,7 @@ fn extract_from_row(row: &ManifestRow) -> Result<Vec<ExtractedPosition>> {
 
     let text = fs::read_to_string(&row.csa_path)
         .with_context(|| format!("failed to read {}", row.csa_path.display()))?;
-    let evals = parse_post_move_eval_comments(&text);
+    let mut evals = parse_post_move_eval_comments(&text);
     let (initial_pos, parsed, _info) = parse_csa_full(&text)
         .with_context(|| format!("failed to parse {}", row.csa_path.display()))?;
     let normal_moves: Vec<_> = parsed
@@ -205,17 +276,34 @@ fn extract_from_row(row: &ManifestRow) -> Result<Vec<ExtractedPosition>> {
             ParsedMove::Special(_) => None,
         })
         .collect();
+    // 評価値コメントの対応付けは行スキャンで行うため、CSA パーサの指し手数と一致しない
+    // 棋譜（1 行複数手など）では index がずれる。ずれたまま誤った eval を記録するより
+    // eval なし扱いにする。
+    if evals.len() != normal_moves.len() {
+        eprintln!(
+            "warning: {}: eval comment scan found {} move lines but parser found {} moves; dropping eval_cp",
+            row.csa_path.display(),
+            evals.len(),
+            normal_moves.len()
+        );
+        evals.clear();
+    }
+    // manifest の total_plies は外部生成のため、CSA パーサの実手数と食い違いうる。
+    // 「アンカー後に 8 手以上残る」の保証は実手数側でも課し、超過アンカーは除外する。
+    if row.total_plies as usize != normal_moves.len() {
+        eprintln!(
+            "warning: {}: manifest total_plies {} != parsed move count {}; clipping anchors to parsed moves",
+            row.csa_path.display(),
+            row.total_plies,
+            normal_moves.len()
+        );
+    }
 
     let mut out = Vec::new();
     for candidate in candidates {
         let anchor_idx = candidate.anchor_ply as usize;
-        if anchor_idx > normal_moves.len() {
-            bail!(
-                "{}: anchor_ply {} exceeds normal move count {}",
-                row.csa_path.display(),
-                candidate.anchor_ply,
-                normal_moves.len()
-            );
+        if anchor_idx + 8 > normal_moves.len() {
+            continue;
         }
 
         let mut pos = initial_pos.clone();
@@ -407,7 +495,7 @@ mod tests {
         .expect("write manifest");
 
         let out_dir = dir.path().join("out");
-        run(&manifest, &out_dir).expect("run");
+        run(&manifest, &out_dir, 1 << 16).expect("run");
 
         let startpos = fs::read_to_string(out_dir.join("startpos.txt")).expect("startpos");
         let startpos_lines: Vec<_> = startpos.lines().collect();
@@ -419,13 +507,66 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let cols: Vec<_> = rows[1].split('\t').collect();
         assert_eq!(cols[0], "1");
-        assert_eq!(cols[1], "1");
-        assert_eq!(cols[3], "20");
-        assert_eq!(cols[4], "entry");
-        assert_eq!(cols[5], "b");
-        assert_eq!(cols[6], "20");
-        assert_eq!(cols[7], "30");
-        assert_eq!(cols[8], "2024");
+        assert_eq!(cols[2], "20");
+        assert_eq!(cols[3], "entry");
+        assert_eq!(cols[4], "b");
+        assert_eq!(cols[5], "20");
+        assert_eq!(cols[6], "30");
+        assert_eq!(cols[7], "2024");
+    }
+
+    #[test]
+    fn run_skips_unreadable_csa_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let normal = dir.path().join("normal.csa");
+        let mut normal_text = simple_board();
+        normal_text.push('\n');
+        normal_text.push_str(&cycle_moves(40, "+7565KI", "+6575KI", "-1939KY", "-3919KY"));
+        normal_text.push_str("%TORYO\n");
+        fs::write(&normal, normal_text).expect("write normal");
+
+        let manifest = dir.path().join("manifest.tsv");
+        // 1 行目: 存在しない CSA (skip)、2 行目: total_plies 過大 (アンカーを実手数に clip、
+        // 残る anchor 20 は 3 行目と同一局面で dedup)、3 行目: 正常
+        fs::write(
+            &manifest,
+            format!(
+                "{}\t20\t-1\t30\n{}\t60\t-1\t100\n{}\t20\t-1\t30\n",
+                dir.path().join("missing.csa").display(),
+                normal.display(),
+                normal.display(),
+            ),
+        )
+        .expect("write manifest");
+
+        let out_dir = dir.path().join("out");
+        run(&manifest, &out_dir, 1 << 16).expect("run must skip broken rows");
+
+        let startpos = fs::read_to_string(out_dir.join("startpos.txt")).expect("startpos");
+        assert_eq!(startpos.lines().count(), 1);
+    }
+
+    #[test]
+    fn extract_drops_evals_when_scan_disagrees_with_parser() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let csa = dir.path().join("multi.csa");
+        let mut text = simple_board();
+        text.push('\n');
+        text.push_str(&cycle_moves(40, "+7565KI", "+6575KI", "-1939KY", "-3919KY"));
+        // パーサは `+`/`-` 始まりの 7 文字以上を手として数えるが、行スキャンは
+        // 座標 digit を要求するため数えない → 手数不一致になる行
+        text.push_str("+ABCDEFG\n%TORYO\n");
+        fs::write(&csa, text).expect("write csa");
+
+        let row = ManifestRow {
+            csa_path: csa,
+            black_entry_ply: 20,
+            white_entry_ply: -1,
+            total_plies: 42,
+        };
+        let extracted = extract_from_row(&row).expect("extract");
+        assert!(!extracted.is_empty());
+        assert!(extracted.iter().all(|item| item.eval_cp.is_none()));
     }
 
     #[test]
@@ -435,7 +576,7 @@ mod tests {
         fs::write(&manifest, "# comment only\n\n").expect("write manifest");
 
         let out_dir = dir.path().join("out");
-        let err = run(&manifest, &out_dir).expect_err("empty extraction must fail");
+        let err = run(&manifest, &out_dir, 1 << 16).expect_err("empty extraction must fail");
         assert!(err.to_string().contains("no start positions extracted"), "{err}");
         assert!(!out_dir.join("startpos.txt").exists());
         assert!(!out_dir.join("provenance.tsv").exists());

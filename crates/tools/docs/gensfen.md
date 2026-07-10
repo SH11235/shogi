@@ -66,8 +66,9 @@ KIF が必要な場合は `tournament` バイナリで対局を回し、その�
 {"ply": 17, "kind": "multipv", "chosen_move": "2g2f", "best_move": "7g7f", "score_gap_cp": 25}
 ```
 
-`kind` は `multipv` または `random`。`random` は探索を行わないため `best_move` と
-`score_gap_cp` が `null` になる。乱択が無い対局でも `diversions: []` を出力する。
+`ply` は乱択した手自体の手数（1-origin、対局 1 手目 = 1）。`kind` は `multipv` または
+`random`。`random` は探索を行わないため `best_move` と `score_gap_cp` が `null` になる。
+乱択が無い対局でも `diversions: []` を出力する。
 
 ## 動作モード
 

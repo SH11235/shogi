@@ -1779,10 +1779,8 @@ impl Position {
         let enemy_field = Self::enemy_field(color);
         let king_in_enemy = enemy_field.contains(self.king_square(color));
         let our_in_enemy = self.pieces_c(color) & enemy_field;
-        let enemy_zone_pieces = our_in_enemy
-            .iter()
-            .filter(|&sq| self.piece_on(sq).piece_type() != PieceType::King)
-            .count() as u32;
+        let kings_in_enemy = (self.pieces(color, PieceType::King) & enemy_field).count();
+        let enemy_zone_pieces = our_in_enemy.count() - kings_in_enemy;
 
         let big_set = PieceTypeSet::bishop_horse() | PieceTypeSet::rook_dragon();
         let big_in_enemy = (self.pieces_c_by_types(color, big_set) & enemy_field).count();
