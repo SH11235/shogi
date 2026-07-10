@@ -77,8 +77,9 @@ target/release/rescore_psv \
 
 ## セットアップ（初回のみ）
 
-前提: NVIDIA GPU + CUDA Toolkit（12.x 以上）、ONNX Runtime 1.24.2 GPU 版、cuDNN 9、
-TensorRT 10（`--onnx-tensorrt` 使用時のみ）。バージョンは揃えること:
+前提: NVIDIA GPU + CUDA Toolkit 12.x（本手順の ONNX Runtime / cuDNN / TensorRT は
+いずれも CUDA 12 系ビルド）、ONNX Runtime 1.24.2 GPU 版、cuDNN 9、TensorRT 10
+（`--onnx-tensorrt` 使用時のみ）。バージョンは揃えること:
 
 | コンポーネント | バージョン | 備考 |
 |---|---|---|
@@ -161,9 +162,12 @@ ort は load-dynamic のためビルド時に libonnxruntime は不要（実行�
 | `--onnx-tensorrt` | false | TensorRT EP（FP16）を使用 |
 | `--onnx-tensorrt-cache` | — | TensorRT エンジンキャッシュ保存先（実質必須） |
 | `--onnx-eval-scale` | 600.0 | 勝率→cp 変換スケール（正の有限値） |
-| `--onnx-draw-ply` | — | AobaZero モデル用の引き分け手数 |
+| `--onnx-draw-ply` | 0（調整なし） | AobaZero モデル用の引き分け手数 |
 | `--expand-output-dir` | — | policy 展開の出力先（レシピ参照） |
 | `--expand-threshold` | 10.0 | 展開する softmax 確率閾値 %（`(0, 100]`） |
+| `--expand-skip-parent-in-check` | false | 親局面が王手なら expand をスキップ（rescore 側は `--skip-in-check` で別制御） |
+| `--expand-skip-child-in-check` | false | 展開した子局面が王手なら expand 出力をスキップ |
+| `--ort-profile` | — | ORT profiling 出力先ディレクトリ（`session.run()` の内訳を JSON 出力、開発用） |
 | `--qsearch-leaf-label` | false | ラベルのみ葉評価にする（`--nnue` 併用必須、レシピ参照） |
 | `--qsearch-leaf-replacement-output` | — | 葉置換 arm の同時出力先（レシピ参照） |
 
