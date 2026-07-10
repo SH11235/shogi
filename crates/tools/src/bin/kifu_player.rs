@@ -32,7 +32,7 @@ struct Cli {
     #[arg(long)]
     csa: Option<PathBuf>,
 
-    /// 修正前のrshogi-csa-serverが手後へ書いた`'*`評価コメントとして解釈する。
+    /// 旧形式のrshogi-csa-serverが手後へ書いた`'*`評価コメントとして解釈する。
     #[arg(long, requires = "csa")]
     legacy_server_eval_comments: bool,
 

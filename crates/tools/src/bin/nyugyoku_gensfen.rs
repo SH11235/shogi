@@ -55,7 +55,7 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_CHECKPOINT_INTERVAL, value_parser = parse_positive_usize)]
     checkpoint_interval: usize,
 
-    /// 修正前のrshogi-csa-serverが手後へ書いた`'*`評価コメントとして解釈する。
+    /// 旧形式のrshogi-csa-serverが手後へ書いた`'*`評価コメントとして解釈する。
     #[arg(long)]
     legacy_server_eval_comments: bool,
 }

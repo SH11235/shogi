@@ -91,7 +91,7 @@ byte位置へ切り戻してから再処理する。dedup開始後はmanifest全
 照合し、変更・追記された入力からの再開を拒否する。checkpoint間隔は
 `--checkpoint-interval`で変更できる。
 
-修正前のrshogi-csa-serverがinline `,T`付き指し手の直後へ`'*`評価コメントを書いた棋譜は、
+旧形式のrshogi-csa-serverがinline `,T`付き指し手の直後へ`'*`評価コメントを書いた棋譜は、
 `--legacy-server-eval-comments`を指定する。通常のCSAでは指定しない。1回のmanifest内で
 Standardと旧server形式を混在させず、形式ごとに別runへ分ける。
 

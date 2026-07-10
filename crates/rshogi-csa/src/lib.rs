@@ -530,7 +530,7 @@ pub enum EvalCommentStyle {
     /// `'*` は次の通常手、`'**` は直前の通常手に帰属する標準解釈。
     #[default]
     Standard,
-    /// 修正前のrshogi-csa-server向け。inline T付き通常手直後の`'*`を前手へ帰属する。
+    /// 旧形式のrshogi-csa-server向け。inline T付き通常手直後の`'*`を前手へ帰属する。
     LegacyServerPost,
 }
 
