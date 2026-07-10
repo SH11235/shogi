@@ -525,6 +525,15 @@ pub enum ParsedMove {
 /// `parse_csa_full_with_evals` の返り値。
 pub type ParsedCsaWithEvals = (Position, Vec<ParsedMove>, GameInfo, Vec<Option<i32>>);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EvalCommentStyle {
+    /// `'*` は次の通常手、`'**` は直前の通常手に帰属する標準解釈。
+    #[default]
+    Standard,
+    /// 修正前のrshogi-csa-server向け。inline T付き通常手直後の`'*`を前手へ帰属する。
+    LegacyServerPost,
+}
+
 /// CSA棋譜から抽出した対局メタデータ
 #[derive(Clone, Debug, Default)]
 pub struct GameInfo {
@@ -567,9 +576,14 @@ pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo
 ///
 /// csa_client の `'*` は直後の通常手、wdoor の `'**` は直前の通常手に対応する。
 pub fn parse_csa_full_with_evals(text: &str) -> Result<ParsedCsaWithEvals> {
-    // rshogi-csa-serverの棋譜だけが出すmarker。旧版serverはinline T付き指し手の直後へ
-    // `'*` を置いていたため、この形式に限って後置コメントとして互換解釈する。
-    let server_record = text.lines().any(|line| line.trim().starts_with("$GAME_ID:"));
+    parse_csa_full_with_evals_style(text, EvalCommentStyle::Standard)
+}
+
+/// 評価コメント形式を明示してCSA棋譜を完全パースする。
+pub fn parse_csa_full_with_evals_style(
+    text: &str,
+    eval_style: EvalCommentStyle,
+) -> Result<ParsedCsaWithEvals> {
     let mut pos = None;
     let mut moves = Vec::new();
     let mut evals = Vec::new();
@@ -637,7 +651,8 @@ pub fn parse_csa_full_with_evals(text: &str) -> Result<ParsedCsaWithEvals> {
         // rshogi csa_client: 直後の通常手を探索した先手視点評価値。
         if let Some(rest) = s.strip_prefix("'*") {
             let cp = parse_leading_eval_cp(rest);
-            if server_record && comment_follows_inline_timed_move {
+            if eval_style == EvalCommentStyle::LegacyServerPost && comment_follows_inline_timed_move
+            {
                 if let Some(last) = evals.last_mut() {
                     *last = cp;
                 }
@@ -1161,14 +1176,15 @@ P-00KA
 
     #[test]
     fn test_legacy_server_single_star_after_inline_timed_move_belongs_to_previous_move() {
-        let text = "$GAME_ID:legacy\nPI\n+7776FU,T1\n'* 100\n-3334FU,T1\n";
-        let (_, _, _, evals) = parse_csa_full_with_evals(text).unwrap();
+        let text = "PI\n+7776FU,T1\n'* 100\n-3334FU,T1\n";
+        let (_, _, _, evals) =
+            parse_csa_full_with_evals_style(text, EvalCommentStyle::LegacyServerPost).unwrap();
         assert_eq!(evals, vec![Some(100), None]);
     }
 
     #[test]
-    fn test_single_star_after_inline_move_without_server_marker_remains_pre_move() {
-        let text = "PI\n+7776FU,T1\n'* 100\n-3334FU,T1\n";
+    fn test_standard_single_star_after_inline_move_remains_pre_move() {
+        let text = "$GAME_ID:external\nPI\n+7776FU,T1\n'* 100\n-3334FU,T1\n";
         let (_, _, _, evals) = parse_csa_full_with_evals(text).unwrap();
         assert_eq!(evals, vec![None, Some(100)]);
     }

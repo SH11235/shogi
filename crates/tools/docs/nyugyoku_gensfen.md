@@ -64,7 +64,9 @@ CSAの`'* <cp> ...`（直後の指し手）と`'** <cp> ...`（直前の指し�
 `/path/to/out.work/`へ継続的に書き出す。manifestの既定10,000行ごと、および各dedup
 パーティション完了時にdurableなbyte位置を`state.json`へ保存する。checkpointでは変更が
 あったpartitionだけをflush・syncし、その後にstateとディレクトリエントリもsyncする。
-partitionと一時出力のprefix digestも保存し、同じbyte長の破損・改変も再開時に拒否する。
+partitionと一時出力のprefix checksumも保存し、同じbyte長の偶発的な破損も再開時に
+best-effortで検出する。checksumは継続可能なFNV-1a 64bitで、敵対的な改変耐性を保証する
+暗号学的digestではない。
 
 中断後は同じ引数に`--resume`を加えて再開する。
 
