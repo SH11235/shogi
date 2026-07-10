@@ -31,7 +31,8 @@ manifestがあるディレクトリを基準に解決する。
 manifestで先に出たものを残す。候補は安定ハッシュでディスクパーティションへ書き、
 各パーティションだけを`HashSet`へロードする。ピークメモリは全候補数ではなく最大
 パーティションのユニーク局面数で決まる。既定は128パーティションで、
-`--partitions`で変更できる。
+`--partitions`で変更できる。partitionファイルはLRU方式で最大32個だけ開くため、既定値でも
+低いfile descriptor上限で動作する。
 
 ### dedupメモリ実測
 
@@ -54,8 +55,9 @@ CSAの`'* <cp> ...`（直後の指し手）と`'** <cp> ...`（直前の指し�
 ## 中断・再開
 
 実行中の候補、一時出力、checkpointは、`--out-dir /path/to/out`に対してsiblingの
-`/path/to/out.work/`へ継続的に書き出す。manifestの既定10,000行ごと、および各dedup
-パーティション完了時にdurableなbyte位置を`state.json`へ保存する。
+`/path/to/out.work/`へ継続的に書き出す。manifestの既定1,000,000行ごと、および各dedup
+パーティション完了時にdurableなbyte位置を`state.json`へ保存する。checkpointでは変更が
+あったpartitionだけをflush・syncし、その後にstateとディレクトリエントリもsyncする。
 
 中断後は同じ引数に`--resume`を加えて再開する。
 
@@ -66,13 +68,17 @@ cargo run -p tools --release --bin nyugyoku_gensfen -- \
   --resume
 ```
 
-処理済みmanifest prefixのSHA-256とパーティション数が一致しなければ再開を拒否する。
-未処理の末尾は修正・追記できる。checkpointより後の一時データは記録済みbyte位置へ
-切り戻してから再処理する。checkpoint間隔は`--checkpoint-interval`で変更できる。
+partition処理中は、処理済みmanifest prefixのSHA-256とパーティション数が一致しなければ
+再開を拒否する。未処理の末尾は修正・追記できる。checkpointより後の一時データは記録済み
+byte位置へ切り戻してから再処理する。dedup開始後はmanifest全体の行数と処理済みprefixを
+照合し、変更・追記された入力からの再開を拒否する。checkpoint間隔は
+`--checkpoint-interval`で変更できる。
 
 最終`out/`は全処理が成功した時だけ、`out.work/`の同一ファイルシステム内renameで
-公開される。既存の`out/`は上書きしない。実行中・失敗時は`out/`が現れず、
-`out.work/`が再開用に残る。
+公開される。Linuxでは`RENAME_NOREPLACE`を使い、並行して作られたものを含む既存の`out/`を
+上書きしない。実行中・失敗時は`out/`が現れず、`out.work/`が再開用に残る。公開直前に
+停止した場合も`run-meta.json`をcheckpointとして`--resume`でき、完成した`out/`に
+`state.json`は含めない。
 
 ## 出力
 

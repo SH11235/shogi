@@ -100,7 +100,15 @@ impl KifuRecord {
             let _ = writeln!(out, "{},T{}", mv.token, mv.elapsed_sec);
             if let Some(c) = mv.comment.as_ref() {
                 // Floodgate 互換の `'` 始まりコメント行。
-                let _ = writeln!(out, "'{c}");
+                // `* <cp>` はこの指し手を探索した評価値なので、手の後に置く形式では
+                // wdoor と同じ `'**` に正規化して「直前の手」への帰属を明示する。
+                if c.starts_with("**") {
+                    let _ = writeln!(out, "'{c}");
+                } else if let Some(rest) = c.strip_prefix('*') {
+                    let _ = writeln!(out, "'**{rest}");
+                } else {
+                    let _ = writeln!(out, "'{c}");
+                }
             }
         }
         // 終局理由コード + 勝敗コード（必要に応じて）。
@@ -300,6 +308,27 @@ mod tests {
         assert!(txt.contains("\n-3334FU,T4\n"));
         // Floodgate 拡張のコメント行（先頭 `'`）。
         assert!(txt.contains("\n'eval=12 pv 3c3d\n"));
+    }
+
+    #[test]
+    fn build_v2_normalizes_post_move_eval_comment_to_double_star() {
+        let mut rec = rec_skeleton();
+        rec.moves[1].comment = Some("* 12 +7776FU".to_owned());
+        let txt = rec.build_v2();
+        assert!(txt.contains("\n-3334FU,T4\n'** 12 +7776FU\n"));
+        let (_, parsed, _) = parse_csa_full(&txt).unwrap();
+        let normal: Vec<_> = parsed
+            .iter()
+            .filter_map(|mv| match mv {
+                ParsedMove::Normal(cm) => Some(cm),
+                ParsedMove::Special(_) => None,
+            })
+            .collect();
+        assert_eq!(normal[0].eval_cp_black, None);
+        assert_eq!(normal[1].eval_cp_black, Some(12));
+
+        rec.moves[1].comment = Some("** 34 +7776FU".to_owned());
+        assert!(rec.build_v2().contains("\n'** 34 +7776FU\n"));
     }
 
     #[test]

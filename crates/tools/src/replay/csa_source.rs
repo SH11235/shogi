@@ -210,14 +210,9 @@ impl GameSource for CsaSource {
                 None => (Move::NONE, format!("{:>4} {}", abs_ply, cm.mv)),
             };
 
-            let score_cp = cm.eval_cp_black.map(|black_pov| {
-                // 先手視点 → 手番相対（後手手番は符号反転）。グラフ側の `black_pov_cp` が
-                // 再度 手番相対 → 先手視点 に戻すので、全ソースで格納形式を揃える。
-                match side {
-                    Color::Black => black_pov,
-                    Color::White => -black_pov,
-                }
-            });
+            let score_cp = cm
+                .eval_cp_black
+                .and_then(|black_pov| black_pov_to_side_relative(black_pov, side));
 
             moves.push(MoveView {
                 ply: abs_ply,
@@ -245,6 +240,15 @@ impl GameSource for CsaSource {
             moves,
             leading_gap_is_drop: false,
         })
+    }
+}
+
+fn black_pov_to_side_relative(black_pov: i32, side: Color) -> Option<i32> {
+    // 先手視点 → 手番相対（後手手番は符号反転）。グラフ側の `black_pov_cp` が
+    // 再度 手番相対 → 先手視点 に戻すので、全ソースで格納形式を揃える。
+    match side {
+        Color::Black => Some(black_pov),
+        Color::White => black_pov.checked_neg(),
     }
 }
 
@@ -403,6 +407,12 @@ mod tests {
         let game = source.load_game(&index, &index.entries[0]).expect("load_game");
         assert_eq!(game.moves[0].annotation.elapsed_ms, Some(3_000));
         assert_eq!(game.moves[1].annotation.elapsed_ms, Some(4_000));
+    }
+
+    #[test]
+    fn minimum_i32_white_eval_does_not_overflow() {
+        assert_eq!(black_pov_to_side_relative(i32::MIN, Color::White), None);
+        assert_eq!(black_pov_to_side_relative(i32::MIN, Color::Black), Some(i32::MIN));
     }
 
     #[test]

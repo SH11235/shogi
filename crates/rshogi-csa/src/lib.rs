@@ -627,9 +627,7 @@ pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo
         }
         // rshogi csa_client: 直後の通常手を探索した先手視点評価値。
         if let Some(rest) = s.strip_prefix("'*") {
-            if let Some(cp) = parse_leading_eval_cp(rest) {
-                pending_eval_cp_black = Some(cp);
-            }
+            pending_eval_cp_black = parse_leading_eval_cp(rest);
             continue;
         }
         // Skip other comments and headers
@@ -673,19 +671,17 @@ pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo
             parse_hand_setup(pos_ref, color, &s[2..])?;
             continue;
         }
-        if s.starts_with('+') || s.starts_with('-') {
-            if s.len() >= 7 {
-                let mv = s[..7].to_string();
-                // インライン消費時間: +7776FU,T30
-                let time_sec = s
-                    .get(7..)
-                    .and_then(|rest| rest.strip_prefix(",T").and_then(|t| t.parse::<u32>().ok()));
-                moves.push(ParsedMove::Normal(CsaMove {
-                    mv,
-                    time_sec,
-                    eval_cp_black: pending_eval_cp_black.take(),
-                }));
-            }
+        if is_csa_move_line(s) {
+            let mv = s[..7].to_string();
+            // インライン消費時間: +7776FU,T30
+            let time_sec = s
+                .get(7..)
+                .and_then(|rest| rest.strip_prefix(",T").and_then(|t| t.parse::<u32>().ok()));
+            moves.push(ParsedMove::Normal(CsaMove {
+                mv,
+                time_sec,
+                eval_cp_black: pending_eval_cp_black.take(),
+            }));
             continue;
         }
     }
@@ -695,6 +691,14 @@ pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo
 
 fn parse_leading_eval_cp(rest: &str) -> Option<i32> {
     rest.split_whitespace().next()?.parse().ok()
+}
+
+fn is_csa_move_line(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 7
+        && matches!(bytes[0], b'+' | b'-')
+        && bytes[1..5].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_uppercase)
 }
 
 fn parse_special_move(s: &str) -> Option<SpecialMove> {
@@ -1134,13 +1138,30 @@ P-00KA
     }
 
     #[test]
-    fn test_later_valid_eval_comment_wins_and_invalid_is_ignored() {
-        let text = "PI\n'* 5\n'* invalid\n'* 10\n+7776FU\n'** invalid\n'** 20 pv\n";
+    fn test_last_eval_comment_wins_and_invalid_pending_is_cleared() {
+        let text = "PI\n'* 5\n'* invalid\n+7776FU\n'* 10\n-3334FU\n'** invalid\n'** 20 pv\n";
         let (_, moves, _) = parse_csa_full(text).unwrap();
+        let normal: Vec<_> = moves
+            .iter()
+            .filter_map(|m| match m {
+                ParsedMove::Normal(cm) => Some(cm),
+                ParsedMove::Special(_) => None,
+            })
+            .collect();
+        assert_eq!(normal[0].eval_cp_black, None);
+        assert_eq!(normal[1].eval_cp_black, Some(20));
+    }
+
+    #[test]
+    fn test_malformed_signed_line_is_not_a_normal_move() {
+        let text = "PI\n'* 10\n+abcdef\n+7776FU\n";
+        let (_, moves, _) = parse_csa_full(text).unwrap();
+        assert_eq!(moves.len(), 1);
         let ParsedMove::Normal(cm) = &moves[0] else {
             panic!("expected normal move");
         };
-        assert_eq!(cm.eval_cp_black, Some(20));
+        assert_eq!(cm.mv, "+7776FU");
+        assert_eq!(cm.eval_cp_black, Some(10));
     }
 
     #[test]

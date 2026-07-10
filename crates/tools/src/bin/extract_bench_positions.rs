@@ -449,11 +449,16 @@ fn parse_csa(path: &Path) -> Result<CsaGame> {
         .with_context(|| format!("CSA を開けません: {}", path.display()))?;
     let (_, parsed, _) = parse_csa_full(&text)
         .with_context(|| format!("CSA を解析できません: {}", path.display()))?;
-    let mut evals = parsed.iter().filter_map(|pm| match pm {
-        ParsedMove::Normal(cm) => Some(cm.eval_cp_black),
-        ParsedMove::Special(_) => None,
-    });
-    let mut moves: Vec<CsaMoveLine> = Vec::new();
+    let moves: Vec<CsaMoveLine> = parsed
+        .iter()
+        .filter_map(|pm| match pm {
+            ParsedMove::Normal(cm) => Some(CsaMoveLine {
+                raw: cm.mv.clone(),
+                eval_raw: cm.eval_cp_black,
+            }),
+            ParsedMove::Special(_) => None,
+        })
+        .collect();
     let mut black_rate = None;
     let mut white_rate = None;
     let mut end_kind = "unknown".to_string();
@@ -468,11 +473,6 @@ fn parse_csa(path: &Path) -> Result<CsaGame> {
             black_rate = parse_rate_comment(trimmed);
         } else if trimmed.starts_with("'white_rate:") {
             white_rate = parse_rate_comment(trimmed);
-        } else if is_csa_move(trimmed) {
-            moves.push(CsaMoveLine {
-                raw: trimmed[..7].to_string(),
-                eval_raw: evals.next().flatten(),
-            });
         } else if trimmed.starts_with('%') {
             end_kind = trimmed.split(',').next().unwrap_or(trimmed).to_string();
         } else if trimmed.starts_with("P+") || trimmed.starts_with("P-") {

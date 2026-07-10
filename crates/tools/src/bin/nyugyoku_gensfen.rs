@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -16,10 +16,10 @@ use rshogi_core::types::{EnteringKingRule, Move};
 use rshogi_csa::{ParsedMove, parse_csa_full};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tools::common::io::write_atomic;
 
 const DEFAULT_PARTITIONS: usize = 128;
-const DEFAULT_CHECKPOINT_INTERVAL: usize = 10_000;
+const DEFAULT_CHECKPOINT_INTERVAL: usize = 1_000_000;
+const MAX_OPEN_PARTITION_WRITERS: usize = 32;
 const STATE_VERSION: u32 = 1;
 
 #[derive(Parser, Debug)]
@@ -145,7 +145,7 @@ fn main() -> Result<()> {
 fn run_with_options(manifest: &Path, out_dir: &Path, options: RunOptions) -> Result<()> {
     ensure!(options.partitions > 0, "partitions must be positive");
     ensure!(options.checkpoint_interval > 0, "checkpoint interval must be positive");
-    if out_dir.exists() {
+    if path_entry_exists(out_dir)? {
         bail!("output directory already exists: {}", out_dir.display());
     }
     let parent = out_dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -158,19 +158,25 @@ fn run_with_options(manifest: &Path, out_dir: &Path, options: RunOptions) -> Res
     let state_path = work_dir.join("state.json");
     let partitions_dir = work_dir.join("partitions");
 
-    let mut state = if work_dir.exists() {
+    let mut state = if path_entry_exists(&work_dir)? {
         if !options.resume {
             bail!(
                 "work directory already exists: {} (use --resume or remove it)",
                 work_dir.display()
             );
         }
+        let resume_path = if state_path.is_file() {
+            state_path.clone()
+        } else {
+            work_dir.join("run-meta.json")
+        };
         let state: RunState = serde_json::from_reader(BufReader::new(
-            File::open(&state_path)
-                .with_context(|| format!("failed to open {}", state_path.display()))?,
+            File::open(&resume_path)
+                .with_context(|| format!("failed to open {}", resume_path.display()))?,
         ))
-        .with_context(|| format!("failed to parse {}", state_path.display()))?;
+        .with_context(|| format!("failed to parse {}", resume_path.display()))?;
         validate_resume_state(&state, &manifest, options.partitions)?;
+        verify_manifest_for_resume(&manifest, &state)?;
         eprintln!(
             "Resuming: phase={:?}, manifest_lines={}, next_partition={}, unique={}",
             state.phase, state.processed_manifest_lines, state.next_partition, state.unique_written
@@ -182,8 +188,10 @@ fn run_with_options(manifest: &Path, out_dir: &Path, options: RunOptions) -> Res
         }
         fs::create_dir(&work_dir)
             .with_context(|| format!("failed to create {}", work_dir.display()))?;
+        sync_directory(parent)?;
         fs::create_dir(&partitions_dir)
             .with_context(|| format!("failed to create {}", partitions_dir.display()))?;
+        sync_directory(&work_dir)?;
         let state = RunState {
             version: STATE_VERSION,
             manifest: manifest.display().to_string(),
@@ -246,6 +254,35 @@ fn validate_resume_state(state: &RunState, manifest: &Path, partitions: usize) -
     Ok(())
 }
 
+fn verify_manifest_for_resume(manifest: &Path, state: &RunState) -> Result<()> {
+    let file = File::open(manifest)
+        .with_context(|| format!("failed to open manifest {}", manifest.display()))?;
+    let mut hasher = Sha256::new();
+    let mut total_lines = 0usize;
+    for (line_idx, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line_idx < state.processed_manifest_lines {
+            update_prefix_hash(&mut hasher, &line);
+        }
+        total_lines = line_idx + 1;
+    }
+    ensure!(
+        total_lines >= state.processed_manifest_lines,
+        "manifest is shorter than the processed prefix recorded in state"
+    );
+    ensure!(
+        hex_digest(hasher.finalize()) == state.processed_prefix_sha256,
+        "manifest processed prefix changed; restart from a new out-dir"
+    );
+    if state.phase != Phase::Partition {
+        ensure!(
+            total_lines == state.processed_manifest_lines,
+            "manifest changed after partitioning completed; restart from a new out-dir"
+        );
+    }
+    Ok(())
+}
+
 fn partition_manifest(
     manifest: &Path,
     work_dir: &Path,
@@ -260,7 +297,8 @@ fn partition_manifest(
             state.partition_bytes[partition],
         )?;
     }
-    let mut writers = open_partition_writers(partitions_dir, state.partitions)?;
+    let mut writers =
+        PartitionWriters::new(partitions_dir, state.partitions, MAX_OPEN_PARTITION_WRITERS)?;
     let file = File::open(manifest)
         .with_context(|| format!("failed to open manifest {}", manifest.display()))?;
     let manifest_dir = manifest.parent().unwrap_or(Path::new("."));
@@ -292,8 +330,7 @@ fn partition_manifest(
             for item in extract_from_row(&row)? {
                 let partition =
                     stable_hash(item.position_key.as_bytes()) as usize % state.partitions;
-                serde_json::to_writer(&mut writers[partition], &item)?;
-                writers[partition].write_all(b"\n")?;
+                writers.write_record(partition, &item)?;
                 state.candidates_written += 1;
             }
         }
@@ -302,7 +339,7 @@ fn partition_manifest(
         state.processed_prefix_sha256 = hex_digest(prefix_hasher.clone().finalize());
         lines_since_checkpoint += 1;
         if lines_since_checkpoint >= checkpoint_interval {
-            flush_partition_writers(&mut writers)?;
+            writers.checkpoint()?;
             update_partition_checkpoint(partitions_dir, state)?;
             save_state(state_path, state)?;
             eprintln!(
@@ -320,7 +357,7 @@ fn partition_manifest(
             "manifest is shorter than the processed prefix recorded in state"
         );
     }
-    flush_partition_writers(&mut writers)?;
+    writers.checkpoint()?;
     update_partition_checkpoint(partitions_dir, state)?;
     state.phase = Phase::Dedup;
     state.next_partition = 0;
@@ -384,7 +421,9 @@ fn deduplicate_partitions(
         state.startpos_bytes = fs::metadata(&startpos_path)?.len();
         state.provenance_bytes = fs::metadata(&provenance_path)?.len();
         save_state(state_path, state)?;
-        fs::remove_file(&path).ok();
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to remove completed partition {}", path.display()))?;
+        sync_directory(partitions_dir)?;
         if partition.is_multiple_of(16) || partition + 1 == state.partitions {
             eprintln!(
                 "dedup: partition {}/{}, {} unique",
@@ -411,6 +450,7 @@ fn initialize_output_files(work_dir: &Path, state: &mut RunState) -> Result<()> 
     )?;
     provenance.flush()?;
     provenance.get_ref().sync_data()?;
+    sync_directory(work_dir)?;
     state.startpos_bytes = 0;
     state.provenance_bytes = fs::metadata(provenance_path)?.len();
     Ok(())
@@ -422,15 +462,21 @@ fn finalize_output(work_dir: &Path, out_dir: &Path, state: &RunState) -> Result<
     let provenance_tmp = work_dir.join("provenance.tsv.tmp");
     publish_staged_file(&startpos_tmp, &work_dir.join("startpos.txt"))?;
     publish_staged_file(&provenance_tmp, &work_dir.join("provenance.tsv"))?;
+    sync_directory(work_dir)?;
     if work_dir.join("partitions").exists() {
         fs::remove_dir_all(work_dir.join("partitions"))?;
+        sync_directory(work_dir)?;
     }
     let meta = serde_json::to_string_pretty(state)?;
-    write_atomic(&work_dir.join("run-meta.json"), &(meta + "\n"))?;
-    fs::rename(work_dir, out_dir).with_context(|| {
+    write_atomic_durable(&work_dir.join("run-meta.json"), &(meta + "\n"))?;
+    if work_dir.join("state.json").exists() {
+        fs::remove_file(work_dir.join("state.json"))?;
+        sync_directory(work_dir)?;
+    }
+    rename_noreplace(work_dir, out_dir).with_context(|| {
         format!("failed to publish {} as {}", work_dir.display(), out_dir.display())
     })?;
-    fs::remove_file(out_dir.join("state.json")).ok();
+    sync_directory(out_dir.parent().unwrap_or(Path::new(".")))?;
     Ok(())
 }
 
@@ -597,26 +643,107 @@ fn partition_path(dir: &Path, partition: usize) -> PathBuf {
     dir.join(format!("partition_{partition:04}.jsonl"))
 }
 
-fn open_partition_writers(dir: &Path, count: usize) -> Result<Vec<BufWriter<File>>> {
-    (0..count)
-        .map(|partition| {
-            let path = partition_path(dir, partition);
+struct CachedPartitionWriter {
+    writer: BufWriter<File>,
+    last_used: u64,
+}
+
+struct PartitionWriters {
+    dir: PathBuf,
+    slots: Vec<Option<CachedPartitionWriter>>,
+    dirty: Vec<bool>,
+    max_open: usize,
+    open_count: usize,
+    tick: u64,
+}
+
+impl PartitionWriters {
+    fn new(dir: &Path, count: usize, max_open: usize) -> Result<Self> {
+        ensure!(max_open > 0, "max_open must be positive");
+        for partition in 0..count {
             OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&path)
-                .map(BufWriter::new)
-                .with_context(|| format!("failed to open {}", path.display()))
+                .open(partition_path(dir, partition))?;
+        }
+        sync_directory(dir)?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            slots: (0..count).map(|_| None).collect(),
+            dirty: vec![false; count],
+            max_open: max_open.min(count.max(1)),
+            open_count: 0,
+            tick: 0,
         })
-        .collect()
-}
-
-fn flush_partition_writers(writers: &mut [BufWriter<File>]) -> Result<()> {
-    for writer in writers {
-        writer.flush()?;
-        writer.get_ref().sync_data()?;
     }
-    Ok(())
+
+    fn write_record(&mut self, partition: usize, item: &ExtractedPosition) -> Result<()> {
+        self.ensure_open(partition)?;
+        let slot = self.slots[partition].as_mut().expect("partition writer was opened");
+        serde_json::to_writer(&mut slot.writer, item)?;
+        slot.writer.write_all(b"\n")?;
+        self.dirty[partition] = true;
+        Ok(())
+    }
+
+    fn ensure_open(&mut self, partition: usize) -> Result<()> {
+        ensure!(partition < self.slots.len(), "partition index out of range");
+        self.tick = self.tick.wrapping_add(1);
+        if let Some(slot) = self.slots[partition].as_mut() {
+            slot.last_used = self.tick;
+            return Ok(());
+        }
+        if self.open_count >= self.max_open {
+            let evict = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, slot)| slot.as_ref().map(|slot| (idx, slot.last_used)))
+                .min_by_key(|&(_, last_used)| last_used)
+                .map(|(idx, _)| idx)
+                .context("no partition writer available for eviction")?;
+            let mut slot = self.slots[evict].take().expect("eviction target exists");
+            slot.writer.flush()?;
+            self.open_count -= 1;
+        }
+        let path = partition_path(&self.dir, partition);
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        self.slots[partition] = Some(CachedPartitionWriter {
+            writer: BufWriter::new(file),
+            last_used: self.tick,
+        });
+        self.open_count += 1;
+        Ok(())
+    }
+
+    fn checkpoint(&mut self) -> Result<()> {
+        for (partition, slot) in self.slots.iter_mut().enumerate() {
+            if self.dirty[partition]
+                && let Some(slot) = slot
+            {
+                slot.writer.flush()?;
+            }
+        }
+        for partition in 0..self.dirty.len() {
+            if !self.dirty[partition] {
+                continue;
+            }
+            if let Some(slot) = self.slots[partition].as_ref() {
+                slot.writer.get_ref().sync_data()?;
+            } else {
+                OpenOptions::new()
+                    .write(true)
+                    .open(partition_path(&self.dir, partition))?
+                    .sync_data()?;
+            }
+            self.dirty[partition] = false;
+        }
+        sync_directory(&self.dir)?;
+        Ok(())
+    }
 }
 
 fn truncate_partial_last_line(path: &Path) -> Result<()> {
@@ -671,16 +798,82 @@ fn update_partition_checkpoint(dir: &Path, state: &mut RunState) -> Result<()> {
 
 fn save_state(path: &Path, state: &RunState) -> Result<()> {
     let json = serde_json::to_string_pretty(state)? + "\n";
+    write_atomic_durable(path, &json)
+}
+
+fn write_atomic_durable(path: &Path, content: &str) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("failed to create state tempfile in {}", parent.display()))?;
-    tmp.write_all(json.as_bytes())?;
+    tmp.write_all(content.as_bytes())?;
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(path)
         .map_err(|e| e.error)
         .with_context(|| format!("failed to publish checkpoint {}", path.display()))?;
+    sync_directory(parent)?;
     Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("failed to open directory {} for sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync directory {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+    })?;
+    // SAFETY: CString により両パスは NUL 終端され、呼び出し中ポインタは有効。
+    // flags=RENAME_NOREPLACE なので既存destinationを置換しない。
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    if path_entry_exists(destination)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("destination already exists: {}", destination.display()),
+        ));
+    }
+    fs::rename(source, destination)
 }
 
 fn update_prefix_hash(hasher: &mut Sha256, line: &str) {
@@ -913,6 +1106,73 @@ mod tests {
         fs::write(&path, b"complete\npartial").unwrap();
         truncate_partial_last_line(&path).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"complete\n");
+    }
+
+    #[test]
+    fn resume_rejects_manifest_changes_after_partitioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("manifest.tsv");
+        fs::write(&manifest, "one\n").unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"one\n");
+        let state = RunState {
+            version: STATE_VERSION,
+            manifest: manifest.display().to_string(),
+            partitions: 1,
+            phase: Phase::Dedup,
+            processed_manifest_lines: 1,
+            processed_prefix_sha256: format!("{:x}", hasher.finalize()),
+            candidates_written: 0,
+            partition_bytes: vec![0],
+            next_partition: 0,
+            unique_written: 0,
+            startpos_bytes: 0,
+            provenance_bytes: 0,
+        };
+
+        verify_manifest_for_resume(&manifest, &state).unwrap();
+        fs::write(&manifest, "changed\n").unwrap();
+        assert!(verify_manifest_for_resume(&manifest, &state).is_err());
+        fs::write(&manifest, "one\nappended\n").unwrap();
+        assert!(verify_manifest_for_resume(&manifest, &state).is_err());
+    }
+
+    #[test]
+    fn partition_writer_cache_bounds_open_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writers = PartitionWriters::new(dir.path(), 128, 4).unwrap();
+        for partition in 0..128 {
+            writers.ensure_open(partition).unwrap();
+            assert!(writers.open_count <= 4);
+        }
+    }
+
+    #[test]
+    fn publish_never_replaces_an_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+
+        assert!(rename_noreplace(&source, &destination).is_err());
+        assert!(source.is_dir());
+        assert!(destination.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_output_is_treated_as_existing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("manifest.tsv");
+        fs::write(&manifest, "# empty\n").unwrap();
+        let out = dir.path().join("out");
+        symlink(dir.path().join("missing"), &out).unwrap();
+
+        let err = run_with_options(&manifest, &out, test_options(false)).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
     }
 
     #[test]
