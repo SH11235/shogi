@@ -45,6 +45,7 @@ pub mod bench_nnue_eval_tool;
 pub mod common;
 pub mod config;
 pub mod dlshogi_features;
+pub mod ek_testset;
 pub mod eval_sfens_tool;
 pub mod kif;
 #[cfg(feature = "dlshogi-onnx")]
