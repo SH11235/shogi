@@ -33,6 +33,7 @@
 | `shuffle_psv` | PSV ファイルのシャッフル |
 | `split_psv` | PSV ファイルを局面数または容量で分割 |
 | `merge_psv` | 複数の PSV ファイルを順序どおり結合 |
+| `relabel_psv` | PSV の score を手番側視点の game_result 由来値へ streaming 置換し、任意で宣言勝ち override / diversions deblunder（[詳細](docs/relabel_psv.md)） |
 | `rescore_psv` | 局面の再評価（探索スコア付与） |
 | `rescore_hcpe` | hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（分散ラベリング・チャンク単位 + 途中 resume 対応） |
 | `preprocess_psv` | PSV ファイルの前処理（qsearch leaf置換等） |
@@ -102,6 +103,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 - [yardstick_score](docs/yardstick_score.md) - labeler の WDL logloss / 参照天井 / リファレンス一致を採点（物差し stage 2）
 - [ek_testset](docs/ek_testset.md) - held-out CSA から入玉評価テストセットを構築し、native NNUE 評価で DT/OC 指標を採点
 - [rescore_psv](docs/rescore_psv.md) - PSV 評価値の再スコアリング（推奨: dlshogi ONNX + TensorRT FP16。qsearch-leaf ラベル / policy 展開 / レジューム対応）
+- [relabel_psv](docs/relabel_psv.md) - PSV score の勝敗ラベル置換と任意の宣言勝ち override / diversions deblunder
 - [rescore_hcpe](docs/rescore_hcpe.md) - hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（共有コアで yardstick とラベル bit 一致、分散ラベリング・チャンク単位 + 途中 resume 対応）
 - [psv_to_hcpe3](docs/psv_to_hcpe3.md) - PSV → dlshogi 学習用 hcpe3 / hcpe 変換（cshogi 互換、streaming、`--evalfix-a` で eval 焼き込み）
 - [book_rescore](docs/book_rescore.md) - YANEURAOU-DB2016 テキスト定跡の候補手に USI 探索または ONNX 静的評価値を付与（実行中は進捗/ETA を stderr 表示）

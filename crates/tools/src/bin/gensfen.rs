@@ -217,6 +217,11 @@ struct Cli {
     #[arg(long)]
     output_training_data: Option<PathBuf>,
 
+    /// PSV の各レコードに対応する game_id を u32 little-endian で出力する sidecar。
+    /// --training-data-format psv でのみ使用できる。
+    #[arg(long)]
+    emit_game_id_sidecar: Option<PathBuf>,
+
     /// 学習データ出力時に序盤の手数をスキップする（1手目からN手目まで）
     /// ランダム性確保のため、序盤の定跡手順をスキップする
     #[arg(
@@ -377,6 +382,9 @@ struct MetaSettings {
     random_startpos: bool,
     #[serde(default)]
     output_training_data: Option<String>,
+    /// PSV レコードと 1:1・同順の game_id sidecar（u32 little-endian）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    game_id_sidecar: Option<String>,
     #[serde(default)]
     skip_initial_ply: u32,
     #[serde(default = "default_skip_in_check")]
@@ -574,6 +582,8 @@ struct TrainingEntry {
 struct TrainingDataCollector {
     entries: Vec<TrainingEntry>,
     writer: BufWriter<File>,
+    /// PSV と同じループで game_id を書く。PSV 以外では常に None。
+    game_id_writer: Option<BufWriter<File>>,
     format: TrainingFormat,
     /// hcpe3 policy 分布の visit 総票数（softmax 量子化に使用）
     policy_total: u16,
@@ -600,6 +610,7 @@ impl TrainingDataCollector {
         format: TrainingFormat,
         policy_total: u16,
         policy_temp: f64,
+        game_id_path: Option<&Path>,
     ) -> Result<Self> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -610,6 +621,13 @@ impl TrainingDataCollector {
         }
         let file = File::create(path)
             .with_context(|| format!("failed to create training data file: {}", path.display()))?;
+        let game_id_writer = game_id_path
+            .map(|game_id_path| {
+                File::create(game_id_path).map(BufWriter::new).with_context(|| {
+                    format!("failed to create game_id sidecar: {}", game_id_path.display())
+                })
+            })
+            .transpose()?;
 
         // 平手判定用の PackedSfen を事前計算
         let mut hirate_pos = Position::new();
@@ -619,6 +637,7 @@ impl TrainingDataCollector {
         Ok(Self {
             entries: Vec::new(),
             writer: BufWriter::new(file),
+            game_id_writer,
             format,
             policy_total,
             policy_temp,
@@ -743,7 +762,7 @@ impl TrainingDataCollector {
 
     /// 対局終了時に勝敗を設定して書き出す
     /// InProgress（手数制限/タイムアウト終了）の対局は学習データに含めない
-    fn finish_game(&mut self, outcome: GameOutcome) -> Result<()> {
+    fn finish_game(&mut self, outcome: GameOutcome, game_id: u32) -> Result<()> {
         // InProgressの対局は学習データとして不適切なので破棄
         if outcome == GameOutcome::InProgress {
             self.skipped_in_progress += self.entries.len() as u64;
@@ -756,7 +775,7 @@ impl TrainingDataCollector {
         }
 
         match self.format {
-            TrainingFormat::Psv => self.finish_game_psv(outcome)?,
+            TrainingFormat::Psv => self.finish_game_psv(outcome, game_id)?,
             TrainingFormat::Pack => self.finish_game_pack(outcome)?,
             TrainingFormat::Hcpe3 => self.finish_game_hcpe3(outcome)?,
         }
@@ -766,7 +785,7 @@ impl TrainingDataCollector {
     }
 
     /// PSV 形式で書き出す（PackedSfenValue 40バイト固定長）
-    fn finish_game_psv(&mut self, outcome: GameOutcome) -> Result<()> {
+    fn finish_game_psv(&mut self, outcome: GameOutcome, game_id: u32) -> Result<()> {
         for (idx, entry) in self.entries.iter().enumerate() {
             // game_result: 手番側から見た勝敗
             // 1 = 勝ち, 0 = 引き分け, -1 = 負け
@@ -801,6 +820,12 @@ impl TrainingDataCollector {
             self.writer
                 .write_all(&psv.to_bytes())
                 .with_context(|| format!("failed to write position {idx} of game"))?;
+            // PSV と sidecar の 1:1・同順を構造的に保つため、同じループで連続して書く。
+            if let Some(writer) = self.game_id_writer.as_mut() {
+                writer.write_all(&game_id.to_le_bytes()).with_context(|| {
+                    format!("failed to write game_id for position {idx} of game")
+                })?;
+            }
             self.total_written += 1;
         }
         Ok(())
@@ -904,6 +929,9 @@ impl TrainingDataCollector {
 
     fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
+        if let Some(writer) = self.game_id_writer.as_mut() {
+            writer.flush()?;
+        }
         Ok(())
     }
 
@@ -1260,6 +1288,7 @@ struct WorkerConfig {
     eval_path: Option<PathBuf>,
     metrics_path: Option<PathBuf>,
     training_data_path: Option<PathBuf>,
+    game_id_sidecar_path: Option<PathBuf>,
     // Output flags
     flush_each_move: bool,
     // Training
@@ -1378,6 +1407,7 @@ fn worker_main(
                 cfg.training_format,
                 cfg.hcpe3_policy_total,
                 cfg.hcpe3_policy_temp,
+                cfg.game_id_sidecar_path.as_deref(),
             )?)
         } else {
             None
@@ -1761,7 +1791,7 @@ fn worker_main(
             }
 
             if let Some(ref mut collector) = training_data_collector {
-                collector.finish_game(outcome)?;
+                collector.finish_game(outcome, game_idx + 1)?;
             }
             writer.flush()?;
 
@@ -2028,6 +2058,12 @@ fn concatenate_temp_files(final_path: &Path, temp_paths: &[PathBuf], append: boo
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
 
+    // 既存 run には sidecar が無い可能性があり、PSV だけへの追記は 1:1 対応を壊す。
+    // 既存 PSV/sidecar の全件検証を暗黙に行わず、安全側で併用を禁止する。
+    if cli.resume && cli.emit_game_id_sidecar.is_some() {
+        bail!("--emit-game-id-sidecar cannot be used with --resume");
+    }
+
     // 時間制限のバリデーション: depth/nodes 指定がなく時間制御もない場合はデフォルト byoyomi を設定
     let has_limit = cli.depth.is_some() || cli.nodes.is_some();
     if !has_limit
@@ -2130,6 +2166,9 @@ fn main() -> Result<()> {
             bail!("unknown training data format: '{}' (expected 'psv', 'pack', or 'hcpe3')", other)
         }
     };
+    if cli.emit_game_id_sidecar.is_some() && training_format != TrainingFormat::Psv {
+        bail!("--emit-game-id-sidecar requires --training-data-format psv");
+    }
 
     validate_hcpe3_opts(
         training_format,
@@ -2150,6 +2189,25 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| default_training_data_path(&output_path, training_data_ext)),
     );
     let training_data_enabled = training_data_path.is_some();
+    let game_id_sidecar_path = cli.emit_game_id_sidecar.clone();
+    if let Some(sidecar_path) = game_id_sidecar_path.as_deref() {
+        validate_game_id_sidecar_path(
+            sidecar_path,
+            &output_path,
+            training_data_path.as_deref(),
+            training_data_ext,
+            cli.concurrency,
+            cli.log_info,
+            cli.emit_eval_file,
+            cli.emit_metrics,
+        )?;
+    }
+    if let Some(parent) = game_id_sidecar_path.as_deref().and_then(Path::parent)
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
 
     let engine_paths = resolve_engine_paths(&cli);
     let threads_black = cli.threads_black.unwrap_or(cli.threads);
@@ -2344,6 +2402,7 @@ fn main() -> Result<()> {
                 sfen: cli.sfen.clone(),
                 random_startpos: cli.random_startpos,
                 output_training_data: training_data_path.as_ref().map(|p| p.display().to_string()),
+                game_id_sidecar: game_id_sidecar_path.as_ref().map(|p| p.display().to_string()),
                 skip_initial_ply: cli.skip_initial_ply,
                 skip_in_check: cli.skip_in_check,
                 shuffle_seed: shuffle_seed_resolved,
@@ -2428,6 +2487,7 @@ fn main() -> Result<()> {
     let mut temp_eval_paths = Vec::new();
     let mut temp_metrics_paths = Vec::new();
     let mut temp_pack_paths = Vec::new();
+    let mut temp_game_id_paths = Vec::new();
 
     for w in 0..cli.concurrency {
         let jsonl_path = output_parent.join(format!("{output_stem}.w{w}.jsonl"));
@@ -2451,6 +2511,9 @@ fn main() -> Result<()> {
         } else {
             None
         };
+        let w_game_id_path = game_id_sidecar_path
+            .as_ref()
+            .map(|_| output_parent.join(format!("{output_stem}.w{w}.game_ids.bin")));
 
         temp_jsonl_paths.push(jsonl_path.clone());
         if let Some(ref p) = w_info_path {
@@ -2464,6 +2527,9 @@ fn main() -> Result<()> {
         }
         if let Some(ref p) = w_training_path {
             temp_pack_paths.push(p.clone());
+        }
+        if let Some(ref p) = w_game_id_path {
+            temp_game_id_paths.push(p.clone());
         }
 
         let cfg = WorkerConfig {
@@ -2498,6 +2564,7 @@ fn main() -> Result<()> {
             eval_path: w_eval_path,
             metrics_path: w_metrics_path,
             training_data_path: w_training_path,
+            game_id_sidecar_path: w_game_id_path,
             flush_each_move: cli.flush_each_move,
             skip_initial_ply: cli.skip_initial_ply,
             skip_in_check: cli.skip_in_check,
@@ -2703,6 +2770,9 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| default_training_data_path(&output_path, training_data_ext));
         concatenate_temp_files(&pack_path, &temp_pack_paths, append_mode)?;
     }
+    if let Some(sidecar_path) = game_id_sidecar_path.as_deref() {
+        concatenate_temp_files(sidecar_path, &temp_game_id_paths, false)?;
+    }
 
     // 最終サマリー
     let actual_games = black_wins + white_wins + draws;
@@ -2744,6 +2814,9 @@ fn main() -> Result<()> {
             "Output: {}",
             training_data_path.as_ref().map_or("-".to_string(), |p| p.display().to_string())
         );
+        if let Some(path) = game_id_sidecar_path.as_deref() {
+            println!("Game ID sidecar: {}", path.display());
+        }
         println!("---------------------");
     }
     println!("gensfen log written to {}", output_path.display());
@@ -2778,6 +2851,108 @@ fn default_training_data_path(jsonl: &Path, ext: &str) -> PathBuf {
     let parent = jsonl.parent().unwrap_or_else(|| Path::new("."));
     let stem = jsonl.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
     parent.join(format!("{stem}.{ext}"))
+}
+
+fn validate_game_id_sidecar_path(
+    sidecar: &Path,
+    output_jsonl: &Path,
+    training_data: Option<&Path>,
+    training_data_ext: &str,
+    concurrency: usize,
+    log_info: bool,
+    emit_eval_file: bool,
+    emit_metrics: bool,
+) -> Result<()> {
+    let normalized_sidecar = normalize_output_path(sidecar)?;
+    let mut final_paths = vec![output_jsonl.to_path_buf()];
+    final_paths.extend(training_data.map(Path::to_path_buf));
+    if log_info {
+        final_paths.push(output_jsonl.with_extension("info.jsonl"));
+    }
+    if emit_eval_file {
+        final_paths.push(default_eval_path(output_jsonl));
+    }
+    if emit_metrics {
+        final_paths.push(default_metrics_path(output_jsonl));
+    }
+    if final_paths
+        .iter()
+        .map(|path| normalize_output_path(path))
+        .collect::<Result<Vec<_>>>()?
+        .contains(&normalized_sidecar)
+    {
+        bail!(
+            "--emit-game-id-sidecar path conflicts with a final output path: {}",
+            sidecar.display()
+        );
+    }
+
+    let parent = output_jsonl.parent().unwrap_or_else(|| Path::new("."));
+    let stem = output_jsonl.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    for worker in 0..concurrency {
+        let mut internal_paths = vec![
+            parent.join(format!("{stem}.w{worker}.jsonl")),
+            parent.join(format!("{stem}.w{worker}.{training_data_ext}")),
+            parent.join(format!("{stem}.w{worker}.game_ids.bin")),
+        ];
+        if log_info {
+            internal_paths.push(parent.join(format!("{stem}.w{worker}.info.jsonl")));
+        }
+        if emit_eval_file {
+            internal_paths.push(parent.join(format!("{stem}.w{worker}.eval.txt")));
+        }
+        if emit_metrics {
+            internal_paths.push(parent.join(format!("{stem}.w{worker}.metrics.jsonl")));
+        }
+        if internal_paths
+            .iter()
+            .map(|path| normalize_output_path(path))
+            .collect::<Result<Vec<_>>>()?
+            .contains(&normalized_sidecar)
+        {
+            bail!(
+                "--emit-game-id-sidecar path conflicts with an internal worker path: {}",
+                sidecar.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 未生成の出力ファイル同士を比較できるよう、存在する最深の祖先を canonicalize し、
+/// 残りの未生成コンポーネントを実体パスに対して正規化する。
+fn normalize_output_path(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    let components: Vec<_> = absolute.components().collect();
+    let mut ancestor_len = components.len();
+    let ancestor = loop {
+        let candidate: PathBuf = components[..ancestor_len].iter().collect();
+        if candidate.try_exists()? {
+            break candidate.canonicalize()?;
+        }
+        ancestor_len -= 1;
+    };
+
+    let mut normalized = ancestor;
+    for component in &components[ancestor_len..] {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    Ok(normalized)
 }
 
 fn native_progress_file_required(layer_stack_num_buckets: Option<usize>) -> bool {
@@ -3322,6 +3497,121 @@ mod tests {
     }
 
     #[test]
+    fn game_id_sidecar_rejects_final_and_worker_path_collisions() {
+        let output = Path::new("run/gensfen.jsonl");
+        let training = Path::new("run/gensfen.psv");
+        for collision in [
+            "run/gensfen.jsonl",
+            "run/gensfen.psv",
+            "run/gensfen.info.jsonl",
+            "run/gensfen.eval.txt",
+            "run/gensfen.metrics.jsonl",
+            "run/gensfen.w0.jsonl",
+            "run/gensfen.w1.psv",
+            "run/gensfen.w0.info.jsonl",
+            "run/gensfen.w1.eval.txt",
+            "run/gensfen.w0.metrics.jsonl",
+            "run/gensfen.w1.game_ids.bin",
+            "run/./gensfen.psv",
+            "run/nested/../gensfen.psv",
+        ] {
+            let error = validate_game_id_sidecar_path(
+                Path::new(collision),
+                output,
+                Some(training),
+                "psv",
+                2,
+                true,
+                true,
+                true,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("conflicts"), "{error:#}");
+        }
+        validate_game_id_sidecar_path(
+            Path::new("run/ids.bin"),
+            output,
+            Some(training),
+            "psv",
+            2,
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn psv_game_id_sidecar_matches_result_game_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let psv_path = dir.path().join("short.psv");
+        let sidecar_path = dir.path().join("short.game_ids.bin");
+        let jsonl_path = dir.path().join("short.jsonl");
+
+        let mut pos = Position::new();
+        pos.set_hirate();
+        let packed = pack_position(&pos);
+        let entry = |side_to_move| TrainingEntry {
+            sfen: packed,
+            score: 10,
+            move16: 0,
+            game_ply: 1,
+            side_to_move,
+            hcpe3: None,
+        };
+
+        {
+            let mut collector = TrainingDataCollector::new(
+                &psv_path,
+                0,
+                false,
+                TrainingFormat::Psv,
+                1000,
+                600.0,
+                Some(&sidecar_path),
+            )
+            .unwrap();
+            collector.entries.push(entry(Color::Black));
+            collector.entries.push(entry(Color::White));
+            collector.finish_game(GameOutcome::BlackWin, 7).unwrap();
+            collector.entries.push(entry(Color::Black));
+            collector.finish_game(GameOutcome::Draw, 9).unwrap();
+            collector.flush().unwrap();
+        }
+
+        let mut jsonl = BufWriter::new(File::create(&jsonl_path).unwrap());
+        for game_id in [7, 9] {
+            serde_json::to_writer(
+                &mut jsonl,
+                &serde_json::json!({"type": "result", "game_id": game_id}),
+            )
+            .unwrap();
+            jsonl.write_all(b"\n").unwrap();
+        }
+        jsonl.flush().unwrap();
+
+        let psv_records =
+            std::fs::metadata(&psv_path).unwrap().len() as usize / PackedSfenValue::SIZE;
+        let sidecar = std::fs::read(&sidecar_path).unwrap();
+        let game_ids: Vec<u32> = sidecar
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(psv_records, game_ids.len());
+        assert_eq!(game_ids, [7, 7, 9]);
+
+        let result_ids: Vec<u32> = BufReader::new(File::open(jsonl_path).unwrap())
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(&line.unwrap()).unwrap()["game_id"]
+                    .as_u64()
+                    .unwrap() as u32
+            })
+            .collect();
+        assert!(game_ids.iter().all(|game_id| result_ids.contains(game_id)));
+    }
+
+    #[test]
     fn finish_game_hcpe3_byte_layout() {
         use rshogi_core::position::Position;
         use rshogi_core::types::Move;
@@ -3342,12 +3632,19 @@ mod tests {
         }];
 
         {
-            let mut col =
-                TrainingDataCollector::new(&path, 0, false, TrainingFormat::Hcpe3, 1000, 600.0)
-                    .unwrap();
+            let mut col = TrainingDataCollector::new(
+                &path,
+                0,
+                false,
+                TrainingFormat::Hcpe3,
+                1000,
+                600.0,
+                None,
+            )
+            .unwrap();
             col.start_game();
             col.record_position(&pos, Some(123), None, Some(mv), mv, &candidates);
-            col.finish_game(GameOutcome::BlackWin).unwrap();
+            col.finish_game(GameOutcome::BlackWin, 1).unwrap();
             col.flush().unwrap();
         }
 
@@ -3403,12 +3700,19 @@ mod tests {
         ];
 
         {
-            let mut col =
-                TrainingDataCollector::new(&path, 0, false, TrainingFormat::Hcpe3, 1000, 600.0)
-                    .unwrap();
+            let mut col = TrainingDataCollector::new(
+                &path,
+                0,
+                false,
+                TrainingFormat::Hcpe3,
+                1000,
+                600.0,
+                None,
+            )
+            .unwrap();
             col.start_game();
             col.record_position(&pos, Some(100), None, Some(m1), m1, &candidates);
-            col.finish_game(GameOutcome::WhiteWin).unwrap();
+            col.finish_game(GameOutcome::WhiteWin, 1).unwrap();
             col.flush().unwrap();
         }
 
@@ -3511,13 +3815,20 @@ mod tests {
         let candidates = vec![legal_candidate(1, 100, "7g7f")];
 
         {
-            let mut col =
-                TrainingDataCollector::new(&path, 0, false, TrainingFormat::Hcpe3, 1000, 600.0)
-                    .unwrap();
+            let mut col = TrainingDataCollector::new(
+                &path,
+                0,
+                false,
+                TrainingFormat::Hcpe3,
+                1000,
+                600.0,
+                None,
+            )
+            .unwrap();
             col.start_game();
             // 実着手 played != 最善手 best。selectedMove16 は replay 用に played を記録する
             col.record_position(&pos, Some(100), None, Some(best), played, &candidates);
-            col.finish_game(GameOutcome::BlackWin).unwrap();
+            col.finish_game(GameOutcome::BlackWin, 1).unwrap();
             col.flush().unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();
@@ -3540,13 +3851,20 @@ mod tests {
         pos.set_hirate();
         let mv = Move::from_usi("7g7f").unwrap();
         {
-            let mut col =
-                TrainingDataCollector::new(&path, 0, false, TrainingFormat::Hcpe3, 1000, 600.0)
-                    .unwrap();
+            let mut col = TrainingDataCollector::new(
+                &path,
+                0,
+                false,
+                TrainingFormat::Hcpe3,
+                1000,
+                600.0,
+                None,
+            )
+            .unwrap();
             col.start_game();
             // --random-multi-pv 未指定相当: 候補なし → 実着手の one-hot (visit=1)
             col.record_position(&pos, Some(50), None, Some(mv), mv, &[]);
-            col.finish_game(GameOutcome::BlackWin).unwrap();
+            col.finish_game(GameOutcome::BlackWin, 1).unwrap();
             col.flush().unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();
@@ -3570,9 +3888,16 @@ mod tests {
         pos.set_hirate();
         let m1 = Move::from_usi("7g7f").unwrap();
         {
-            let mut col =
-                TrainingDataCollector::new(&path, 0, false, TrainingFormat::Hcpe3, 1000, 600.0)
-                    .unwrap();
+            let mut col = TrainingDataCollector::new(
+                &path,
+                0,
+                false,
+                TrainingFormat::Hcpe3,
+                1000,
+                600.0,
+                None,
+            )
+            .unwrap();
             col.start_game();
             col.record_position(
                 &pos,
@@ -3593,7 +3918,7 @@ mod tests {
                 m2,
                 &[legal_candidate(1, -15, "3c3d")],
             );
-            col.finish_game(GameOutcome::Draw).unwrap();
+            col.finish_game(GameOutcome::Draw, 1).unwrap();
             col.flush().unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();
@@ -3624,9 +3949,16 @@ mod tests {
         let m2 = Move::from_usi("3c3d").unwrap();
         let expected_hcp = pack_position_hcp(&after);
         {
-            let mut col =
-                TrainingDataCollector::new(&path, 0, false, TrainingFormat::Hcpe3, 1000, 600.0)
-                    .unwrap();
+            let mut col = TrainingDataCollector::new(
+                &path,
+                0,
+                false,
+                TrainingFormat::Hcpe3,
+                1000,
+                600.0,
+                None,
+            )
+            .unwrap();
             col.start_game();
             // 局面A を記録 → 評価値欠落でセグメント破棄 → 局面C（着手後）で取り直す
             col.record_position(
@@ -3646,7 +3978,7 @@ mod tests {
                 m2,
                 &[legal_candidate(1, 40, "3c3d")],
             );
-            col.finish_game(GameOutcome::BlackWin).unwrap();
+            col.finish_game(GameOutcome::BlackWin, 1).unwrap();
             col.flush().unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();
