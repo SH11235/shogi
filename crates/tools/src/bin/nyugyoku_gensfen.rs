@@ -134,8 +134,11 @@ struct RunOptions {
 
 fn parse_partition_count(value: &str) -> std::result::Result<usize, String> {
     let value = parse_positive_usize(value)?;
-    if value > 256 {
-        return Err("must be <= 256".to_string());
+    // partition ごとの書込 buffer (64 KiB) が partitions x 64 KiB のメモリになるため、
+    // 上限 4096 (buffer 合計 256 MiB) で頭打ちにする。10 億ユニーク局面でも
+    // 1 partition あたり ~25 万キーに収まり dedup set は数十 MB で済む。
+    if value > 4096 {
+        return Err("must be <= 4096".to_string());
     }
     Ok(value)
 }

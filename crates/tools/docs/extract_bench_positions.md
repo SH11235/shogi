@@ -33,10 +33,11 @@ cargo run -p tools --bin extract_bench_positions -- \
 | `--min-rating <u32>` | 3000 | floodgate 両者に要求する最小レート（不明レートは除外） |
 | `--per-cell <usize>` | 200 | `label_bench` の層化セルあたり採択数 |
 | `--nyugyoku-max <usize>` | 50000 | 入玉オーバーサンプルの最大局面数 |
-| `--startpos-eval-abs-max <i32>` | 150 | `startpos` 出力に許す絶対評価値上限 |
+| `--startpos-eval-abs-max <u32>` | 150 | `startpos` 出力に許す絶対評価値上限 |
 | `--startpos-ply <u32>` | 100 | `startpos` 出力の中心 ply |
 | `--startpos-window <u32>` | 4 | `startpos` 出力の ply 窓幅 |
 | `--seed <u64>` | 1 | 決定的サンプリング用 seed |
+| `--legacy-server-eval-comments` | false | 手の後へ `'*` 評価コメントを書く旧形式の rshogi-csa-server 棋譜として解釈（[CSA 評価値](#csa-評価値)参照） |
 
 ## 出力
 

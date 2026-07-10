@@ -387,6 +387,9 @@ struct MetaSettings {
     /// NativeBackend の progress8kpabs 進行度係数ファイル
     #[serde(default, skip_serializing_if = "Option::is_none")]
     progress_file: Option<String>,
+    /// progress_file 内容の SHA-256（resume 時に同一パスへの係数差し替えを検出する）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    progress_file_sha256: Option<String>,
 }
 
 fn default_skip_in_check() -> bool {
@@ -1869,6 +1872,8 @@ struct ResumeState {
     shuffle_seed: Option<u64>,
     /// meta 行に保存された progress_file（存在しない場合は None）
     progress_file: Option<String>,
+    /// meta 行に保存された progress_file 内容の SHA-256（存在しない場合は None）
+    progress_file_sha256: Option<String>,
 }
 
 /// 既存の JSONL 出力ファイルを解析し、完了済み対局数と勝敗を取得する。
@@ -1885,6 +1890,7 @@ fn parse_resume_state(path: &Path) -> Result<ResumeState> {
     let mut draws: u32 = 0;
     let mut shuffle_seed: Option<u64> = None;
     let mut progress_file: Option<String> = None;
+    let mut progress_file_sha256: Option<String> = None;
     let mut last_parse_error = false;
 
     for line in reader.lines() {
@@ -1911,6 +1917,10 @@ fn parse_resume_state(path: &Path) -> Result<ResumeState> {
                     shuffle_seed = settings.get("shuffle_seed").and_then(|v| v.as_u64());
                     progress_file = settings
                         .get("progress_file")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                    progress_file_sha256 = settings
+                        .get("progress_file_sha256")
                         .and_then(|v| v.as_str())
                         .map(ToString::to_string);
                 }
@@ -1940,12 +1950,23 @@ fn parse_resume_state(path: &Path) -> Result<ResumeState> {
         draws,
         shuffle_seed,
         progress_file,
+        progress_file_sha256,
     })
+}
+
+/// progress 係数ファイル内容の SHA-256 (hex)。resume 時の同一性検証と meta 記録に使う。
+fn progress_file_sha256_hex(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read --progress-file {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
 fn validate_resume_progress_file(
     meta_progress_file: Option<&str>,
+    meta_progress_sha256: Option<&str>,
     cli_progress_file: Option<&Path>,
+    cli_progress_sha256: Option<&str>,
 ) -> Result<()> {
     let cli_progress_file = cli_progress_file.map(|p| p.display().to_string());
     if meta_progress_file != cli_progress_file.as_deref() {
@@ -1954,6 +1975,15 @@ fn validate_resume_progress_file(
              (meta={}, cli={})",
             meta_progress_file.unwrap_or("<none>"),
             cli_progress_file.as_deref().unwrap_or("<none>"),
+        );
+    }
+    // パス一致だけでは同一パスへの係数差し替えを検出できないため、内容も照合する
+    if meta_progress_sha256 != cli_progress_sha256 {
+        bail!(
+            "--resume: --progress-file content does not match meta settings.progress_file_sha256 \
+             (meta={}, cli={})",
+            meta_progress_sha256.unwrap_or("<none>"),
+            cli_progress_sha256.unwrap_or("<none>"),
         );
     }
     Ok(())
@@ -2055,9 +2085,13 @@ fn main() -> Result<()> {
             bail!("--resume: 出力ファイルが見つかりません: {}", output_path.display());
         }
         let state = parse_resume_state(&output_path)?;
+        let cli_progress_sha256 =
+            cli.progress_file.as_deref().map(progress_file_sha256_hex).transpose()?;
         validate_resume_progress_file(
             state.progress_file.as_deref(),
+            state.progress_file_sha256.as_deref(),
             cli.progress_file.as_deref(),
+            cli_progress_sha256.as_deref(),
         )?;
         if state.completed_games >= cli.games {
             println!(
@@ -2296,6 +2330,11 @@ fn main() -> Result<()> {
                 skip_in_check: cli.skip_in_check,
                 shuffle_seed: shuffle_seed_resolved,
                 progress_file: cli.progress_file.as_ref().map(|p| p.display().to_string()),
+                progress_file_sha256: cli
+                    .progress_file
+                    .as_deref()
+                    .map(progress_file_sha256_hex)
+                    .transpose()?,
             },
             engine_cmd: EngineCommandMeta {
                 path_black: engine_paths.black.path.display().to_string(),
@@ -3070,23 +3109,35 @@ mod tests {
 
     #[test]
     fn validate_resume_progress_file_requires_exact_match() {
-        assert!(validate_resume_progress_file(None, None).is_ok());
+        let path = Some(Path::new("/tmp/progress.bin"));
+        assert!(validate_resume_progress_file(None, None, None, None).is_ok());
         assert!(
-            validate_resume_progress_file(
-                Some("/tmp/progress.bin"),
-                Some(Path::new("/tmp/progress.bin"))
-            )
-            .is_ok()
+            validate_resume_progress_file(Some("/tmp/progress.bin"), Some("ab"), path, Some("ab"))
+                .is_ok()
         );
         assert!(
             validate_resume_progress_file(
                 Some("/tmp/progress.bin"),
-                Some(Path::new("/tmp/./progress.bin"))
+                Some("ab"),
+                Some(Path::new("/tmp/./progress.bin")),
+                Some("ab")
             )
             .is_err()
         );
-        assert!(validate_resume_progress_file(Some("/tmp/progress.bin"), None).is_err());
-        assert!(validate_resume_progress_file(None, Some(Path::new("/tmp/progress.bin"))).is_err());
+        // パスが同じでも内容 SHA-256 が異なる（係数差し替え）なら拒否する
+        assert!(
+            validate_resume_progress_file(Some("/tmp/progress.bin"), Some("ab"), path, Some("cd"))
+                .is_err()
+        );
+        assert!(
+            validate_resume_progress_file(Some("/tmp/progress.bin"), None, path, Some("ab"))
+                .is_err()
+        );
+        assert!(
+            validate_resume_progress_file(Some("/tmp/progress.bin"), Some("ab"), None, None)
+                .is_err()
+        );
+        assert!(validate_resume_progress_file(None, None, path, Some("ab")).is_err());
     }
 
     #[test]
@@ -3096,7 +3147,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                r#"{"type":"meta","settings":{"shuffle_seed":7,"progress_file":"/tmp/progress.bin"}}"#,
+                r#"{"type":"meta","settings":{"shuffle_seed":7,"progress_file":"/tmp/progress.bin","progress_file_sha256":"abcd"}}"#,
                 "\n",
                 r#"{"type":"result","game_id":3,"outcome":"black_win"}"#,
                 "\n"
@@ -3108,6 +3159,7 @@ mod tests {
         assert_eq!(state.completed_games, 3);
         assert_eq!(state.shuffle_seed, Some(7));
         assert_eq!(state.progress_file.as_deref(), Some("/tmp/progress.bin"));
+        assert_eq!(state.progress_file_sha256.as_deref(), Some("abcd"));
     }
 
     #[test]
