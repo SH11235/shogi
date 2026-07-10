@@ -35,5 +35,7 @@ cargo run -p tools --release --bin ek_testset -- eval \
 ```
 
 標準出力と `--out` に同じ JSON を出します。評価値は手番側視点 cp として扱い、DT は宣言可能局面の
-符号一致率と +600cp 超過率、OC は実対局結果との符号一致率、cross entropy、Brier、5 分位 calibration
-を出します。符号一致率では `eval == 0` を一致に含めず、DT/OC とも不一致として扱います。
+符号一致率と +600cp 超過率、OC は実対局結果との符号一致率、cross entropy、Brier、予測勝率を
+[0,1] で 10 等分した等幅ビンの calibration（ビンごとの平均予測勝率と実勝率）を出します。calibration は
+全予測を保持せずビンごとの逐次集計で求めるため、ピークメモリは入力件数に非依存です。符号一致率では
+`eval == 0` を一致に含めず、DT/OC とも不一致として扱います。

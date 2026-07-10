@@ -72,6 +72,12 @@ name = "kifu_player"
 path = "src/bin/kifu_player.rs"
 required-features = ["kifu-player"]
 
+# ek_testset は CSA replay (kifu-player feature 配下) に依存するため gate する。
+[[bin]]
+name = "ek_testset"
+path = "src/bin/ek_testset.rs"
+required-features = ["kifu-player"]
+
 [dependencies]
 # Workspace dependencies
 anyhow.workspace = true

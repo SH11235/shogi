@@ -165,7 +165,13 @@ struct ScoredLabel {
     label: Label,
 }
 
-#[derive(Debug, Default)]
+/// OC calibration の固定幅ビン数（予測勝率 [0,1] を等幅分割）。
+///
+/// 全予測を保持して分位分割する代わりに、ビンごとの件数・予測和・勝敗和だけを
+/// 逐次加算する。ピークメモリを入力件数に非依存（ビン数固定）にするため。
+const OC_CALIBRATION_BINS: usize = 10;
+
+#[derive(Debug)]
 struct EvalMetricBuilder {
     records: usize,
     dt_evals: Vec<i32>,
@@ -173,7 +179,26 @@ struct EvalMetricBuilder {
     oc_sign_ok: usize,
     oc_ce: f64,
     oc_brier: f64,
-    oc_calibration_rows: Vec<(f64, f64)>,
+    // 等幅ビンごとの逐次集計（件数 / 予測勝率和 / 勝敗和）。
+    oc_cal_count: [usize; OC_CALIBRATION_BINS],
+    oc_cal_pred_sum: [f64; OC_CALIBRATION_BINS],
+    oc_cal_win_sum: [f64; OC_CALIBRATION_BINS],
+}
+
+impl Default for EvalMetricBuilder {
+    fn default() -> Self {
+        Self {
+            records: 0,
+            dt_evals: Vec::new(),
+            oc_n: 0,
+            oc_sign_ok: 0,
+            oc_ce: 0.0,
+            oc_brier: 0.0,
+            oc_cal_count: [0; OC_CALIBRATION_BINS],
+            oc_cal_pred_sum: [0.0; OC_CALIBRATION_BINS],
+            oc_cal_win_sum: [0.0; OC_CALIBRATION_BINS],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -542,11 +567,14 @@ impl EvalMetricBuilder {
         self.oc_n += 1;
         self.oc_ce += -(target * p.ln() + (1.0 - target) * (1.0 - p).ln());
         self.oc_brier += (p - target).powi(2);
-        self.oc_calibration_rows.push((p, target));
+        // 予測勝率 p を等幅ビンへ振り分けて逐次加算（[0,1) を BINS 等分、p=1.0 は最終ビン）。
+        let bin = ((p * OC_CALIBRATION_BINS as f64) as usize).min(OC_CALIBRATION_BINS - 1);
+        self.oc_cal_count[bin] += 1;
+        self.oc_cal_pred_sum[bin] += p;
+        self.oc_cal_win_sum[bin] += target;
     }
 
-    fn finish(mut self) -> (usize, DtMetrics, OcMetrics) {
-        self.oc_calibration_rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    fn finish(self) -> (usize, DtMetrics, OcMetrics) {
         let oc = if self.oc_n == 0 {
             OcMetrics::default()
         } else {
@@ -555,10 +583,28 @@ impl EvalMetricBuilder {
                 sign_acc: Some(rate(self.oc_sign_ok, self.oc_n)),
                 wdl_cross_entropy: Some(self.oc_ce / self.oc_n as f64),
                 brier: Some(self.oc_brier / self.oc_n as f64),
-                calibration: calibration_bins(&self.oc_calibration_rows, 5),
+                calibration: self.calibration_bins(),
             }
         };
         (self.records, dt_metrics(&self.dt_evals), oc)
+    }
+
+    /// 等幅ビンの逐次集計から calibration テーブルを構築する（空ビンは省く）。
+    fn calibration_bins(&self) -> Vec<CalibrationBin> {
+        let mut out = Vec::new();
+        for bin in 0..OC_CALIBRATION_BINS {
+            let n = self.oc_cal_count[bin];
+            if n == 0 {
+                continue;
+            }
+            out.push(CalibrationBin {
+                bin,
+                n,
+                avg_pred: self.oc_cal_pred_sum[bin] / n as f64,
+                win_rate: self.oc_cal_win_sum[bin] / n as f64,
+            });
+        }
+        out
     }
 }
 
@@ -576,31 +622,6 @@ fn dt_metrics(evals: &[i32]) -> DtMetrics {
         eval_median: Some(percentile_sorted(&sorted, 0.5)),
         eval_p10: Some(percentile_sorted(&sorted, 0.1)),
     }
-}
-
-fn calibration_bins(rows: &[(f64, f64)], bins: usize) -> Vec<CalibrationBin> {
-    if rows.is_empty() || bins == 0 {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for bin in 0..bins {
-        let start = rows.len() * bin / bins;
-        let end = rows.len() * (bin + 1) / bins;
-        if start == end {
-            continue;
-        }
-        let slice = &rows[start..end];
-        let n = slice.len();
-        let avg_pred = slice.iter().map(|(p, _)| *p).sum::<f64>() / n as f64;
-        let win_rate = slice.iter().map(|(_, y)| *y).sum::<f64>() / n as f64;
-        out.push(CalibrationBin {
-            bin,
-            n,
-            avg_pred,
-            win_rate,
-        });
-    }
-    out
 }
 
 fn percentile_sorted(sorted: &[i32], q: f64) -> i32 {
