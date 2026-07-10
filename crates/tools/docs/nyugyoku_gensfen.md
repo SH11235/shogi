@@ -1,128 +1,139 @@
 # nyugyoku_gensfen — 入玉 gensfen 開始局面抽出
 
-floodgate CSA 棋譜の manifest から、玉が敵陣へ初侵入した手数を基準に gensfen 用の
-開始局面ファイルを作る。候補は disk partition 方式で exact dedup するため、全候補を
-メモリへ保持しない。checkpoint/resume と完了時の atomic publish に対応する。
+floodgate CSA 棋譜の manifest から、玉が敵陣へ初侵入した手数を基準に入玉開始局面を抽出し、
+gensfen の `--startpos-file` にそのまま渡せる `startpos.txt` を作る。
 
-## 入力
+## クイックスタート
+
+### 1. 抽出する
 
 ```bash
 cargo run -p tools --release --bin nyugyoku_gensfen -- \
   --manifest /path/to/manifest.tsv \
-  --out-dir /path/to/out
+  --out-dir  /path/to/out
 ```
 
-manifest はタブ区切り4列:
+成功すると `/path/to/out/` に以下が生成される。`out/` は全処理が成功した時だけ出現し、
+実行中・失敗時は sibling の `/path/to/out.work/` に作業データが残る（再開可能、後述）。
+
+- `startpos.txt` — `gensfen --startpos-file` にそのまま渡せる
+- `provenance.tsv` — 各開始局面の出典（棋譜・アンカー手・評価値）
+- `run-meta.json` — 件数・partition 数などの完了メタデータ
+
+### 2. gensfen に渡す
+
+```bash
+cargo run -p tools --release --bin gensfen -- \
+  --startpos-file /path/to/out/startpos.txt \
+  --eval-file /path/to/eval.bin
+  # 対局条件などは gensfen.md を参照
+```
+
+`startpos.txt` の 1-origin 行番号は gensfen result JSONL の `start_pos_index` に対応し、
+`provenance.tsv` の `startpos_line` で開始局面の出典を追える。
+
+### 進捗の読み方
+
+処理は manifest を先頭から流し、stderr に警告を出しながら進む。以下は異常終了ではなく、
+対象行を飛ばして続行している合図:
+
+- **CSA 読込・パース失敗**: その行を warn+skip して続行する
+- **total_plies 食い違い**: manifest の手数と CSA 実手数がずれた棋譜。警告を出し、
+  実手数を超えるアンカーを除外して続行する
+
+manifest 自体の形式異常だけはエラーで停止する。既定 100 万行ごと・10 分ごと・
+各 dedup partition 完了時に `out.work/state.json` へ checkpoint が保存される。
+
+### 中断と再開
+
+中断したら、同じ引数に `--resume` を足して再実行する。再開は checkpoint 時点から続く。
+
+```bash
+cargo run -p tools --release --bin nyugyoku_gensfen -- \
+  --manifest /path/to/manifest.tsv \
+  --out-dir  /path/to/out \
+  --resume
+```
+
+**既処理部分の manifest 書き換え・参照先 CSA の内容変更・`--partitions` /
+`--legacy-server-eval-comments` の変更があると再開は拒否される**（partition 処理中の
+manifest 末尾への追記だけは可。dedup 開始後は行数追加も拒否）。`--resume` 開始時は
+既処理 prefix と参照 CSA を先頭から再検証するため巨大 corpus の終盤では時間がかかるが、
+CSA 解析・局面再生・partition 書込みはやり直さない。公開直前に停止した場合も
+`run-meta.json` を checkpoint として `--resume` できる。
+
+## 入力（manifest）
+
+タブ区切り 4 列:
 
 ```text
 csa_path	black_entry_ply	white_entry_ply	total_plies
 ```
 
-`entry_ply` は玉が敵陣三段へ初侵入した手数。未侵入は `-1`。相対`csa_path`は
-manifestがあるディレクトリを基準に解決する。
+`entry_ply` は玉が敵陣三段へ初侵入した手数。未侵入は `-1`。相対 `csa_path` は
+manifest があるディレクトリを基準に解決する。
 
-## 抽出・dedupルール
+## 抽出・dedup ルール
 
-各侵入イベントごとに`{entry-40, entry-20, entry, entry+20}`を候補にし、
-`16 <= anchor <= total_plies - 8`を満たすものだけ採用する。CSAを先頭から
-アンカー手数まで再生し、その局面で手番側が27点法の宣言勝ち可能なら除外する。
+各侵入イベントごとに `{entry-40, entry-20, entry, entry+20}` を候補にし、
+`16 <= anchor <= total_plies - 8` を満たすものだけ採用する。「アンカー後に 8 手以上残る」
+の保証は manifest の `total_plies` だけでなく CSA パーサの実手数にも課す。CSA を先頭から
+アンカー手数まで再生し、その局面で手番側が 27 点法の宣言勝ち可能なら除外する。
 
-「アンカー後に8手以上残る」の保証はmanifestの`total_plies`だけでなくCSAパーサの
-実手数にも課す。両者が食い違う棋譜は警告を出し、実手数を超えるアンカーを除外する。
-CSA側の異常（読込失敗・パース失敗）はその行を警告付きでskipし、処理を続行する
-（sources digestには読めた内容だけを積むため、skipがあってもresume整合は保たれる）。
-manifest自体の形式異常はエラーで停止する。
+盤面・手番・持ち駒が同じ局面は、SFEN の手数が異なっても同一として exact dedup し、
+manifest で先に出たものを残す。
 
-盤面・手番・持ち駒が同じ局面は、SFENの手数が異なっても同一としてexact dedupし、
-manifestで先に出たものを残す。候補は安定ハッシュでディスクパーティションへ書き、
-各パーティションだけを`HashSet`へロードする。ピークメモリは全候補数ではなく最大
-パーティションのユニーク局面数で決まる。既定は128パーティションで、
-`--partitions`で変更できる。partitionごとに64 KiBのメモリbuffer（既定で合計8 MiB）を
-持ち、満杯時だけ対象ファイルをopen・追記・closeする。checkpointのsyncも1ファイルずつ
-行うため、partition数に比例してfile descriptorを保持しない。
+## オプション
 
-### dedupメモリ実測
+| フラグ | 既定 | 説明 |
+|---|---|---|
+| `--manifest <PATH>` | （必須） | 入力 manifest（TSV 4 列） |
+| `--out-dir <DIR>` | （必須） | 出力先。既存ディレクトリがあると起動エラー |
+| `--partitions <N>` | 128 | dedup のディスクパーティション数（1〜4096）。ピークメモリのレバー（後述） |
+| `--resume` | false | `<out-dir>.work` の checkpoint から再開 |
+| `--checkpoint-interval <N>` | 1000000 | checkpoint を保存する manifest 処理行数間隔 |
+| `--legacy-server-eval-comments` | false | 手の後へ `'*` 評価コメントを書く旧形式の rshogi-csa-server 棋譜として解釈 |
 
-2026-07-10、同じ形式のユニークSFENキー500万件を生成する`rustc -O`の小さな
-ハーネスを`/usr/bin/time`で測定した結果:
-
-| 方式 | peak RSS | 経過時間 |
-|---|---:|---:|
-| 全件`HashSet<String>`（変更前相当） | 831,592 KiB | 8.31秒 |
-| 128分割し1partitionずつ`HashSet` | 9,416 KiB | 1.77秒 |
-
-ハーネスは`board side hand`形式のキーを連番で500万個生成し、分割版は
-`index % 128`ごとにsetを作成・解放した。実ツールではこれにCSA解析とpartition
-ファイルI/Oが加わるが、dedup setのピークが全件数ではなく最大partitionで決まることを
-確認するための測定である。
-
-一時ディスク量は候補数だけでなく、source pathを含むJSONL record長に比例する。1億候補では
-数十GiB以上になり得るため、本番投入前に小さい代表manifestで`out.work/partitions`の
-1候補あたりbyte数を測り、同一filesystemへ十分な空きを確保する。この表の時間は
-disk I/Oを含むend-to-end throughput値ではない。
-
-CSAの`'* <cp> ...`（直後の指し手）と`'** <cp> ...`（直前の指し手）を解釈し、
-アンカー手を探索した局面の先手視点評価値をprovenanceへ記録する。
-
-## 中断・再開
-
-実行中の候補、一時出力、checkpointは、`--out-dir /path/to/out`に対してsiblingの
-`/path/to/out.work/`へ継続的に書き出す。manifestの既定1,000,000行ごと、または10分ごと、
-および各dedup
-パーティション完了時にdurableなbyte位置を`state.json`へ保存する。checkpointでは変更が
-あったpartitionだけをflush・syncし、その後にstateとディレクトリエントリもsyncする。
-partitionと一時出力のprefix checksumも保存し、同じbyte長の偶発的な破損も再開時に
-best-effortで検出する。checksumは継続可能なFNV-1a 64bitで、敵対的な改変耐性を保証する
-暗号学的digestではない。
-
-中断後は同じ引数に`--resume`を加えて再開する。
-
-```bash
-cargo run -p tools --release --bin nyugyoku_gensfen -- \
-  --manifest /path/to/manifest.tsv \
-  --out-dir /path/to/out \
-  --resume
-```
-
-partition処理中は、処理済みmanifest prefix、そこから参照されるCSA内容の累積SHA-256、
-パーティション数が一致しなければ再開を拒否する。未処理の末尾は修正・追記できる。
-checkpointより後の一時データは記録済み
-byte位置へ切り戻してから再処理する。dedup開始後はmanifest全体の行数と処理済みprefixを
-照合し、変更・追記された入力からの再開を拒否する。checkpoint間隔は
-`--checkpoint-interval`で変更できる。
-
-旧形式のrshogi-csa-serverがinline `,T`付き指し手の直後へ`'*`評価コメントを書いた棋譜は、
-`--legacy-server-eval-comments`を指定する。通常のCSAでは指定しない。1回のmanifest内で
-Standardと旧server形式を混在させず、形式ごとに別runへ分ける。
-
-`--resume`開始時は、処理済みmanifest prefixと候補があったCSA本体を先頭から再検証する。
-この検証は成果物の混在を防ぐためのもので、10分checkpointの対象外である。巨大corpusの
-終盤では再検証自体に時間がかかるが、CSA解析・局面再生とpartition書込みはやり直さない。
-
-最終`out/`は全処理が成功した時だけ、`out.work/`の同一ファイルシステム内renameで
-公開される。Linuxでは`RENAME_NOREPLACE`を使い、並行して作られたものを含む既存の`out/`を
-上書きしない。実行中・失敗時は`out/`が現れず、`out.work/`が再開用に残る。公開直前に
-停止した場合も`run-meta.json`をcheckpointとして`--resume`でき、完成した`out/`に
-`state.json`は含めない。
+`--legacy-server-eval-comments` は 1 回の manifest 内で標準形式と旧 server 形式を
+混在させず、形式ごとに別 run へ分けて使う。
 
 ## 出力
 
-```text
-out/
-  startpos.txt      # gensfen --startpos-file にそのまま渡せる
-  provenance.tsv    # startpos の出典
-  run-meta.json     # 件数・partition 数などの完了メタデータ
-```
-
-`provenance.tsv`の列:
+`provenance.tsv` の列:
 
 ```text
 startpos_line	source_csa	anchor_ply	anchor_kind	entry_side	anchor_move_eval_cp_black	total_plies	source_year
 ```
 
-`startpos_line`は`startpos.txt`の1-origin行番号で、gensfen result JSONLの
-`start_pos_index`と対応する。出力順はpartition番号順で、同じ入力・同じ
-`--partitions`ならbit単位で決定的になる。
+`startpos_line` は `startpos.txt` の 1-origin 行番号。出力順は partition 番号順で、
+同じ入力・同じ `--partitions` なら bit 単位で決定的になる。
 
-`anchor_move_eval_cp_black`は出力SFENの静的評価値ではなく、アンカー手を選んだ探索の
-先手視点評価値である。
+`anchor_move_eval_cp_black` は、CSA の `'* <cp> ...`（直後の指し手に帰属）と
+`'** <cp> ...`（直前の指し手に帰属）の評価コメントから取った、アンカー手を探索した
+局面の**先手視点**評価値。出力 SFEN の静的評価値ではない。
+
+## 運用上の注意（リソース見積もり）
+
+- **メモリ**: dedup のピークメモリは全候補数ではなく「最大 partition のユニーク局面数」で
+  決まる。ユニーク SFEN キー 500 万件の実測（2026-07-10）では、全件 `HashSet<String>`
+  831,592 KiB / 8.31 秒に対し、128 分割して 1 partition ずつ処理すると 9,416 KiB /
+  1.77 秒（dedup set 部分のみの比較で、CSA 解析や disk I/O は含まない）。数億〜十億
+  候補の規模では `--partitions` を増やして 1 partition あたりのユニーク数を抑える。
+- **一時ディスク**: 候補数と source path を含む JSONL レコード長に比例し、1 億候補で
+  数十 GiB 以上になり得る。本番投入前に小さい代表 manifest で `out.work/partitions` の
+  1 候補あたり byte 数を測り、同一 filesystem へ十分な空きを確保する。
+- **成果物の公開**: 最終 `out/` は全処理が成功した時だけ現れ、既存の `out/` を
+  上書きしない。実行中・失敗時は `out.work/` が再開用に残る。完成した `out/` に
+  `state.json` は含まれない。
+
+## 内部動作（参考）
+
+候補は position key の安定ハッシュで `out.work/partitions/` の各ファイルへ振り分け、
+partition 単位でだけ `HashSet` へロードして dedup する（partition ごとに 64 KiB の
+書込みバッファを持ち、file descriptor は partition 数に比例して保持しない）。
+checkpoint では変更のあった partition と一時出力を flush・sync し、byte 位置と
+継続可能な FNV-1a 64bit checksum を `state.json` に保存する（checksum は偶発的破損の
+best-effort 検出用で、暗号学的 digest ではない）。resume 時は既処理 manifest prefix と
+参照 CSA 内容の累積 SHA-256 を照合し、checkpoint より後の一時データは記録済み byte 位置へ
+切り戻してから再処理する。公開は `out.work/` から同一 filesystem 内の rename
+（Linux では `RENAME_NOREPLACE`）で行う。

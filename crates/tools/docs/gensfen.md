@@ -48,8 +48,8 @@ KIF が必要な場合は `tournament` バイナリで対局を回し、その�
 
 ### result JSONL の入玉メタ
 
-`gensfen.jsonl` の `type=result` 行には、終局局面の入玉関連メタが含まれる。裁定は従来どおりで、
-`--max-moves` 到達時は引き分けのまま記録する。
+`gensfen.jsonl` の `type=result` 行には、終局局面の入玉関連メタが含まれる。これらは
+記録用のメタ列であって終局裁定には影響せず、`--max-moves` 到達時は引き分けとして記録される。
 
 | フィールド | 説明 |
 |-----------|------|
@@ -76,7 +76,9 @@ KIF が必要な場合は `tournament` バイナリで対局を回し、その�
 `--eval-file` で評価関数ファイルの指定が必須。
 LayerStacks 系ネット（`num_buckets > 1`）を native で使う場合は、`--progress-file` で
 progress8kpabs 係数ファイルを指定する。未指定ならゼロ係数へのサイレントフォールバックを防ぐため
-起動時にエラーにする。指定パスは meta 行の `settings.progress_file` に記録される。
+起動時にエラーにする。指定パスは meta 行の `settings.progress_file` に、内容の SHA-256 は
+`settings.progress_file_sha256` に記録され、`--resume` 時はパスと内容の両方を照合する
+（同一パスへの係数差し替えも検出する）。
 native LayerStacks 実行時は stderr に `LayerStacks num_buckets=N` と、ワーカー終了時の
 `progress bucket distribution: [...] (used X/N)` を出力するため、短時間ランでも bucket 使用状況を確認できる。
 
