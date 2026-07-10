@@ -499,6 +499,11 @@ pub struct CsaMove {
     pub mv: String,
     /// 消費時間（秒）。`,T30` のように指し手行に含まれる場合に Some
     pub time_sec: Option<u32>,
+    /// 指し手を探索した局面の評価値（先手視点 centipawn）。
+    ///
+    /// csa_client の `'*` コメントは直後の指し手、wdoor の `'**` コメントは
+    /// 直前の指し手へ対応付ける。評価値が無い場合や数値でない場合は `None`。
+    pub eval_cp_black: Option<i32>,
 }
 
 /// CSA特殊手
@@ -554,12 +559,14 @@ pub fn parse_csa(text: &str) -> Result<(Position, Vec<String>, GameInfo)> {
     Ok((pos, simple_moves, info))
 }
 
-/// CSA棋譜を完全パース。指し手は消費時間・特殊手を含む `ParsedMove` で返す。
+/// CSA棋譜を完全パース。指し手は消費時間・先手視点評価値・特殊手を含む
+/// [`ParsedMove`] で返す。
 pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo)> {
     let mut pos = None;
     let mut moves = Vec::new();
     let mut info = GameInfo::default();
     let mut explicit_board = false;
+    let mut pending_eval_cp_black = None;
     for line in text.lines() {
         let raw = line.trim_end_matches('\r');
         let s = raw.trim();
@@ -605,6 +612,23 @@ pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo
         if let Some(rest) = s.strip_prefix("'white_rate:") {
             if let Some(v) = parse_rate_value(rest) {
                 info.white_rating = Some(v);
+            }
+            continue;
+        }
+        // wdoor / shogi-server: 直前の通常手を探索した先手視点評価値。
+        if let Some(rest) = s.strip_prefix("'**") {
+            if let Some(cp) = parse_leading_eval_cp(rest)
+                && let Some(ParsedMove::Normal(last)) =
+                    moves.iter_mut().rev().find(|m| matches!(m, ParsedMove::Normal(_)))
+            {
+                last.eval_cp_black = Some(cp);
+            }
+            continue;
+        }
+        // rshogi csa_client: 直後の通常手を探索した先手視点評価値。
+        if let Some(rest) = s.strip_prefix("'*") {
+            if let Some(cp) = parse_leading_eval_cp(rest) {
+                pending_eval_cp_black = Some(cp);
             }
             continue;
         }
@@ -656,13 +680,21 @@ pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo
                 let time_sec = s
                     .get(7..)
                     .and_then(|rest| rest.strip_prefix(",T").and_then(|t| t.parse::<u32>().ok()));
-                moves.push(ParsedMove::Normal(CsaMove { mv, time_sec }));
+                moves.push(ParsedMove::Normal(CsaMove {
+                    mv,
+                    time_sec,
+                    eval_cp_black: pending_eval_cp_black.take(),
+                }));
             }
             continue;
         }
     }
     let pos = pos.unwrap_or_else(initial_position);
     Ok((pos, moves, info))
+}
+
+fn parse_leading_eval_cp(rest: &str) -> Option<i32> {
+    rest.split_whitespace().next()?.parse().ok()
 }
 
 fn parse_special_move(s: &str) -> Option<SpecialMove> {
@@ -1074,6 +1106,41 @@ P-00KA
             }
             _ => panic!("expected normal move"),
         }
+    }
+
+    #[test]
+    fn test_parse_eval_comments_for_both_record_styles() {
+        let text = concat!(
+            "V2.2\r\nPI\r\n",
+            "'* 45 -3334FU\r\n",
+            "+7776FU\r\nT5\r\n",
+            "-3334FU,T10\r\n",
+            "'** -30 +2726FU\r\n",
+            "%TORYO\r\n",
+        );
+        let (_, moves, _) = parse_csa_full(text).unwrap();
+        let normal: Vec<_> = moves
+            .iter()
+            .filter_map(|m| match m {
+                ParsedMove::Normal(cm) => Some(cm),
+                ParsedMove::Special(_) => None,
+            })
+            .collect();
+        assert_eq!(normal.len(), 2);
+        assert_eq!(normal[0].eval_cp_black, Some(45));
+        assert_eq!(normal[0].time_sec, Some(5));
+        assert_eq!(normal[1].eval_cp_black, Some(-30));
+        assert_eq!(normal[1].time_sec, Some(10));
+    }
+
+    #[test]
+    fn test_later_valid_eval_comment_wins_and_invalid_is_ignored() {
+        let text = "PI\n'* 5\n'* invalid\n'* 10\n+7776FU\n'** invalid\n'** 20 pv\n";
+        let (_, moves, _) = parse_csa_full(text).unwrap();
+        let ParsedMove::Normal(cm) = &moves[0] else {
+            panic!("expected normal move");
+        };
+        assert_eq!(cm.eval_cp_black, Some(20));
     }
 
     #[test]

@@ -1,26 +1,26 @@
 //! floodgate CSA 由来の入玉アンカー局面を gensfen 用 startpos に変換する。
 //!
-//! # 手動確認手順
-//!
-//! 1. 外部スクリプトで `csa_path<TAB>black_entry_ply<TAB>white_entry_ply<TAB>total_plies`
-//!    形式の manifest を1行以上用意する。
-//! 2. `cargo run -p tools --bin nyugyoku_gensfen -- --manifest /path/to/manifest.tsv --out-dir /tmp/nyugyoku-startpos`
-//!    を実行する。
-//! 3. `/tmp/nyugyoku-startpos/startpos.txt` を
-//!    `cargo run -p tools --bin gensfen -- --startpos-file /tmp/nyugyoku-startpos/startpos.txt ...`
-//!    に渡し、`provenance.tsv` の `startpos_line` と gensfen result の `start_pos_index`
-//!    が対応することを確認する。
+//! 候補は安定ハッシュでディスクへ分割し、パーティション単位で exact dedup する。
+//! 実行中の状態は `<out-dir>.work/state.json` に保存し、`--resume` で再開できる。
+//! 完了時だけ work ディレクトリを `out-dir` へ rename して成果物を公開する。
 
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::Parser;
 use rshogi_core::position::Position as CorePosition;
 use rshogi_core::types::{EnteringKingRule, Move};
 use rshogi_csa::{ParsedMove, parse_csa_full};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tools::common::io::write_atomic;
+
+const DEFAULT_PARTITIONS: usize = 128;
+const DEFAULT_CHECKPOINT_INTERVAL: usize = 10_000;
+const STATE_VERSION: u32 = 1;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,9 +33,21 @@ struct Cli {
     #[arg(long)]
     manifest: PathBuf,
 
-    /// startpos.txt と provenance.tsv の出力先
+    /// startpos.txt と provenance.tsv の出力先（既存ディレクトリは上書きしない）
     #[arg(long)]
     out_dir: PathBuf,
+
+    /// exact dedup 用のディスクパーティション数
+    #[arg(long, default_value_t = DEFAULT_PARTITIONS, value_parser = parse_partition_count)]
+    partitions: usize,
+
+    /// `<out-dir>.work` の checkpoint から再開する
+    #[arg(long, default_value_t = false)]
+    resume: bool,
+
+    /// manifest の処理行数ごとに partition を flush して checkpoint を保存する
+    #[arg(long, default_value_t = DEFAULT_CHECKPOINT_INTERVAL, value_parser = parse_positive_usize)]
+    checkpoint_interval: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -53,88 +65,382 @@ struct AnchorCandidate {
     entry_side: char,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ExtractedPosition {
+    /// 手数を除いた exact dedup キー（盤面・手番・持ち駒）。
+    position_key: String,
     sfen: String,
     source_csa: PathBuf,
     anchor_ply: u32,
-    anchor_kind: &'static str,
+    anchor_kind: String,
     entry_side: char,
-    eval_cp: Option<i32>,
+    /// アンカー手を探索した局面の先手視点評価値。
+    anchor_move_eval_cp_black: Option<i32>,
     total_plies: u32,
     source_year: Option<u16>,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    run(&cli.manifest, &cli.out_dir)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Phase {
+    Partition,
+    Dedup,
+    Finalize,
 }
 
-fn run(manifest: &Path, out_dir: &Path) -> Result<()> {
-    fs::create_dir_all(out_dir)
-        .with_context(|| format!("failed to create {}", out_dir.display()))?;
-    let startpos_path = out_dir.join("startpos.txt");
-    let provenance_path = out_dir.join("provenance.tsv");
-    let mut startpos = BufWriter::new(
-        File::create(&startpos_path)
-            .with_context(|| format!("failed to create {}", startpos_path.display()))?,
-    );
-    let mut provenance = BufWriter::new(
-        File::create(&provenance_path)
-            .with_context(|| format!("failed to create {}", provenance_path.display()))?,
-    );
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunState {
+    version: u32,
+    manifest: String,
+    partitions: usize,
+    phase: Phase,
+    /// 先頭から処理済みの manifest 行数（コメント・空行を含む）。
+    processed_manifest_lines: usize,
+    /// 処理済み prefix を `line + "\n"` で連結した SHA-256。
+    processed_prefix_sha256: String,
+    candidates_written: u64,
+    /// 最後のcheckpointでdurableだった各partitionのbyte長。
+    partition_bytes: Vec<u64>,
+    next_partition: usize,
+    unique_written: u64,
+    startpos_bytes: u64,
+    provenance_bytes: u64,
+}
 
-    writeln!(
-        provenance,
-        "id\tstartpos_line\tsource_csa\tanchor_ply\tanchor_kind\tentry_side\teval_cp\ttotal_plies\tsource_year"
-    )?;
+struct RunOptions {
+    partitions: usize,
+    resume: bool,
+    checkpoint_interval: usize,
+}
 
-    let mut seen = HashSet::new();
-    let mut next_id = 1usize;
+fn parse_partition_count(value: &str) -> std::result::Result<usize, String> {
+    let value = parse_positive_usize(value)?;
+    if value > 256 {
+        return Err("must be <= 256".to_string());
+    }
+    Ok(value)
+}
+
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let value: usize = value.parse().map_err(|_| "must be an integer".to_string())?;
+    if value == 0 {
+        return Err("must be positive".to_string());
+    }
+    Ok(value)
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    run_with_options(
+        &cli.manifest,
+        &cli.out_dir,
+        RunOptions {
+            partitions: cli.partitions,
+            resume: cli.resume,
+            checkpoint_interval: cli.checkpoint_interval,
+        },
+    )
+}
+
+fn run_with_options(manifest: &Path, out_dir: &Path, options: RunOptions) -> Result<()> {
+    ensure!(options.partitions > 0, "partitions must be positive");
+    ensure!(options.checkpoint_interval > 0, "checkpoint interval must be positive");
+    if out_dir.exists() {
+        bail!("output directory already exists: {}", out_dir.display());
+    }
+    let parent = out_dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let manifest = manifest
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize manifest {}", manifest.display()))?;
+    let work_dir = work_dir_for(out_dir)?;
+    let state_path = work_dir.join("state.json");
+    let partitions_dir = work_dir.join("partitions");
+
+    let mut state = if work_dir.exists() {
+        if !options.resume {
+            bail!(
+                "work directory already exists: {} (use --resume or remove it)",
+                work_dir.display()
+            );
+        }
+        let state: RunState = serde_json::from_reader(BufReader::new(
+            File::open(&state_path)
+                .with_context(|| format!("failed to open {}", state_path.display()))?,
+        ))
+        .with_context(|| format!("failed to parse {}", state_path.display()))?;
+        validate_resume_state(&state, &manifest, options.partitions)?;
+        eprintln!(
+            "Resuming: phase={:?}, manifest_lines={}, next_partition={}, unique={}",
+            state.phase, state.processed_manifest_lines, state.next_partition, state.unique_written
+        );
+        state
+    } else {
+        if options.resume {
+            bail!("--resume requested but work directory does not exist: {}", work_dir.display());
+        }
+        fs::create_dir(&work_dir)
+            .with_context(|| format!("failed to create {}", work_dir.display()))?;
+        fs::create_dir(&partitions_dir)
+            .with_context(|| format!("failed to create {}", partitions_dir.display()))?;
+        let state = RunState {
+            version: STATE_VERSION,
+            manifest: manifest.display().to_string(),
+            partitions: options.partitions,
+            phase: Phase::Partition,
+            processed_manifest_lines: 0,
+            processed_prefix_sha256: empty_sha256(),
+            candidates_written: 0,
+            partition_bytes: vec![0; options.partitions],
+            next_partition: 0,
+            unique_written: 0,
+            startpos_bytes: 0,
+            provenance_bytes: 0,
+        };
+        save_state(&state_path, &state)?;
+        state
+    };
+
+    match state.phase {
+        Phase::Partition => {
+            partition_manifest(
+                &manifest,
+                &work_dir,
+                &partitions_dir,
+                &state_path,
+                &mut state,
+                options.checkpoint_interval,
+            )?;
+            deduplicate_partitions(&work_dir, &partitions_dir, &state_path, &mut state)?;
+        }
+        Phase::Dedup => {
+            deduplicate_partitions(&work_dir, &partitions_dir, &state_path, &mut state)?;
+        }
+        Phase::Finalize => {}
+    }
+
+    if state.unique_written == 0 {
+        fs::remove_dir_all(&work_dir).ok();
+        bail!("no start positions extracted from manifest {}", manifest.display());
+    }
+    finalize_output(&work_dir, out_dir, &state)?;
+    eprintln!(
+        "Done: {} unique start positions ({} candidates)",
+        state.unique_written, state.candidates_written
+    );
+    Ok(())
+}
+
+fn validate_resume_state(state: &RunState, manifest: &Path, partitions: usize) -> Result<()> {
+    ensure!(state.version == STATE_VERSION, "unsupported state version: {}", state.version);
+    ensure!(
+        state.manifest == manifest.display().to_string(),
+        "manifest path does not match state"
+    );
+    ensure!(state.partitions == partitions, "--partitions does not match state");
+    ensure!(
+        state.partition_bytes.len() == partitions,
+        "partition checkpoint count does not match state"
+    );
+    Ok(())
+}
+
+fn partition_manifest(
+    manifest: &Path,
+    work_dir: &Path,
+    partitions_dir: &Path,
+    state_path: &Path,
+    state: &mut RunState,
+    checkpoint_interval: usize,
+) -> Result<()> {
+    for partition in 0..state.partitions {
+        truncate_partition_to_checkpoint(
+            &partition_path(partitions_dir, partition),
+            state.partition_bytes[partition],
+        )?;
+    }
+    let mut writers = open_partition_writers(partitions_dir, state.partitions)?;
     let file = File::open(manifest)
         .with_context(|| format!("failed to open manifest {}", manifest.display()))?;
+    let manifest_dir = manifest.parent().unwrap_or(Path::new("."));
+    let mut prefix_hasher = Sha256::new();
+    let mut lines_since_checkpoint = 0usize;
+
     for (line_idx, line) in BufReader::new(file).lines().enumerate() {
         let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        update_prefix_hash(&mut prefix_hasher, &line);
+        if line_idx < state.processed_manifest_lines {
+            if line_idx + 1 == state.processed_manifest_lines {
+                let actual = hex_digest(prefix_hasher.clone().finalize());
+                ensure!(
+                    actual == state.processed_prefix_sha256,
+                    "manifest processed prefix changed; remove {} and restart",
+                    work_dir.display()
+                );
+            }
             continue;
         }
-        let row = parse_manifest_row(trimmed)
-            .with_context(|| format!("invalid manifest line {}", line_idx + 1))?;
-        let extracted = extract_from_row(&row)?;
-        for item in extracted {
-            if !seen.insert(item.sfen.clone()) {
+
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            let mut row = parse_manifest_row(trimmed)
+                .with_context(|| format!("invalid manifest line {}", line_idx + 1))?;
+            if row.csa_path.is_relative() {
+                row.csa_path = manifest_dir.join(&row.csa_path);
+            }
+            for item in extract_from_row(&row)? {
+                let partition =
+                    stable_hash(item.position_key.as_bytes()) as usize % state.partitions;
+                serde_json::to_writer(&mut writers[partition], &item)?;
+                writers[partition].write_all(b"\n")?;
+                state.candidates_written += 1;
+            }
+        }
+
+        state.processed_manifest_lines = line_idx + 1;
+        state.processed_prefix_sha256 = hex_digest(prefix_hasher.clone().finalize());
+        lines_since_checkpoint += 1;
+        if lines_since_checkpoint >= checkpoint_interval {
+            flush_partition_writers(&mut writers)?;
+            update_partition_checkpoint(partitions_dir, state)?;
+            save_state(state_path, state)?;
+            eprintln!(
+                "partition: {} manifest lines, {} candidates",
+                state.processed_manifest_lines, state.candidates_written
+            );
+            lines_since_checkpoint = 0;
+        }
+    }
+
+    if state.processed_manifest_lines > 0 {
+        let actual = hex_digest(prefix_hasher.finalize());
+        ensure!(
+            actual == state.processed_prefix_sha256,
+            "manifest is shorter than the processed prefix recorded in state"
+        );
+    }
+    flush_partition_writers(&mut writers)?;
+    update_partition_checkpoint(partitions_dir, state)?;
+    state.phase = Phase::Dedup;
+    state.next_partition = 0;
+    initialize_output_files(work_dir, state)?;
+    save_state(state_path, state)?;
+    Ok(())
+}
+
+fn deduplicate_partitions(
+    work_dir: &Path,
+    partitions_dir: &Path,
+    state_path: &Path,
+    state: &mut RunState,
+) -> Result<()> {
+    let startpos_path = work_dir.join("startpos.txt.tmp");
+    let provenance_path = work_dir.join("provenance.tsv.tmp");
+    truncate_to_checkpoint(&startpos_path, state.startpos_bytes)?;
+    truncate_to_checkpoint(&provenance_path, state.provenance_bytes)?;
+    let mut startpos = BufWriter::new(OpenOptions::new().append(true).open(&startpos_path)?);
+    let mut provenance = BufWriter::new(OpenOptions::new().append(true).open(&provenance_path)?);
+
+    for partition in state.next_partition..state.partitions {
+        let path = partition_path(partitions_dir, partition);
+        truncate_partial_last_line(&path)?;
+        let file =
+            File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        let mut seen = HashSet::new();
+        for (line_idx, line) in BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.is_empty() {
                 continue;
             }
-            let startpos_line = next_id;
+            let item: ExtractedPosition = serde_json::from_str(&line).with_context(|| {
+                format!("invalid partition record {}:{}", path.display(), line_idx + 1)
+            })?;
+            if !seen.insert(item.position_key.clone()) {
+                continue;
+            }
+            state.unique_written += 1;
             writeln!(startpos, "position sfen {}", item.sfen)?;
             writeln!(
                 provenance,
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                next_id,
-                startpos_line,
+                state.unique_written,
+                state.unique_written,
                 item.source_csa.display(),
                 item.anchor_ply,
                 item.anchor_kind,
                 item.entry_side,
-                item.eval_cp.map_or_else(String::new, |v| v.to_string()),
+                item.anchor_move_eval_cp_black.map_or_else(String::new, |v| v.to_string()),
                 item.total_plies,
                 item.source_year.map_or_else(String::new, |v| v.to_string()),
             )?;
-            next_id += 1;
+        }
+        drop(seen);
+        startpos.flush()?;
+        provenance.flush()?;
+        startpos.get_ref().sync_data()?;
+        provenance.get_ref().sync_data()?;
+        state.next_partition = partition + 1;
+        state.startpos_bytes = fs::metadata(&startpos_path)?.len();
+        state.provenance_bytes = fs::metadata(&provenance_path)?.len();
+        save_state(state_path, state)?;
+        fs::remove_file(&path).ok();
+        if partition.is_multiple_of(16) || partition + 1 == state.partitions {
+            eprintln!(
+                "dedup: partition {}/{}, {} unique",
+                partition + 1,
+                state.partitions,
+                state.unique_written
+            );
         }
     }
+    state.phase = Phase::Finalize;
+    save_state(state_path, state)?;
+    Ok(())
+}
 
-    if next_id == 1 {
-        drop(startpos);
-        drop(provenance);
-        let _ = fs::remove_file(&startpos_path);
-        let _ = fs::remove_file(&provenance_path);
-        bail!("no start positions extracted from manifest {}", manifest.display());
-    }
-
-    startpos.flush()?;
+fn initialize_output_files(work_dir: &Path, state: &mut RunState) -> Result<()> {
+    let startpos_path = work_dir.join("startpos.txt.tmp");
+    let provenance_path = work_dir.join("provenance.tsv.tmp");
+    let startpos = File::create(&startpos_path)?;
+    startpos.sync_data()?;
+    let mut provenance = BufWriter::new(File::create(&provenance_path)?);
+    writeln!(
+        provenance,
+        "id\tstartpos_line\tsource_csa\tanchor_ply\tanchor_kind\tentry_side\tanchor_move_eval_cp_black\ttotal_plies\tsource_year"
+    )?;
     provenance.flush()?;
+    provenance.get_ref().sync_data()?;
+    state.startpos_bytes = 0;
+    state.provenance_bytes = fs::metadata(provenance_path)?.len();
+    Ok(())
+}
+
+fn finalize_output(work_dir: &Path, out_dir: &Path, state: &RunState) -> Result<()> {
+    ensure!(state.next_partition == state.partitions, "dedup is not complete");
+    let startpos_tmp = work_dir.join("startpos.txt.tmp");
+    let provenance_tmp = work_dir.join("provenance.tsv.tmp");
+    publish_staged_file(&startpos_tmp, &work_dir.join("startpos.txt"))?;
+    publish_staged_file(&provenance_tmp, &work_dir.join("provenance.tsv"))?;
+    if work_dir.join("partitions").exists() {
+        fs::remove_dir_all(work_dir.join("partitions"))?;
+    }
+    let meta = serde_json::to_string_pretty(state)?;
+    write_atomic(&work_dir.join("run-meta.json"), &(meta + "\n"))?;
+    fs::rename(work_dir, out_dir).with_context(|| {
+        format!("failed to publish {} as {}", work_dir.display(), out_dir.display())
+    })?;
+    fs::remove_file(out_dir.join("state.json")).ok();
+    Ok(())
+}
+
+fn publish_staged_file(staged: &Path, final_path: &Path) -> Result<()> {
+    if staged.exists() {
+        File::open(staged)?.sync_all()?;
+        fs::rename(staged, final_path)?;
+    } else {
+        ensure!(final_path.is_file(), "missing staged output: {}", staged.display());
+    }
     Ok(())
 }
 
@@ -173,9 +479,9 @@ fn append_anchor_candidates(
         (0, "entry"),
         (20, "entry+20"),
     ];
-    let max_anchor = total_plies as i32 - 8;
+    let max_anchor = i64::from(total_plies) - 8;
     for (offset, anchor_kind) in OFFSETS {
-        let anchor = entry_ply + offset;
+        let anchor = i64::from(entry_ply) + i64::from(offset);
         if anchor < 16 || anchor > max_anchor {
             continue;
         }
@@ -195,13 +501,12 @@ fn extract_from_row(row: &ManifestRow) -> Result<Vec<ExtractedPosition>> {
 
     let text = fs::read_to_string(&row.csa_path)
         .with_context(|| format!("failed to read {}", row.csa_path.display()))?;
-    let evals = parse_post_move_eval_comments(&text);
     let (initial_pos, parsed, _info) = parse_csa_full(&text)
         .with_context(|| format!("failed to parse {}", row.csa_path.display()))?;
     let normal_moves: Vec<_> = parsed
         .iter()
         .filter_map(|pm| match pm {
-            ParsedMove::Normal(cm) => Some(cm.mv.as_str()),
+            ParsedMove::Normal(cm) => Some(cm),
             ParsedMove::Special(_) => None,
         })
         .collect();
@@ -219,12 +524,12 @@ fn extract_from_row(row: &ManifestRow) -> Result<Vec<ExtractedPosition>> {
         }
 
         let mut pos = initial_pos.clone();
-        for mv in normal_moves.iter().take(anchor_idx) {
-            pos.apply_csa_move(mv).with_context(|| {
+        for cm in normal_moves.iter().take(anchor_idx) {
+            pos.apply_csa_move(&cm.mv).with_context(|| {
                 format!(
                     "{}: failed to replay move {} for anchor {}",
                     row.csa_path.display(),
-                    mv,
+                    cm.mv,
                     candidate.anchor_ply
                 )
             })?;
@@ -235,12 +540,13 @@ fn extract_from_row(row: &ManifestRow) -> Result<Vec<ExtractedPosition>> {
             continue;
         }
         out.push(ExtractedPosition {
+            position_key: position_key(&sfen)?,
             sfen,
             source_csa: row.csa_path.clone(),
             anchor_ply: candidate.anchor_ply,
-            anchor_kind: candidate.anchor_kind,
+            anchor_kind: candidate.anchor_kind.to_string(),
             entry_side: candidate.entry_side,
-            eval_cp: evals.get(anchor_idx - 1).copied().flatten(),
+            anchor_move_eval_cp_black: normal_moves[anchor_idx - 1].eval_cp_black,
             total_plies: row.total_plies,
             source_year: extract_source_year(&row.csa_path),
         });
@@ -248,35 +554,20 @@ fn extract_from_row(row: &ManifestRow) -> Result<Vec<ExtractedPosition>> {
     Ok(out)
 }
 
+fn position_key(sfen: &str) -> Result<String> {
+    let mut tokens = sfen.split_whitespace();
+    let board = tokens.next().context("SFEN has no board")?;
+    let side = tokens.next().context("SFEN has no side-to-move")?;
+    let hand = tokens.next().context("SFEN has no hand")?;
+    ensure!(tokens.next().is_some(), "SFEN has no move count");
+    Ok(format!("{board} {side} {hand}"))
+}
+
 fn is_declarable_for_side_to_move(sfen: &str) -> Result<bool> {
     let mut pos = CorePosition::new();
     pos.set_sfen(sfen)
         .map_err(|e| anyhow!("invalid SFEN after CSA replay: {e:?}: {sfen}"))?;
     Ok(pos.declaration_win(EnteringKingRule::Point27) != Move::NONE)
-}
-
-fn parse_post_move_eval_comments(text: &str) -> Vec<Option<i32>> {
-    fn leading_score(rest: &str) -> Option<i32> {
-        rest.split_whitespace().next().and_then(|s| s.parse().ok())
-    }
-
-    let mut scores = Vec::new();
-    for raw in text.lines() {
-        let line = raw.trim();
-        if is_csa_move_line(line) {
-            scores.push(None);
-        } else if let Some(rest) = line.strip_prefix("'**")
-            && let (Some(last), Some(cp)) = (scores.last_mut(), leading_score(rest))
-        {
-            *last = Some(cp);
-        }
-    }
-    scores
-}
-
-fn is_csa_move_line(line: &str) -> bool {
-    let b = line.as_bytes();
-    b.len() >= 7 && (b[0] == b'+' || b[0] == b'-') && b[1..5].iter().all(u8::is_ascii_digit)
 }
 
 fn extract_source_year(path: &Path) -> Option<u16> {
@@ -291,6 +582,127 @@ fn extract_source_year(path: &Path) -> Option<u16> {
         }
         None
     })
+}
+
+fn work_dir_for(out_dir: &Path) -> Result<PathBuf> {
+    let name = out_dir
+        .file_name()
+        .ok_or_else(|| anyhow!("out-dir must have a final path component"))?;
+    let mut work_name = name.to_os_string();
+    work_name.push(".work");
+    Ok(out_dir.with_file_name(work_name))
+}
+
+fn partition_path(dir: &Path, partition: usize) -> PathBuf {
+    dir.join(format!("partition_{partition:04}.jsonl"))
+}
+
+fn open_partition_writers(dir: &Path, count: usize) -> Result<Vec<BufWriter<File>>> {
+    (0..count)
+        .map(|partition| {
+            let path = partition_path(dir, partition);
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map(BufWriter::new)
+                .with_context(|| format!("failed to open {}", path.display()))
+        })
+        .collect()
+}
+
+fn flush_partition_writers(writers: &mut [BufWriter<File>]) -> Result<()> {
+    for writer in writers {
+        writer.flush()?;
+        writer.get_ref().sync_data()?;
+    }
+    Ok(())
+}
+
+fn truncate_partial_last_line(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte)?;
+    if byte[0] == b'\n' {
+        return Ok(());
+    }
+    let mut pos = len - 1;
+    while pos > 0 {
+        pos -= 1;
+        file.seek(SeekFrom::Start(pos))?;
+        file.read_exact(&mut byte)?;
+        if byte[0] == b'\n' {
+            file.set_len(pos + 1)?;
+            return Ok(());
+        }
+    }
+    file.set_len(0)?;
+    Ok(())
+}
+
+fn truncate_to_checkpoint(path: &Path, len: u64) -> Result<()> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    ensure!(file.metadata()?.len() >= len, "{} is shorter than checkpoint", path.display());
+    file.set_len(len)?;
+    Ok(())
+}
+
+fn truncate_partition_to_checkpoint(path: &Path, len: u64) -> Result<()> {
+    let file = OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
+    ensure!(file.metadata()?.len() >= len, "{} is shorter than checkpoint", path.display());
+    file.set_len(len)?;
+    Ok(())
+}
+
+fn update_partition_checkpoint(dir: &Path, state: &mut RunState) -> Result<()> {
+    for partition in 0..state.partitions {
+        state.partition_bytes[partition] = fs::metadata(partition_path(dir, partition))?.len();
+    }
+    Ok(())
+}
+
+fn save_state(path: &Path, state: &RunState) -> Result<()> {
+    let json = serde_json::to_string_pretty(state)? + "\n";
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create state tempfile in {}", parent.display()))?;
+    tmp.write_all(json.as_bytes())?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("failed to publish checkpoint {}", path.display()))?;
+    Ok(())
+}
+
+fn update_prefix_hash(hasher: &mut Sha256, line: &str) {
+    hasher.update(line.as_bytes());
+    hasher.update(b"\n");
+}
+
+fn empty_sha256() -> String {
+    hex_digest(Sha256::new().finalize())
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -353,6 +765,22 @@ mod tests {
         .join("\n")
     }
 
+    fn write_game(path: &Path, board: &str, plies: usize) {
+        let mut text = board.to_string();
+        text.push('\n');
+        text.push_str(&cycle_moves(plies, "+7565KI", "+6575KI", "-1939KY", "-3919KY"));
+        text.push_str("%TORYO\n");
+        fs::write(path, text).unwrap();
+    }
+
+    fn test_options(resume: bool) -> RunOptions {
+        RunOptions {
+            partitions: 4,
+            resume,
+            checkpoint_interval: 1,
+        }
+    }
+
     #[test]
     fn anchor_candidates_clip_by_bounds() {
         let row = ManifestRow {
@@ -361,9 +789,8 @@ mod tests {
             white_entry_ply: -1,
             total_plies: 50,
         };
-        let anchors = anchor_candidates(&row);
         assert_eq!(
-            anchors,
+            anchor_candidates(&row),
             vec![
                 AnchorCandidate {
                     anchor_ply: 20,
@@ -380,70 +807,142 @@ mod tests {
     }
 
     #[test]
-    fn run_extracts_clips_filters_declarable_and_dedups() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn run_extracts_filters_declarable_and_dedups_without_move_count() {
+        let dir = tempfile::tempdir().unwrap();
         let year_dir = dir.path().join("2024");
-        fs::create_dir(&year_dir).expect("mkdir");
+        fs::create_dir(&year_dir).unwrap();
+        write_game(&year_dir.join("normal.csa"), &simple_board(), 60);
 
-        let normal = year_dir.join("normal.csa");
-        let mut normal_text = simple_board();
-        normal_text.push('\n');
-        normal_text.push_str(&cycle_moves(40, "+7565KI", "+6575KI", "-1939KY", "-3919KY"));
-        normal_text.push_str("%TORYO\n");
-        fs::write(&normal, normal_text).expect("write normal");
-
-        let kachi = year_dir.join("kachi.csa");
-        let mut kachi_text = declarable_board();
-        kachi_text.push('\n');
-        kachi_text.push_str(&cycle_moves(40, "+7161KI", "+6171KI", "-1939KY", "-3919KY"));
-        kachi_text.push_str("%KACHI\n");
-        fs::write(&kachi, kachi_text).expect("write kachi");
+        let mut kachi = declarable_board();
+        kachi.push('\n');
+        kachi.push_str(&cycle_moves(40, "+7161KI", "+6171KI", "-1939KY", "-3919KY"));
+        kachi.push_str("%KACHI\n");
+        fs::write(year_dir.join("kachi.csa"), kachi).unwrap();
 
         let manifest = dir.path().join("manifest.tsv");
-        fs::write(
-            &manifest,
-            format!("{}\t20\t20\t30\n{}\t20\t-1\t30\n", normal.display(), kachi.display()),
-        )
-        .expect("write manifest");
+        fs::write(&manifest, "2024/normal.csa\t20\t40\t60\n2024/kachi.csa\t20\t-1\t30\n").unwrap();
+        let out = dir.path().join("out");
+        run_with_options(&manifest, &out, test_options(false)).unwrap();
 
-        let out_dir = dir.path().join("out");
-        run(&manifest, &out_dir).expect("run");
-
-        let startpos = fs::read_to_string(out_dir.join("startpos.txt")).expect("startpos");
-        let startpos_lines: Vec<_> = startpos.lines().collect();
-        assert_eq!(startpos_lines.len(), 1);
-        assert!(startpos_lines[0].starts_with("position sfen "));
-
-        let provenance = fs::read_to_string(out_dir.join("provenance.tsv")).expect("provenance");
+        let startpos = fs::read_to_string(out.join("startpos.txt")).unwrap();
+        // 20手目と40手目は同じ盤面へ戻るため、手数を除いたキーで1件になる。
+        assert_eq!(startpos.lines().count(), 1);
+        let provenance = fs::read_to_string(out.join("provenance.tsv")).unwrap();
         let rows: Vec<_> = provenance.lines().collect();
         assert_eq!(rows.len(), 2);
         let cols: Vec<_> = rows[1].split('\t').collect();
-        assert_eq!(cols[0], "1");
-        assert_eq!(cols[1], "1");
         assert_eq!(cols[3], "20");
-        assert_eq!(cols[4], "entry");
-        assert_eq!(cols[5], "b");
         assert_eq!(cols[6], "20");
-        assert_eq!(cols[7], "30");
         assert_eq!(cols[8], "2024");
+        assert!(out.join("run-meta.json").is_file());
+        assert!(!work_dir_for(&out).unwrap().exists());
+
+        let out2 = dir.path().join("out2");
+        run_with_options(&manifest, &out2, test_options(false)).unwrap();
+        for name in ["startpos.txt", "provenance.tsv", "run-meta.json"] {
+            assert_eq!(fs::read(out.join(name)).unwrap(), fs::read(out2.join(name)).unwrap());
+        }
     }
 
     #[test]
-    fn run_bails_when_manifest_extracts_no_positions() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn failed_run_keeps_final_output_absent_and_can_resume_after_tail_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        write_game(&dir.path().join("a.csa"), &simple_board(), 40);
         let manifest = dir.path().join("manifest.tsv");
-        fs::write(&manifest, "# comment only\n\n").expect("write manifest");
+        fs::write(&manifest, "a.csa\t20\t-1\t30\nbad-row\n").unwrap();
+        let out = dir.path().join("out");
+        let err = run_with_options(
+            &manifest,
+            &out,
+            RunOptions {
+                partitions: 4,
+                resume: false,
+                checkpoint_interval: 10,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid manifest line 2"));
+        assert!(!out.exists());
+        assert!(work_dir_for(&out).unwrap().join("state.json").is_file());
 
-        let out_dir = dir.path().join("out");
-        let err = run(&manifest, &out_dir).expect_err("empty extraction must fail");
-        assert!(err.to_string().contains("no start positions extracted"), "{err}");
-        assert!(!out_dir.join("startpos.txt").exists());
-        assert!(!out_dir.join("provenance.tsv").exists());
+        // checkpoint より後の末尾を修正でき、未checkpointのpartition書き込みは切り戻される。
+        fs::write(&manifest, "a.csa\t20\t-1\t30\n# fixed\n").unwrap();
+        run_with_options(
+            &manifest,
+            &out,
+            RunOptions {
+                partitions: 4,
+                resume: true,
+                checkpoint_interval: 10,
+            },
+        )
+        .unwrap();
+        assert!(out.join("startpos.txt").is_file());
+        assert_eq!(fs::read_to_string(out.join("startpos.txt")).unwrap().lines().count(), 1);
     }
 
     #[test]
-    fn parses_post_move_eval_comments_only() {
-        let text = "PI\n'* 999\n+7776FU\n'** 12 pv\n-3334FU\n'** -5\n";
-        assert_eq!(parse_post_move_eval_comments(text), vec![Some(12), Some(-5)]);
+    fn existing_output_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("manifest.tsv");
+        fs::write(&manifest, "# empty\n").unwrap();
+        let out = dir.path().join("out");
+        fs::create_dir(&out).unwrap();
+        fs::write(out.join("startpos.txt"), "known-good\n").unwrap();
+        let err = run_with_options(&manifest, &out, test_options(false)).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        assert_eq!(fs::read_to_string(out.join("startpos.txt")).unwrap(), "known-good\n");
+    }
+
+    #[test]
+    fn empty_extraction_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("manifest.tsv");
+        fs::write(&manifest, "# comment only\n\n").unwrap();
+        let out = dir.path().join("out");
+        let err = run_with_options(&manifest, &out, test_options(false)).unwrap_err();
+        assert!(err.to_string().contains("no start positions extracted"));
+        assert!(!out.exists());
+        assert!(!work_dir_for(&out).unwrap().exists());
+    }
+
+    #[test]
+    fn partial_partition_record_is_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.jsonl");
+        fs::write(&path, b"complete\npartial").unwrap();
+        truncate_partial_last_line(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"complete\n");
+    }
+
+    #[test]
+    fn finalize_recovers_after_one_staged_file_was_already_renamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("out.work");
+        let out = dir.path().join("out");
+        fs::create_dir(&work).unwrap();
+        fs::create_dir(work.join("partitions")).unwrap();
+        fs::write(work.join("startpos.txt"), "position sfen x\n").unwrap();
+        fs::write(work.join("provenance.tsv.tmp"), "header\n").unwrap();
+        fs::write(work.join("state.json"), "checkpoint\n").unwrap();
+        let state = RunState {
+            version: STATE_VERSION,
+            manifest: "manifest.tsv".to_string(),
+            partitions: 1,
+            phase: Phase::Finalize,
+            processed_manifest_lines: 1,
+            processed_prefix_sha256: empty_sha256(),
+            candidates_written: 1,
+            partition_bytes: vec![0],
+            next_partition: 1,
+            unique_written: 1,
+            startpos_bytes: 16,
+            provenance_bytes: 7,
+        };
+        finalize_output(&work, &out, &state).unwrap();
+        assert!(out.join("startpos.txt").is_file());
+        assert!(out.join("provenance.tsv").is_file());
+        assert!(out.join("run-meta.json").is_file());
+        assert!(!out.join("state.json").exists());
     }
 }

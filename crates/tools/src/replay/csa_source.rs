@@ -110,7 +110,10 @@ impl GameSource for CsaSource {
 
             // 評価値コメントは元々先手視点なので、そのまま指標へ流す。
             let mut acc = EvalAccumulator::default();
-            for cp in parse_eval_comments(&text).into_iter().flatten() {
+            for cp in parsed.iter().filter_map(|m| match m {
+                ParsedMove::Normal(cm) => cm.eval_cp_black,
+                ParsedMove::Special(_) => None,
+            }) {
                 acc.push(cp);
             }
 
@@ -158,12 +161,7 @@ impl GameSource for CsaSource {
             .with_context(|| format!("failed to read {}", meta.path.display()))?;
         let (mut pos, parsed, _info) = parse_csa_full(&text)
             .with_context(|| format!("failed to parse {}", meta.path.display()))?;
-        // 先手視点で書かれたコメントを手番相対へ戻す前段として、通常手ごとの
-        // 先手視点スコアを読み出しておく（PV は無視、無い手は None）。
-        let scores = parse_eval_comments(&text);
-
         let mut moves = Vec::new();
-        let mut normal_idx = 0usize;
         for pm in &parsed {
             let ParsedMove::Normal(cm) = pm else {
                 continue; // 終局特殊手は再生対象の指し手列には含めない。
@@ -212,7 +210,7 @@ impl GameSource for CsaSource {
                 None => (Move::NONE, format!("{:>4} {}", abs_ply, cm.mv)),
             };
 
-            let score_cp = scores.get(normal_idx).copied().flatten().map(|black_pov| {
+            let score_cp = cm.eval_cp_black.map(|black_pov| {
                 // 先手視点 → 手番相対（後手手番は符号反転）。グラフ側の `black_pov_cp` が
                 // 再度 手番相対 → 先手視点 に戻すので、全ソースで格納形式を揃える。
                 match side {
@@ -241,7 +239,6 @@ impl GameSource for CsaSource {
             if legal_mv.is_none() || !applied {
                 break;
             }
-            normal_idx += 1;
         }
 
         Ok(GameRecord {
@@ -296,41 +293,6 @@ fn derive_outcome(
         // 中断は結果なし。
         SpecialMove::Interrupt => None,
     }
-}
-
-/// 評価値コメントを走査し、通常手（`[+-]NNNN..` 行）の出現順に対応する先手視点スコアを
-/// 返す。記録の系統でコメントの帰属が異なる（module doc 参照）:
-/// - `'*`（csa_client 自前記録）は**直後**の手のスコア
-/// - `'**`（wdoor / shogi-server 記録）は**直前**の手のスコア
-///
-/// 消費時間はここでは扱わない（独立 `T` 行・インライン `,T` とも `parse_csa_full` が
-/// `CsaMove::time_sec` へ格納済みで、`%TORYO` 等の終局手に付く `T` も型で除外される）。
-/// PV は使わない。コメントの無い手は `None`。
-fn parse_eval_comments(text: &str) -> Vec<Option<i32>> {
-    fn leading_score(rest: &str) -> Option<i32> {
-        rest.split_whitespace().next().and_then(|t| t.parse::<i32>().ok())
-    }
-    let mut scores: Vec<Option<i32>> = Vec::new();
-    let mut pending: Option<i32> = None;
-    for raw in text.lines() {
-        let s = raw.trim();
-        if let Some(rest) = s.strip_prefix("'**") {
-            if let (Some(last), Some(cp)) = (scores.last_mut(), leading_score(rest)) {
-                *last = Some(cp);
-            }
-        } else if let Some(rest) = s.strip_prefix("'*") {
-            pending = leading_score(rest);
-        } else if is_csa_move_line(s) {
-            scores.push(pending.take());
-        }
-    }
-    scores
-}
-
-/// `+7776FU` / `-0055FU` 形式の指し手行か（`%`/`T`/`P`/`N`/`'` などのメタ行を除外する）。
-fn is_csa_move_line(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() >= 7 && (b[0] == b'+' || b[0] == b'-') && b[1..5].iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(test)]

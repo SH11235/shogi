@@ -15,6 +15,7 @@ use rshogi_core::position::Position;
 use rshogi_core::types::{
     Color, EnteringKingRule, File as ShogiFile, Move, PieceType, Rank, Square,
 };
+use rshogi_csa::{ParsedMove, parse_csa_full};
 use serde::{Deserialize, Serialize};
 use tools::common::dedup::collect_input_paths;
 
@@ -444,17 +445,21 @@ fn process_csa_file(path: &Path, cli: &Cli, stats: &mut Stats) -> Result<Option<
 }
 
 fn parse_csa(path: &Path) -> Result<CsaGame> {
-    let file = File::open(path).with_context(|| format!("CSA を開けません: {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("CSA を開けません: {}", path.display()))?;
+    let (_, parsed, _) = parse_csa_full(&text)
+        .with_context(|| format!("CSA を解析できません: {}", path.display()))?;
+    let mut evals = parsed.iter().filter_map(|pm| match pm {
+        ParsedMove::Normal(cm) => Some(cm.eval_cp_black),
+        ParsedMove::Special(_) => None,
+    });
     let mut moves: Vec<CsaMoveLine> = Vec::new();
-    let mut pending_eval: Option<i32> = None;
     let mut black_rate = None;
     let mut white_rate = None;
     let mut end_kind = "unknown".to_string();
     let mut non_hirate = false;
 
-    for line in reader.lines() {
-        let line = line?;
+    for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -463,16 +468,10 @@ fn parse_csa(path: &Path) -> Result<CsaGame> {
             black_rate = parse_rate_comment(trimmed);
         } else if trimmed.starts_with("'white_rate:") {
             white_rate = parse_rate_comment(trimmed);
-        } else if let Some(cp) = parse_eval_comment(trimmed) {
-            if let Some(last) = moves.last_mut() {
-                last.eval_raw = Some(cp);
-            } else {
-                pending_eval = Some(cp);
-            }
         } else if is_csa_move(trimmed) {
             moves.push(CsaMoveLine {
                 raw: trimmed[..7].to_string(),
-                eval_raw: pending_eval.take(),
+                eval_raw: evals.next().flatten(),
             });
         } else if trimmed.starts_with('%') {
             end_kind = trimmed.split(',').next().unwrap_or(trimmed).to_string();
@@ -830,11 +829,6 @@ fn parse_rate_comment(line: &str) -> Option<u32> {
         .parse::<u32>()
         .ok()
         .or_else(|| value.parse::<f64>().ok().map(|v| v as u32))
-}
-
-fn parse_eval_comment(line: &str) -> Option<i32> {
-    let rest = line.strip_prefix("'** ")?;
-    rest.split_whitespace().next()?.parse().ok()
 }
 
 fn is_csa_move(line: &str) -> bool {
