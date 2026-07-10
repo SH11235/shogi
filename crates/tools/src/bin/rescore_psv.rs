@@ -1518,23 +1518,31 @@ fn process_file_with_search(
             handles.into_iter().map(|h| h.join().expect("Worker thread panicked")).collect()
         });
 
-        // 連続分割なのでワーカー順の連結がそのまま入力順になる
-        for result in results.into_iter().flatten() {
-            match result {
-                ProcessResult::Ok(record, clipped) => {
-                    if clipped {
-                        clipped_count += 1;
+        // 連続分割なのでワーカー順の連結がそのまま入力順になる。
+        // 中断でワーカーがスライス途中で止まった場合は、そこで書き出しを打ち切り
+        // 出力を入力の連続 prefix に保つ（歯抜けの部分出力を作らない）
+        for (worker_results, slice) in results.into_iter().zip(chunk.chunks(slice_size)) {
+            let truncated = worker_results.len() < slice.len();
+            for result in worker_results {
+                match result {
+                    ProcessResult::Ok(record, clipped) => {
+                        if clipped {
+                            clipped_count += 1;
+                        }
+                        writer.write_all(&record)?;
+                        total_written += 1;
                     }
-                    writer.write_all(&record)?;
-                    total_written += 1;
-                }
-                ProcessResult::Skip => skipped_count += 1,
-                ProcessResult::Error(e) => {
-                    error_count += 1;
-                    if verbose {
-                        eprintln!("Error processing record: {e}");
+                    ProcessResult::Skip => skipped_count += 1,
+                    ProcessResult::Error(e) => {
+                        error_count += 1;
+                        if verbose {
+                            eprintln!("Error processing record: {e}");
+                        }
                     }
                 }
+            }
+            if truncated {
+                break;
             }
         }
     }
@@ -1980,10 +1988,11 @@ fn process_file_with_engine(
             pending = next_pending;
         }
 
-        // 入力順で書き出し（未評価 = 中断分は出力しない）
+        // 入力順で書き出し。未評価（None）は中断時にのみ残り、そこで打ち切って
+        // 出力を入力の連続 prefix に保つ（歯抜けの部分出力を作らない）
         for ((psv, _), score) in chunk.iter().zip(&chunk_scores) {
             let Some(evaluated) = score else {
-                continue;
+                break;
             };
             let Some(raw_score) = *evaluated else {
                 error_count += 1;
