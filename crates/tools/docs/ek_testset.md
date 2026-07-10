@@ -20,7 +20,7 @@ cargo run -p tools --release --bin ek_testset -- build \
 | `sfens.txt` | `testset.jsonl` と同順の SFEN |
 | `meta.json` | 入力、件数、パラメータ、生成元 CSA 一覧 |
 
-このブランチでは `entering_king_point_info` が core に未公開のため、点数系フィールド
+core が `entering_king_point_info` を公開していないため、点数系フィールド
 （`points_stm`, `king_in_enemy_stm`, `enemy_zone_pieces_stm`）は出力しません。DT ラベルは
 `Position::declaration_win(EnteringKingRule::Point27)` で作ります。
 

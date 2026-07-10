@@ -1,8 +1,8 @@
 //! 入玉評価テストセットの構築・採点ツール。
 //!
 //! CSA replay と勝敗導出は `replay::csa_source::CsaSource` に委譲する。宣言判定は
-//! `Position::declaration_win(EnteringKingRule::Point27)` を使う。このブランチには
-//! `entering_king_point_info` が公開されていないため、点数系フィールドは JSONL に出さない。
+//! `Position::declaration_win(EnteringKingRule::Point27)` を使う。core が
+//! `entering_king_point_info` を公開していないため、点数系フィールドは JSONL に出さない。
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -62,8 +62,8 @@ struct BuildArgs {
     /// 対象区間を何手ごとにサンプルするか。
     #[arg(long, default_value_t = DEFAULT_SAMPLE_STRIDE)]
     sample_stride: u32,
-    /// draw を除外するか。既定 true。
-    #[arg(long, default_value_t = true)]
+    /// draw を除外するか (`--drop-draw false` で draw 対局も含める)。
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     drop_draw: bool,
 }
 
@@ -115,6 +115,7 @@ struct BuildMeta {
     drop_draw: bool,
     games_indexed: usize,
     games_used: usize,
+    games_skipped_broken: usize,
     records: usize,
     dt_records: usize,
     oc_records: usize,
@@ -171,10 +172,19 @@ struct ScoredLabel {
 /// 逐次加算する。ピークメモリを入力件数に非依存（ビン数固定）にするため。
 const OC_CALIBRATION_BINS: usize = 10;
 
+/// DT 評価値ヒストグラムの片側範囲 [cp]。
+///
+/// 全評価値を保持する代わりに 1cp 幅の固定長ヒストグラムへ逐次加算し、ピークメモリを
+/// 入力件数に非依存にする。範囲は静的評価の実用域を十分覆い、範囲外は端に飽和させる
+/// （分位値は範囲内なら正確、範囲外は ±DT_EVAL_HIST_MAX_CP に丸まる）。
+const DT_EVAL_HIST_MAX_CP: i32 = 32_000;
+const DT_EVAL_HIST_LEN: usize = DT_EVAL_HIST_MAX_CP as usize * 2 + 1;
+
 #[derive(Debug)]
 struct EvalMetricBuilder {
     records: usize,
-    dt_evals: Vec<i32>,
+    // index = clamp(eval_cp) + DT_EVAL_HIST_MAX_CP の件数。
+    dt_hist: Box<[u64]>,
     oc_n: usize,
     oc_sign_ok: usize,
     oc_ce: f64,
@@ -189,7 +199,7 @@ impl Default for EvalMetricBuilder {
     fn default() -> Self {
         Self {
             records: 0,
-            dt_evals: Vec::new(),
+            dt_hist: vec![0; DT_EVAL_HIST_LEN].into_boxed_slice(),
             oc_n: 0,
             oc_sign_ok: 0,
             oc_ce: 0.0,
@@ -241,6 +251,7 @@ fn run_build(args: &BuildArgs) -> Result<()> {
     let mut dt_records = 0usize;
     let mut oc_records = 0usize;
     let mut games_used = 0usize;
+    let mut games_skipped_broken = 0usize;
 
     for entry in &index.entries {
         let Some(outcome) = entry.outcome else {
@@ -252,6 +263,11 @@ fn run_build(args: &BuildArgs) -> Result<()> {
 
         let game = source.load_game(&index, entry)?;
         let source_csa = source_path(&index, entry)?;
+        if !replay_is_complete(&game.moves, entry.ply_count) {
+            games_skipped_broken += 1;
+            eprintln!("warning: {source_csa}: 再生を末尾まで信頼できないため対局ごと除外します");
+            continue;
+        }
         let built = build_records_for_game(
             &game.moves,
             outcome,
@@ -266,7 +282,8 @@ fn run_build(args: &BuildArgs) -> Result<()> {
             if record.dt_label == Some(Label::Win) {
                 dt_records += 1;
             }
-            if matches!(record.oc_label, Label::Win | Label::Loss | Label::Draw) {
+            // eval 側の OC 採点は draw を除外するため、meta の oc_records も win/loss のみ数える。
+            if matches!(record.oc_label, Label::Win | Label::Loss) {
                 oc_records += 1;
             }
             serde_json::to_writer(&mut testset, &record)?;
@@ -285,12 +302,13 @@ fn run_build(args: &BuildArgs) -> Result<()> {
         drop_draw: args.drop_draw,
         games_indexed: index.entries.len(),
         games_used,
+        games_skipped_broken,
         records,
         dt_records,
         oc_records,
         sources: index.pair_files.iter().map(|m| m.path.display().to_string()).collect(),
         notes: vec![
-            "このブランチでは entering_king_point_info が未公開のため points_stm / king_in_enemy_stm / enemy_zone_pieces_stm は省略".to_string(),
+            "core が entering_king_point_info を公開していないため points_stm / king_in_enemy_stm / enemy_zone_pieces_stm は省略".to_string(),
         ],
     };
     let mut meta_writer = BufWriter::new(File::create(&meta_path)?);
@@ -407,6 +425,14 @@ fn king_in_enemy_zone(pos: &Position, side: Color) -> bool {
     }
 }
 
+/// 再生が末尾まで信頼できるか。
+///
+/// `CsaSource::load_game` は core 上で信頼できない手を `Move::NONE` にして再生を打ち切る。
+/// 打ち切られた対局の途中局面へ最終結果ラベルを付けると誤ラベルになるため、対局ごと除外する。
+fn replay_is_complete(moves: &[MoveView], expected_normal_moves: u32) -> bool {
+    moves.len() as u64 == u64::from(expected_normal_moves) && moves.iter().all(|m| m.mv.is_normal())
+}
+
 fn oc_label_for_stm(outcome: GameOutcomeView, stm: Color) -> Label {
     match outcome {
         GameOutcomeView::Win(winner) if winner == stm => Label::Win,
@@ -433,8 +459,8 @@ fn color_label(c: Color) -> char {
 }
 
 fn run_eval(args: &EvalArgs) -> Result<()> {
-    if args.scale <= 0.0 {
-        bail!("--scale は正の値を指定してください");
+    if !args.scale.is_finite() || args.scale <= 0.0 {
+        bail!("--scale は正の有限値を指定してください");
     }
 
     let weights = load_progress_coeff_kpabs(&args.progress_file)
@@ -539,7 +565,8 @@ impl EvalMetricBuilder {
     fn push(&mut self, record: &TestsetRecord, eval_cp: i32, scale: f64) {
         self.records += 1;
         if record.dt_label == Some(Label::Win) {
-            self.dt_evals.push(eval_cp);
+            let clamped = eval_cp.clamp(-DT_EVAL_HIST_MAX_CP, DT_EVAL_HIST_MAX_CP);
+            self.dt_hist[(clamped + DT_EVAL_HIST_MAX_CP) as usize] += 1;
         }
         if matches!(record.oc_label, Label::Win | Label::Loss) {
             self.push_oc(
@@ -586,7 +613,7 @@ impl EvalMetricBuilder {
                 calibration: self.calibration_bins(),
             }
         };
-        (self.records, dt_metrics(&self.dt_evals), oc)
+        (self.records, dt_metrics(&self.dt_hist), oc)
     }
 
     /// 等幅ビンの逐次集計から calibration テーブルを構築する（空ビンは省く）。
@@ -608,26 +635,36 @@ impl EvalMetricBuilder {
     }
 }
 
-fn dt_metrics(evals: &[i32]) -> DtMetrics {
-    if evals.is_empty() {
+fn dt_metrics(hist: &[u64]) -> DtMetrics {
+    let n: u64 = hist.iter().sum();
+    if n == 0 {
         return DtMetrics::default();
     }
-    let mut sorted = evals.to_vec();
-    sorted.sort_unstable();
-    let n = sorted.len();
+    // cp > threshold の件数（threshold は DT_EVAL_HIST_MAX_CP 未満が前提）。
+    let count_above = |threshold: i32| -> u64 {
+        hist[(threshold + 1 + DT_EVAL_HIST_MAX_CP) as usize..].iter().sum()
+    };
     DtMetrics {
-        n,
-        sign_acc: Some(rate(evals.iter().filter(|&&v| v > 0).count(), n)),
-        decisive_acc: Some(rate(evals.iter().filter(|&&v| v > DECISIVE_CP).count(), n)),
-        eval_median: Some(percentile_sorted(&sorted, 0.5)),
-        eval_p10: Some(percentile_sorted(&sorted, 0.1)),
+        n: n as usize,
+        sign_acc: Some(count_above(0) as f64 / n as f64),
+        decisive_acc: Some(count_above(DECISIVE_CP) as f64 / n as f64),
+        eval_median: Some(hist_percentile(hist, n, 0.5)),
+        eval_p10: Some(hist_percentile(hist, n, 0.1)),
     }
 }
 
-fn percentile_sorted(sorted: &[i32], q: f64) -> i32 {
-    debug_assert!(!sorted.is_empty());
-    let idx = ((sorted.len() - 1) as f64 * q).floor() as usize;
-    sorted[idx]
+/// ソート列の `floor((n-1)*q)` 番目に相当する値をヒストグラムの累積和で求める。
+fn hist_percentile(hist: &[u64], n: u64, q: f64) -> i32 {
+    debug_assert!(n > 0);
+    let target = ((n - 1) as f64 * q).floor() as u64;
+    let mut cum = 0u64;
+    for (idx, &count) in hist.iter().enumerate() {
+        cum += count;
+        if cum > target {
+            return idx as i32 - DT_EVAL_HIST_MAX_CP;
+        }
+    }
+    unreachable!("target < n のため累積和は必ず target を超える")
 }
 
 fn rate(num: usize, den: usize) -> f64 {
@@ -681,6 +718,23 @@ mod tests {
         concat!("V2.2\n", "P+51OU00FU\n", "P-59OU\n", "+\n", "'* -80\n", "+0044FU\n", "%TORYO\n",);
 
     #[test]
+    fn drop_draw_flag_is_settable() {
+        let base = ["ek_testset", "build", "--input", "in", "--out-dir", "out"];
+        let cli = Cli::try_parse_from(base).expect("parse default");
+        let Command::Build(args) = cli.command else {
+            panic!("build expected")
+        };
+        assert!(args.drop_draw);
+
+        let with_false = base.iter().chain(&["--drop-draw", "false"]);
+        let cli = Cli::try_parse_from(with_false).expect("parse --drop-draw false");
+        let Command::Build(args) = cli.command else {
+            panic!("build expected")
+        };
+        assert!(!args.drop_draw);
+    }
+
+    #[test]
     fn build_labels_declarable_csa() {
         let records = build_records_from_csa(DECLARABLE_CSA);
         assert!(!records.is_empty());
@@ -709,6 +763,55 @@ mod tests {
         assert_eq!(r.dt_label, None);
         assert_eq!(r.oc_label, Label::Win);
         assert_eq!(r.floodgate_eval_cp, Some(-80));
+    }
+
+    // 打歩は 1 段目に打てないため、core の合法手ゲートで `Move::NONE` にフォールバックする。
+    const ILLEGAL_MOVE_CSA: &str =
+        concat!("V2.2\n", "P+51OU00FU\n", "P-59OU\n", "+\n", "+0011FU\n", "%TORYO\n",);
+
+    fn load_first_game(text: &str) -> (Vec<MoveView>, u32) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csa(dir.path(), "game.csa", text);
+        let source = CsaSource::new(dir.path());
+        let index = source.build_index().expect("build_index");
+        let entry = &index.entries[0];
+        let game = source.load_game(&index, entry).expect("load_game");
+        (game.moves, entry.ply_count)
+    }
+
+    #[test]
+    fn replay_is_complete_accepts_trusted_and_rejects_illegal_replay() {
+        let (moves, ply_count) = load_first_game(DECLARABLE_CSA);
+        assert!(replay_is_complete(&moves, ply_count));
+
+        let (moves, ply_count) = load_first_game(ILLEGAL_MOVE_CSA);
+        assert!(!replay_is_complete(&moves, ply_count));
+    }
+
+    #[test]
+    fn dt_metrics_from_histogram_match_sorted_semantics() {
+        let dt = |eval_cp: i32| {
+            let mut r = TestsetRecord {
+                sfen: String::new(),
+                stm: 'b',
+                ply: 1,
+                source_csa: String::new(),
+                is_declarable: true,
+                dt_label: Some(Label::Win),
+                oc_label: Label::Win,
+                floodgate_eval_cp: None,
+            };
+            r.sfen = "4k4/9/9/9/9/9/9/9/4K4 b - 1".to_string();
+            (r, eval_cp)
+        };
+        // -40000 は端 (-32000) に飽和する。ソート列は [-32000, 0, 100, 700]。
+        let records = vec![dt(700), dt(-40_000), dt(0), dt(100)];
+        let (dt, _) = compute_metrics(&records, 100.0);
+        assert_eq!(dt.n, 4);
+        assert_eq!(dt.sign_acc, Some(0.5));
+        assert_eq!(dt.decisive_acc, Some(0.25));
+        assert_eq!(dt.eval_median, Some(0));
+        assert_eq!(dt.eval_p10, Some(-32_000));
     }
 
     #[test]
