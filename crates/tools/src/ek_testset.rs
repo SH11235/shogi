@@ -252,6 +252,7 @@ fn run_build(args: &BuildArgs) -> Result<()> {
     // 対局ごとの index/メタやパス一覧をコーパス全体分保持しないよう、CSA を
     // 決定的な順序の遅延走査で 1 ファイル = 1 対局ずつ読み込んで処理する。
     for path in csa_paths(&args.input)? {
+        let path = path?;
         let source = CsaSource::new(&path);
         let index = source.build_index()?;
         for warning in &index.warnings {
@@ -338,8 +339,9 @@ fn run_build(args: &BuildArgs) -> Result<()> {
 ///
 /// 全パスを収集・保持せず、ディレクトリごとにファイル名ソートした DFS で遅延走査する
 /// （ピークメモリはディレクトリの fan-out に比例し、総ファイル数に非依存）。
-/// `follow_links(false)` で symlink は辿らない（ループ回避）。
-fn csa_paths(input: &Path) -> Result<Box<dyn Iterator<Item = PathBuf>>> {
+/// `follow_links(false)` で symlink は辿らない（ループ回避）。走査エラーは握りつぶさず
+/// `Err` として返す（欠落したサブツリーを「完全な held-out セット」と誤認させないため）。
+fn csa_paths(input: &Path) -> Result<Box<dyn Iterator<Item = Result<PathBuf>>>> {
     let md = fs::metadata(input)
         .with_context(|| format!("入力を確認できません: {}", input.display()))?;
     if md.is_dir() {
@@ -348,15 +350,15 @@ fn csa_paths(input: &Path) -> Result<Box<dyn Iterator<Item = PathBuf>>> {
                 .follow_links(false)
                 .sort_by_file_name()
                 .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_type().is_file()
-                        && e.path().extension().and_then(|x| x.to_str()) == Some("csa")
-                })
-                .map(|e| e.into_path()),
+                .filter_map(|entry| match entry {
+                    Ok(e) => (e.file_type().is_file()
+                        && e.path().extension().and_then(|x| x.to_str()) == Some("csa"))
+                    .then(|| Ok(e.into_path())),
+                    Err(e) => Some(Err(anyhow!(e).context("入力ディレクトリの走査に失敗しました"))),
+                }),
         ))
     } else {
-        Ok(Box::new(std::iter::once(input.to_path_buf())))
+        Ok(Box::new(std::iter::once(Ok(input.to_path_buf()))))
     }
 }
 
