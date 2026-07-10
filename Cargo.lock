@@ -3344,6 +3344,7 @@ dependencies = [
  "rshogi-core",
  "rshogi-csa",
  "rshogi-csa-client",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",

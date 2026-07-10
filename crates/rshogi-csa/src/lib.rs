@@ -522,6 +522,18 @@ pub enum ParsedMove {
     Special(SpecialMove),
 }
 
+/// `parse_csa_full_with_evals` の返り値。
+pub type ParsedCsaWithEvals = (Position, Vec<ParsedMove>, GameInfo, Vec<Option<i32>>);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EvalCommentStyle {
+    /// `'*` は次の通常手、`'**` は直前の通常手に帰属する標準解釈。
+    #[default]
+    Standard,
+    /// 修正前のrshogi-csa-server向け。inline T付き通常手直後の`'*`を前手へ帰属する。
+    LegacyServerPost,
+}
+
 /// CSA棋譜から抽出した対局メタデータ
 #[derive(Clone, Debug, Default)]
 pub struct GameInfo {
@@ -554,13 +566,34 @@ pub fn parse_csa(text: &str) -> Result<(Position, Vec<String>, GameInfo)> {
     Ok((pos, simple_moves, info))
 }
 
-/// CSA棋譜を完全パース。指し手は消費時間・特殊手を含む `ParsedMove` で返す。
+/// CSA棋譜を完全パース。既存APIとの互換性のため評価コメントは返さない。
 pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo)> {
+    let (pos, moves, info, _) = parse_csa_full_with_evals(text)?;
+    Ok((pos, moves, info))
+}
+
+/// CSA棋譜を完全パースし、通常手と同じ順序の先手視点評価値も返す。
+///
+/// csa_client の `'*` は直後の通常手、wdoor の `'**` は直前の通常手に対応する。
+pub fn parse_csa_full_with_evals(text: &str) -> Result<ParsedCsaWithEvals> {
+    parse_csa_full_with_evals_style(text, EvalCommentStyle::Standard)
+}
+
+/// 評価コメント形式を明示してCSA棋譜を完全パースする。
+pub fn parse_csa_full_with_evals_style(
+    text: &str,
+    eval_style: EvalCommentStyle,
+) -> Result<ParsedCsaWithEvals> {
     let mut pos = None;
     let mut moves = Vec::new();
+    let mut evals = Vec::new();
     let mut info = GameInfo::default();
     let mut explicit_board = false;
+    let mut pending_eval_cp_black = None;
+    let mut follows_inline_timed_move = false;
     for line in text.lines() {
+        let comment_follows_inline_timed_move = follows_inline_timed_move;
+        follows_inline_timed_move = false;
         let raw = line.trim_end_matches('\r');
         let s = raw.trim();
         if s.is_empty() || s.starts_with('V') {
@@ -608,6 +641,26 @@ pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo
             }
             continue;
         }
+        // wdoor / shogi-server: 直前の通常手を探索した先手視点評価値。
+        if let Some(rest) = s.strip_prefix("'**") {
+            if let (Some(cp), Some(last)) = (parse_leading_eval_cp(rest), evals.last_mut()) {
+                *last = Some(cp);
+            }
+            continue;
+        }
+        // rshogi csa_client: 直後の通常手を探索した先手視点評価値。
+        if let Some(rest) = s.strip_prefix("'*") {
+            let cp = parse_leading_eval_cp(rest);
+            if eval_style == EvalCommentStyle::LegacyServerPost && comment_follows_inline_timed_move
+            {
+                if let Some(last) = evals.last_mut() {
+                    *last = cp;
+                }
+            } else {
+                pending_eval_cp_black = cp;
+            }
+            continue;
+        }
         // Skip other comments and headers
         if s.starts_with('\'') || s.starts_with('$') {
             continue;
@@ -649,20 +702,32 @@ pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo
             parse_hand_setup(pos_ref, color, &s[2..])?;
             continue;
         }
-        if s.starts_with('+') || s.starts_with('-') {
-            if s.len() >= 7 {
-                let mv = s[..7].to_string();
-                // インライン消費時間: +7776FU,T30
-                let time_sec = s
-                    .get(7..)
-                    .and_then(|rest| rest.strip_prefix(",T").and_then(|t| t.parse::<u32>().ok()));
-                moves.push(ParsedMove::Normal(CsaMove { mv, time_sec }));
-            }
+        if is_csa_move_line(s) {
+            let mv = s[..7].to_string();
+            // インライン消費時間: +7776FU,T30
+            let time_sec = s
+                .get(7..)
+                .and_then(|rest| rest.strip_prefix(",T").and_then(|t| t.parse::<u32>().ok()));
+            moves.push(ParsedMove::Normal(CsaMove { mv, time_sec }));
+            evals.push(pending_eval_cp_black.take());
+            follows_inline_timed_move = time_sec.is_some();
             continue;
         }
     }
     let pos = pos.unwrap_or_else(initial_position);
-    Ok((pos, moves, info))
+    Ok((pos, moves, info, evals))
+}
+
+fn parse_leading_eval_cp(rest: &str) -> Option<i32> {
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+fn is_csa_move_line(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 7
+        && matches!(bytes[0], b'+' | b'-')
+        && bytes[1..5].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_uppercase)
 }
 
 fn parse_special_move(s: &str) -> Option<SpecialMove> {
@@ -1038,7 +1103,7 @@ P-00KA
     #[test]
     fn test_parse_time_inline() {
         let text = "PI\n+7776FU,T5\n-3334FU,T10\n%TORYO\n";
-        let (_, moves, _) = parse_csa_full(text).unwrap();
+        let (_, moves, _, _evals) = parse_csa_full_with_evals(text).unwrap();
         assert_eq!(moves.len(), 3);
         match &moves[0] {
             ParsedMove::Normal(cm) => {
@@ -1060,7 +1125,7 @@ P-00KA
     #[test]
     fn test_parse_time_standalone_t_line() {
         let text = "PI\n+7776FU\nT5\n-3334FU\nT10\n";
-        let (_, moves, _) = parse_csa_full(text).unwrap();
+        let (_, moves, _, _evals) = parse_csa_full_with_evals(text).unwrap();
         assert_eq!(moves.len(), 2);
         match &moves[0] {
             ParsedMove::Normal(cm) => {
@@ -1074,6 +1139,66 @@ P-00KA
             }
             _ => panic!("expected normal move"),
         }
+    }
+
+    #[test]
+    fn test_parse_eval_comments_for_both_record_styles() {
+        let text = concat!(
+            "V2.2\r\nPI\r\n",
+            "'* 45 -3334FU\r\n",
+            "+7776FU\r\nT5\r\n",
+            "-3334FU,T10\r\n",
+            "'** -30 +2726FU\r\n",
+            "%TORYO\r\n",
+        );
+        let (_, moves, _, evals) = parse_csa_full_with_evals(text).unwrap();
+        let normal: Vec<_> = moves
+            .iter()
+            .filter_map(|m| match m {
+                ParsedMove::Normal(cm) => Some(cm),
+                ParsedMove::Special(_) => None,
+            })
+            .collect();
+        assert_eq!(normal.len(), 2);
+        assert_eq!(evals[0], Some(45));
+        assert_eq!(normal[0].time_sec, Some(5));
+        assert_eq!(evals[1], Some(-30));
+        assert_eq!(normal[1].time_sec, Some(10));
+    }
+
+    #[test]
+    fn test_last_eval_comment_wins_and_invalid_pending_is_cleared() {
+        let text = "PI\n'* 5\n'* invalid\n+7776FU\n'* 10\n-3334FU\n'** invalid\n'** 20 pv\n";
+        let (_, _moves, _, evals) = parse_csa_full_with_evals(text).unwrap();
+        assert_eq!(evals[0], None);
+        assert_eq!(evals[1], Some(20));
+    }
+
+    #[test]
+    fn test_legacy_server_single_star_after_inline_timed_move_belongs_to_previous_move() {
+        let text = "PI\n+7776FU,T1\n'* 100\n-3334FU,T1\n";
+        let (_, _, _, evals) =
+            parse_csa_full_with_evals_style(text, EvalCommentStyle::LegacyServerPost).unwrap();
+        assert_eq!(evals, vec![Some(100), None]);
+    }
+
+    #[test]
+    fn test_standard_single_star_after_inline_move_remains_pre_move() {
+        let text = "$GAME_ID:external\nPI\n+7776FU,T1\n'* 100\n-3334FU,T1\n";
+        let (_, _, _, evals) = parse_csa_full_with_evals(text).unwrap();
+        assert_eq!(evals, vec![None, Some(100)]);
+    }
+
+    #[test]
+    fn test_malformed_signed_line_is_not_a_normal_move() {
+        let text = "PI\n'* 10\n+abcdef\n+7776FU\n";
+        let (_, moves, _, evals) = parse_csa_full_with_evals(text).unwrap();
+        assert_eq!(moves.len(), 1);
+        let ParsedMove::Normal(cm) = &moves[0] else {
+            panic!("expected normal move");
+        };
+        assert_eq!(cm.mv, "+7776FU");
+        assert_eq!(evals, vec![Some(10)]);
     }
 
     #[test]

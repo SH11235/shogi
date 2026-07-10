@@ -678,7 +678,7 @@ where
     }
 
     let comment = if s.config.server.floodgate && info.has_score() {
-        Some(build_floodgate_comment(info, s.my_color, &s.pos, &result.bestmove))
+        build_floodgate_comment(info, s.my_color, &s.pos, &result.bestmove)
     } else {
         None
     };
@@ -1688,11 +1688,11 @@ fn build_floodgate_comment(
     my_color: Color,
     pos: &Position,
     last_bestmove: &str,
-) -> String {
+) -> Option<String> {
     let score = if let Some(cp) = info.score_cp {
         match my_color {
             Color::Black => cp,
-            Color::White => -cp,
+            Color::White => cp.checked_neg()?,
         }
     } else if let Some(mate) = info.score_mate {
         let base = if mate > 0 { 100000 } else { -100000 };
@@ -1701,13 +1701,13 @@ fn build_floodgate_comment(
             Color::White => -base,
         }
     } else {
-        0
+        return None;
     };
     let mut comment = format!("* {score}");
     if !info.pv.is_empty() {
         let mut pv_pos = pos.clone();
         if info.pv.first().map(|s| s.as_str()) != Some(last_bestmove) {
-            return comment;
+            return Some(comment);
         }
         for usi_mv in &info.pv {
             if let Ok(csa) = usi_move_to_csa(usi_mv, &pv_pos) {
@@ -1720,7 +1720,7 @@ fn build_floodgate_comment(
             }
         }
     }
-    comment
+    Some(comment)
 }
 
 // ────────────────────────────────────────────
@@ -1875,7 +1875,7 @@ mod tests {
 
         let comment = build_floodgate_comment(&info, Color::Black, &pos, "7g7f");
 
-        assert_eq!(comment, "* 123 +7776FU -3334FU +2726FU -8384FU");
+        assert_eq!(comment.as_deref(), Some("* 123 +7776FU -3334FU +2726FU -8384FU"));
     }
 
     #[test]
@@ -1885,7 +1885,7 @@ mod tests {
 
         let comment = build_floodgate_comment(&info, Color::Black, &pos, "7g7f");
 
-        assert_eq!(comment, "* 123");
+        assert_eq!(comment.as_deref(), Some("* 123"));
     }
 
     #[test]
@@ -1895,7 +1895,17 @@ mod tests {
 
         let comment = build_floodgate_comment(&info, Color::Black, &pos, "7g7f");
 
-        assert_eq!(comment, "* 123 +7776FU -3334FU");
+        assert_eq!(comment.as_deref(), Some("* 123 +7776FU -3334FU"));
+    }
+
+    #[test]
+    fn floodgate_comment_omits_unrepresentable_white_min_score() {
+        let pos = rshogi_csa::initial_position();
+        let info = SearchInfo {
+            score_cp: Some(i32::MIN),
+            ..SearchInfo::default()
+        };
+        assert_eq!(build_floodgate_comment(&info, Color::White, &pos, "7g7f"), None);
     }
 
     #[test]

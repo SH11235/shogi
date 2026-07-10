@@ -19,7 +19,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use rshogi_core::position::Position;
 use rshogi_core::types::{Color, Move};
 use rshogi_csa::{
-    Color as CsaColor, ParsedMove, SpecialMove, csa_move_to_usi, parse_csa_full, usi_move_to_csa,
+    Color as CsaColor, EvalCommentStyle, ParsedMove, SpecialMove, csa_move_to_usi,
+    parse_csa_full_with_evals_style, usi_move_to_csa,
 };
 use walkdir::WalkDir;
 
@@ -38,6 +39,7 @@ use super::model::{
 pub struct CsaSource {
     /// ディレクトリ（配下の `*.csa` を横断）または単一 `.csa` ファイル。
     input: PathBuf,
+    eval_comment_style: EvalCommentStyle,
 }
 
 impl CsaSource {
@@ -45,7 +47,17 @@ impl CsaSource {
     pub fn new(input: impl Into<PathBuf>) -> Self {
         Self {
             input: input.into(),
+            eval_comment_style: EvalCommentStyle::Standard,
         }
+    }
+
+    pub fn with_legacy_server_eval_comments(mut self, enabled: bool) -> Self {
+        self.eval_comment_style = if enabled {
+            EvalCommentStyle::LegacyServerPost
+        } else {
+            EvalCommentStyle::Standard
+        };
+        self
     }
 
     /// 入力がディレクトリなら配下の `*.csa` を（サブディレクトリも再帰して）パス順で、
@@ -93,16 +105,17 @@ impl GameSource for CsaSource {
                     continue;
                 }
             };
-            let (init, parsed, info) = match parse_csa_full(&text) {
-                Ok(v) => v,
-                Err(e) => {
-                    warnings.push(format!(
-                        "{}: CSA として解釈できないため読み飛ばしました（{e}）",
-                        path.display()
-                    ));
-                    continue;
-                }
-            };
+            let (init, parsed, info, evals) =
+                match parse_csa_full_with_evals_style(&text, self.eval_comment_style) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warnings.push(format!(
+                            "{}: CSA として解釈できないため読み飛ばしました（{e}）",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                };
 
             let normal_count =
                 parsed.iter().filter(|m| matches!(m, ParsedMove::Normal(_))).count() as u32;
@@ -110,7 +123,7 @@ impl GameSource for CsaSource {
 
             // 評価値コメントは元々先手視点なので、そのまま指標へ流す。
             let mut acc = EvalAccumulator::default();
-            for cp in parse_eval_comments(&text).into_iter().flatten() {
+            for cp in evals.into_iter().flatten() {
                 acc.push(cp);
             }
 
@@ -156,18 +169,16 @@ impl GameSource for CsaSource {
             .ok_or_else(|| anyhow!("file_idx {file_idx} not found in index"))?;
         let text = fs::read_to_string(&meta.path)
             .with_context(|| format!("failed to read {}", meta.path.display()))?;
-        let (mut pos, parsed, _info) = parse_csa_full(&text)
-            .with_context(|| format!("failed to parse {}", meta.path.display()))?;
-        // 先手視点で書かれたコメントを手番相対へ戻す前段として、通常手ごとの
-        // 先手視点スコアを読み出しておく（PV は無視、無い手は None）。
-        let scores = parse_eval_comments(&text);
-
+        let (mut pos, parsed, _info, evals) =
+            parse_csa_full_with_evals_style(&text, self.eval_comment_style)
+                .with_context(|| format!("failed to parse {}", meta.path.display()))?;
+        let mut evals = evals.into_iter();
         let mut moves = Vec::new();
-        let mut normal_idx = 0usize;
         for pm in &parsed {
             let ParsedMove::Normal(cm) = pm else {
                 continue; // 終局特殊手は再生対象の指し手列には含めない。
             };
+            let eval_cp_black = evals.next().flatten();
             let sfen_before = pos.to_sfen();
 
             // ラベル・手番・絶対手数は rshogi_core 側の局面から取る（JSONL/PSV と同一の
@@ -212,14 +223,8 @@ impl GameSource for CsaSource {
                 None => (Move::NONE, format!("{:>4} {}", abs_ply, cm.mv)),
             };
 
-            let score_cp = scores.get(normal_idx).copied().flatten().map(|black_pov| {
-                // 先手視点 → 手番相対（後手手番は符号反転）。グラフ側の `black_pov_cp` が
-                // 再度 手番相対 → 先手視点 に戻すので、全ソースで格納形式を揃える。
-                match side {
-                    Color::Black => black_pov,
-                    Color::White => -black_pov,
-                }
-            });
+            let score_cp =
+                eval_cp_black.and_then(|black_pov| black_pov_to_side_relative(black_pov, side));
 
             moves.push(MoveView {
                 ply: abs_ply,
@@ -241,13 +246,21 @@ impl GameSource for CsaSource {
             if legal_mv.is_none() || !applied {
                 break;
             }
-            normal_idx += 1;
         }
 
         Ok(GameRecord {
             moves,
             leading_gap_is_drop: false,
         })
+    }
+}
+
+fn black_pov_to_side_relative(black_pov: i32, side: Color) -> Option<i32> {
+    // 先手視点 → 手番相対（後手手番は符号反転）。グラフ側の `black_pov_cp` が
+    // 再度 手番相対 → 先手視点 に戻すので、全ソースで格納形式を揃える。
+    match side {
+        Color::Black => Some(black_pov),
+        Color::White => black_pov.checked_neg(),
     }
 }
 
@@ -296,41 +309,6 @@ fn derive_outcome(
         // 中断は結果なし。
         SpecialMove::Interrupt => None,
     }
-}
-
-/// 評価値コメントを走査し、通常手（`[+-]NNNN..` 行）の出現順に対応する先手視点スコアを
-/// 返す。記録の系統でコメントの帰属が異なる（module doc 参照）:
-/// - `'*`（csa_client 自前記録）は**直後**の手のスコア
-/// - `'**`（wdoor / shogi-server 記録）は**直前**の手のスコア
-///
-/// 消費時間はここでは扱わない（独立 `T` 行・インライン `,T` とも `parse_csa_full` が
-/// `CsaMove::time_sec` へ格納済みで、`%TORYO` 等の終局手に付く `T` も型で除外される）。
-/// PV は使わない。コメントの無い手は `None`。
-fn parse_eval_comments(text: &str) -> Vec<Option<i32>> {
-    fn leading_score(rest: &str) -> Option<i32> {
-        rest.split_whitespace().next().and_then(|t| t.parse::<i32>().ok())
-    }
-    let mut scores: Vec<Option<i32>> = Vec::new();
-    let mut pending: Option<i32> = None;
-    for raw in text.lines() {
-        let s = raw.trim();
-        if let Some(rest) = s.strip_prefix("'**") {
-            if let (Some(last), Some(cp)) = (scores.last_mut(), leading_score(rest)) {
-                *last = Some(cp);
-            }
-        } else if let Some(rest) = s.strip_prefix("'*") {
-            pending = leading_score(rest);
-        } else if is_csa_move_line(s) {
-            scores.push(pending.take());
-        }
-    }
-    scores
-}
-
-/// `+7776FU` / `-0055FU` 形式の指し手行か（`%`/`T`/`P`/`N`/`'` などのメタ行を除外する）。
-fn is_csa_move_line(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() >= 7 && (b[0] == b'+' || b[0] == b'-') && b[1..5].iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(test)]
@@ -441,6 +419,24 @@ mod tests {
         let game = source.load_game(&index, &index.entries[0]).expect("load_game");
         assert_eq!(game.moves[0].annotation.elapsed_ms, Some(3_000));
         assert_eq!(game.moves[1].annotation.elapsed_ms, Some(4_000));
+    }
+
+    #[test]
+    fn legacy_server_eval_style_is_available_to_consumer() {
+        let text = "V2.2\n$GAME_ID:legacy\nPI\n+7776FU,T1\n'* 100\n-3334FU,T1\n%TORYO\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csa(dir.path(), "a.csa", text);
+        let source = CsaSource::new(dir.path()).with_legacy_server_eval_comments(true);
+        let index = source.build_index().expect("build_index");
+        let game = source.load_game(&index, &index.entries[0]).expect("load_game");
+        assert_eq!(game.moves[0].annotation.score_cp, Some(100));
+        assert_eq!(game.moves[1].annotation.score_cp, None);
+    }
+
+    #[test]
+    fn minimum_i32_white_eval_does_not_overflow() {
+        assert_eq!(black_pov_to_side_relative(i32::MIN, Color::White), None);
+        assert_eq!(black_pov_to_side_relative(i32::MIN, Color::Black), Some(i32::MIN));
     }
 
     #[test]

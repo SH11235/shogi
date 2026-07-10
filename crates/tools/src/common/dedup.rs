@@ -15,15 +15,24 @@ use sysinfo::Disks;
 pub const PSV_SIZE: usize = 40;
 /// PackedSfen 部分のサイズ（バイト）
 pub const SFEN_SIZE: usize = 32;
+pub const FNV1A64_OFFSET: u64 = 0xcbf29ce484222325;
+
+pub fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// バイト列の決定的なFNV-1a 64bitハッシュ。
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    fnv1a64_update(FNV1A64_OFFSET, bytes)
+}
 
 /// PackedSfen（32バイト）の FNV-1a 64bit ハッシュ
 pub fn hash_packed_sfen(sfen: &[u8; SFEN_SIZE]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in sfen.iter() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+    fnv1a64(sfen)
 }
 
 /// PSV レコードから game_ply を取得（offset 36, u16 LE）

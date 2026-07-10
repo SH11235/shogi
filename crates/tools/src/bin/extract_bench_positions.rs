@@ -15,6 +15,7 @@ use rshogi_core::position::Position;
 use rshogi_core::types::{
     Color, EnteringKingRule, File as ShogiFile, Move, PieceType, Rank, Square,
 };
+use rshogi_csa::{EvalCommentStyle, ParsedMove, parse_csa_full_with_evals_style};
 use serde::{Deserialize, Serialize};
 use tools::common::dedup::collect_input_paths;
 
@@ -37,6 +38,10 @@ struct Cli {
     #[arg(long)]
     out_dir: PathBuf,
 
+    /// 修正前のrshogi-csa-serverが手後へ書いた`'*`評価コメントとして解釈する。
+    #[arg(long)]
+    legacy_server_eval_comments: bool,
+
     /// floodgate の両対局者に要求する最小レート。不明レートは除外。
     #[arg(long, default_value_t = 3000)]
     min_rating: u32,
@@ -51,7 +56,7 @@ struct Cli {
 
     /// startpos 出力に許す絶対評価値上限。
     #[arg(long, default_value_t = 150)]
-    startpos_eval_abs_max: i32,
+    startpos_eval_abs_max: u32,
 
     /// startpos 出力の中心 ply。
     #[arg(long, default_value_t = 100)]
@@ -368,7 +373,7 @@ fn is_csa_path(path: &Path) -> bool {
 }
 
 fn process_csa_file(path: &Path, cli: &Cli, stats: &mut Stats) -> Result<Option<ExtractedGame>> {
-    let game = parse_csa(path)?;
+    let game = parse_csa(path, cli.legacy_server_eval_comments)?;
     if game.non_hirate {
         add_count(&mut stats.skipped_by_reason, "non_hirate");
         return Ok(None);
@@ -443,18 +448,33 @@ fn process_csa_file(path: &Path, cli: &Cli, stats: &mut Stats) -> Result<Option<
     }))
 }
 
-fn parse_csa(path: &Path) -> Result<CsaGame> {
-    let file = File::open(path).with_context(|| format!("CSA を開けません: {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut moves: Vec<CsaMoveLine> = Vec::new();
-    let mut pending_eval: Option<i32> = None;
+fn parse_csa(path: &Path, legacy_server_eval_comments: bool) -> Result<CsaGame> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("CSA を開けません: {}", path.display()))?;
+    let style = if legacy_server_eval_comments {
+        EvalCommentStyle::LegacyServerPost
+    } else {
+        EvalCommentStyle::Standard
+    };
+    let (_, parsed, _, evals) = parse_csa_full_with_evals_style(&text, style)
+        .with_context(|| format!("CSA を解析できません: {}", path.display()))?;
+    let mut evals = evals.into_iter();
+    let moves: Vec<CsaMoveLine> = parsed
+        .iter()
+        .filter_map(|pm| match pm {
+            ParsedMove::Normal(cm) => Some(CsaMoveLine {
+                raw: cm.mv.clone(),
+                eval_raw: evals.next().flatten(),
+            }),
+            ParsedMove::Special(_) => None,
+        })
+        .collect();
     let mut black_rate = None;
     let mut white_rate = None;
     let mut end_kind = "unknown".to_string();
     let mut non_hirate = false;
 
-    for line in reader.lines() {
-        let line = line?;
+    for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -463,17 +483,6 @@ fn parse_csa(path: &Path) -> Result<CsaGame> {
             black_rate = parse_rate_comment(trimmed);
         } else if trimmed.starts_with("'white_rate:") {
             white_rate = parse_rate_comment(trimmed);
-        } else if let Some(cp) = parse_eval_comment(trimmed) {
-            if let Some(last) = moves.last_mut() {
-                last.eval_raw = Some(cp);
-            } else {
-                pending_eval = Some(cp);
-            }
-        } else if is_csa_move(trimmed) {
-            moves.push(CsaMoveLine {
-                raw: trimmed[..7].to_string(),
-                eval_raw: pending_eval.take(),
-            });
         } else if trimmed.starts_with('%') {
             end_kind = trimmed.split(',').next().unwrap_or(trimmed).to_string();
         } else if trimmed.starts_with("P+") || trimmed.starts_with("P-") {
@@ -832,11 +841,6 @@ fn parse_rate_comment(line: &str) -> Option<u32> {
         .or_else(|| value.parse::<f64>().ok().map(|v| v as u32))
 }
 
-fn parse_eval_comment(line: &str) -> Option<i32> {
-    let rest = line.strip_prefix("'** ")?;
-    rest.split_whitespace().next()?.parse().ok()
-}
-
 fn is_csa_move(line: &str) -> bool {
     let bytes = line.as_bytes();
     bytes.len() >= 7
@@ -853,11 +857,11 @@ fn csa_side(raw: &str) -> Result<Color> {
     }
 }
 
-fn mover_view_to_black(eval_raw: i32, side: Color) -> i32 {
+fn mover_view_to_black(eval_raw: i32, side: Color) -> i64 {
     if side == Color::Black {
-        eval_raw
+        i64::from(eval_raw)
     } else {
-        -eval_raw
+        -i64::from(eval_raw)
     }
 }
 
@@ -949,7 +953,7 @@ fn eval_band(eval: Option<i32>) -> &'static str {
     let Some(eval) = eval else {
         return "unknown";
     };
-    match eval.abs() {
+    match eval.unsigned_abs() {
         0..=150 => "0-150",
         151..=600 => "151-600",
         601..=1500 => "601-1500",
@@ -972,7 +976,7 @@ fn maybe_set_startpos(record: &BenchRecord, cli: &Cli, slot: &mut Option<BenchRe
     };
     if slot.is_none()
         && (lower..=upper).contains(&record.ply)
-        && eval.abs() <= cli.startpos_eval_abs_max
+        && eval.unsigned_abs() <= cli.startpos_eval_abs_max
     {
         *slot = Some(record.clone());
     }
@@ -1065,6 +1069,7 @@ mod tests {
     fn mover_view_conversion_flips_white() {
         assert_eq!(mover_view_to_black(120, Color::Black), 120);
         assert_eq!(mover_view_to_black(120, Color::White), -120);
+        assert_eq!(mover_view_to_black(i32::MIN, Color::White), 2_147_483_648);
     }
 
     #[test]
@@ -1124,7 +1129,7 @@ mod tests {
             ),
         )
         .expect("write csa");
-        let game = parse_csa(&path).expect("parse csa");
+        let game = parse_csa(&path, false).expect("parse csa");
         assert_eq!(game.moves.len(), 2);
         assert_eq!(game.black_rate, Some(3200));
         assert_eq!(game.white_rate, Some(3100));
@@ -1149,7 +1154,7 @@ mod tests {
             ),
         )
         .expect("write csa");
-        let game = parse_csa(&path).expect("parse csa");
+        let game = parse_csa(&path, false).expect("parse csa");
         assert!(game.non_hirate);
     }
 
@@ -1174,6 +1179,7 @@ mod tests {
         assert_eq!(eval_band(Some(1501)), "1501+");
         assert_eq!(eval_band(Some(29_999)), "1501+");
         assert_eq!(eval_band(Some(-30_000)), "mate");
+        assert_eq!(eval_band(Some(i32::MIN)), "mate");
     }
 
     #[test]

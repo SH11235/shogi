@@ -32,6 +32,10 @@ struct Cli {
     #[arg(long)]
     csa: Option<PathBuf>,
 
+    /// 修正前のrshogi-csa-serverが手後へ書いた`'*`評価コメントとして解釈する。
+    #[arg(long, requires = "csa")]
+    legacy_server_eval_comments: bool,
+
     /// SECS 秒ごとに入力を再スキャンし、新しい対局を一覧へ自動追加する（値省略時 5 秒）。
     /// csa_client の記録 dir を連続対局中に開いておく用途。--psv では使えない。
     #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "5")]
@@ -51,7 +55,9 @@ fn main() -> Result<()> {
     } else if let Some(dir) = cli.tournament_dir {
         Box::new(JsonlSource::new(dir))
     } else if let Some(path) = cli.csa {
-        Box::new(CsaSource::new(path))
+        Box::new(
+            CsaSource::new(path).with_legacy_server_eval_comments(cli.legacy_server_eval_comments),
+        )
     } else {
         bail!("--psv / --tournament-dir / --csa のいずれか一つを指定してください");
     };

@@ -81,9 +81,9 @@ impl RecordedMove {
         } else {
             self.eval_mate.map(|m| if m > 0 { 100000 } else { -100000 })
         };
-        raw.map(|v| match self.side_to_move {
-            Color::Black => v,
-            Color::White => -v,
+        raw.and_then(|v| match self.side_to_move {
+            Color::Black => Some(v),
+            Color::White => v.checked_neg(),
         })
     }
 }
@@ -286,4 +286,23 @@ fn sanitize_filename(name: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_score_omits_unrepresentable_white_min_value() {
+        let mv = RecordedMove {
+            csa_move: "-3334FU".to_owned(),
+            time_sec: 1,
+            eval_cp: Some(i32::MIN),
+            eval_mate: None,
+            depth: None,
+            pv: Vec::new(),
+            side_to_move: Color::White,
+        };
+        assert_eq!(mv.effective_score(), None);
+    }
 }

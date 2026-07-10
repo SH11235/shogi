@@ -76,7 +76,12 @@ cargo run -p tools --bin extract_bench_positions -- \
 
 ## CSA 評価値
 
-CSA の評価コメントは指し手直後の `'** <cp> ...` を読みます。floodgate の評価値は**手番によらず常に先手視点**であり、そのまま `eval_cp_black` に使います。
+CSA の評価コメントは、csa_client形式の指し手直前 `'* <cp> ...` と、wdoor形式の
+指し手直後 `'** <cp> ...` の両方を読みます。floodgate の評価値は**手番によらず常に
+先手視点**であり、そのまま `eval_cp_black` に使います。
+
+修正前のrshogi-csa-server棋譜では`--legacy-server-eval-comments`を指定します。1回の入力へ
+Standard形式と旧server形式を混在させず、形式ごとに別runへ分けます。
 
 評価値は「指し手側がその局面を探索して報告した探索値」なので、**指し手前の局面**に対応付けます (PSV の `score` フィールドと同じ規約: 局面 + その局面の探索値 + そこで指された手)。
 
