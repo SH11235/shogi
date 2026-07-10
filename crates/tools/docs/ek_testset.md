@@ -2,6 +2,14 @@
 
 `ek_testset` は、held-out CSA 棋譜から入玉局面の静的評価テストセットを作り、native NNUE 評価で採点するツールです。
 
+局面には 2 種類のラベルを付け、それぞれ別の指標系で採点します:
+
+- **DT (Declaration Truth / 宣言真値)**: `Position::declaration_win` が「手番側の宣言勝ち成立」と
+  判定した局面に付く「手番側勝ち」ラベル。ルールベースの判定なので ground truth として扱える。
+  評価関数が勝ち確定局面を正しくプラスに読めるかを測る。
+- **OC (Outcome Calibration / 勝敗較正)**: 実対局の最終結果を手番側視点の win/loss にしたラベル。
+  評価値から作る予測勝率 `sigmoid(eval/scale)` が実勝率とどれだけ整合するか（較正）を測る。
+
 ## build
 
 ```bash
