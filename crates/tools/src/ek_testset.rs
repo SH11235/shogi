@@ -19,6 +19,7 @@ use rshogi_core::nnue::{
 use rshogi_core::position::Position;
 use rshogi_core::types::{Color, EnteringKingRule, Move, Rank};
 use serde::{Deserialize, Serialize};
+use walkdir::WalkDir;
 
 use crate::replay::csa_source::CsaSource;
 use crate::replay::model::{GameIndex, GameIndexEntry, GameOutcomeView, GameSource, MoveView};
@@ -235,10 +236,6 @@ fn run_build(args: &BuildArgs) -> Result<()> {
     fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("出力ディレクトリを作成できません: {}", args.out_dir.display()))?;
 
-    // 対局ごとの index/メタをコーパス全体分保持しないよう、CSA を 1 ファイル = 1 対局ずつ
-    // 読み込んで処理する（パス一覧は file_idx を安定させるためソート収集が必要で保持する）。
-    let paths = CsaSource::new(&args.input).collect_paths()?;
-
     let testset_path = args.out_dir.join("testset.jsonl");
     let sfens_path = args.out_dir.join("sfens.txt");
     let meta_path = args.out_dir.join("meta.json");
@@ -252,8 +249,10 @@ fn run_build(args: &BuildArgs) -> Result<()> {
     let mut games_used = 0usize;
     let mut games_skipped_broken = 0usize;
 
-    for path in &paths {
-        let source = CsaSource::new(path);
+    // 対局ごとの index/メタやパス一覧をコーパス全体分保持しないよう、CSA を
+    // 決定的な順序の遅延走査で 1 ファイル = 1 対局ずつ読み込んで処理する。
+    for path in csa_paths(&args.input)? {
+        let source = CsaSource::new(&path);
         let index = source.build_index()?;
         for warning in &index.warnings {
             eprintln!("warning: {warning}");
@@ -333,6 +332,32 @@ fn run_build(args: &BuildArgs) -> Result<()> {
         testset_path.display()
     );
     Ok(())
+}
+
+/// 入力がディレクトリなら配下の `*.csa` を、単一ファイルならそれ 1 つを列挙する。
+///
+/// 全パスを収集・保持せず、ディレクトリごとにファイル名ソートした DFS で遅延走査する
+/// （ピークメモリはディレクトリの fan-out に比例し、総ファイル数に非依存）。
+/// `follow_links(false)` で symlink は辿らない（ループ回避）。
+fn csa_paths(input: &Path) -> Result<Box<dyn Iterator<Item = PathBuf>>> {
+    let md = fs::metadata(input)
+        .with_context(|| format!("入力を確認できません: {}", input.display()))?;
+    if md.is_dir() {
+        Ok(Box::new(
+            WalkDir::new(input)
+                .follow_links(false)
+                .sort_by_file_name()
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_type().is_file()
+                        && e.path().extension().and_then(|x| x.to_str()) == Some("csa")
+                })
+                .map(|e| e.into_path()),
+        ))
+    } else {
+        Ok(Box::new(std::iter::once(input.to_path_buf())))
+    }
 }
 
 fn build_records_for_game(

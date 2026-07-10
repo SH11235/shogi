@@ -52,7 +52,7 @@ impl CsaSource {
     /// 単一ファイルならそれ 1 つを返す。floodgate は `YYYY/MM/DD/*.csa` のように日付
     /// ディレクトリへネストするため再帰する。実行のたびに `file_idx` を安定させるよう
     /// 全体を収集してからソートする。`follow_links(false)` で symlink は辿らない（ループ回避）。
-    pub(crate) fn collect_paths(&self) -> Result<Vec<PathBuf>> {
+    fn collect_paths(&self) -> Result<Vec<PathBuf>> {
         let md = fs::metadata(&self.input)
             .with_context(|| format!("failed to stat {}", self.input.display()))?;
         if md.is_dir() {
