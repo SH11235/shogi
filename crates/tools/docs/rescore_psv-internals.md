@@ -26,7 +26,8 @@ VRAM（エンジン/コンテキスト）はセッション数に応じて増え
 なら結果は同一、書き出しは writer がバッチ通番で再整列するため、出力はセッション数・
 スレッド数に依存せず逐次実装と bit 一致する。cold cache 初回実行では 2 本目以降の
 セッションが 1 本目の初回バッチ完了（= エンジン確定・キャッシュ書き込み）を待って
-から開始するため、全セッションが同一エンジンを使う。
+から開始するため、全セッションが同一エンジンを使う（実測: cold 初回でもエンジン
+ビルドは 1 回のみ）。
 
 TensorRT の cold cache **初回実行そのもの**は、実行途中のエンジン/プロファイル確定
 （端数バッチ等の新 shape）により、キャッシュ済みエンジンでの再実行と最下位ビットが
@@ -41,6 +42,8 @@ bit 再現の基準にはキャッシュ済み（warm）エンジンでの実行
 pageable→pinned ステージング（CPU 介在）を伴い実質同期化するが、pinned 化でこれが
 消えて真の async 転送になる。確保できない環境（CPU 推論 / 確保失敗）では pageable に
 自動フォールバックする。pinned 化はメモリ場所のみの差で、出力は bit 一致する。
+pinned 化により転送は推論と overlap され支配項ではなくなるため、入力 FP16 化による
+転送量半減の効果も小さい。
 
 ### TensorRT FP32 を使わない理由
 
@@ -93,7 +96,8 @@ fingerprint に含まれる項目:
 - replacement 有効時: `--qsearch-leaf-replacement-output` の canonicalize 済みパス
   とその出力サイズ
 
-後方互換: 旧 marker のキー欠落は `false` 扱い。`--qsearch-leaf-label=true` だが
+後方互換: 旧 marker の `--qsearch-leaf-label` / `replacement` キー欠落は `false`
+扱い。`--qsearch-leaf-label=true` だが
 葉探索 NNUE キーを持たない旧 marker は NNUE メタを `None` として読み、現設定と
 fingerprint 不一致になって再生成される。
 
@@ -146,6 +150,10 @@ score + root の `game_result`。両 arm は同一ループで 1:1 lockstep に�
 [rescore] overall done 10.0M/10.0M (4 files) 8.3k pos/s took 00:20:05
 ```
 
-全体進捗の分母は起動時に `metadata().len() / 40` の合算で算出（全件 load しない）。
-`--limit` は各ファイルに適用され、`.done` skip / レジューム分も全体進捗に反映される。
-速度確定前（ウォームアップ中）の ETA は `--/-- --:--` 表示。
+TTY のバーは日本語表記、非 TTY のログ行は grep しやすい英語表記
+（`elapsed` / `remaining` / `ETA`）。全体進捗の分母は起動時に
+`metadata().len() / 40` の合算で算出（全件 load しない）。`--limit` は各ファイルに
+適用され、`.done` skip / レジューム分も全体進捗に反映される。速度確定前
+（ウォームアップ中）の ETA は `--/-- --:--` 表示。破損 / パース不能レコード・
+途中切れ・空ファイルがあると進捗が 100% に届かないことがあるが表示上の挙動で、
+rescore 出力（有効レコードのみ）には影響しない。

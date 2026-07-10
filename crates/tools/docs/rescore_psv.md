@@ -1,8 +1,8 @@
 # rescore_psv — PSV 評価値の再スコアリング + ポリシー展開
 
 PSV（PackedSfenValue）ファイルの評価値（score）を付け替えるツール。全モードが
-チャンクストリーミングで動作し、**ピークメモリは入力件数に依存しない**ため、
-数十億局面のファイルもそのまま処理できる。
+ストリーミングで動作し、**ピークメモリは入力件数に依存しない**ため、数十億局面の
+ファイルもそのまま処理できる。
 
 | モード | 評価器 | 用途 |
 |---|---|---|
@@ -77,7 +77,7 @@ target/release/rescore_psv \
 
 ## セットアップ（初回のみ）
 
-前提: NVIDIA GPU + CUDA Toolkit 12.x、ONNX Runtime 1.24.2 GPU 版、cuDNN 9、
+前提: NVIDIA GPU + CUDA Toolkit（12.x 以上）、ONNX Runtime 1.24.2 GPU 版、cuDNN 9、
 TensorRT 10（`--onnx-tensorrt` 使用時のみ）。バージョンは揃えること:
 
 | コンポーネント | バージョン | 備考 |
@@ -85,6 +85,9 @@ TensorRT 10（`--onnx-tensorrt` 使用時のみ）。バージョンは揃える
 | ONNX Runtime GPU | 1.24.2 | ort crate 2.0.0-rc.12 対応版。CUDA 12 ビルドを使う |
 | cuDNN | 9.x (9.8.0.87) | ORT GPU 版の依存 |
 | TensorRT | 10.x (10.11.0.33) | ORT 1.24.2 は `libnvinfer.so.10` を要求 |
+
+> ort crate は 2.0.0-rc.12（Release Candidate）。ort の安定版リリース後は
+> バージョン対応表を要確認。
 
 ```bash
 wget https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-gpu-1.24.2.tgz
@@ -97,17 +100,22 @@ tar xzf TensorRT-10.11.0.33.Linux.x86_64-gnu.cuda-12.9.tar.gz -C ~/lib/
 
 環境変数（クイックスタート参照）を `.bashrc` 等に追加する。`ORT_DYLIB_PATH` は
 ONNX Runtime を実行時に dlopen するために必須（未設定はエラーになる）。
+`LD_LIBRARY_PATH` は TensorRT・cuDNN・CUDA 等の依存ライブラリの検索パスで、
+TensorRT を使わない場合は TensorRT のパスを省略できる。GPU モードでは起動時に
+CUDA が利用可能かチェックし、CPU への暗黙フォールバックを防止する。
 
 ### Windows / 特定 GPU の補足
 
 - Windows は同一バージョンの Windows 版を導入し、`LD_LIBRARY_PATH` の代わりに
-  `PATH` へ追加する。直リンク:
+  `PATH` へ追加する（`$env:ORT_DYLIB_PATH = "C:\path\to\onnxruntime.dll"` /
+  `$env:PATH = "C:\path\to\TensorRT\lib;...;" + $env:PATH`）。直リンク:
   [ONNX Runtime](https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-gpu-1.24.2.zip)（CUDA 12 ビルド。`cuda13` 版ではない）/
   [cuDNN 9](https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.8.0.87_cuda12-archive.zip)/
   [TensorRT 10.11](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.11.0/zip/TensorRT-10.11.0.33.Windows.win10.cuda-12.9.zip)
-- RTX 5090 / Blackwell (sm_120) はこの構成でそのまま動作する。
-- 外部データ形式の ONNX（本体が小さく `.onnx.data` を伴うモデル）は両ファイルを
-  同一ディレクトリに置く。
+- RTX 5090 / Blackwell (sm_120) はこの構成でそのまま動作する（キャッシュ生成物例:
+  `<cache dir>/TensorrtExecutionProvider_..._fp16_sm120.engine`）。
+- 外部データ形式の ONNX（本体 〜150KB + `.onnx.data` 数十 MB のモデル）は両ファイル
+  を同一ディレクトリに置く（ORT が本体からの相対パスで外部ウェイトを読むため）。
 
 ## ビルド
 
@@ -123,6 +131,8 @@ dlshogi 系 ONNX（`--dlshogi-onnx-model`）は default feature。AobaZero 系
 cargo build --release -p tools --bin rescore_psv
 cargo build --release -p tools --features aobazero-onnx --bin rescore_psv  # AobaZero も使う場合
 ```
+
+ort は load-dynamic のためビルド時に libonnxruntime は不要（実行時に dlopen する）。
 
 ## オプションリファレンス
 
@@ -147,10 +157,15 @@ cargo build --release -p tools --features aobazero-onnx --bin rescore_psv  # Aob
 | `--onnx-model` | — | AobaZero 系 ONNX モデルパス（`aobazero-onnx` feature） |
 | `--onnx-batch-size` | 256 | 推論バッチサイズ |
 | `--onnx-gpu-id` | 0 | GPU 番号（複数 GPU 時の選択。`-1` で CPU 推論） |
-| `--onnx-sessions` | 2 | GPU 推論の多重化数。既定 2 が実測最適。VRAM は増えるが出力は bit 一致 |
+| `--onnx-sessions` | 2 | GPU 推論の多重化数（1〜4、CPU 推論では常に 1）。既定 2 が実測最適。VRAM は増えるが出力は bit 一致 |
 | `--onnx-tensorrt` | false | TensorRT EP（FP16）を使用 |
 | `--onnx-tensorrt-cache` | — | TensorRT エンジンキャッシュ保存先（実質必須） |
 | `--onnx-eval-scale` | 600.0 | 勝率→cp 変換スケール（正の有限値） |
+| `--onnx-draw-ply` | — | AobaZero モデル用の引き分け手数 |
+| `--expand-output-dir` | — | policy 展開の出力先（レシピ参照） |
+| `--expand-threshold` | 10.0 | 展開する softmax 確率閾値 %（`(0, 100]`） |
+| `--qsearch-leaf-label` | false | ラベルのみ葉評価にする（`--nnue` 併用必須、レシピ参照） |
+| `--qsearch-leaf-replacement-output` | — | 葉置換 arm の同時出力先（レシピ参照） |
 
 ### 内部 NNUE / 探索 / 外部エンジンモード
 
@@ -160,7 +175,7 @@ cargo build --release -p tools --features aobazero-onnx --bin rescore_psv  # Aob
 | `--use-qsearch` | false | 静的評価の代わりに qsearch 評価を使用 |
 | `--search-depth` | — | 指定深さの alpha-beta 探索スコアを使用（`--use-qsearch` と排他） |
 | `--hash-mb` | 64 | スレッドごとの置換表サイズ MB（`--search-depth` 時） |
-| `--max-nodes` / `--max-time` | 0（無制限） | 1 局面あたりの探索ノード / ミリ秒上限。探索爆発ガード |
+| `--max-nodes` / `--max-time` | 0（無制限） | 1 局面あたりの探索ノード / ミリ秒上限（`--search-depth` 時のみ有効）。探索爆発ガード |
 | `--max-ply` | 16 | qsearch の最大深さ |
 | `--apply-qsearch-leaf` | false | 局面を qsearch 葉に置換して出力 |
 | `--source-fv-scale` / `--target-fv-scale` | 24 / 24 | FV_SCALE 変換（通常は変換不要） |
@@ -198,7 +213,8 @@ rescore_psv --input "data/*.bin" --output-dir rescored/ \
 
 王手親局面は評価が不安定になりやすい（詰み・詰めろ・王手放置が混在）ため、
 学習ノイズを減らしたい場合に使う。ONNX モードでは推論自体は実行し書き出しだけを
-抑制するので、expand 機能とは独立に働く。
+抑制するので、expand 機能とは独立に働く（推論コストは王手親局面の割合分だけ僅かに
+増える。教師データ中の王手局面は通常 1 桁 %）。
 
 ### ポリシー展開（`--expand-output-dir`）
 
@@ -217,7 +233,8 @@ rescore_psv --input data.bin --output-dir rescored/ \
   初期化されるので、スコアが必要なら展開結果を改めて `rescore_psv` に通す。
 - `--expand-skip-parent-in-check` / `--expand-skip-child-in-check` で expand 側の
   王手フィルタを `--skip-in-check`（rescore 側）と独立に制御できる。
-- `--output-dir` と `--expand-output-dir` は別ディレクトリ必須（起動時エラー）。
+- 出力ファイル名は入力ファイル名と同じ。`--output-dir` と `--expand-output-dir` は
+  別ディレクトリ必須（起動時エラー）。
 - 多段パイプライン（展開結果をさらに展開）も可能。各段で入力・出力・expand 先を
   すべて別ディレクトリにする。誤設定（旧段の出力 = 次段の入力の同一実体など）は
   起動時に検出してエラーになる。
@@ -236,13 +253,15 @@ rescore_psv --input "data/*.bin" --output-dir rescored_leaflabel/ \
 ```
 
 - `--nnue`（葉探索用）と `--dlshogi-onnx-model`（葉ラベル用）の両方が必須。
-  dlshogi モデル専用（AobaZero 非対応）。`--apply-qsearch-leaf` / expand と併用不可。
+  dlshogi モデル専用（AobaZero は特徴量が手数 game_ply を含み、葉へ進めても root の
+  game_ply が混入するため非対応）。`--apply-qsearch-leaf` / expand と併用不可。
 - 葉で手番が反転した場合は root 手番視点へ符号反転する。王手 root は葉探索せず
   原局面のまま評価する。
 - `--qsearch-leaf-replacement-output <dir>` を併用すると、同一 1 パスで
   **葉局面に置換した**レコード（leaf-REPLACEMENT arm）も別ディレクトリに書き出せる。
   2 工程（`--apply-qsearch-leaf` → DL rescore）と bit 一致し、再計算を半減できる。
-  レコード仕様の詳細は [internals](rescore_psv-internals.md) 参照。
+  `--output-dir` とは別ディレクトリ必須。レコード仕様の詳細は
+  [internals](rescore_psv-internals.md) 参照。
 
 ### 内部 NNUE / 探索 / 外部エンジンでリスコアする
 
@@ -290,7 +309,9 @@ rescore_psv --input data.bin --output-dir rescored/ \
 - **`--search-depth` / `--engine`**: 同一設定での再実行は bit 一致するが、
   スレッド数 / エンジンプロセス数を変えると局面割り当てが変わり出力スコアも
   変わる（置換表・エンジン内部状態が担当局面列を通して持ち越されるため）。
-  再現性が必要なら `--threads` を明示的に固定し、`--max-time` は使わないこと。
+  再現性が必要ならスレッド数（`--threads`）/ エンジンプロセス数（`--engine-threads`）
+  を明示的に固定し、`--max-time` は使わないこと。`--engine` では外部エンジン自体が
+  決定的であること（内部スレッド数 1 等）も条件。
 
 ## トラブルシューティング
 
@@ -309,7 +330,8 @@ rescore_psv --input data.bin --output-dir rescored/ \
 | `--onnx-eval-scale must be a positive finite value` | 0 以下 / NaN / inf | 正の有限値（通常 600.0）を指定 |
 | `... must point to different directories` | 出力系ディレクトリの同一指定 | 別ディレクトリを指定 |
 | `--qsearch-leaf-replacement-output requires --qsearch-leaf-label` | replacement のみ指定 | `--qsearch-leaf-label` を併用 |
-| `Output path is a symlink` / `hardlink to the input file` | 出力予定パスが入力と同一実体 | 別ディレクトリを指定 |
+| `Output path is a symlink` | 既存出力が symlink（リンク先を問わず truncate を拒否） | symlink を削除するか別ディレクトリを使う |
+| `Output path is a hardlink to the input file` | 既存出力が入力と同じ inode（Unix） | 別ディレクトリを指定 |
 | `Stale expand artifact ... resolves to the current input file` | 旧 expand 出力と現在 input が同一（多段パイプライン） | 入力を移動するか `--expand-output-dir` を変更 |
 | `... path contains '='` / `non-UTF-8 characters` | マーカー非対応のパス文字 | パスをリネーム（`v1.0=alpha` → `v1.0-alpha` 等） |
 | `All engine processes have failed` | 外部エンジンが全プロセス死亡 | エンジンのログ / `--usi-option` / `--engine-timeout` を確認 |
