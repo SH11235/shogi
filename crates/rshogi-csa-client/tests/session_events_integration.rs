@@ -16,7 +16,6 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,7 +23,9 @@ use std::thread;
 use std::time::Duration;
 
 use rshogi_csa_client::config::CsaClientConfig;
-use rshogi_csa_client::engine::{SpawnOptions, UsiEngine};
+use rshogi_csa_client::engine::SpawnOptions;
+
+mod common;
 use rshogi_csa_client::events::{
     DisconnectReason, MovePlayer, ReconnectState, SearchInfoEmitPolicy, SessionError,
     SessionEventSink, SessionProgress, SinkError,
@@ -79,11 +80,6 @@ fn write_lines(writer: &mut std::net::TcpStream, lines: &[&str]) {
 ///   - `gameover ...` -> 何もしない
 ///   - `quit` -> 終了
 fn mock_usi_engine_script() -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let dir = tempfile_root();
-    let seq = SEQ.fetch_add(1, AtomicOrdering::SeqCst);
-    let path = dir.join(format!("mock_usi_engine_{}_{}.sh", std::process::id(), seq));
     let script = r#"#!/usr/bin/env bash
 # mock USI engine for csa-client integration test
 while IFS= read -r line; do
@@ -118,23 +114,13 @@ while IFS= read -r line; do
     esac
 done
 "#;
-    std::fs::write(&path, script).expect("write mock engine script");
-    let mut perms = std::fs::metadata(&path).expect("stat").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).expect("set perms");
-    path
+    common::write_mock_script("mock_usi_engine", script)
 }
 
 /// ponder miss 後の次 go で info を出さず即 bestmove を返す mock。
 /// stop で返す bestmove の直後に stale info を出し、次 go に漏れないことを検証する。
 /// ponderhit はこのシナリオでは到達しない想定（到達したら exit 1 でテストを落とす）。
 fn mock_usi_engine_stale_ponder_info_script() -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let dir = tempfile_root();
-    let seq = SEQ.fetch_add(1, AtomicOrdering::SeqCst);
-    let path =
-        dir.join(format!("mock_usi_engine_stale_ponder_info_{}_{}.sh", std::process::id(), seq));
     let script = r#"#!/usr/bin/env bash
 go_count=0
 while IFS= read -r line; do
@@ -176,11 +162,7 @@ while IFS= read -r line; do
     esac
 done
 "#;
-    std::fs::write(&path, script).expect("write mock engine script");
-    let mut perms = std::fs::metadata(&path).expect("stat").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).expect("set perms");
-    path
+    common::write_mock_script("mock_usi_engine_stale_ponder_info", script)
 }
 
 fn tempfile_root() -> PathBuf {
@@ -334,7 +316,7 @@ fn fresh_session_emits_expected_event_sequence() {
     let mut conn = CsaConnection::connect("127.0.0.1", port, false).expect("connect");
     conn.login("alice", "pw").expect("login");
 
-    let mut engine = UsiEngine::spawn(
+    let mut engine = common::spawn_engine(
         &config.engine.path,
         &config.engine.options,
         SpawnOptions {
@@ -420,7 +402,7 @@ fn ponder_miss_stale_info_does_not_attach_to_next_instant_bestmove() {
 
     let mut conn = CsaConnection::connect("127.0.0.1", port, false).expect("connect");
     conn.login("alice", "pw").expect("login");
-    let mut engine = UsiEngine::spawn(
+    let mut engine = common::spawn_engine(
         &config.engine.path,
         &config.engine.options,
         SpawnOptions {
@@ -495,7 +477,7 @@ fn resumed_session_emits_resumed_event_and_no_history_replay() {
     conn.login_reconnect("alice", "pw", "g-resume", "tok-xyz")
         .expect("login_reconnect");
 
-    let mut engine = UsiEngine::spawn(
+    let mut engine = common::spawn_engine(
         &config.engine.path,
         &config.engine.options,
         SpawnOptions {
@@ -567,7 +549,7 @@ fn resumed_state_last_sfen_matches_summary_position_section() {
     let mut conn = CsaConnection::connect("127.0.0.1", port, false).expect("connect");
     conn.login_reconnect("alice", "pw", "g-resume-sfen", "tok-xyz")
         .expect("login_reconnect");
-    let mut engine = UsiEngine::spawn(
+    let mut engine = common::spawn_engine(
         &config.engine.path,
         &config.engine.options,
         SpawnOptions {
@@ -686,7 +668,7 @@ fn fatal_sink_triggers_clean_closure_and_returns_sink_aborted() {
     let mut conn = CsaConnection::connect("127.0.0.1", port, false).expect("connect");
     conn.login("alice", "pw").expect("login");
 
-    let mut engine = UsiEngine::spawn(
+    let mut engine = common::spawn_engine(
         &config.engine.path,
         &config.engine.options,
         SpawnOptions {
@@ -766,7 +748,7 @@ fn external_shutdown_emits_shutdown_disconnected_and_returns_shutdown_error() {
     let mut conn = CsaConnection::connect("127.0.0.1", port, false).expect("connect");
     conn.login("alice", "pw").expect("login");
 
-    let mut engine = UsiEngine::spawn(
+    let mut engine = common::spawn_engine(
         &config.engine.path,
         &config.engine.options,
         SpawnOptions {
@@ -839,7 +821,7 @@ fn external_shutdown_observed_through_legacy_run_game_session() {
     let mut conn = CsaConnection::connect("127.0.0.1", port, false).expect("connect");
     conn.login("alice", "pw").expect("login");
 
-    let mut engine = UsiEngine::spawn(
+    let mut engine = common::spawn_engine(
         &config.engine.path,
         &config.engine.options,
         SpawnOptions {
@@ -894,7 +876,7 @@ fn nonfatal_sink_does_not_invoke_on_error_and_session_continues() {
     let mut conn = CsaConnection::connect("127.0.0.1", port, false).expect("connect");
     conn.login("alice", "pw").expect("login");
 
-    let mut engine = UsiEngine::spawn(
+    let mut engine = common::spawn_engine(
         &config.engine.path,
         &config.engine.options,
         SpawnOptions {
@@ -1008,7 +990,7 @@ fn live_jsonl_grows_during_game() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut conn = CsaConnection::connect("127.0.0.1", port, false).expect("connect");
     conn.login("alice", "pw").expect("login");
-    let mut engine = UsiEngine::spawn(
+    let mut engine = common::spawn_engine(
         &config.engine.path,
         &config.engine.options,
         SpawnOptions {

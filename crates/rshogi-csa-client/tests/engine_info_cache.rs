@@ -1,7 +1,6 @@
 #![cfg(unix)]
 
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -10,17 +9,14 @@ use std::time::Duration;
 
 use rshogi_csa_client::engine::{SearchOutcome, SpawnOptions, UsiEngine};
 
+mod common;
+
 fn write_mock_engine(script: &str, name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("{}_{}.sh", name, std::process::id()));
-    std::fs::write(&path, script).expect("write mock engine script");
-    let mut perms = std::fs::metadata(&path).expect("stat").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).expect("set perms");
-    path
+    common::write_mock_script(name, script)
 }
 
 fn spawn_engine(path: &Path) -> UsiEngine {
-    UsiEngine::spawn(
+    common::spawn_engine(
         path,
         &HashMap::new(),
         SpawnOptions {
