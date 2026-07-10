@@ -157,6 +157,7 @@ position sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1
 | オプション | デフォルト | 説明 |
 |-----------|-----------|------|
 | `--output-training-data PATH` | `<out-dir>/gensfen.psv` | 学習データ出力先 |
+| `--emit-game-id-sidecar PATH` | — | PSV 各レコードと 1:1・同順の `game_id` を u32 little-endian で出力（PSV 専用） |
 | `--training-data-format FORMAT` | psv | `psv`（40バイト固定）/ `pack`（32バイト + メタ）/ `hcpe3`（可変長棋譜 + policy） |
 | `--hcpe3-policy-total N` | 1000 | hcpe3 の policy 分布に割り当てる visit 総票数 |
 | `--hcpe3-policy-temp F` | 600.0 | hcpe3 の policy softmax 温度（centipawn 単位、大きいほど分布を均す） |
@@ -191,6 +192,15 @@ position sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1
 |-----------|------|
 | `--out-dir DIR` | 出力ディレクトリ（resume 時必須） |
 | `--resume` | 前回中断したセッションを再開する |
+
+`--emit-game-id-sidecar` と `--resume` は併用できない。既存 run に sidecar が無い場合の
+PSV との 1:1 対応を壊さないため、明示的にエラーとする。sidecar のパスは meta 行の
+`settings.game_id_sidecar` にも記録される。並行実行時は PSV と sidecar の両方をワーカー別の
+一時ファイルへ書き、同じワーカー順で最終ファイルへ連結する。sidecar には JSONL・PSV・
+info log・eval file・metrics の最終出力パス、およびそれらと sidecar の内部ワーカーパスを
+指定できず、衝突時は処理開始前にエラーにする。パスは絶対化し、存在する最深の祖先を
+canonicalize してから残りの未存在コンポーネントを正規化するため、symlink 直後の `..` を
+含む同じパスの別表記も衝突として扱う。
 
 ## 重複回避の詳細
 
