@@ -1,5 +1,9 @@
 # relabel_psv — PSV 勝敗ラベルへの score 置換
 
+`--output` が展開後の `--input` または `--game-id-sidecar` と同じファイル実体を
+指す場合は、入力の truncate を防ぐため処理開始前にエラーで拒否します。相対パスの
+別表記、symlink、および Unix 上の hardlink も同一ファイルとして扱います。
+
 `PackedSfenValue` の `score` を、各レコードの `game_result` から得た飽和値へ置換する。
 `game_result` と `score` はどちらもその局面の手番側視点で、勝ちを正、負けを負、引分を 0 とする。
 

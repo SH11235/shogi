@@ -41,6 +41,125 @@ fn hirate() -> Position {
     pos
 }
 
+fn assert_rejected_without_modifying(command: &mut Command, protected: &Path) {
+    let original = std::fs::read(protected).unwrap();
+    let result = command.output().unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("resolves to the same file"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(std::fs::read(protected).unwrap(), original);
+}
+
+#[test]
+fn output_with_equivalent_relative_spelling_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("x.psv");
+    let pos = hirate();
+    write_psv(&input, &[record(&pos, 10, 1, 1)]);
+
+    assert_rejected_without_modifying(
+        Command::new(BIN)
+            .current_dir(dir.path())
+            .args(["--input", "./x.psv", "--output", "x.psv"]),
+        &input,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn output_through_symlink_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.psv");
+    let output = dir.path().join("output.psv");
+    let pos = hirate();
+    write_psv(&input, &[record(&pos, 10, 1, 1)]);
+    symlink(&input, &output).unwrap();
+
+    assert_rejected_without_modifying(
+        Command::new(BIN).args([
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ]),
+        &input,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn output_through_hardlink_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.psv");
+    let output = dir.path().join("output.psv");
+    let pos = hirate();
+    write_psv(&input, &[record(&pos, 10, 1, 1)]);
+    std::fs::hard_link(&input, &output).unwrap();
+
+    assert_rejected_without_modifying(
+        Command::new(BIN).args([
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ]),
+        &input,
+    );
+}
+
+#[test]
+fn output_distinct_from_input_is_accepted() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.psv");
+    let output = dir.path().join("nested/output.psv");
+    let pos = hirate();
+    write_psv(&input, &[record(&pos, 10, 1, 1)]);
+
+    let result = Command::new(BIN)
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(read_psv(&output)[0].score, 2500);
+}
+
+#[test]
+fn output_same_as_game_id_sidecar_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.psv");
+    let sidecar = dir.path().join("game_ids.bin");
+    let diversions = dir.path().join("games.jsonl");
+    let pos = hirate();
+    write_psv(&input, &[record(&pos, 10, 1, 1)]);
+    std::fs::write(&sidecar, 42u32.to_le_bytes()).unwrap();
+    std::fs::write(&diversions, "{\"type\":\"meta\"}\n").unwrap();
+
+    assert_rejected_without_modifying(
+        Command::new(BIN).args([
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            sidecar.to_str().unwrap(),
+            "--deblunder",
+            "--game-id-sidecar",
+            sidecar.to_str().unwrap(),
+            "--diversions",
+            diversions.to_str().unwrap(),
+        ]),
+        &sidecar,
+    );
+}
+
 #[test]
 fn score_is_replaced_from_side_to_move_game_result_and_is_deterministic() {
     let dir = TempDir::new().unwrap();

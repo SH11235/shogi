@@ -8,6 +8,7 @@ use clap::{Parser, ValueEnum};
 use rshogi_core::position::Position;
 use rshogi_core::types::{EnteringKingRule, Move};
 use serde_json::Value;
+use tools::common::dedup::canonicalize_maybe_new;
 use tools::packed_sfen::{PackedSfenValue, unpack_sfen};
 
 #[derive(Debug, Parser)]
@@ -90,12 +91,7 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let input_paths = expand_paths(&cli.input, "--input")?;
-    if input_paths.iter().any(|path| path == &cli.output) {
-        bail!("--output must differ from every input path");
-    }
-    if cli.game_id_sidecar.as_deref() == Some(cli.output.as_path()) {
-        bail!("--output must differ from --game-id-sidecar");
-    }
+    validate_output_path(&cli.output, &input_paths, cli.game_id_sidecar.as_deref())?;
     let diversion_bounds = if cli.deblunder {
         load_diversion_bounds(&expand_paths(&cli.diversions, "--diversions")?)?
     } else {
@@ -243,6 +239,65 @@ fn expand_paths(patterns: &[String], option: &str) -> Result<Vec<PathBuf>> {
         bail!("{option} matched no files");
     }
     Ok(paths.into_iter().collect())
+}
+
+/// 出力を truncate する前に、入力または sidecar と同じ実体を指していないか検査する。
+fn validate_output_path(
+    output: &Path,
+    input_paths: &[PathBuf],
+    game_id_sidecar: Option<&Path>,
+) -> Result<()> {
+    let normalized_output = canonicalize_maybe_new(output)
+        .with_context(|| format!("failed to normalize --output {}", output.display()))?;
+
+    for input in input_paths {
+        validate_distinct_file(output, &normalized_output, input, "--input")?;
+    }
+    if let Some(sidecar) = game_id_sidecar {
+        validate_distinct_file(output, &normalized_output, sidecar, "--game-id-sidecar")?;
+    }
+    Ok(())
+}
+
+fn validate_distinct_file(
+    output: &Path,
+    normalized_output: &Path,
+    protected: &Path,
+    option: &str,
+) -> Result<()> {
+    let canonical_protected = protected
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {option} {}", protected.display()))?;
+    if normalized_output == canonical_protected || same_inode(output, protected)? {
+        bail!(
+            "--output {} resolves to the same file as {option} {}; refusing to truncate it",
+            output.display(),
+            protected.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_inode(a: &Path, b: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let a_metadata = match a.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to stat --output {}", a.display()));
+        }
+    };
+    let b_metadata = b
+        .metadata()
+        .with_context(|| format!("failed to stat protected input {}", b.display()))?;
+    Ok(a_metadata.dev() == b_metadata.dev() && a_metadata.ino() == b_metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn same_inode(_a: &Path, _b: &Path) -> Result<bool> {
+    Ok(false)
 }
 
 fn load_diversion_bounds(paths: &[PathBuf]) -> Result<HashMap<u32, DiversionBounds>> {
