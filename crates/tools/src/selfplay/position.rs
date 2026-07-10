@@ -12,6 +12,8 @@ pub struct ParsedPosition {
     pub startpos: bool,
     pub sfen: Option<String>,
     pub moves: Vec<String>,
+    /// `--startpos-file` 内の元行番号。ファイル由来でない場合は None。
+    pub source_line: Option<usize>,
 }
 
 /// 開始局面群をファイル / 単一SFEN / デフォルト(平手) からロードする。
@@ -38,11 +40,12 @@ pub fn load_start_positions(
                     continue;
                 }
                 // position形式または生のSFEN形式の両方をサポート
-                let parsed = parse_position_line(trimmed)
+                let mut parsed = parse_position_line(trimmed)
                     .or_else(|_| parse_sfen_only(trimmed))
                     .with_context(|| {
                         format!("invalid position syntax on line {}: {}", idx + 1, trimmed)
                     })?;
+                parsed.source_line = Some(idx + 1);
                 build_position(&parsed, pass_rights_black, pass_rights_white).with_context(
                     || format!("invalid position on line {}: {}", idx + 1, trimmed),
                 )?;
@@ -66,6 +69,7 @@ pub fn load_start_positions(
                 startpos: true,
                 sfen: None,
                 moves: Vec::new(),
+                source_line: None,
             };
             Ok((vec![parsed], vec!["position startpos".to_string()]))
         }
@@ -85,6 +89,7 @@ pub fn parse_position_line(line: &str) -> Result<ParsedPosition> {
                 startpos: true,
                 sfen: None,
                 moves,
+                source_line: None,
             })
         }
         Some("sfen") => {
@@ -103,6 +108,7 @@ pub fn parse_position_line(line: &str) -> Result<ParsedPosition> {
                 startpos: false,
                 sfen: Some(sfen_tokens.join(" ")),
                 moves,
+                source_line: None,
             })
         }
         other => bail!("expected 'startpos' or 'sfen' after 'position', got {:?}", other),
@@ -119,6 +125,7 @@ pub fn parse_sfen_only(line: &str) -> Result<ParsedPosition> {
         startpos: false,
         sfen: Some(trimmed.to_string()),
         moves: Vec::new(),
+        source_line: None,
     })
 }
 

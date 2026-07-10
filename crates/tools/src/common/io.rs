@@ -94,3 +94,62 @@ pub fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
     tmp.persist(path).with_context(|| format!("rename to {}", path.display()))?;
     Ok(())
 }
+
+/// ファイル本体と親directoryを同期してからatomic replaceする。
+pub fn write_atomic_durable(path: &Path, content: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create durable temp file in {}", parent.display()))?;
+    tmp.write_all(content.as_bytes())?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("publish durable file {}", path.display()))?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+/// dangling symlinkも含め、path entryの存在を確認する。
+pub fn path_entry_exists(path: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+pub fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    File::open(path)
+        .with_context(|| format!("open directory {} for sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync directory {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn sync_directory(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// destinationが存在する場合は置換せずに失敗するrename。
+#[cfg(target_os = "linux")]
+pub fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE).map_err(Into::into)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    if path_entry_exists(destination)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("destination already exists: {}", destination.display()),
+        ));
+    }
+    std::fs::rename(source, destination)
+}

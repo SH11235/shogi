@@ -118,9 +118,10 @@ pub use network::{
     get_layer_stack_bucket_mode, get_layer_stack_progress_kpabs_weights, get_network, init_nnue,
     init_nnue_from_bytes, is_halfka_256_loaded, is_halfka_512_loaded, is_halfka_1024_loaded,
     is_halfka_hm_256_loaded, is_halfka_hm_512_loaded, is_halfka_hm_1024_loaded,
-    is_layer_stacks_loaded, is_nnue_initialized, parse_layer_stack_bucket_mode,
-    parse_nnue_architecture, progress_sum_to_bucket, reset_layer_stack_progress_kpabs_weights,
-    set_fv_scale_override, set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
+    is_layer_stacks_loaded, is_nnue_initialized, load_progress_coeff_kpabs,
+    load_progress_coeff_kpabs_from_bytes, parse_layer_stack_bucket_mode, parse_nnue_architecture,
+    progress_sum_to_bucket, reset_layer_stack_progress_kpabs_weights, set_fv_scale_override,
+    set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
     set_nnue_architecture_override,
 };
 #[cfg(all(feature = "layerstacks-512x16x32", feature = "ft-halfka_hm_merged"))]

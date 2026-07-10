@@ -3,7 +3,6 @@
 //! 将棋GUIとの通信を行うUSIプロトコル実装。
 
 use std::io::{self, BufRead, Write};
-use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -15,10 +14,10 @@ use rshogi_core::eval::{
     set_pass_right_value_phased,
 };
 use rshogi_core::nnue::{
-    AccumulatorStackVariant, LayerStackBucketMode, SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, clear_nnue,
-    evaluate_dispatch, get_network, init_nnue, parse_layer_stack_bucket_mode,
-    parse_nnue_architecture, print_nnue_stats, reset_layer_stack_progress_kpabs_weights,
-    set_fv_scale_override, set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
+    AccumulatorStackVariant, LayerStackBucketMode, clear_nnue, evaluate_dispatch, get_network,
+    init_nnue, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode, parse_nnue_architecture,
+    print_nnue_stats, reset_layer_stack_progress_kpabs_weights, set_fv_scale_override,
+    set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
     set_nnue_architecture_override,
 };
 use rshogi_core::position::Position;
@@ -37,26 +36,6 @@ const ENGINE_VERSION: &str = "0.1.0";
 const ENGINE_AUTHOR: &str = "sh11235";
 /// 探索スレッド用のスタックサイズ（SearchWorkerが大きいため増やす）
 const SEARCH_STACK_SIZE: usize = 64 * 1024 * 1024;
-
-fn load_progress_coeff_kpabs(path: &str) -> Result<Box<[f32]>, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("failed to read LS_PROGRESS_COEFF '{path}': {e}"))?;
-    let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * size_of::<f64>();
-    if bytes.len() != expected {
-        return Err(format!(
-            "progress.bin size mismatch: got {} bytes, expected {}",
-            bytes.len(),
-            expected
-        ));
-    }
-
-    let weights: Vec<f32> = bytes
-        .chunks_exact(size_of::<f64>())
-        .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("chunk size is checked")) as f32)
-        .collect();
-
-    Ok(weights.into_boxed_slice())
-}
 
 /// USIエンジンの状態
 struct UsiEngine {

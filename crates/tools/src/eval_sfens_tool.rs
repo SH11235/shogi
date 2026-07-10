@@ -12,15 +12,14 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::io::{BufRead, BufReader};
-use std::mem::size_of;
 use std::path::PathBuf;
 
 use rshogi_core::nnue::{
     AccumulatorLayerStacks, AffineTransform, FeatureSet, LayerStackBucketMode, LsFeatureSpec,
-    NNUE_PYTORCH_L3, NNUENetwork, NetworkLayerStacks, SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
+    NNUE_PYTORCH_L3, NNUENetwork, NetworkLayerStacks,
     compute_layer_stack_progress8kpabs_bucket_index, get_layer_stack_progress_kpabs_weights,
-    ls_dispatch_ft_size, set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
-    sqr_clipped_relu_transform,
+    load_progress_coeff_kpabs, ls_dispatch_ft_size, set_layer_stack_bucket_mode,
+    set_layer_stack_progress_kpabs_weights, sqr_clipped_relu_transform,
 };
 use rshogi_core::position::Position;
 use rshogi_core::types::Color;
@@ -56,24 +55,6 @@ struct Cli {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum BucketMode {
     Progress8kpabs,
-}
-
-fn load_progress_coeff_kpabs(path: &PathBuf) -> Result<Box<[f32]>, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("failed to read --progress-coeff '{}': {e}", path.display()))?;
-    let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * size_of::<f64>();
-    if bytes.len() != expected {
-        return Err(format!(
-            "progress.bin size mismatch: got {} bytes, expected {}",
-            bytes.len(),
-            expected
-        ));
-    }
-    let weights: Vec<f32> = bytes
-        .chunks_exact(size_of::<f64>())
-        .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("chunk size is checked")) as f32)
-        .collect();
-    Ok(weights.into_boxed_slice())
 }
 
 fn padded_input(input_dim: usize) -> usize {

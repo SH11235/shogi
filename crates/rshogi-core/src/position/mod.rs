@@ -25,7 +25,7 @@ mod zobrist;
 pub use board_effect::BoardEffects;
 #[cfg(feature = "move-features")]
 pub use move_features::MoveFeatures;
-pub use pos::Position;
+pub use pos::{EnteringKingPointInfo, Position};
 pub use sfen::{SFEN_HIRATE, SfenError};
 pub use state::StateInfo;
 pub use zobrist::{ZOBRIST, zobrist_hand, zobrist_no_pawns, zobrist_psq, zobrist_side};

@@ -33,10 +33,11 @@ cargo run -p tools --bin extract_bench_positions -- \
 | `--min-rating <u32>` | 3000 | floodgate 両者に要求する最小レート（不明レートは除外） |
 | `--per-cell <usize>` | 200 | `label_bench` の層化セルあたり採択数 |
 | `--nyugyoku-max <usize>` | 50000 | 入玉オーバーサンプルの最大局面数 |
-| `--startpos-eval-abs-max <i32>` | 150 | `startpos` 出力に許す絶対評価値上限 |
+| `--startpos-eval-abs-max <u32>` | 150 | `startpos` 出力に許す絶対評価値上限 |
 | `--startpos-ply <u32>` | 100 | `startpos` 出力の中心 ply |
 | `--startpos-window <u32>` | 4 | `startpos` 出力の ply 窓幅 |
 | `--seed <u64>` | 1 | 決定的サンプリング用 seed |
+| `--legacy-server-eval-comments` | false | 手の後へ `'*` 評価コメントを書く旧形式の rshogi-csa-server 棋譜として解釈（[CSA 評価値](#csa-評価値)参照） |
 
 ## 出力
 
@@ -76,7 +77,12 @@ cargo run -p tools --bin extract_bench_positions -- \
 
 ## CSA 評価値
 
-CSA の評価コメントは指し手直後の `'** <cp> ...` を読みます。floodgate の評価値は**手番によらず常に先手視点**であり、そのまま `eval_cp_black` に使います。
+CSA の評価コメントは、csa_client形式の指し手直前 `'* <cp> ...` と、wdoor形式の
+指し手直後 `'** <cp> ...` の両方を読みます。floodgate の評価値は**手番によらず常に
+先手視点**であり、そのまま `eval_cp_black` に使います。
+
+旧形式のrshogi-csa-server棋譜では`--legacy-server-eval-comments`を指定します。1回の入力へ
+Standard形式と旧server形式を混在させず、形式ごとに別runへ分けます。
 
 評価値は「指し手側がその局面を探索して報告した探索値」なので、**指し手前の局面**に対応付けます (PSV の `score` フィールドと同じ規約: 局面 + その局面の探索値 + そこで指された手)。
 

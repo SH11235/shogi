@@ -46,13 +46,46 @@ runs/gensfen/20260317-120000/
 KIF が必要な場合は `tournament` バイナリで対局を回し、その出力 jsonl を
 [`jsonl_to_kif`](tools-reference.md) で変換する。
 
+### result JSONL の入玉メタ
+
+`gensfen.jsonl` の `type=result` 行には、終局局面の入玉関連メタが含まれる。これらは
+記録用のメタ列であって終局裁定には影響せず、`--max-moves` 到達時は引き分けとして記録される。
+
+| フィールド | 説明 |
+|-----------|------|
+| `start_pos_index` | `--startpos-file` の元行番号（ファイル由来でない場合は 1-origin の開始局面番号） |
+| `start_sfen` | 対局開始時点の SFEN |
+| `final_points_black` / `final_points_white` | CSA 27点法の宣言点数 |
+| `king_in_enemy_black` / `king_in_enemy_white` | 自玉が敵陣三段内にいるか |
+| `enemy_zone_pieces_black` / `enemy_zone_pieces_white` | 敵陣三段内の自駒数（玉除く） |
+| `diversions` | `--random-multi-pv` / `--random-move-count` で PV1 以外を選んだ来歴配列 |
+
+`diversions` の各要素は次の形:
+
+```json
+{"ply": 17, "kind": "multipv", "chosen_move": "2g2f", "best_move": "7g7f", "score_gap_cp": 25}
+```
+
+`ply` は乱択した手自体の手数（1-origin、対局 1 手目 = 1）。`kind` は `multipv` または
+`random`。`random` は探索を行わないため `best_move` と `score_gap_cp` が `null` になる。
+乱択が無い対局でも `diversions: []` を出力する。
+
 ## 動作モード
 
 デフォルトは **NativeBackend**（`rshogi-core` を直接呼び出すマルチスレッド単一プロセス）。
 `--eval-file` で評価関数ファイルの指定が必須。
+LayerStacks 系ネット（`num_buckets > 1`）を native で使う場合は、`--progress-file` で
+progress8kpabs 係数ファイルを指定する。未指定ならゼロ係数へのサイレントフォールバックを防ぐため
+起動時にエラーにする。指定パスは meta 行の `settings.progress_file` に、内容の SHA-256 は
+`settings.progress_file_sha256` に記録され、`--resume` 時はパスと内容の両方を照合する
+（同一パスへの係数差し替えも検出する）。
+native LayerStacks 実行時は stderr に `LayerStacks num_buckets=N` と、ワーカー終了時の
+`progress bucket distribution: [...] (used X/N)` を出力するため、短時間ランでも bucket 使用状況を確認できる。
 
 USI モードを使う場合は `--native=false --engine-path /path/to/usi-engine` を指定する。
 このとき `--engine-path-black/white` で先後を別エンジンにすることも可能。
+USI モードでは `--progress-file` は使わず、必要な場合は `--usi-option LS_PROGRESS_COEFF=/path/to/progress.bin`
+でエンジン側へ渡す。
 
 ### USI 単一エンジン最適化
 
@@ -89,6 +122,7 @@ TT/履歴が共有されるため棋力評価には不向きだが、教師局�
 |-----------|-----------|------|
 | `--native[=BOOL]` | true | NativeBackend を使用（`--eval-file` 必須） |
 | `--eval-file PATH` | (native 時必須) | NNUE 評価関数ファイル |
+| `--progress-file PATH` | (LS native 時必須) | native LayerStacks 用 progress8kpabs 係数ファイル |
 | `--keep-tt[=BOOL]` | false | TT を対局間で保持（実験用） |
 | `--engine-path PATH` | (USI 時必須) | エンジンバイナリパス |
 | `--engine-path-black/white PATH` | — | 先後別エンジン |
@@ -184,6 +218,7 @@ seed で順列を再構築し、完了済み対局数分だけ進めることで
 探索時に N 候補を評価し、PV1 のスコアとの差が `--random-multi-pv-diff` 以内の候補から
 ランダムに選択してプレイする。学習データには PV1 のスコアと手を記録する（局面の真の評価値）。
 多様な局面を自然に生成できる。
+PV1 以外が選ばれた手は result 行の `diversions` に `kind=multipv` として記録される。
 
 **推奨ユースケース**: 対局数が開始局面数を大幅に上回る場合（例: 50万局 vs 3万局面プール）。
 開始局面の no-repeat だけでは 2 周目以降に同一対局が再現されるため、MultiPV ランダム
@@ -194,6 +229,7 @@ seed で順列を再構築し、完了済み対局数分だけ進めることで
 序盤の `--random-move-min-ply` 〜 `--random-move-max-ply` の範囲から N 手をランダムに選び、
 その手数では合法手からランダムに 1 手選択する（エンジン探索をスキップ）。
 ランダムムーブ前の蓄積エントリは全クリアされる（tanuki- 方式）。
+選ばれた手は result 行の `diversions` に `kind=random` として記録される。
 
 ### dedup rate 警告
 
