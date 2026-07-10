@@ -33,19 +33,34 @@ fn spawn_opts(stderr_passthrough: bool) -> SpawnOptions {
     }
 }
 
+/// `write_mock_script` の write fd が開いている間に別スレッドの spawn が fork すると、
+/// 子プロセスが write fd を継承したまま exec 前の窓に入り、その script の exec が
+/// `ETXTBSY` (Text file busy) で落ちる。script 書き込みと fork を [`FORK_WRITE_LOCK`]
+/// で直列化することで「write fd open 中の fork」を排除する。
+fn spawn_mock_engine(
+    path: &Path,
+    options: &HashMap<String, toml::Value>,
+    opts: SpawnOptions,
+) -> anyhow::Result<UsiEngine> {
+    let _guard = FORK_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    UsiEngine::spawn(path, options, opts)
+}
+
 static SCRIPT_SEQ: AtomicU64 = AtomicU64::new(0);
-static TMPDIR_LOCK: Mutex<()> = Mutex::new(());
+/// 書き込みと fork の片方だけを直列化しても ETXTBSY レースが残る —
+/// `spawn_mock_engine` の doc comment 参照。
+static FORK_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// 与えた bash script を 0o755 の実行可能ファイルとして一時ディレクトリに書き出し、
 /// path を返す。test ごとに unique な名前を付与する。
 ///
-/// Linux で `cargo test` を並列実行すると、`std::fs::write` 完了直後の `Command::spawn`
-/// で稀に `Text file busy (ETXTBSY)` を踏むため、tmp 書き出し → `sync_all` → chmod →
-/// atomic rename の順で kernel に「書き終えた実行可能ファイル」を確実に認識させる
-/// (PR #596 review で指摘された flake への対応)。
+/// tmp path へ書き込み → close → chmod → atomic rename の順にすることで、自スレッドの
+/// write fd が exec と重なる経路を塞ぐ。加えて書き込み区間全体を [`FORK_WRITE_LOCK`] で
+/// 覆い、並行 test の fork (`spawn_mock_engine`) が open 中の write fd を子に継承して
+/// `ETXTBSY` を起こすレースを排除する。
 fn write_mock_script(name: &str, body: &str) -> PathBuf {
     use std::io::Write;
-    let _guard = TMPDIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = FORK_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let seq = SCRIPT_SEQ.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir();
     let final_path =
@@ -95,7 +110,7 @@ exit 1
 "#;
     let path = write_mock_script("dying_immediate", script);
     let opts: HashMap<String, toml::Value> = HashMap::new();
-    let err = match UsiEngine::spawn(&path, &opts, spawn_opts(false)) {
+    let err = match spawn_mock_engine(&path, &opts, spawn_opts(false)) {
         Ok(_) => panic!("spawn 即時死で error が期待される"),
         Err(e) => e,
     };
@@ -127,7 +142,7 @@ exit 1
     let path = write_mock_script("dying_after_handshake", script);
     let opts: HashMap<String, toml::Value> = HashMap::new();
     let mut engine =
-        UsiEngine::spawn(&path, &opts, spawn_opts(false)).expect("初回 handshake は成功する想定");
+        spawn_mock_engine(&path, &opts, spawn_opts(false)).expect("初回 handshake は成功する想定");
     // engine プロセスは usiok+readyok を返した直後に exit。
     // new_game() は usinewgame + isready を送る。BrokenPipe か recv Disconnected
     // のいずれかから engine_exited_error() に合流する。
@@ -167,7 +182,7 @@ done
     let path = write_mock_script("dying_during_go", script);
     let opts: HashMap<String, toml::Value> = HashMap::new();
     let mut engine =
-        UsiEngine::spawn(&path, &opts, spawn_opts(false)).expect("初回 handshake は成功");
+        spawn_mock_engine(&path, &opts, spawn_opts(false)).expect("初回 handshake は成功");
     engine.new_game().expect("new_game は成功");
     let shutdown = AtomicBool::new(false);
     let (_tx, server_rx) = mpsc::channel::<Event>();
@@ -204,7 +219,7 @@ exit 1
     let path = write_mock_script("long_stderr_line", script);
     let opts: HashMap<String, toml::Value> = HashMap::new();
     // initialize は usiok 後 isready を送る → engine 死亡で error
-    let err = match UsiEngine::spawn(&path, &opts, spawn_opts(false)) {
+    let err = match spawn_mock_engine(&path, &opts, spawn_opts(false)) {
         Ok(_) => panic!("isready 送信前後で engine 死亡 → error が期待される"),
         Err(e) => e,
     };
@@ -234,7 +249,7 @@ exit 1
 "#;
     let path = write_mock_script("crlf_stderr", script);
     let opts: HashMap<String, toml::Value> = HashMap::new();
-    let err = match UsiEngine::spawn(&path, &opts, spawn_opts(false)) {
+    let err = match spawn_mock_engine(&path, &opts, spawn_opts(false)) {
         Ok(_) => panic!("isready 後 engine 死亡 → error が期待される"),
         Err(e) => e,
     };
@@ -265,7 +280,7 @@ exit 1
 "#;
     let path = write_mock_script("empty_line_not_eof", script);
     let opts: HashMap<String, toml::Value> = HashMap::new();
-    let err = match UsiEngine::spawn(&path, &opts, spawn_opts(false)) {
+    let err = match spawn_mock_engine(&path, &opts, spawn_opts(false)) {
         Ok(_) => panic!("isready 後 engine 死亡 → error が期待される"),
         Err(e) => e,
     };
@@ -298,7 +313,7 @@ exit 1
     let path = write_mock_script("passthrough_smoke", script);
     let opts: HashMap<String, toml::Value> = HashMap::new();
     // SpawnOptions { stderr_passthrough: true } で起動。
-    let err = match UsiEngine::spawn(&path, &opts, spawn_opts(true)) {
+    let err = match spawn_mock_engine(&path, &opts, spawn_opts(true)) {
         Ok(_) => panic!("spawn 即時死で error が期待される"),
         Err(e) => e,
     };
@@ -369,7 +384,7 @@ read line
     let path = write_mock_script("grandchild_killpg", &script);
     let opts: HashMap<String, toml::Value> = HashMap::new();
     let engine =
-        UsiEngine::spawn(&path, &opts, spawn_opts(false)).expect("初回 handshake は成功する想定");
+        spawn_mock_engine(&path, &opts, spawn_opts(false)).expect("初回 handshake は成功する想定");
     let parent_pid = engine.child_pid_for_test();
 
     // 孫 pid が pid_file に書かれるまで待つ (最大 2 秒)。
