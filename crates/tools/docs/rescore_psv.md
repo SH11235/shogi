@@ -190,7 +190,7 @@ cargo run --release -p tools --bin rescore_psv -- \
 | `--qsearch-leaf-label` | false | root 局面を保持し、ラベルだけを qsearch 葉の評価にする（後述）。`--nnue`（葉探索用）併用必須 |
 | `--qsearch-leaf-replacement-output` | — | `--qsearch-leaf-label` と併用し、同一 1 パスで葉局面に置換したレコードを別ディレクトリにも書き出す（後述）。`--qsearch-leaf-label` 必須・`--output-dir` と別ディレクトリ必須 |
 | `--max-ply` | 16 | qsearch の最大深さ（`--qsearch-leaf-label` の葉探索でも使用） |
-| `--threads` | 1 | 処理スレッド数（rayon による特徴量構築の並列化） |
+| `--threads` | 0（論理コア数） | 処理スレッド数（rayon による特徴量構築の並列化） |
 
 > **性能メモ（内部 NNUE 評価モード）**: PSV → 局面の復元は SFEN 文字列・`Position::set_sfen`
 > を経由せず `unpack_sfen_to_parts` → `Position::set_from_parts` で直接構築する（per-record の
@@ -200,9 +200,10 @@ cargo run --release -p tools --bin rescore_psv -- \
 
 ### メモリ挙動（全モード共通）
 
-全モード（静的 NNUE / qsearch / `--search-depth` / `--engine` / ONNX）がチャンク
-ストリーミングで動作し、**ピークメモリは入力ファイルの件数に依存しない**
-（100 万件単位で読み込み → 並列処理 → 書き出しを繰り返す）。数十億局面の
+全モードで**ピークメモリは入力ファイルの件数に依存しない**。静的 NNUE / qsearch /
+`--search-depth` / `--engine` は 100 万件単位のチャンクストリーミング（読み込み →
+並列処理 → 書き出しの繰り返し）、ONNX は `--onnx-batch-size` 単位の固定 slot
+パイプライン（「ONNX モードの供給パイプライン」参照）で動作する。数十億局面の
 入力ファイルもそのまま処理できる。
 
 `--search-depth` 使用時の主なメモリ消費は置換表（`--hash-mb` × スレッド数）。
@@ -210,11 +211,17 @@ cargo run --release -p tools --bin rescore_psv -- \
 
 ### `--search-depth` / `--engine` の決定性
 
-- 同一の入力・設定（スレッド数 / エンジン数を含む）での再実行は bit 一致する。
-- ただし**スレッド数（`--engine` ではエンジンプロセス数）を変えると出力スコアが
+- 同一の入力・設定での再実行は bit 一致する。ただし以下の条件付き:
+  - スレッド数 / エンジンプロセス数を明示的に固定する（`--threads 0` は実行時の
+    CPU 数依存になる）
+  - `--max-time` を使わない（時間ベースの探索打ち切りは実行ごとに変わる）
+  - `--engine` では外部エンジン自体が決定的であること（内部スレッド数 1 等）
+- **スレッド数（`--engine` ではエンジンプロセス数）を変えると出力スコアが
   変わりうる**。探索ワーカーの置換表・履歴（`--engine` ではエンジン内部状態）は
   担当局面列を通して持ち越されるため、局面の割り当てが変わると探索結果に影響する。
-  再現性が必要な場合はスレッド数も固定すること。
+- `--engine` でエンジンプロセスが死んだ場合、その担当分の未評価レコードは生存
+  エンジンに再割り当てされる。全エンジンが死んだ場合はエラー終了し、部分出力を
+  成功扱いしない（`--delete-input` でも入力は削除されない）。
 
 ### ポリシー展開オプション（`--expand-output-dir` 指定時）
 

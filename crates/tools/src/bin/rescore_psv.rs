@@ -54,9 +54,10 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
-// Arc/Mutex/Instant は ONNX 直推論パイプライン専用（バッチ供給の Receiver 共有・
+// mpsc/Arc/Mutex/Instant は ONNX 直推論パイプライン専用（バッチ供給の Receiver 共有・
 // フェーズ計時）。ONNX 無効ビルドでの unused import を避けるため cfg で囲う。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+use std::sync::mpsc;
 #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1428,7 +1429,6 @@ fn process_file_with_search(
         );
     }
 
-    // 設定値をキャプチャ
     let max_nodes = cli.max_nodes;
     let max_time = cli.max_time;
     let score_clip = cli.score_clip;
@@ -1515,7 +1515,7 @@ fn process_file_with_search(
             handles.into_iter().map(|h| h.join().expect("Worker thread panicked")).collect()
         });
 
-        // ワーカー順に連結 = 入力順で書き出し
+        // 連続分割なのでワーカー順の連結がそのまま入力順になる
         for result in results.into_iter().flatten() {
             match result {
                 ProcessResult::Ok(record, clipped) => {
@@ -1804,7 +1804,7 @@ impl UsiEngine {
 /// 非依存にする。
 fn process_file_with_engine(
     cli: &Cli,
-    engines: &mut [UsiEngine],
+    engines: &mut Vec<UsiEngine>,
     input_path: &PathBuf,
     output_path: &PathBuf,
     process_count: u64,
@@ -1834,6 +1834,9 @@ fn process_file_with_engine(
 
     // 死んだエンジンプロセスは以降のチャンクの割り当てから除外する
     let mut alive: Vec<bool> = vec![true; engines.len()];
+    // エンジン死亡でスライス途中に残った未評価レコードは、捨てずに
+    // 次チャンクで生存エンジンへ再割り当てする
+    let mut carry: Vec<(PackedSfenValue, String)> = Vec::new();
 
     let mut error_count = 0u64;
     let mut clipped_count = 0u64;
@@ -1851,7 +1854,8 @@ fn process_file_with_engine(
 
         // チャンク読み込み（パース + SFEN 展開 + 王手フィルタ）
         let want = (CHUNK_SIZE as u64).min(process_count.saturating_sub(total_read)) as usize;
-        let mut chunk: Vec<(PackedSfenValue, String)> = Vec::with_capacity(want);
+        let mut chunk: Vec<(PackedSfenValue, String)> = std::mem::take(&mut carry);
+        chunk.reserve(want);
         let mut buffer = [0u8; PackedSfenValue::SIZE];
         let mut read_this_chunk = 0usize;
         while read_this_chunk < want {
@@ -1881,7 +1885,7 @@ fn process_file_with_engine(
             }
             chunk.push((psv, sfen));
         }
-        if read_this_chunk == 0 {
+        if read_this_chunk == 0 && chunk.is_empty() {
             break;
         }
         total_read += read_this_chunk as u64;
@@ -1940,18 +1944,19 @@ fn process_file_with_engine(
                 .collect()
         });
 
-        // ワーカー順に連結 = 入力順で書き出し
+        // 連続分割なのでワーカー順の連結がそのまま入力順になる
         let mut slices = chunk.chunks(slice_size);
         for (engine_idx, scores, died) in results {
             let slice = slices.next().unwrap_or(&[]);
             if died {
                 alive[engine_idx] = false;
+                // 未評価で残ったスライス後半は次チャンクで生存エンジンに再割り当てする
+                carry.extend(slice[scores.len()..].iter().cloned());
                 eprintln!(
                     "Warning: engine process #{engine_idx} failed and is excluded from further processing"
                 );
             }
-            // scores はエンジン死亡 / 中断時にスライスより短いことがあり、
-            // 未評価分は出力に含めない（zip で先頭一致分のみ書く）
+            // 中断時は scores がスライスより短く、zip で評価済みの先頭一致分のみ書く
             for ((psv, _), score) in slice.iter().zip(&scores) {
                 let Some(raw_score) = *score else {
                     error_count += 1;
@@ -1997,6 +2002,10 @@ fn process_file_with_engine(
         );
     }
     eprintln!("Wrote {total_written} records");
+
+    // 死亡エンジンをプールから除去し、後続の入力ファイルに割り当てない
+    let mut alive_flags = alive.into_iter();
+    engines.retain(|_| alive_flags.next().expect("alive length matches engines"));
 
     Ok(())
 }
