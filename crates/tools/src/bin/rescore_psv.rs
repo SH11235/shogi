@@ -1917,7 +1917,9 @@ fn process_file_with_engine(
             let mut alive_engines: Vec<(usize, &mut UsiEngine)> =
                 engines.iter_mut().enumerate().filter(|(idx, _)| alive[*idx]).collect();
             if alive_engines.is_empty() {
-                anyhow::bail!("All engine processes have failed");
+                // 全滅。評価済み prefix を書き出してからエラーにするため、
+                // ここでは抜けるだけにする（書き出し後の全滅チェックで bail）
+                break;
             }
             let slice_size = pending.len().div_ceil(alive_engines.len()).max(1);
 
@@ -1988,8 +1990,8 @@ fn process_file_with_engine(
             pending = next_pending;
         }
 
-        // 入力順で書き出し。未評価（None）は中断時にのみ残り、そこで打ち切って
-        // 出力を入力の連続 prefix に保つ（歯抜けの部分出力を作らない）
+        // 入力順で書き出し。未評価（None）は中断か全エンジン死亡時にのみ残り、
+        // そこで打ち切って出力を入力の連続 prefix に保つ（歯抜けの部分出力を作らない）
         for ((psv, _), score) in chunk.iter().zip(&chunk_scores) {
             let Some(evaluated) = score else {
                 break;
@@ -2012,6 +2014,14 @@ fn process_file_with_engine(
             };
             writer.write_all(&new_psv.to_bytes())?;
             total_written += 1;
+        }
+
+        // 全エンジン死亡はファイル失敗として扱う（未評価が残らず正常にチャンクを
+        // 消化し切った場合も含む）。成功扱いにすると評価失敗レコードを欠いた出力の
+        // まま完了し、--delete-input が入力を削除しうる
+        if alive.iter().all(|a| !*a) {
+            writer.flush()?;
+            anyhow::bail!("All engine processes have failed");
         }
     }
 
