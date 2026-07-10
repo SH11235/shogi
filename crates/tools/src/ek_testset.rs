@@ -26,7 +26,8 @@ use crate::replay::model::{GameIndex, GameIndexEntry, GameOutcomeView, GameSourc
 
 const DEFAULT_MIN_PLY_FROM_ENTRY: i32 = -20;
 const DEFAULT_SAMPLE_STRIDE: u32 = 4;
-const DEFAULT_SCALE: f64 = 290.0;
+// cp→勝率の Ponanza 定数 (p = sigmoid(cp/600))。学習側の scale (FV_SCALE 調整用) とは無関係。
+const DEFAULT_SCALE: f64 = 600.0;
 const DECISIVE_CP: i32 = 600;
 const PROB_EPS: f64 = 1e-12;
 
@@ -63,8 +64,9 @@ struct BuildArgs {
     /// 対象区間を何手ごとにサンプルするか。
     #[arg(long, default_value_t = DEFAULT_SAMPLE_STRIDE)]
     sample_stride: u32,
-    /// draw を除外するか (`--drop-draw false` で draw 対局も含める)。
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// draw 対局を除外するか。既定 false: 入玉の変換失敗（千日手・持将棋）は
+    /// このテストセットが測りたい弱点そのものなので、draw も採点対象に含める。
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     drop_draw: bool,
 }
 
@@ -119,7 +121,9 @@ struct BuildMeta {
     games_skipped_broken: usize,
     records: usize,
     dt_records: usize,
+    // oc_records は勝敗ラベル（符号一致率の分母）、draw_records は draw（期待スコア 0.5 で採点）。
     oc_records: usize,
+    draw_records: usize,
     // 生成元 CSA の一覧は持たない（レコードごとの source_csa が生成元を記録する）。
     notes: Vec<String>,
 }
@@ -147,6 +151,8 @@ struct DtMetrics {
 #[derive(Debug, Serialize, Default, PartialEq)]
 struct OcMetrics {
     n: usize,
+    // n のうち draw（期待スコア 0.5 で採点）。sign_acc の分母は n - n_draw。
+    n_draw: usize,
     sign_acc: Option<f64>,
     wdl_cross_entropy: Option<f64>,
     brier: Option<f64>,
@@ -158,7 +164,8 @@ struct CalibrationBin {
     bin: usize,
     n: usize,
     avg_pred: f64,
-    win_rate: f64,
+    // 平均実スコア（win=1 / draw=0.5 / loss=0）。
+    score_rate: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -187,6 +194,7 @@ struct EvalMetricBuilder {
     // index = clamp(eval_cp) + DT_EVAL_HIST_MAX_CP の件数。
     dt_hist: Box<[u64]>,
     oc_n: usize,
+    oc_draw: usize,
     oc_sign_ok: usize,
     oc_ce: f64,
     oc_brier: f64,
@@ -202,6 +210,7 @@ impl Default for EvalMetricBuilder {
             records: 0,
             dt_hist: vec![0; DT_EVAL_HIST_LEN].into_boxed_slice(),
             oc_n: 0,
+            oc_draw: 0,
             oc_sign_ok: 0,
             oc_ce: 0.0,
             oc_brier: 0.0,
@@ -245,6 +254,7 @@ fn run_build(args: &BuildArgs) -> Result<()> {
     let mut records = 0usize;
     let mut dt_records = 0usize;
     let mut oc_records = 0usize;
+    let mut draw_records = 0usize;
     let mut games_indexed = 0usize;
     let mut games_used = 0usize;
     let mut games_skipped_broken = 0usize;
@@ -291,9 +301,9 @@ fn run_build(args: &BuildArgs) -> Result<()> {
                 if record.dt_label == Some(Label::Win) {
                     dt_records += 1;
                 }
-                // eval 側の OC 採点は draw を除外するため、meta の oc_records も win/loss のみ数える。
-                if matches!(record.oc_label, Label::Win | Label::Loss) {
-                    oc_records += 1;
+                match record.oc_label {
+                    Label::Win | Label::Loss => oc_records += 1,
+                    Label::Draw => draw_records += 1,
                 }
                 serde_json::to_writer(&mut testset, &record)?;
                 writeln!(testset)?;
@@ -316,6 +326,7 @@ fn run_build(args: &BuildArgs) -> Result<()> {
         records,
         dt_records,
         oc_records,
+        draw_records,
         notes: vec![
             "core が entering_king_point_info を公開していないため points_stm / king_in_enemy_stm / enemy_zone_pieces_stm は省略".to_string(),
         ],
@@ -326,10 +337,11 @@ fn run_build(args: &BuildArgs) -> Result<()> {
     meta_writer.flush()?;
 
     eprintln!(
-        "wrote {} records (dt={}, oc={}) to {}",
+        "wrote {} records (dt={}, oc={}, draw={}) to {}",
         records,
         dt_records,
         oc_records,
+        draw_records,
         testset_path.display()
     );
     Ok(())
@@ -606,29 +618,30 @@ impl EvalMetricBuilder {
             let clamped = eval_cp.clamp(-DT_EVAL_HIST_MAX_CP, DT_EVAL_HIST_MAX_CP);
             self.dt_hist[(clamped + DT_EVAL_HIST_MAX_CP) as usize] += 1;
         }
-        if matches!(record.oc_label, Label::Win | Label::Loss) {
-            self.push_oc(
-                ScoredLabel {
-                    eval_cp,
-                    label: record.oc_label,
-                },
-                scale,
-            );
-        }
+        self.push_oc(
+            ScoredLabel {
+                eval_cp,
+                label: record.oc_label,
+            },
+            scale,
+        );
     }
 
     fn push_oc(&mut self, record: ScoredLabel, scale: f64) {
+        // draw は入玉の変換失敗（千日手・持将棋）の署名そのものなので採点対象に含め、
+        // 期待スコア 0.5 として CE/Brier/calibration に算入する。符号一致率は勝敗のみ。
         let target = match record.label {
             Label::Win => 1.0,
+            Label::Draw => 0.5,
             Label::Loss => 0.0,
-            Label::Draw => unreachable!("draw は OC 採点対象外"),
         };
-        let p = sigmoid(f64::from(record.eval_cp) / scale).clamp(PROB_EPS, 1.0 - PROB_EPS);
-        if (record.eval_cp > 0 && record.label == Label::Win)
-            || (record.eval_cp < 0 && record.label == Label::Loss)
-        {
-            self.oc_sign_ok += 1;
+        match record.label {
+            Label::Win if record.eval_cp > 0 => self.oc_sign_ok += 1,
+            Label::Loss if record.eval_cp < 0 => self.oc_sign_ok += 1,
+            Label::Draw => self.oc_draw += 1,
+            _ => {}
         }
+        let p = sigmoid(f64::from(record.eval_cp) / scale).clamp(PROB_EPS, 1.0 - PROB_EPS);
         self.oc_n += 1;
         self.oc_ce += -(target * p.ln() + (1.0 - target) * (1.0 - p).ln());
         self.oc_brier += (p - target).powi(2);
@@ -643,9 +656,11 @@ impl EvalMetricBuilder {
         let oc = if self.oc_n == 0 {
             OcMetrics::default()
         } else {
+            let decisive = self.oc_n - self.oc_draw;
             OcMetrics {
                 n: self.oc_n,
-                sign_acc: Some(rate(self.oc_sign_ok, self.oc_n)),
+                n_draw: self.oc_draw,
+                sign_acc: (decisive > 0).then(|| rate(self.oc_sign_ok, decisive)),
                 wdl_cross_entropy: Some(self.oc_ce / self.oc_n as f64),
                 brier: Some(self.oc_brier / self.oc_n as f64),
                 calibration: self.calibration_bins(),
@@ -666,7 +681,7 @@ impl EvalMetricBuilder {
                 bin,
                 n,
                 avg_pred: self.oc_cal_pred_sum[bin] / n as f64,
-                win_rate: self.oc_cal_win_sum[bin] / n as f64,
+                score_rate: self.oc_cal_win_sum[bin] / n as f64,
             });
         }
         out
@@ -762,14 +777,14 @@ mod tests {
         let Command::Build(args) = cli.command else {
             panic!("build expected")
         };
-        assert!(args.drop_draw);
+        assert!(!args.drop_draw);
 
-        let with_false = base.iter().chain(&["--drop-draw", "false"]);
-        let cli = Cli::try_parse_from(with_false).expect("parse --drop-draw false");
+        let with_true = base.iter().chain(&["--drop-draw", "true"]);
+        let cli = Cli::try_parse_from(with_true).expect("parse --drop-draw true");
         let Command::Build(args) = cli.command else {
             panic!("build expected")
         };
-        assert!(!args.drop_draw);
+        assert!(args.drop_draw);
     }
 
     #[test]
@@ -827,6 +842,26 @@ mod tests {
     }
 
     #[test]
+    fn all_draw_input_yields_no_sign_acc() {
+        let draw = TestsetRecord {
+            sfen: "4k4/9/9/9/9/9/9/9/4K4 b - 1".to_string(),
+            stm: 'b',
+            ply: 1,
+            source_csa: String::new(),
+            is_declarable: false,
+            dt_label: None,
+            oc_label: Label::Draw,
+            floodgate_eval_cp: None,
+        };
+        let records = vec![(draw.clone(), 100), (draw, -100)];
+        let (_, oc) = compute_metrics(&records, 600.0);
+        assert_eq!(oc.n, 2);
+        assert_eq!(oc.n_draw, 2);
+        assert_eq!(oc.sign_acc, None);
+        assert!(oc.wdl_cross_entropy.unwrap() > 0.0);
+    }
+
+    #[test]
     fn dt_metrics_from_histogram_match_sorted_semantics() {
         let dt = |eval_cp: i32| {
             let r = TestsetRecord {
@@ -868,17 +903,23 @@ mod tests {
         dt_win.dt_label = Some(Label::Win);
         let mut loss = base.clone();
         loss.oc_label = Label::Loss;
-        let records = vec![(dt_win, 700), (base, 100), (loss, -100)];
+        let mut draw = base.clone();
+        draw.oc_label = Label::Draw;
+        let records = vec![(dt_win, 700), (base, 100), (loss, -100), (draw, 0)];
         let (dt, oc) = compute_metrics(&records, 100.0);
         assert_eq!(dt.n, 1);
         assert_eq!(dt.sign_acc, Some(1.0));
         assert_eq!(dt.decisive_acc, Some(1.0));
         assert_eq!(dt.eval_median, Some(700));
-        assert_eq!(oc.n, 3);
+        assert_eq!(oc.n, 4);
+        assert_eq!(oc.n_draw, 1);
+        // 符号一致率の分母は勝敗の 3 件のみ（draw は含めない）。
         assert_eq!(oc.sign_acc, Some(1.0));
+        // draw (eval=0) は p=0.5, target=0.5 で CE=ln2, Brier=0 を寄与する。
         let expected_p = sigmoid(1.0);
-        let expected_ce = -((expected_p.ln() * 2.0) + sigmoid(7.0).ln()) / 3.0;
+        let expected_ce =
+            (-((expected_p.ln() * 2.0) + sigmoid(7.0).ln()) + std::f64::consts::LN_2) / 4.0;
         assert!((oc.wdl_cross_entropy.unwrap() - expected_ce).abs() < 1e-12);
-        assert_eq!(oc.calibration.iter().map(|b| b.n).sum::<usize>(), 3);
+        assert_eq!(oc.calibration.iter().map(|b| b.n).sum::<usize>(), 4);
     }
 }

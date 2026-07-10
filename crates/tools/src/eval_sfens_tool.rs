@@ -315,7 +315,8 @@ fn run_eval_for_network<
     let mut acc = AccumulatorLayerStacks::<L1>::new();
     let mut dumped_debug = false;
 
-    println!("sfen\tbucket\traw\tscore");
+    // raw は network head 出力、score は Value 内部スケール (歩=90)、score_cp は cp (歩=100)。
+    println!("sfen\tbucket\traw\tscore\tscore_cp");
     for (i, line) in reader.lines().enumerate() {
         if i >= cli.count {
             break;
@@ -359,7 +360,7 @@ fn run_eval_for_network<
             dumped_debug = true;
         }
 
-        println!("{sfen}\t{bucket_index}\t{raw}\t{}", value.raw());
+        println!("{sfen}\t{bucket_index}\t{raw}\t{}\t{}", value.raw(), value.to_cp());
     }
 
     Ok(())
