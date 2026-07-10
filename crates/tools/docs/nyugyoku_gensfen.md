@@ -61,7 +61,8 @@ CSAの`'* <cp> ...`（直後の指し手）と`'** <cp> ...`（直前の指し�
 ## 中断・再開
 
 実行中の候補、一時出力、checkpointは、`--out-dir /path/to/out`に対してsiblingの
-`/path/to/out.work/`へ継続的に書き出す。manifestの既定10,000行ごと、および各dedup
+`/path/to/out.work/`へ継続的に書き出す。manifestの既定1,000,000行ごと、または10分ごと、
+および各dedup
 パーティション完了時にdurableなbyte位置を`state.json`へ保存する。checkpointでは変更が
 あったpartitionだけをflush・syncし、その後にstateとディレクトリエントリもsyncする。
 partitionと一時出力のprefix checksumも保存し、同じbyte長の偶発的な破損も再開時に
@@ -83,6 +84,9 @@ checkpointより後の一時データは記録済み
 byte位置へ切り戻してから再処理する。dedup開始後はmanifest全体の行数と処理済みprefixを
 照合し、変更・追記された入力からの再開を拒否する。checkpoint間隔は
 `--checkpoint-interval`で変更できる。
+
+修正前のrshogi-csa-serverがinline `,T`付き指し手の直後へ`'*`評価コメントを書いた棋譜は、
+`--legacy-server-eval-comments`を指定する。通常のCSAでは指定しない。
 
 最終`out/`は全処理が成功した時だけ、`out.work/`の同一ファイルシステム内renameで
 公開される。Linuxでは`RENAME_NOREPLACE`を使い、並行して作られたものを含む既存の`out/`を

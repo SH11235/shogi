@@ -8,12 +8,13 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::Parser;
 use rshogi_core::position::Position as CorePosition;
 use rshogi_core::types::{EnteringKingRule, Move};
-use rshogi_csa::{ParsedMove, parse_csa_full_with_evals};
+use rshogi_csa::{EvalCommentStyle, ParsedMove, parse_csa_full_with_evals_style};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tools::common::dedup::{FNV1A64_OFFSET, fnv1a64, fnv1a64_update, get_disk_available};
@@ -22,7 +23,8 @@ use tools::common::io::{
 };
 
 const DEFAULT_PARTITIONS: usize = 128;
-const DEFAULT_CHECKPOINT_INTERVAL: usize = 10_000;
+const DEFAULT_CHECKPOINT_INTERVAL: usize = 1_000_000;
+const DEFAULT_CHECKPOINT_MAX_ELAPSED: Duration = Duration::from_secs(10 * 60);
 const PARTITION_BUFFER_BYTES: usize = 64 * 1024;
 const STATE_VERSION: u32 = 3;
 
@@ -52,6 +54,10 @@ struct Cli {
     /// manifest の処理行数ごとに partition を flush して checkpoint を保存する
     #[arg(long, default_value_t = DEFAULT_CHECKPOINT_INTERVAL, value_parser = parse_positive_usize)]
     checkpoint_interval: usize,
+
+    /// 修正前のrshogi-csa-serverが手後へ書いた`'*`評価コメントとして解釈する。
+    #[arg(long)]
+    legacy_server_eval_comments: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +110,7 @@ struct RunState {
     processed_prefix_sha256: String,
     /// 処理済み行が参照するCSA内容をmanifest順に加えたSHA-256。
     processed_sources_sha256: String,
+    legacy_server_eval_comments: bool,
     candidates_written: u64,
     /// 最後のcheckpointでdurableだった各partitionのbyte長。
     partition_bytes: Vec<u64>,
@@ -121,6 +128,7 @@ struct RunOptions {
     partitions: usize,
     resume: bool,
     checkpoint_interval: usize,
+    legacy_server_eval_comments: bool,
 }
 
 fn parse_partition_count(value: &str) -> std::result::Result<usize, String> {
@@ -148,6 +156,7 @@ fn main() -> Result<()> {
             partitions: cli.partitions,
             resume: cli.resume,
             checkpoint_interval: cli.checkpoint_interval,
+            legacy_server_eval_comments: cli.legacy_server_eval_comments,
         },
     )
 }
@@ -191,7 +200,12 @@ fn run_with_options(manifest: &Path, out_dir: &Path, options: RunOptions) -> Res
                 .with_context(|| format!("failed to open {}", resume_path.display()))?,
         ))
         .with_context(|| format!("failed to parse {}", resume_path.display()))?;
-        validate_resume_state(&state, &manifest, options.partitions)?;
+        validate_resume_state(
+            &state,
+            &manifest,
+            options.partitions,
+            options.legacy_server_eval_comments,
+        )?;
         if state.phase != Phase::Partition {
             verify_manifest_for_resume(&manifest, &state)?;
         }
@@ -218,6 +232,7 @@ fn run_with_options(manifest: &Path, out_dir: &Path, options: RunOptions) -> Res
             processed_manifest_lines: 0,
             processed_prefix_sha256: empty_sha256(),
             processed_sources_sha256: empty_sha256(),
+            legacy_server_eval_comments: options.legacy_server_eval_comments,
             candidates_written: 0,
             partition_bytes: vec![0; options.partitions],
             partition_hashes: vec![FNV1A64_OFFSET; options.partitions],
@@ -262,13 +277,22 @@ fn run_with_options(manifest: &Path, out_dir: &Path, options: RunOptions) -> Res
     Ok(())
 }
 
-fn validate_resume_state(state: &RunState, manifest: &Path, partitions: usize) -> Result<()> {
+fn validate_resume_state(
+    state: &RunState,
+    manifest: &Path,
+    partitions: usize,
+    legacy_server_eval_comments: bool,
+) -> Result<()> {
     ensure!(state.version == STATE_VERSION, "unsupported state version: {}", state.version);
     ensure!(
         state.manifest == manifest.display().to_string(),
         "manifest path does not match state"
     );
     ensure!(state.partitions == partitions, "--partitions does not match state");
+    ensure!(
+        state.legacy_server_eval_comments == legacy_server_eval_comments,
+        "--legacy-server-eval-comments does not match state"
+    );
     ensure!(
         state.partition_bytes.len() == partitions,
         "partition checkpoint count does not match state"
@@ -343,6 +367,7 @@ fn partition_manifest(
     let mut prefix_hasher = Sha256::new();
     let mut sources_hasher = Sha256::new();
     let mut lines_since_checkpoint = 0usize;
+    let mut last_checkpoint = Instant::now();
 
     for (line_idx, line) in BufReader::new(file).lines().enumerate() {
         let line = line?;
@@ -376,7 +401,7 @@ fn partition_manifest(
         }
 
         if let (Some(row), Some(csa_text)) = (row.as_ref(), csa_text.as_deref()) {
-            for item in extract_from_row_text(row, csa_text)? {
+            for item in extract_from_row_text(row, csa_text, state.legacy_server_eval_comments)? {
                 let partition = fnv1a64(item.position_key.as_bytes()) as usize % state.partitions;
                 writers.write_record(partition, &item)?;
                 state.candidates_written += 1;
@@ -387,7 +412,9 @@ fn partition_manifest(
         state.processed_prefix_sha256 = hex_digest(prefix_hasher.clone().finalize());
         state.processed_sources_sha256 = hex_digest(sources_hasher.clone().finalize());
         lines_since_checkpoint += 1;
-        if lines_since_checkpoint >= checkpoint_interval {
+        if lines_since_checkpoint >= checkpoint_interval
+            || last_checkpoint.elapsed() >= DEFAULT_CHECKPOINT_MAX_ELAPSED
+        {
             writers.checkpoint()?;
             update_partition_checkpoint(partitions_dir, state)?;
             state.partition_hashes.clone_from(&writers.hashes);
@@ -397,6 +424,7 @@ fn partition_manifest(
                 state.processed_manifest_lines, state.candidates_written
             );
             lines_since_checkpoint = 0;
+            last_checkpoint = Instant::now();
         }
     }
 
@@ -666,12 +694,21 @@ fn append_anchor_candidates(
     }
 }
 
-fn extract_from_row_text(row: &ManifestRow, text: &str) -> Result<Vec<ExtractedPosition>> {
+fn extract_from_row_text(
+    row: &ManifestRow,
+    text: &str,
+    legacy_server_eval_comments: bool,
+) -> Result<Vec<ExtractedPosition>> {
     let candidates = anchor_candidates(row);
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-    let (initial_pos, parsed, _info, evals) = parse_csa_full_with_evals(text)
+    let style = if legacy_server_eval_comments {
+        EvalCommentStyle::LegacyServerPost
+    } else {
+        EvalCommentStyle::Standard
+    };
+    let (initial_pos, parsed, _info, evals) = parse_csa_full_with_evals_style(text, style)
         .with_context(|| format!("failed to parse {}", row.csa_path.display()))?;
     let normal_moves: Vec<_> = parsed
         .iter()
@@ -1025,6 +1062,7 @@ mod tests {
             partitions: 4,
             resume,
             checkpoint_interval: 1,
+            legacy_server_eval_comments: false,
         }
     }
 
@@ -1105,6 +1143,7 @@ mod tests {
                 partitions: 4,
                 resume: false,
                 checkpoint_interval: 10,
+                legacy_server_eval_comments: false,
             },
         )
         .unwrap_err();
@@ -1121,6 +1160,7 @@ mod tests {
                 partitions: 4,
                 resume: true,
                 checkpoint_interval: 10,
+                legacy_server_eval_comments: false,
             },
         )
         .unwrap();
@@ -1143,7 +1183,8 @@ mod tests {
                 RunOptions {
                     partitions: 4,
                     resume: false,
-                    checkpoint_interval: 1
+                    checkpoint_interval: 1,
+                    legacy_server_eval_comments: false,
                 },
             )
             .is_err()
@@ -1158,6 +1199,7 @@ mod tests {
                 partitions: 4,
                 resume: true,
                 checkpoint_interval: 1,
+                legacy_server_eval_comments: false,
             },
         )
         .unwrap_err();
@@ -1233,6 +1275,7 @@ mod tests {
             processed_manifest_lines: 0,
             processed_prefix_sha256: empty_sha256(),
             processed_sources_sha256: empty_sha256(),
+            legacy_server_eval_comments: false,
             candidates_written: 0,
             partition_bytes: vec![0],
             partition_hashes: vec![FNV1A64_OFFSET],
@@ -1264,6 +1307,7 @@ mod tests {
             processed_manifest_lines: 1,
             processed_prefix_sha256: format!("{:x}", hasher.finalize()),
             processed_sources_sha256: empty_sha256(),
+            legacy_server_eval_comments: false,
             candidates_written: 0,
             partition_bytes: vec![0],
             partition_hashes: vec![FNV1A64_OFFSET],
@@ -1351,6 +1395,7 @@ mod tests {
             processed_manifest_lines: 1,
             processed_prefix_sha256: empty_sha256(),
             processed_sources_sha256: empty_sha256(),
+            legacy_server_eval_comments: false,
             candidates_written: 1,
             partition_bytes: vec![0],
             partition_hashes: vec![FNV1A64_OFFSET],
@@ -1384,6 +1429,7 @@ mod tests {
             processed_manifest_lines: 0,
             processed_prefix_sha256: empty_sha256(),
             processed_sources_sha256: empty_sha256(),
+            legacy_server_eval_comments: false,
             candidates_written: 1,
             partition_bytes: vec![0],
             partition_hashes: vec![FNV1A64_OFFSET],

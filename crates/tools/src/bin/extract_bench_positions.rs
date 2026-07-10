@@ -15,7 +15,7 @@ use rshogi_core::position::Position;
 use rshogi_core::types::{
     Color, EnteringKingRule, File as ShogiFile, Move, PieceType, Rank, Square,
 };
-use rshogi_csa::{ParsedMove, parse_csa_full_with_evals};
+use rshogi_csa::{EvalCommentStyle, ParsedMove, parse_csa_full_with_evals_style};
 use serde::{Deserialize, Serialize};
 use tools::common::dedup::collect_input_paths;
 
@@ -37,6 +37,10 @@ struct Cli {
     /// 出力ディレクトリ。
     #[arg(long)]
     out_dir: PathBuf,
+
+    /// 修正前のrshogi-csa-serverが手後へ書いた`'*`評価コメントとして解釈する。
+    #[arg(long)]
+    legacy_server_eval_comments: bool,
 
     /// floodgate の両対局者に要求する最小レート。不明レートは除外。
     #[arg(long, default_value_t = 3000)]
@@ -369,7 +373,7 @@ fn is_csa_path(path: &Path) -> bool {
 }
 
 fn process_csa_file(path: &Path, cli: &Cli, stats: &mut Stats) -> Result<Option<ExtractedGame>> {
-    let game = parse_csa(path)?;
+    let game = parse_csa(path, cli.legacy_server_eval_comments)?;
     if game.non_hirate {
         add_count(&mut stats.skipped_by_reason, "non_hirate");
         return Ok(None);
@@ -444,10 +448,15 @@ fn process_csa_file(path: &Path, cli: &Cli, stats: &mut Stats) -> Result<Option<
     }))
 }
 
-fn parse_csa(path: &Path) -> Result<CsaGame> {
+fn parse_csa(path: &Path, legacy_server_eval_comments: bool) -> Result<CsaGame> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("CSA を開けません: {}", path.display()))?;
-    let (_, parsed, _, evals) = parse_csa_full_with_evals(&text)
+    let style = if legacy_server_eval_comments {
+        EvalCommentStyle::LegacyServerPost
+    } else {
+        EvalCommentStyle::Standard
+    };
+    let (_, parsed, _, evals) = parse_csa_full_with_evals_style(&text, style)
         .with_context(|| format!("CSA を解析できません: {}", path.display()))?;
     let mut evals = evals.into_iter();
     let moves: Vec<CsaMoveLine> = parsed
@@ -1120,7 +1129,7 @@ mod tests {
             ),
         )
         .expect("write csa");
-        let game = parse_csa(&path).expect("parse csa");
+        let game = parse_csa(&path, false).expect("parse csa");
         assert_eq!(game.moves.len(), 2);
         assert_eq!(game.black_rate, Some(3200));
         assert_eq!(game.white_rate, Some(3100));
@@ -1145,7 +1154,7 @@ mod tests {
             ),
         )
         .expect("write csa");
-        let game = parse_csa(&path).expect("parse csa");
+        let game = parse_csa(&path, false).expect("parse csa");
         assert!(game.non_hirate);
     }
 

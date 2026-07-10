@@ -19,8 +19,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use rshogi_core::position::Position;
 use rshogi_core::types::{Color, Move};
 use rshogi_csa::{
-    Color as CsaColor, ParsedMove, SpecialMove, csa_move_to_usi, parse_csa_full_with_evals,
-    usi_move_to_csa,
+    Color as CsaColor, EvalCommentStyle, ParsedMove, SpecialMove, csa_move_to_usi,
+    parse_csa_full_with_evals_style, usi_move_to_csa,
 };
 use walkdir::WalkDir;
 
@@ -39,6 +39,7 @@ use super::model::{
 pub struct CsaSource {
     /// ディレクトリ（配下の `*.csa` を横断）または単一 `.csa` ファイル。
     input: PathBuf,
+    eval_comment_style: EvalCommentStyle,
 }
 
 impl CsaSource {
@@ -46,7 +47,15 @@ impl CsaSource {
     pub fn new(input: impl Into<PathBuf>) -> Self {
         Self {
             input: input.into(),
+            eval_comment_style: EvalCommentStyle::Standard,
         }
+    }
+
+    pub fn with_legacy_server_eval_comments(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.eval_comment_style = EvalCommentStyle::LegacyServerPost;
+        }
+        self
     }
 
     /// 入力がディレクトリなら配下の `*.csa` を（サブディレクトリも再帰して）パス順で、
@@ -94,16 +103,17 @@ impl GameSource for CsaSource {
                     continue;
                 }
             };
-            let (init, parsed, info, evals) = match parse_csa_full_with_evals(&text) {
-                Ok(v) => v,
-                Err(e) => {
-                    warnings.push(format!(
-                        "{}: CSA として解釈できないため読み飛ばしました（{e}）",
-                        path.display()
-                    ));
-                    continue;
-                }
-            };
+            let (init, parsed, info, evals) =
+                match parse_csa_full_with_evals_style(&text, self.eval_comment_style) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warnings.push(format!(
+                            "{}: CSA として解釈できないため読み飛ばしました（{e}）",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                };
 
             let normal_count =
                 parsed.iter().filter(|m| matches!(m, ParsedMove::Normal(_))).count() as u32;
@@ -157,8 +167,9 @@ impl GameSource for CsaSource {
             .ok_or_else(|| anyhow!("file_idx {file_idx} not found in index"))?;
         let text = fs::read_to_string(&meta.path)
             .with_context(|| format!("failed to read {}", meta.path.display()))?;
-        let (mut pos, parsed, _info, evals) = parse_csa_full_with_evals(&text)
-            .with_context(|| format!("failed to parse {}", meta.path.display()))?;
+        let (mut pos, parsed, _info, evals) =
+            parse_csa_full_with_evals_style(&text, self.eval_comment_style)
+                .with_context(|| format!("failed to parse {}", meta.path.display()))?;
         let mut evals = evals.into_iter();
         let mut moves = Vec::new();
         for pm in &parsed {
@@ -406,6 +417,18 @@ mod tests {
         let game = source.load_game(&index, &index.entries[0]).expect("load_game");
         assert_eq!(game.moves[0].annotation.elapsed_ms, Some(3_000));
         assert_eq!(game.moves[1].annotation.elapsed_ms, Some(4_000));
+    }
+
+    #[test]
+    fn legacy_server_eval_style_is_available_to_consumer() {
+        let text = "V2.2\n$GAME_ID:legacy\nPI\n+7776FU,T1\n'* 100\n-3334FU,T1\n%TORYO\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csa(dir.path(), "a.csa", text);
+        let source = CsaSource::new(dir.path()).with_legacy_server_eval_comments(true);
+        let index = source.build_index().expect("build_index");
+        let game = source.load_game(&index, &index.entries[0]).expect("load_game");
+        assert_eq!(game.moves[0].annotation.score_cp, Some(100));
+        assert_eq!(game.moves[1].annotation.score_cp, None);
     }
 
     #[test]
