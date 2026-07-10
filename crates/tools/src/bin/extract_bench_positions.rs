@@ -15,7 +15,7 @@ use rshogi_core::position::Position;
 use rshogi_core::types::{
     Color, EnteringKingRule, File as ShogiFile, Move, PieceType, Rank, Square,
 };
-use rshogi_csa::{ParsedMove, parse_csa_full};
+use rshogi_csa::{ParsedMove, parse_csa_full_with_evals};
 use serde::{Deserialize, Serialize};
 use tools::common::dedup::collect_input_paths;
 
@@ -52,7 +52,7 @@ struct Cli {
 
     /// startpos 出力に許す絶対評価値上限。
     #[arg(long, default_value_t = 150)]
-    startpos_eval_abs_max: i32,
+    startpos_eval_abs_max: u32,
 
     /// startpos 出力の中心 ply。
     #[arg(long, default_value_t = 100)]
@@ -447,14 +447,15 @@ fn process_csa_file(path: &Path, cli: &Cli, stats: &mut Stats) -> Result<Option<
 fn parse_csa(path: &Path) -> Result<CsaGame> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("CSA を開けません: {}", path.display()))?;
-    let (_, parsed, _) = parse_csa_full(&text)
+    let (_, parsed, _, evals) = parse_csa_full_with_evals(&text)
         .with_context(|| format!("CSA を解析できません: {}", path.display()))?;
+    let mut evals = evals.into_iter();
     let moves: Vec<CsaMoveLine> = parsed
         .iter()
         .filter_map(|pm| match pm {
             ParsedMove::Normal(cm) => Some(CsaMoveLine {
                 raw: cm.mv.clone(),
-                eval_raw: cm.eval_cp_black,
+                eval_raw: evals.next().flatten(),
             }),
             ParsedMove::Special(_) => None,
         })
@@ -847,11 +848,11 @@ fn csa_side(raw: &str) -> Result<Color> {
     }
 }
 
-fn mover_view_to_black(eval_raw: i32, side: Color) -> i32 {
+fn mover_view_to_black(eval_raw: i32, side: Color) -> i64 {
     if side == Color::Black {
-        eval_raw
+        i64::from(eval_raw)
     } else {
-        -eval_raw
+        -i64::from(eval_raw)
     }
 }
 
@@ -943,7 +944,7 @@ fn eval_band(eval: Option<i32>) -> &'static str {
     let Some(eval) = eval else {
         return "unknown";
     };
-    match eval.abs() {
+    match eval.unsigned_abs() {
         0..=150 => "0-150",
         151..=600 => "151-600",
         601..=1500 => "601-1500",
@@ -966,7 +967,7 @@ fn maybe_set_startpos(record: &BenchRecord, cli: &Cli, slot: &mut Option<BenchRe
     };
     if slot.is_none()
         && (lower..=upper).contains(&record.ply)
-        && eval.abs() <= cli.startpos_eval_abs_max
+        && eval.unsigned_abs() <= cli.startpos_eval_abs_max
     {
         *slot = Some(record.clone());
     }
@@ -1059,6 +1060,7 @@ mod tests {
     fn mover_view_conversion_flips_white() {
         assert_eq!(mover_view_to_black(120, Color::Black), 120);
         assert_eq!(mover_view_to_black(120, Color::White), -120);
+        assert_eq!(mover_view_to_black(i32::MIN, Color::White), 2_147_483_648);
     }
 
     #[test]
@@ -1168,6 +1170,7 @@ mod tests {
         assert_eq!(eval_band(Some(1501)), "1501+");
         assert_eq!(eval_band(Some(29_999)), "1501+");
         assert_eq!(eval_band(Some(-30_000)), "mate");
+        assert_eq!(eval_band(Some(i32::MIN)), "mate");
     }
 
     #[test]

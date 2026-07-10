@@ -19,7 +19,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use rshogi_core::position::Position;
 use rshogi_core::types::{Color, Move};
 use rshogi_csa::{
-    Color as CsaColor, ParsedMove, SpecialMove, csa_move_to_usi, parse_csa_full, usi_move_to_csa,
+    Color as CsaColor, ParsedMove, SpecialMove, csa_move_to_usi, parse_csa_full_with_evals,
+    usi_move_to_csa,
 };
 use walkdir::WalkDir;
 
@@ -93,7 +94,7 @@ impl GameSource for CsaSource {
                     continue;
                 }
             };
-            let (init, parsed, info) = match parse_csa_full(&text) {
+            let (init, parsed, info, evals) = match parse_csa_full_with_evals(&text) {
                 Ok(v) => v,
                 Err(e) => {
                     warnings.push(format!(
@@ -110,10 +111,7 @@ impl GameSource for CsaSource {
 
             // 評価値コメントは元々先手視点なので、そのまま指標へ流す。
             let mut acc = EvalAccumulator::default();
-            for cp in parsed.iter().filter_map(|m| match m {
-                ParsedMove::Normal(cm) => cm.eval_cp_black,
-                ParsedMove::Special(_) => None,
-            }) {
+            for cp in evals.into_iter().flatten() {
                 acc.push(cp);
             }
 
@@ -159,13 +157,15 @@ impl GameSource for CsaSource {
             .ok_or_else(|| anyhow!("file_idx {file_idx} not found in index"))?;
         let text = fs::read_to_string(&meta.path)
             .with_context(|| format!("failed to read {}", meta.path.display()))?;
-        let (mut pos, parsed, _info) = parse_csa_full(&text)
+        let (mut pos, parsed, _info, evals) = parse_csa_full_with_evals(&text)
             .with_context(|| format!("failed to parse {}", meta.path.display()))?;
+        let mut evals = evals.into_iter();
         let mut moves = Vec::new();
         for pm in &parsed {
             let ParsedMove::Normal(cm) = pm else {
                 continue; // 終局特殊手は再生対象の指し手列には含めない。
             };
+            let eval_cp_black = evals.next().flatten();
             let sfen_before = pos.to_sfen();
 
             // ラベル・手番・絶対手数は rshogi_core 側の局面から取る（JSONL/PSV と同一の
@@ -210,9 +210,8 @@ impl GameSource for CsaSource {
                 None => (Move::NONE, format!("{:>4} {}", abs_ply, cm.mv)),
             };
 
-            let score_cp = cm
-                .eval_cp_black
-                .and_then(|black_pov| black_pov_to_side_relative(black_pov, side));
+            let score_cp =
+                eval_cp_black.and_then(|black_pov| black_pov_to_side_relative(black_pov, side));
 
             moves.push(MoveView {
                 ply: abs_ply,

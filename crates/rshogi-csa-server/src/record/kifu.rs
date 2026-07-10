@@ -104,7 +104,14 @@ impl KifuRecord {
                 // wdoor と同じ `'**` に正規化して「直前の手」への帰属を明示する。
                 if c.starts_with("**") {
                     let _ = writeln!(out, "'{c}");
-                } else if let Some(rest) = c.strip_prefix('*') {
+                } else if let Some(rest) = c.strip_prefix('*').filter(|rest| {
+                    rest.starts_with(char::is_whitespace)
+                        && rest
+                            .split_whitespace()
+                            .next()
+                            .and_then(|v| v.parse::<i32>().ok())
+                            .is_some()
+                }) {
                     let _ = writeln!(out, "'**{rest}");
                 } else {
                     let _ = writeln!(out, "'{c}");
@@ -316,19 +323,15 @@ mod tests {
         rec.moves[1].comment = Some("* 12 +7776FU".to_owned());
         let txt = rec.build_v2();
         assert!(txt.contains("\n-3334FU,T4\n'** 12 +7776FU\n"));
-        let (_, parsed, _) = parse_csa_full(&txt).unwrap();
-        let normal: Vec<_> = parsed
-            .iter()
-            .filter_map(|mv| match mv {
-                ParsedMove::Normal(cm) => Some(cm),
-                ParsedMove::Special(_) => None,
-            })
-            .collect();
-        assert_eq!(normal[0].eval_cp_black, None);
-        assert_eq!(normal[1].eval_cp_black, Some(12));
+        let (_, _, _, evals) = rshogi_csa::parse_csa_full_with_evals(&txt).unwrap();
+        assert_eq!(evals[0], None);
+        assert_eq!(evals[1], Some(12));
 
         rec.moves[1].comment = Some("** 34 +7776FU".to_owned());
         assert!(rec.build_v2().contains("\n'** 34 +7776FU\n"));
+
+        rec.moves[1].comment = Some("*engine note".to_owned());
+        assert!(rec.build_v2().contains("\n'*engine note\n"));
     }
 
     #[test]

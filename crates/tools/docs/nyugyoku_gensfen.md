@@ -31,8 +31,9 @@ manifestがあるディレクトリを基準に解決する。
 manifestで先に出たものを残す。候補は安定ハッシュでディスクパーティションへ書き、
 各パーティションだけを`HashSet`へロードする。ピークメモリは全候補数ではなく最大
 パーティションのユニーク局面数で決まる。既定は128パーティションで、
-`--partitions`で変更できる。partitionファイルはLRU方式で最大32個だけ開くため、既定値でも
-低いfile descriptor上限で動作する。
+`--partitions`で変更できる。partitionごとに64 KiBのメモリbuffer（既定で合計8 MiB）を
+持ち、満杯時だけ対象ファイルをopen・追記・closeする。checkpointのsyncも1ファイルずつ
+行うため、partition数に比例してfile descriptorを保持しない。
 
 ### dedupメモリ実測
 
@@ -49,13 +50,18 @@ manifestで先に出たものを残す。候補は安定ハッシュでディス
 ファイルI/Oが加わるが、dedup setのピークが全件数ではなく最大partitionで決まることを
 確認するための測定である。
 
+一時ディスク量は候補数だけでなく、source pathを含むJSONL record長に比例する。1億候補では
+数十GiB以上になり得るため、本番投入前に小さい代表manifestで`out.work/partitions`の
+1候補あたりbyte数を測り、同一filesystemへ十分な空きを確保する。この表の時間は
+disk I/Oを含むend-to-end throughput値ではない。
+
 CSAの`'* <cp> ...`（直後の指し手）と`'** <cp> ...`（直前の指し手）を解釈し、
 アンカー手を探索した局面の先手視点評価値をprovenanceへ記録する。
 
 ## 中断・再開
 
 実行中の候補、一時出力、checkpointは、`--out-dir /path/to/out`に対してsiblingの
-`/path/to/out.work/`へ継続的に書き出す。manifestの既定1,000,000行ごと、および各dedup
+`/path/to/out.work/`へ継続的に書き出す。manifestの既定10,000行ごと、および各dedup
 パーティション完了時にdurableなbyte位置を`state.json`へ保存する。checkpointでは変更が
 あったpartitionだけをflush・syncし、その後にstateとディレクトリエントリもsyncする。
 
@@ -68,8 +74,9 @@ cargo run -p tools --release --bin nyugyoku_gensfen -- \
   --resume
 ```
 
-partition処理中は、処理済みmanifest prefixのSHA-256とパーティション数が一致しなければ
-再開を拒否する。未処理の末尾は修正・追記できる。checkpointより後の一時データは記録済み
+partition処理中は、処理済みmanifest prefix、そこから参照されるCSA内容の累積SHA-256、
+パーティション数が一致しなければ再開を拒否する。未処理の末尾は修正・追記できる。
+checkpointより後の一時データは記録済み
 byte位置へ切り戻してから再処理する。dedup開始後はmanifest全体の行数と処理済みprefixを
 照合し、変更・追記された入力からの再開を拒否する。checkpoint間隔は
 `--checkpoint-interval`で変更できる。

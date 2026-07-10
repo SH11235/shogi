@@ -499,11 +499,6 @@ pub struct CsaMove {
     pub mv: String,
     /// 消費時間（秒）。`,T30` のように指し手行に含まれる場合に Some
     pub time_sec: Option<u32>,
-    /// 指し手を探索した局面の評価値（先手視点 centipawn）。
-    ///
-    /// csa_client の `'*` コメントは直後の指し手、wdoor の `'**` コメントは
-    /// 直前の指し手へ対応付ける。評価値が無い場合や数値でない場合は `None`。
-    pub eval_cp_black: Option<i32>,
 }
 
 /// CSA特殊手
@@ -526,6 +521,9 @@ pub enum ParsedMove {
     Normal(CsaMove),
     Special(SpecialMove),
 }
+
+/// `parse_csa_full_with_evals` の返り値。
+pub type ParsedCsaWithEvals = (Position, Vec<ParsedMove>, GameInfo, Vec<Option<i32>>);
 
 /// CSA棋譜から抽出した対局メタデータ
 #[derive(Clone, Debug, Default)]
@@ -559,15 +557,26 @@ pub fn parse_csa(text: &str) -> Result<(Position, Vec<String>, GameInfo)> {
     Ok((pos, simple_moves, info))
 }
 
-/// CSA棋譜を完全パース。指し手は消費時間・先手視点評価値・特殊手を含む
-/// [`ParsedMove`] で返す。
+/// CSA棋譜を完全パース。既存APIとの互換性のため評価コメントは返さない。
 pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo)> {
+    let (pos, moves, info, _) = parse_csa_full_with_evals(text)?;
+    Ok((pos, moves, info))
+}
+
+/// CSA棋譜を完全パースし、通常手と同じ順序の先手視点評価値も返す。
+///
+/// csa_client の `'*` は直後の通常手、wdoor の `'**` は直前の通常手に対応する。
+pub fn parse_csa_full_with_evals(text: &str) -> Result<ParsedCsaWithEvals> {
     let mut pos = None;
     let mut moves = Vec::new();
+    let mut evals = Vec::new();
     let mut info = GameInfo::default();
     let mut explicit_board = false;
     let mut pending_eval_cp_black = None;
+    let mut follows_inline_timed_move = false;
     for line in text.lines() {
+        let comment_follows_inline_timed_move = follows_inline_timed_move;
+        follows_inline_timed_move = false;
         let raw = line.trim_end_matches('\r');
         let s = raw.trim();
         if s.is_empty() || s.starts_with('V') {
@@ -617,17 +626,21 @@ pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo
         }
         // wdoor / shogi-server: 直前の通常手を探索した先手視点評価値。
         if let Some(rest) = s.strip_prefix("'**") {
-            if let Some(cp) = parse_leading_eval_cp(rest)
-                && let Some(ParsedMove::Normal(last)) =
-                    moves.iter_mut().rev().find(|m| matches!(m, ParsedMove::Normal(_)))
-            {
-                last.eval_cp_black = Some(cp);
+            if let (Some(cp), Some(last)) = (parse_leading_eval_cp(rest), evals.last_mut()) {
+                *last = Some(cp);
             }
             continue;
         }
         // rshogi csa_client: 直後の通常手を探索した先手視点評価値。
         if let Some(rest) = s.strip_prefix("'*") {
-            pending_eval_cp_black = parse_leading_eval_cp(rest);
+            let cp = parse_leading_eval_cp(rest);
+            if comment_follows_inline_timed_move {
+                if let Some(last) = evals.last_mut() {
+                    *last = cp;
+                }
+            } else {
+                pending_eval_cp_black = cp;
+            }
             continue;
         }
         // Skip other comments and headers
@@ -677,16 +690,14 @@ pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo
             let time_sec = s
                 .get(7..)
                 .and_then(|rest| rest.strip_prefix(",T").and_then(|t| t.parse::<u32>().ok()));
-            moves.push(ParsedMove::Normal(CsaMove {
-                mv,
-                time_sec,
-                eval_cp_black: pending_eval_cp_black.take(),
-            }));
+            moves.push(ParsedMove::Normal(CsaMove { mv, time_sec }));
+            evals.push(pending_eval_cp_black.take());
+            follows_inline_timed_move = time_sec.is_some();
             continue;
         }
     }
     let pos = pos.unwrap_or_else(initial_position);
-    Ok((pos, moves, info))
+    Ok((pos, moves, info, evals))
 }
 
 fn parse_leading_eval_cp(rest: &str) -> Option<i32> {
@@ -1074,7 +1085,7 @@ P-00KA
     #[test]
     fn test_parse_time_inline() {
         let text = "PI\n+7776FU,T5\n-3334FU,T10\n%TORYO\n";
-        let (_, moves, _) = parse_csa_full(text).unwrap();
+        let (_, moves, _, _evals) = parse_csa_full_with_evals(text).unwrap();
         assert_eq!(moves.len(), 3);
         match &moves[0] {
             ParsedMove::Normal(cm) => {
@@ -1096,7 +1107,7 @@ P-00KA
     #[test]
     fn test_parse_time_standalone_t_line() {
         let text = "PI\n+7776FU\nT5\n-3334FU\nT10\n";
-        let (_, moves, _) = parse_csa_full(text).unwrap();
+        let (_, moves, _, _evals) = parse_csa_full_with_evals(text).unwrap();
         assert_eq!(moves.len(), 2);
         match &moves[0] {
             ParsedMove::Normal(cm) => {
@@ -1122,7 +1133,7 @@ P-00KA
             "'** -30 +2726FU\r\n",
             "%TORYO\r\n",
         );
-        let (_, moves, _) = parse_csa_full(text).unwrap();
+        let (_, moves, _, evals) = parse_csa_full_with_evals(text).unwrap();
         let normal: Vec<_> = moves
             .iter()
             .filter_map(|m| match m {
@@ -1131,37 +1142,37 @@ P-00KA
             })
             .collect();
         assert_eq!(normal.len(), 2);
-        assert_eq!(normal[0].eval_cp_black, Some(45));
+        assert_eq!(evals[0], Some(45));
         assert_eq!(normal[0].time_sec, Some(5));
-        assert_eq!(normal[1].eval_cp_black, Some(-30));
+        assert_eq!(evals[1], Some(-30));
         assert_eq!(normal[1].time_sec, Some(10));
     }
 
     #[test]
     fn test_last_eval_comment_wins_and_invalid_pending_is_cleared() {
         let text = "PI\n'* 5\n'* invalid\n+7776FU\n'* 10\n-3334FU\n'** invalid\n'** 20 pv\n";
-        let (_, moves, _) = parse_csa_full(text).unwrap();
-        let normal: Vec<_> = moves
-            .iter()
-            .filter_map(|m| match m {
-                ParsedMove::Normal(cm) => Some(cm),
-                ParsedMove::Special(_) => None,
-            })
-            .collect();
-        assert_eq!(normal[0].eval_cp_black, None);
-        assert_eq!(normal[1].eval_cp_black, Some(20));
+        let (_, _moves, _, evals) = parse_csa_full_with_evals(text).unwrap();
+        assert_eq!(evals[0], None);
+        assert_eq!(evals[1], Some(20));
+    }
+
+    #[test]
+    fn test_legacy_server_single_star_after_inline_timed_move_belongs_to_previous_move() {
+        let text = "PI\n+7776FU,T1\n'* 100\n-3334FU,T1\n";
+        let (_, _, _, evals) = parse_csa_full_with_evals(text).unwrap();
+        assert_eq!(evals, vec![Some(100), None]);
     }
 
     #[test]
     fn test_malformed_signed_line_is_not_a_normal_move() {
         let text = "PI\n'* 10\n+abcdef\n+7776FU\n";
-        let (_, moves, _) = parse_csa_full(text).unwrap();
+        let (_, moves, _, evals) = parse_csa_full_with_evals(text).unwrap();
         assert_eq!(moves.len(), 1);
         let ParsedMove::Normal(cm) = &moves[0] else {
             panic!("expected normal move");
         };
         assert_eq!(cm.mv, "+7776FU");
-        assert_eq!(cm.eval_cp_black, Some(10));
+        assert_eq!(evals, vec![Some(10)]);
     }
 
     #[test]
