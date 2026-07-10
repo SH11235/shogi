@@ -82,6 +82,7 @@ fn write_lines(writer: &mut std::net::TcpStream, lines: &[&str]) {
 fn mock_usi_engine_script() -> PathBuf {
     let script = r#"#!/usr/bin/env bash
 # mock USI engine for csa-client integration test
+go_count=0
 while IFS= read -r line; do
     case "$line" in
         usi)
@@ -96,8 +97,15 @@ while IFS= read -r line; do
         position*)
             ;;
         go*)
-            echo "info depth 5 score cp 100 nodes 1234 nps 5000 time 200 pv 7g7f"
-            echo "bestmove 7g7f"
+            # 2 回目以降の go には応答しない: 即 bestmove を返すと終局通知の
+            # 処理とレースし、echo 待ち前の局面適用・record/live JSONL 追記が
+            # 走り得る。client は終局検出で stop を送るので、bestmove は下の
+            # stop への応答としてのみ返し、読み捨てさせる。
+            go_count=$((go_count + 1))
+            if [ "$go_count" -eq 1 ]; then
+                echo "info depth 5 score cp 100 nodes 1234 nps 5000 time 200 pv 7g7f"
+                echo "bestmove 7g7f"
+            fi
             ;;
         ponderhit)
             echo "info depth 5 score cp 100 nodes 1234 nps 5000 time 200 pv 7g7f"
@@ -118,7 +126,9 @@ done
 }
 
 /// ponder miss 後の次 go で info を出さず即 bestmove を返す mock。
-/// stop で返す bestmove の直後に stale info を出し、次 go に漏れないことを検証する。
+/// stop への応答は stale info → bestmove の順で書く: client の読み捨ては
+/// 「bestmove がその go の最終出力」という出力契約に依拠しており、bestmove の
+/// 後に書くと読み捨てとレースする。
 /// ponderhit はこのシナリオでは到達しない想定（到達したら exit 1 でテストを落とす）。
 fn mock_usi_engine_stale_ponder_info_script() -> PathBuf {
     let script = r#"#!/usr/bin/env bash
@@ -153,8 +163,8 @@ while IFS= read -r line; do
             exit 1
             ;;
         stop)
-            echo "bestmove 3c3d"
             echo "info depth 1 score cp -32001 nodes 0 pv 1c1d"
+            echo "bestmove 3c3d"
             ;;
         quit)
             exit 0
