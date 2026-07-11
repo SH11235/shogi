@@ -40,6 +40,11 @@ ONNX labeler モード（`--onnx-model`）は `dlshogi-onnx` feature（default �
 ONNX 推論には GPU 版 ONNX Runtime（+ CUDA/cuDNN、TensorRT 使用時は TensorRT）が要り、`ORT_DYLIB_PATH`
 / `LD_LIBRARY_PATH` で明示します（`label_bench_dl` と同じ）。`ort` は 1.24 系想定。
 
+`--onnx-model` 使用時の正常終了は、出力を flush した後に通常のプロセス teardown を踏まず即時終了します
+（`_exit`）。ONNX Runtime（TensorRT EP）をロードしたプロセスは exit 時のライブラリデストラクタ連鎖が
+glibc ヒープを壊し、正常完了後に `corrupted double-linked list` abort（exit code 134）を間欠的に
+起こすため、その回避です。出力は即時終了前に書き終わっており欠けません。
+
 ```bash
 export ORT_DYLIB_PATH=/path/to/onnxruntime-linux-x64-gpu-1.24.x/lib/libonnxruntime.so
 export LD_LIBRARY_PATH=/path/to/onnxruntime/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}

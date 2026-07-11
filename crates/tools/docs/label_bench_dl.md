@@ -71,3 +71,7 @@ FP16 推論は `--onnx-tensorrt` を付けます（初回はエンジンコン�
 ## メモリ
 
 入力 jsonl は `--onnx-batch-size` 行ずつ streaming で読み、推論後に書き出します。全件を貯めないため**ピークメモリは入力件数に非依存**で、バッチ分の局面・JSON object と特徴量バッファの上限で頭打ちになります。
+
+## 終了動作
+
+正常終了は、出力 jsonl を flush した後に通常のプロセス teardown を踏まず即時終了します（`_exit`）。ONNX Runtime（TensorRT EP）をロードしたプロセスは exit 時のライブラリデストラクタ連鎖が glibc ヒープを壊し、正常完了後に `corrupted double-linked list` abort（exit code 134）を間欠的に起こすため、その回避です。出力は即時終了前に書き終わっており欠けません。エラー終了は従来経路のため稀に exit 134 になることがありますが、その場合も stderr のエラーメッセージが一次情報です。

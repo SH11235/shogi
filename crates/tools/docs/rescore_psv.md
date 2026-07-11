@@ -331,6 +331,16 @@ rescore_psv --input data.bin --output-dir rescored/ \
   を明示的に固定し、`--max-time` は使わないこと。`--engine` では外部エンジン自体が
   決定的であること（内部スレッド数 1 等）も条件。
 
+## 終了動作（ONNX モード）
+
+ONNX モードの正常終了は、全出力（rescore 出力・`.done` マーカー）を flush した後、
+通常のプロセス teardown を踏まずに即時終了する（`_exit`）。ONNX Runtime
+（TensorRT EP）をロードしたプロセスは exit 時のライブラリデストラクタ連鎖が
+glibc ヒープを壊し、全処理の正常完了後に `corrupted double-linked list` abort
+（exit code 134）を間欠的に起こすため、その回避。出力は即時終了前に書き終わって
+おり欠けない。エラー終了は従来経路のため稀に exit 134 で落ちることがあるが、
+その場合も stderr のエラーメッセージが一次情報。
+
 ## トラブルシューティング
 
 | エラーメッセージ | 原因 | 対処 |
