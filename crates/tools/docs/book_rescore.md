@@ -27,7 +27,6 @@ cargo run -p tools --release --bin book_rescore -- \
   --book input.db \
   --out rescored_static.db \
   --dlshogi-onnx-model /path/to/dlshogi_model.onnx \
-  --onnx-batch-size 256 \
   --onnx-gpu-id 0 \
   --eval-scale 600.0 \
   --journal rescored_static.jsonl \
@@ -44,7 +43,7 @@ cargo run -p tools --release --bin book_rescore -- \
 | `--engine-option <k=v>` | USI option。複数指定可（USI 探索モード） |
 | `--go "<args>"` | `go` に渡す引数。例: `nodes 100000`, `depth 15`（USI 探索モード） |
 | `--dlshogi-onnx-model <path>` | dlshogi 形式 ONNX value head。`--engine` と排他 |
-| `--onnx-batch-size <N>` | ONNX 推論バッチサイズ。既定 256 |
+| `--onnx-batch-size <N>` | ONNX 推論バッチサイズ。既定 1024（GPU 推論の実測で 512〜2048 はフラット、256 は −13% 遅い。CPU 推論・省メモリ環境では小さい値も検討） |
 | `--onnx-gpu-id <id>` | ONNX 推論の GPU ID。`-1` で CPU。既定 0 |
 | `--onnx-tensorrt` | ONNX 推論で TensorRT EP を使う |
 | `--onnx-tensorrt-cache <dir>` | TensorRT エンジンキャッシュ保存先 |

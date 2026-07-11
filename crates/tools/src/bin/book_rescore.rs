@@ -30,7 +30,7 @@ struct Cli {
     engine_options: Vec<String>,
     #[arg(long)]
     dlshogi_onnx_model: Option<PathBuf>,
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 1024)]
     onnx_batch_size: usize,
     #[arg(long, default_value_t = 0)]
     onnx_gpu_id: i32,
