@@ -2483,18 +2483,35 @@ impl GameRoom {
                 );
             }
         };
-        if let Err(e) = bucket.put(&index_key, body.clone()).execute().await {
+        let games_index_written = match bucket.put(&index_key, body.clone()).execute().await {
+            Ok(_) => true,
+            Err(e) => {
+                crate::structured_log!(
+                    event: "games_index_put_failed",
+                    component: "game_room",
+                    game_id: cfg.game_id,
+                    inv_key: index_key,
+                    err: format!("{e:?}"),
+                );
+                failed_keys.push(FailedExportObject {
+                    key: index_key.clone(),
+                    body_kind: ExportBodyKind::Meta,
+                });
+                false
+            }
+        };
+
+        // R2 が正本なので D1 検索 index は best-effort。欠落は cron backfill が
+        // 後から補完し、ここでの失敗は対局終了・R2 retry 判定へ影響させない。
+        if games_index_written
+            && let Err(e) = crate::games_search_index::upsert_entry(&self.env, &entry).await
+        {
             crate::structured_log!(
-                event: "games_index_put_failed",
+                event: "games_search_index_upsert_failed",
                 component: "game_room",
                 game_id: cfg.game_id,
-                inv_key: index_key,
                 err: format!("{e:?}"),
             );
-            failed_keys.push(FailedExportObject {
-                key: index_key.clone(),
-                body_kind: ExportBodyKind::Meta,
-            });
         }
 
         if failed_keys.is_empty() {

@@ -8,11 +8,12 @@
 //! - [`run_live_orphan_sweep`]: `live-games-index/` を pagination loop で list
 //!   し、対応する `kifu-by-id/<id>.meta.json` (= 終局済 primary 判定キー、設計
 //!   v3 §3) が存在する live entry を delete する (orphan 掃除)。https://github.com/SH11235/rshogi/issues/629 で
-//!   1 page → 複数 page (`SWEEP_DEADLINE_MS` 内) に拡張した。
+//!   1 page → 複数 page (共有 deadline 内) に拡張した。
 //!
 //! `run_games_index_backfill` は 1 page (1000 件) のみ処理し、cursor の持ち越し
 //! は行わない (= 次回 cron で続行する eventual semantics)。
-//! `run_live_orphan_sweep` は cron 30s 制限の安全側 (`SWEEP_DEADLINE_MS`) 内で
+//! games-search backfill と `run_live_orphan_sweep` は cron 30s 制限の安全側
+//! (`SCHEDULED_WORK_DEADLINE_MS`) を共有し、
 //! 複数 page を処理し、超過分は次回 cron に持ち越す (cursor は再開しない =
 //! 先頭から再走査するが、live key は新しい対局順なので大きな問題にならない)。
 //! admin invoke endpoint や 1 万件超の bulk 並列化はスコープ外
@@ -46,15 +47,146 @@ pub(crate) const META_SUFFIX: &str = ".meta.json";
 /// 経由で複数ページ一気に処理する案 (設計 v2 §5 (a)) を別 issue で検討する。
 pub(crate) const PAGE_SIZE: u32 = 1000;
 
-/// `run_live_orphan_sweep` の 1 cron 内 pagination 上限 (https://github.com/SH11235/rshogi/issues/629)。
+/// D1 state に保存する完了マーカー。R2 cursor と衝突しない予約値。
+const GAMES_SEARCH_BACKFILL_COMPLETE: &str = "__COMPLETE__";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchBackfillStart {
+    Scan,
+    HealRecent,
+}
+
+impl SearchBackfillStart {
+    /// ログ用の識別文字列。運用時に Scan(通常バックフィル) と
+    /// HealRecent(完了後の自己修復) を区別できるようにする。
+    fn as_log_str(self) -> &'static str {
+        match self {
+            Self::Scan => "scan",
+            Self::HealRecent => "heal_recent",
+        }
+    }
+}
+
+impl SearchBackfillStart {
+    fn initial_cursor(self, saved_cursor: Option<String>) -> Option<String> {
+        match self {
+            Self::Scan => saved_cursor,
+            Self::HealRecent => None,
+        }
+    }
+
+    fn list_limit(self) -> u32 {
+        match self {
+            Self::Scan => PAGE_SIZE,
+            Self::HealRecent => GAMES_SEARCH_HEAL_LIMIT,
+        }
+    }
+
+    fn max_pages(self) -> Option<u32> {
+        match self {
+            Self::Scan => None,
+            Self::HealRecent => Some(1),
+        }
+    }
+}
+
+fn search_backfill_start(cursor: Option<&str>) -> SearchBackfillStart {
+    if cursor == Some(GAMES_SEARCH_BACKFILL_COMPLETE) {
+        SearchBackfillStart::HealRecent
+    } else {
+        SearchBackfillStart::Scan
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchBackfillItemOutcome {
+    PermanentSkip,
+    R2GetError,
+    R2BodyMissing,
+    R2BodyReadError,
+    D1UpsertError,
+    DeadlineExceeded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchBackfillItemControl {
+    Continue,
+    RetryPage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchBackfillStateOperation<'a> {
+    RetryPage,
+    CursorMissing,
+    UpdateCursor(&'a str),
+    MarkComplete,
+}
+
+#[derive(Debug, Default)]
+struct SearchBackfillPageState {
+    retry_page: bool,
+}
+
+impl SearchBackfillPageState {
+    fn record(&mut self, outcome: SearchBackfillItemOutcome) -> SearchBackfillItemControl {
+        match outcome {
+            SearchBackfillItemOutcome::PermanentSkip => SearchBackfillItemControl::Continue,
+            SearchBackfillItemOutcome::R2GetError
+            | SearchBackfillItemOutcome::R2BodyMissing
+            | SearchBackfillItemOutcome::R2BodyReadError
+            | SearchBackfillItemOutcome::D1UpsertError
+            | SearchBackfillItemOutcome::DeadlineExceeded => {
+                self.retry_page = true;
+                SearchBackfillItemControl::RetryPage
+            }
+        }
+    }
+
+    fn finish<'a>(
+        self,
+        truncated: bool,
+        next_cursor: Option<&'a str>,
+    ) -> SearchBackfillStateOperation<'a> {
+        if self.retry_page {
+            SearchBackfillStateOperation::RetryPage
+        } else if truncated {
+            next_cursor.map_or(
+                SearchBackfillStateOperation::CursorMissing,
+                SearchBackfillStateOperation::UpdateCursor,
+            )
+        } else {
+            SearchBackfillStateOperation::MarkComplete
+        }
+    }
+}
+
+/// games-search backfill と orphan sweep が共有する 1 cron 内の処理期限。
 ///
 /// Cloudflare Workers の cron 起動は wall-clock 30s 制限を持つため、安全側
-/// マージン (5s) を引いた 25s で打ち切り、未処理 page は次回 cron に持ち越す。
-/// 各 object 処理は `head` + 条件付き `delete` (Class B) で平均 5-10ms 想定の
-/// ため、1 page (1000 件) で約 5-10s。25s なら 2-3 page を安全に処理できる。
-pub(crate) const SWEEP_DEADLINE_MS: u64 = 25_000;
+/// マージン (5s) を引いた 25s を cron 発火時刻から共有する。search backfill が
+/// 長引いた場合、後続 sweep の残り時間はその分だけ減り、0 にもなりうる
+/// (:15/:30/:45 は sweep 単独で従来同等の実質 25s を使えるため、:00 で
+/// sweep が飢餓しても最大 15 分で全予算に回復する)。
+pub(crate) const SCHEDULED_WORK_DEADLINE_MS: u64 = 25_000;
 
-/// `run_live_orphan_sweep` の安全側 page 上限 (https://github.com/SH11235/rshogi/issues/629)。`SWEEP_DEADLINE_MS`
+/// 完了後の自己修復で毎 cron に再 upsert する最新 games-index 件数。
+///
+/// 「1 時間あたりの終局数が本値を超えない」という前提の下でのみ、D1 upsert
+/// 失敗からの eventual recovery を保証する (この前提を超える局数が同一時間内に
+/// 終局すると、押し出された古いエントリの再訪は保証されない)。R2 が正本のため
+/// 実害は検索結果からの一時的な欠落のみで、`games_search_backfill_state` の
+/// `r2_cursor` を手動でリセットすれば全走査を再開できる。
+const GAMES_SEARCH_HEAL_LIMIT: u32 = 100;
+
+fn shared_budget_remaining_ms(started_at_ms: u64, now_ms: u64) -> u64 {
+    SCHEDULED_WORK_DEADLINE_MS.saturating_sub(now_ms.saturating_sub(started_at_ms))
+}
+
+fn shared_deadline_reached(started_at_ms: u64, now_ms: u64) -> bool {
+    shared_budget_remaining_ms(started_at_ms, now_ms) == 0
+}
+
+/// `run_live_orphan_sweep` の安全側 page 上限 (https://github.com/SH11235/rshogi/issues/629)。共有 deadline
 /// を超えなくても、cursor が永遠に truncated を返し続ける異常時に無限 loop を
 /// 避けるための break 条件。100 page = 100,000 件で十分な余白。
 pub(crate) const SWEEP_MAX_PAGES: u32 = 100;
@@ -115,7 +247,7 @@ pub struct SweepStats {
     /// 走査した R2 list page 数 (https://github.com/SH11235/rshogi/issues/629)。pagination loop 化に伴って導入。
     /// 1 cron で複数 page を処理した状況をログから確認するための運用 metric。
     pub pages: u32,
-    /// `SWEEP_DEADLINE_MS` 経過で打ち切った場合に `true`。`true` の cron が
+    /// 共有 deadline 経過で打ち切った場合に `true`。`true` の cron が
     /// 連続したら page size または cron 頻度の見直しが必要 (https://github.com/SH11235/rshogi/issues/629)。
     pub deadline_reached: bool,
     /// `SWEEP_MAX_PAGES` に到達して打ち切った場合に `true`。summary の件数が
@@ -168,14 +300,17 @@ pub(crate) fn live_entry_hard_ttl_expired(age_ms: u64) -> bool {
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use super::{
-        BackfillStats, KIFU_BY_ID_PREFIX, LIVE_ENTRY_HARD_TTL_MS, LiveEntryFields, META_SUFFIX,
-        MetaForIndexKey, PAGE_SIZE, SWEEP_DEADLINE_MS, SWEEP_MAX_PAGES, SweepStats,
-        live_entry_hard_ttl_expired,
+        BackfillStats, GAMES_SEARCH_BACKFILL_COMPLETE, KIFU_BY_ID_PREFIX, LIVE_ENTRY_HARD_TTL_MS,
+        LiveEntryFields, META_SUFFIX, MetaForIndexKey, PAGE_SIZE, SWEEP_MAX_PAGES,
+        SearchBackfillItemOutcome, SearchBackfillPageState, SearchBackfillStateOperation,
+        SweepStats, live_entry_hard_ttl_expired, search_backfill_start, shared_deadline_reached,
     };
     use worker::{Date, Env, Result};
 
     use crate::config::ConfigKeys;
+    use crate::games_index::KEY_PREFIX as GAMES_INDEX_PREFIX;
     use crate::games_index::games_index_key;
+    use crate::games_search_index::{OwnedGamesIndexEntry, upsert_owned};
     use crate::live_games_index::LIVE_KEY_PREFIX;
     use crate::x1_paths::kifu_by_id_meta_key;
 
@@ -316,6 +451,159 @@ mod imp {
         Ok(stats)
     }
 
+    /// R2 `games-index/` をページングし、D1 検索 index を冪等 upsert する。
+    /// cron 発火時刻から sweep と共有する 25 秒以内だけ処理する。
+    pub async fn run_games_search_backfill(
+        env: &Env,
+        scheduled_started_at_ms: u64,
+    ) -> Result<BackfillStats> {
+        let mut stats = BackfillStats::default();
+        let bucket = match env.bucket(ConfigKeys::KIFU_BUCKET_BINDING) {
+            Ok(bucket) => bucket,
+            Err(e) => {
+                crate::structured_log!(event: "games_search_backfill_bucket_failed", component: "backfill", err: format!("{e:?}"));
+                return Ok(stats);
+            }
+        };
+        let db = match env.d1(ConfigKeys::GAMES_SEARCH_DB_BINDING) {
+            Ok(db) => db,
+            Err(e) => {
+                crate::structured_log!(event: "games_search_backfill_d1_failed", component: "backfill", err: format!("{e:?}"));
+                return Ok(stats);
+            }
+        };
+        let saved_cursor = match db
+            .prepare("SELECT r2_cursor FROM games_search_backfill_state WHERE singleton = 1")
+            .first::<String>(Some("r2_cursor"))
+            .await
+        {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                crate::structured_log!(event: "games_search_backfill_state_read_failed", component: "backfill", err: format!("{e:?}"));
+                return Ok(stats);
+            }
+        };
+        let start = search_backfill_start(saved_cursor.as_deref());
+        let mut cursor = start.initial_cursor(saved_cursor);
+        let mut pages = 0_u32;
+        loop {
+            if shared_deadline_reached(scheduled_started_at_ms, Date::now().as_millis()) {
+                break;
+            }
+            // 完了後の自己修復は newest-first の先頭 100 件を cursor なしで 1 page
+            // だけ再 upsert する固定コスト処理。独立した deadline は設けず、開始前と
+            // 各 object 後の共有 deadline 判定に含める。
+            let mut builder = bucket.list().prefix(GAMES_INDEX_PREFIX).limit(start.list_limit());
+            if let Some(value) = cursor.as_deref() {
+                builder = builder.cursor(value);
+            }
+            let page = match builder.execute().await {
+                Ok(page) => page,
+                Err(e) => {
+                    crate::structured_log!(event: "games_search_backfill_list_failed", component: "backfill", err: format!("{e:?}"));
+                    break;
+                }
+            };
+            pages = pages.saturating_add(1);
+            let mut page_state = SearchBackfillPageState::default();
+            for object in page.objects() {
+                if shared_deadline_reached(scheduled_started_at_ms, Date::now().as_millis()) {
+                    page_state.record(SearchBackfillItemOutcome::DeadlineExceeded);
+                    break;
+                }
+                let key = object.key();
+                stats.listed = stats.listed.saturating_add(1);
+                let fetched = match bucket.get(&key).execute().await {
+                    Ok(Some(object)) => object,
+                    Ok(None) => {
+                        crate::structured_log!(event: "games_search_backfill_get_missing", component: "backfill", key: key);
+                        stats.skipped = stats.skipped.saturating_add(1);
+                        continue;
+                    }
+                    Err(e) => {
+                        crate::structured_log!(event: "games_search_backfill_get_failed", component: "backfill", key: key, err: format!("{e:?}"));
+                        page_state.record(SearchBackfillItemOutcome::R2GetError);
+                        stats.skipped = stats.skipped.saturating_add(1);
+                        break;
+                    }
+                };
+                let Some(body) = fetched.body() else {
+                    crate::structured_log!(event: "games_search_backfill_body_missing", component: "backfill", key: key);
+                    page_state.record(SearchBackfillItemOutcome::R2BodyMissing);
+                    stats.skipped = stats.skipped.saturating_add(1);
+                    break;
+                };
+                let bytes = match body.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        crate::structured_log!(event: "games_search_backfill_read_failed", component: "backfill", key: key, err: format!("{e:?}"));
+                        page_state.record(SearchBackfillItemOutcome::R2BodyReadError);
+                        stats.skipped = stats.skipped.saturating_add(1);
+                        break;
+                    }
+                };
+                let entry = match serde_json::from_slice::<OwnedGamesIndexEntry>(&bytes) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        // JSON 破損は恒久エラーとしてこの object だけを skip する。
+                        crate::structured_log!(event: "games_search_backfill_parse_failed", component: "backfill", key: key, err: format!("{e:?}"));
+                        stats.skipped = stats.skipped.saturating_add(1);
+                        page_state.record(SearchBackfillItemOutcome::PermanentSkip);
+                        continue;
+                    }
+                };
+                match upsert_owned(env, &entry).await {
+                    Ok(()) => stats.put = stats.put.saturating_add(1),
+                    Err(e) => {
+                        crate::structured_log!(event: "games_search_backfill_upsert_failed", component: "backfill", game_id: entry.game_id, err: format!("{e:?}"));
+                        stats.skipped = stats.skipped.saturating_add(1);
+                        page_state.record(SearchBackfillItemOutcome::D1UpsertError);
+                        break;
+                    }
+                }
+                if shared_deadline_reached(scheduled_started_at_ms, Date::now().as_millis()) {
+                    page_state.record(SearchBackfillItemOutcome::DeadlineExceeded);
+                    break;
+                }
+            }
+            if start.max_pages().is_some_and(|max_pages| pages >= max_pages) {
+                break;
+            }
+            let next_cursor = page.cursor();
+            let operation = page_state.finish(page.truncated(), next_cursor.as_deref());
+            let state_value = match operation {
+                SearchBackfillStateOperation::RetryPage => break,
+                SearchBackfillStateOperation::CursorMissing => {
+                    crate::structured_log!(event: "games_search_backfill_cursor_missing", component: "backfill");
+                    break;
+                }
+                SearchBackfillStateOperation::UpdateCursor(value) => value,
+                SearchBackfillStateOperation::MarkComplete => GAMES_SEARCH_BACKFILL_COMPLETE,
+            };
+            let bind = [worker::wasm_bindgen::JsValue::from_str(state_value)];
+            let state_statement = match db
+                .prepare("INSERT INTO games_search_backfill_state (singleton, r2_cursor) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET r2_cursor=excluded.r2_cursor")
+                .bind(&bind)
+            {
+                Ok(statement) => statement,
+                Err(e) => {
+                    crate::structured_log!(event: "games_search_backfill_state_prepare_failed", component: "backfill", err: format!("{e:?}"));
+                    break;
+                }
+            };
+            if let Err(e) = state_statement.run().await {
+                crate::structured_log!(event: "games_search_backfill_state_write_failed", component: "backfill", err: format!("{e:?}"));
+                break;
+            }
+            if operation == SearchBackfillStateOperation::MarkComplete {
+                break;
+            }
+            cursor = Some(state_value.to_owned());
+        }
+        crate::structured_log!(event: "games_search_backfill_progress", component: "backfill", mode: start.as_log_str(), listed: stats.listed, put: stats.put, skipped: stats.skipped);
+        Ok(stats)
+    }
+
     /// `live-games-index/<inv>-<id>.json` の各 entry について、対応する終局済
     /// meta (`kifu-by-id/<id>.meta.json`) が存在する live entry を delete する。
     ///
@@ -339,7 +627,8 @@ mod imp {
     /// の間は cursor を辿って次 page を処理し、以下のいずれかの条件で打ち切る:
     ///
     /// 1. `truncated() == false` (全件処理完了)
-    /// 2. 経過時間 ≥ `SWEEP_DEADLINE_MS` (cron 30s 制限を圧迫しないための安全
+    /// 2. cron 発火からの経過時間 ≥ `SCHEDULED_WORK_DEADLINE_MS` (search backfill
+    ///    と共有する安全
     ///    側打ち切り。object loop 内でも判定して 1 page 完走を待たない)
     /// 3. `pages >= SWEEP_MAX_PAGES` (異常時の無限 loop ガード)
     ///
@@ -347,8 +636,11 @@ mod imp {
     /// live key prefix の昇順 lexicographic に依存した再走査)。
     ///
     /// 各失敗は logfmt で記録し `Err` を伝播しない。
-    pub async fn run_live_orphan_sweep(env: &Env) -> Result<SweepStats> {
-        let started_at_ms = Date::now().as_millis();
+    pub async fn run_live_orphan_sweep(
+        env: &Env,
+        scheduled_started_at_ms: u64,
+    ) -> Result<SweepStats> {
+        let started_at_ms = scheduled_started_at_ms;
         let mut stats = SweepStats::default();
 
         let bucket = match env.bucket(ConfigKeys::KIFU_BUCKET_BINDING) {
@@ -373,7 +665,7 @@ mod imp {
             // 前に確認しておかないと 30s cron 制限の境界で 1 page 余分に R2 list
             // を発行してしまうケースが残る。1 page 取得 (R2 list) は約 50-200ms
             // 必要なので、deadline ギリギリで再 list するより安全側で break する。
-            if Date::now().as_millis().saturating_sub(started_at_ms) >= SWEEP_DEADLINE_MS {
+            if shared_deadline_reached(started_at_ms, Date::now().as_millis()) {
                 stats.deadline_reached = true;
                 break 'outer;
             }
@@ -409,9 +701,7 @@ mod imp {
                 } = match read_live_entry_fields(&bucket, &live_key).await {
                     Some(f) => f,
                     None => {
-                        if Date::now().as_millis().saturating_sub(started_at_ms)
-                            >= SWEEP_DEADLINE_MS
-                        {
+                        if shared_deadline_reached(started_at_ms, Date::now().as_millis()) {
                             stats.deadline_reached = true;
                             break 'outer;
                         }
@@ -431,9 +721,7 @@ mod imp {
                             meta_key: meta_key,
                             err: format!("{e:?}"),
                         );
-                        if Date::now().as_millis().saturating_sub(started_at_ms)
-                            >= SWEEP_DEADLINE_MS
-                        {
+                        if shared_deadline_reached(started_at_ms, Date::now().as_millis()) {
                             stats.deadline_reached = true;
                             break 'outer;
                         }
@@ -454,7 +742,7 @@ mod imp {
                     // 前者は正常状態、後者は本 sweep の対象外 (設計 v3 §3 の意図的
                     // な保守)。
                     stats.record_live_without_meta(age_ms);
-                    if Date::now().as_millis().saturating_sub(started_at_ms) >= SWEEP_DEADLINE_MS {
+                    if shared_deadline_reached(started_at_ms, Date::now().as_millis()) {
                         stats.deadline_reached = true;
                         break 'outer;
                     }
@@ -469,7 +757,7 @@ mod imp {
                         live_key: live_key,
                         err: format!("{e:?}"),
                     );
-                    if Date::now().as_millis().saturating_sub(started_at_ms) >= SWEEP_DEADLINE_MS {
+                    if shared_deadline_reached(started_at_ms, Date::now().as_millis()) {
                         stats.deadline_reached = true;
                         break 'outer;
                     }
@@ -494,7 +782,7 @@ mod imp {
                     stats.deleted = stats.deleted.saturating_add(1);
                 }
 
-                if Date::now().as_millis().saturating_sub(started_at_ms) >= SWEEP_DEADLINE_MS {
+                if shared_deadline_reached(started_at_ms, Date::now().as_millis()) {
                     stats.deadline_reached = true;
                     break 'outer;
                 }
@@ -610,7 +898,7 @@ mod imp {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use imp::{run_games_index_backfill, run_live_orphan_sweep};
+pub use imp::{run_games_index_backfill, run_games_search_backfill, run_live_orphan_sweep};
 
 #[cfg(test)]
 mod tests {
@@ -702,6 +990,66 @@ mod tests {
     }
 
     #[test]
+    fn search_backfill_deadline_selects_retry_page_and_keeps_cursor() {
+        let mut state = SearchBackfillPageState::default();
+        assert_eq!(
+            state.record(SearchBackfillItemOutcome::DeadlineExceeded),
+            SearchBackfillItemControl::RetryPage
+        );
+        assert_eq!(state.finish(true, Some("next")), SearchBackfillStateOperation::RetryPage);
+    }
+
+    #[test]
+    fn search_backfill_temporary_io_failures_keep_cursor() {
+        for failure in [
+            SearchBackfillItemOutcome::R2GetError,
+            SearchBackfillItemOutcome::R2BodyMissing,
+            SearchBackfillItemOutcome::R2BodyReadError,
+            SearchBackfillItemOutcome::D1UpsertError,
+        ] {
+            let mut state = SearchBackfillPageState::default();
+            assert_eq!(state.record(failure), SearchBackfillItemControl::RetryPage, "{failure:?}");
+            assert_eq!(
+                state.finish(true, Some("next")),
+                SearchBackfillStateOperation::RetryPage,
+                "{failure:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_backfill_json_parse_failure_advances_cursor() {
+        let mut state = SearchBackfillPageState::default();
+        assert_eq!(
+            state.record(SearchBackfillItemOutcome::PermanentSkip),
+            SearchBackfillItemControl::Continue
+        );
+        assert_eq!(
+            state.finish(true, Some("next")),
+            SearchBackfillStateOperation::UpdateCursor("next")
+        );
+    }
+
+    #[test]
+    fn search_backfill_completion_marker_runs_one_bounded_healing_page() {
+        let start = search_backfill_start(Some(GAMES_SEARCH_BACKFILL_COMPLETE));
+        assert_eq!(start, SearchBackfillStart::HealRecent);
+        assert_eq!(start.list_limit(), 100);
+        assert_eq!(start.max_pages(), Some(1));
+        assert_eq!(start.initial_cursor(Some(GAMES_SEARCH_BACKFILL_COMPLETE.to_owned())), None);
+        assert_eq!(start.as_log_str(), "heal_recent");
+        assert_eq!(search_backfill_start(None).as_log_str(), "scan");
+    }
+
+    #[test]
+    fn shared_budget_consumed_by_search_leaves_nothing_for_sweep() {
+        let cron_started_at_ms = 1_000;
+        let search_finished_at_ms = cron_started_at_ms + SCHEDULED_WORK_DEADLINE_MS;
+        assert_eq!(shared_budget_remaining_ms(cron_started_at_ms, search_finished_at_ms), 0);
+        assert!(shared_deadline_reached(cron_started_at_ms, search_finished_at_ms));
+    }
+
+    #[test]
     fn sweep_stats_default_is_zero() {
         let stats = SweepStats::default();
         assert_eq!(
@@ -734,18 +1082,18 @@ mod tests {
 
     #[test]
     fn sweep_deadline_is_safely_below_workers_30s_limit() {
-        // Cloudflare Workers cron の wall-clock 制限は 30s。`SWEEP_DEADLINE_MS`
-        // は安全側マージン (≥ 5s) を確保していないと、deadline 検知後の
+        // Cloudflare Workers cron の wall-clock 制限は 30s。search backfill と
+        // sweep の共有 deadline は安全側マージン (≥ 5s) を確保していないと、検知後の
         // pagination break + 後続ログ出力中に 30s 制限を踏む恐れがある。
         const _: () = assert!(
-            SWEEP_DEADLINE_MS + 5_000 <= 30_000,
-            "SWEEP_DEADLINE_MS must leave at least a 5s margin under the 30s cron limit",
+            SCHEDULED_WORK_DEADLINE_MS + 5_000 <= 30_000,
+            "shared scheduled work deadline must leave a 5s margin under the 30s cron limit",
         );
     }
 
     #[test]
     fn sweep_max_pages_caps_runaway_pagination() {
-        // `SWEEP_DEADLINE_MS` を超えなくても、cursor が壊れて truncated を
+        // 共有 deadline を超えなくても、cursor が壊れて truncated を
         // 返し続けるような異常時に無限 loop を避けるための gate。1 page =
         // 1000 件で 100 page = 100,000 件は live-games-index の現実的な
         // 上限を大きく超えている。

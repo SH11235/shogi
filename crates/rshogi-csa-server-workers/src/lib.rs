@@ -43,6 +43,7 @@ pub mod datetime;
 pub mod export_retry;
 pub mod floodgate_history;
 pub mod games_index;
+pub mod games_search_index;
 // `handle_auth` は `WORKERS_HANDLE_AUTH` whitelist の parse + password SHA256
 // 比較を担う。`HandleAuthRegistry` + `verify` は I/O 非依存の
 // pure helper でホスト target からテストできるよう `pub mod` で公開する。
@@ -161,7 +162,8 @@ fn minute_of_hour(epoch_ms: f64) -> i64 {
 /// ミリ秒なので、起動が数秒遅延しても分判定は予定どおり安定する:
 ///
 /// - 分が [`BACKFILL_MINUTE`] (0 分) のとき: `run_games_index_backfill` →
-///   `run_live_orphan_sweep` を順次実行する。
+///   `run_games_search_backfill` → `run_live_orphan_sweep` を順次実行する。後二者は
+///   cron 発火直後の時刻を共有し、合わせて 25 秒以内に打ち切る。
 /// - それ以外 (15 / 30 / 45 分) のとき: `run_live_orphan_sweep` のみ。
 ///   delete best-effort 失敗時の復旧遅延を 15 分以内に詰めるための高頻度経路
 ///   (https://github.com/SH11235/rshogi/issues/629)。
@@ -177,6 +179,7 @@ pub async fn scheduled(
     env: worker::Env,
     _ctx: worker::ScheduleContext,
 ) {
+    let started_at_ms = worker::Date::now().as_millis();
     let cron = event.cron();
     // 単一 cron のため発火の区別は cron 文字列でなくスケジュール時刻の分で行う。
     let minute = minute_of_hour(event.schedule());
@@ -191,8 +194,16 @@ pub async fn scheduled(
                 err: format!("{e:?}"),
             );
         }
+        if let Err(e) = backfill::run_games_search_backfill(&env, started_at_ms).await {
+            crate::structured_log!(
+                event: "games_search_backfill_failed",
+                component: "scheduled",
+                cron: cron,
+                err: format!("{e:?}"),
+            );
+        }
     }
-    if let Err(e) = backfill::run_live_orphan_sweep(&env).await {
+    if let Err(e) = backfill::run_live_orphan_sweep(&env, started_at_ms).await {
         crate::structured_log!(
             event: "live_orphan_sweep_failed",
             component: "scheduled",

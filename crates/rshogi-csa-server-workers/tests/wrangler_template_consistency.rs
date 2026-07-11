@@ -27,6 +27,7 @@ use rshogi_csa_server_workers::config::ConfigKeys;
 /// 各種 binding / `[vars]` キーを集約する。
 struct TemplateBindings {
     r2_bindings: Vec<String>,
+    d1_bindings: Vec<String>,
     do_bindings: Vec<String>,
     vars_keys: Vec<String>,
     /// `[triggers] crons = [...]` の値を保持する (https://github.com/SH11235/rshogi/issues/551)。空配列は未宣言。
@@ -50,6 +51,16 @@ fn load_template_bindings() -> TemplateBindings {
     // `[[r2_buckets]]` 配列の各エントリから `binding = "..."` を集める。
     let r2_bindings = doc
         .get("r2_buckets")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.get("binding").and_then(|v| v.as_str()).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let d1_bindings = doc
+        .get("d1_databases")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -87,6 +98,7 @@ fn load_template_bindings() -> TemplateBindings {
 
     TemplateBindings {
         r2_bindings,
+        d1_bindings,
         do_bindings,
         vars_keys,
         crons,
@@ -131,6 +143,11 @@ fn assert_bidirectional(category: &str, code_side: &[&'static str], template_sid
 #[test]
 fn wrangler_template_r2_bindings_match_config_keys() {
     assert_bidirectional("r2_bindings", ConfigKeys::ALL_R2_BINDINGS, &TEMPLATE.r2_bindings);
+}
+
+#[test]
+fn wrangler_template_d1_bindings_match_config_keys() {
+    assert_bidirectional("d1_bindings", ConfigKeys::ALL_D1_BINDINGS, &TEMPLATE.d1_bindings);
 }
 
 /// `wrangler.toml.example` の `[[durable_objects.bindings]]` 配列が、
