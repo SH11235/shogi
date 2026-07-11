@@ -221,8 +221,10 @@ struct Cli {
     #[arg(long)]
     dlshogi_onnx_model: Option<PathBuf>,
 
-    /// ONNX推論バッチサイズ（--onnx-model/--dlshogi-onnx-model使用時）
-    #[arg(long, default_value_t = 256)]
+    /// ONNX推論バッチサイズ（--onnx-model/--dlshogi-onnx-model使用時）。
+    /// GPU 推論の実測（dlshogi 系 + TensorRT）では 512〜2048 がほぼフラットで
+    /// 256 以下は GPU 利用率が下がり遅い。CPU 推論・省メモリ環境では小さい値も検討。
+    #[arg(long, default_value_t = 1024)]
     onnx_batch_size: usize,
 
     /// ONNX推論の GPU ID（-1=CPU）
@@ -231,8 +233,9 @@ struct Cli {
 
     /// ONNX推論セッション数（GPU 推論時のみ有効、CPU 推論では常に 1）。
     /// 2 以上で複数セッション round-robin により H2D/D2H 転送と compute をオーバーラップ
-    /// させる（in-flight 多重化）。出力はバッチ順に再整列されるため、同一 TensorRT
-    /// エンジンキャッシュを使う限り出力はセッション数に依存せず bit 一致する。
+    /// させる（in-flight 多重化）。出力はバッチ順に再整列される。同一 TensorRT
+    /// エンジンキャッシュならセッション数に依存せず出力が一致することを
+    /// dlshogi 系 + TensorRT の実測で確認済み（全モデル / EP の一般保証ではない）。
     /// VRAM 使用量はセッション数に応じて増える。
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=4))]
     onnx_sessions: u64,
