@@ -106,6 +106,12 @@ preview_bucket_name = "local-floodgate-history-dev"
 [triggers]
 crons = ["0,15,30,45 * * * *"]
 
+[[d1_databases]]
+binding = "GAMES_SEARCH_DB"
+database_name = "rshogi-csa-games-search-local"
+database_id = "REPLACE_WITH_LOCAL_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
 # --- 変数 ---
 # WebSocket Upgrade 時の Origin 許可リスト（カンマ区切り）。ブラウザ経由
 # （Origin ヘッダ付き）のリクエストに対する CSRF 防御に使う。

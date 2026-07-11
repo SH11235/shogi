@@ -1,6 +1,6 @@
 //! viewer 配信 HTTP API (`/api/v1/games`) のルーティングと R2 アクセス。
 //!
-//! v3 設計 (https://github.com/SH11235/rshogi/issues/542 issuecomment-4338088406) に準拠する 3 エンドポイント:
+//! v3 設計 (https://github.com/SH11235/rshogi/issues/542 issuecomment-4338088406) に準拠する 4 エンドポイント:
 //!
 //! - `GET /api/v1/games?cursor=<opaque>&limit=<N>` 一覧 (終局済)
 //!   `KIFU_BUCKET.list({prefix: "games-index/", cursor, limit})` を 1 回呼び、
@@ -14,6 +14,8 @@
 //!   semantics、`/api/v1/games/<id>` のような単局エンドポイントは進行中対局には
 //!   設けない (= viewer 側は live entry を **発見手段** として扱い、行クリック時に
 //!   WS spectate 接続で実状態を確認する)。
+//! - `GET /api/v1/games/search` D1 検索 (終局済)
+//!   選手名・結果・source・終局日時で絞り込み、page pagination で返す。
 //! - `GET /api/v1/games/<game_id>` 単局 (終局済)
 //!   `kifu-by-id/<encoded_game_id>.csa` を直接 get する。本文 (CSA V2) と
 //!   `kifu-by-id/<encoded_game_id>.meta.json` から取得した正準メタ (https://github.com/SH11235/rshogi/issues/551
@@ -96,6 +98,10 @@ use worker::{Env, Headers, Method, Request, Response, Result, Url};
 use crate::client_kind::normalize_client_kind;
 use crate::config::{ConfigKeys, OriginAllowList, is_viewer_api_enabled};
 use crate::games_index::KEY_PREFIX as GAMES_INDEX_PREFIX;
+use crate::games_search_index::{
+    DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, QueryValue, SearchGameSummary, SearchParams, SearchRow,
+    build_search_query, validate_pagination,
+};
 use crate::live_games_index::LIVE_KEY_PREFIX;
 use crate::origin::{OriginDecision, evaluate};
 use crate::x1_paths::{kifu_by_id_meta_key, kifu_by_id_object_key};
@@ -141,6 +147,9 @@ pub async fn try_handle(req: &Request, env: &Env) -> Result<Option<Response>> {
     if path == "/api/v1/games" {
         return Ok(Some(handle_list(req, env, &url).await?));
     }
+    if path == "/api/v1/games/search" {
+        return Ok(Some(handle_search(req, env, &url).await?));
+    }
     // `/api/v1/games/live` は `/api/v1/games/<game_id>` より先にマッチさせる
     // (`live` という ID の単局取得を 1 件目で誤って受けないため)。
     if path == "/api/v1/games/live" {
@@ -165,10 +174,10 @@ pub async fn try_handle(req: &Request, env: &Env) -> Result<Option<Response>> {
 /// viewer 配信 API 配下のパスかどうかを判定する純粋ロジック。
 ///
 /// `OPTIONS` preflight 経路で対象パスをゲートするためにも使用する。
-/// `/api/v1/games` (一覧)、`/api/v1/games/live` (live 一覧)、
+/// `/api/v1/games` (一覧)、`/api/v1/games/live` (live 一覧)、検索、
 /// `/api/v1/games/<id>` (単局) のみを true とする。
 fn is_viewer_api_path(path: &str) -> bool {
-    if path == "/api/v1/games" || path == "/api/v1/games/live" {
+    if matches!(path, "/api/v1/games" | "/api/v1/games/live" | "/api/v1/games/search") {
         return true;
     }
     if let Some(rest) = path.strip_prefix("/api/v1/games/") {
@@ -232,6 +241,151 @@ struct ListResponse {
 struct LiveListResponse {
     live_games: Vec<serde_json::Value>,
     next_cursor: Option<String>,
+}
+
+// 他のレスポンス (`ListResponse` の `next_cursor` 等) と同じく wire は snake_case
+// のまま返す (client 側の decode 層が snake_case → camelCase 変換を担う規約)。
+#[derive(Debug, Serialize)]
+struct SearchResponse {
+    games: Vec<SearchGameSummary>,
+    page: u32,
+    page_size: u32,
+    total_count: u64,
+}
+
+fn parse_search_params(url: &Url) -> std::result::Result<SearchParams, String> {
+    let mut params = SearchParams {
+        name: None,
+        result: None,
+        source: None,
+        from: None,
+        to: None,
+        page: 1,
+        page_size: DEFAULT_PAGE_SIZE,
+    };
+    for (key, value) in url.query_pairs() {
+        let value = value.into_owned();
+        match key.as_ref() {
+            "name" => params.name = Some(value),
+            "result" => params.result = Some(value),
+            "source" => params.source = Some(value),
+            "from" => {
+                params.from =
+                    Some(value.parse().map_err(|_| "from must be an epoch millisecond integer")?)
+            }
+            "to" => {
+                params.to =
+                    Some(value.parse().map_err(|_| "to must be an epoch millisecond integer")?)
+            }
+            "page" => params.page = value.parse().map_err(|_| "page must be a positive integer")?,
+            "pageSize" => {
+                params.page_size =
+                    value.parse().map_err(|_| format!("pageSize must be 1..={MAX_PAGE_SIZE}"))?
+            }
+            _ => {}
+        }
+    }
+    validate_pagination(params.page, params.page_size)?;
+    Ok(params)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn d1_bind_values(values: &[QueryValue]) -> Vec<worker::wasm_bindgen::JsValue> {
+    values
+        .iter()
+        .map(|value| match value {
+            QueryValue::Text(value) => worker::wasm_bindgen::JsValue::from_str(value),
+            QueryValue::Integer(value) => worker::wasm_bindgen::JsValue::from_f64(*value),
+        })
+        .collect()
+}
+
+async fn handle_search(req: &Request, env: &Env, url: &Url) -> Result<Response> {
+    if let Some(blocked) = check_origin(req, env)? {
+        return Ok(blocked);
+    }
+    let params = match parse_search_params(url) {
+        Ok(params) => params,
+        Err(message) => return with_cors(no_store_error(message, 400)?, req, env),
+    };
+    let query = build_search_query(&params);
+    let db = match env.d1(ConfigKeys::GAMES_SEARCH_DB_BINDING) {
+        Ok(db) => db,
+        Err(e) => {
+            log_viewer_api_failed(
+                "games_search_d1_binding",
+                &extract_client_kind(req),
+                &e.to_string(),
+            );
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let filter_values = d1_bind_values(&query.filter_values);
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        total_count: u64,
+    }
+    let count_statement = match db.prepare(&query.count_sql).bind(&filter_values) {
+        Ok(statement) => statement,
+        Err(e) => {
+            log_viewer_api_failed(
+                "games_search_count_prepare",
+                &extract_client_kind(req),
+                &e.to_string(),
+            );
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let count = match count_statement.first::<CountRow>(None).await {
+        Ok(Some(row)) => row.total_count,
+        Ok(None) => 0,
+        Err(e) => {
+            log_viewer_api_failed("games_search_count", &extract_client_kind(req), &e.to_string());
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let mut row_values = filter_values;
+    row_values.push(worker::wasm_bindgen::JsValue::from_f64(f64::from(query.limit)));
+    row_values.push(worker::wasm_bindgen::JsValue::from_f64(query.offset as f64));
+    let rows_statement = match db.prepare(&query.rows_sql).bind(&row_values) {
+        Ok(statement) => statement,
+        Err(e) => {
+            log_viewer_api_failed(
+                "games_search_rows_prepare",
+                &extract_client_kind(req),
+                &e.to_string(),
+            );
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let rows = match rows_statement.all().await.and_then(|result| result.results::<SearchRow>()) {
+        Ok(rows) => rows,
+        Err(e) => {
+            log_viewer_api_failed("games_search_rows", &extract_client_kind(req), &e.to_string());
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let games: std::result::Result<Vec<_>, _> =
+        rows.into_iter().map(SearchRow::into_summary).collect();
+    let games = match games {
+        Ok(games) => games,
+        Err(e) => {
+            log_viewer_api_failed(
+                "games_search_clock_parse",
+                &extract_client_kind(req),
+                &e.to_string(),
+            );
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let mut response = Response::from_json(&SearchResponse {
+        games,
+        page: params.page,
+        page_size: params.page_size,
+        total_count: count,
+    })?;
+    set_cache_control(&mut response, CacheableKind::List.cache_control_header())?;
+    with_cors(response, req, env)
 }
 
 /// 単局 API レスポンスの wire 形状。
@@ -866,7 +1020,29 @@ mod tests {
     fn is_viewer_api_path_accepts_root_paths() {
         assert!(is_viewer_api_path("/api/v1/games"));
         assert!(is_viewer_api_path("/api/v1/games/live"));
+        assert!(is_viewer_api_path("/api/v1/games/search"));
         assert!(is_viewer_api_path("/api/v1/games/abc-123"));
+    }
+
+    #[test]
+    fn parse_search_params_rejects_pagination_boundaries() {
+        for query in ["page=0", "pageSize=0", "pageSize=101"] {
+            let url =
+                Url::parse(&format!("https://example.com/api/v1/games/search?{query}")).unwrap();
+            assert!(parse_search_params(&url).is_err(), "query={query}");
+        }
+        let url =
+            Url::parse("https://example.com/api/v1/games/search?page=1&pageSize=100").unwrap();
+        assert!(parse_search_params(&url).is_ok());
+    }
+
+    #[test]
+    fn parse_search_params_rejects_invalid_time_bounds() {
+        for query in ["from=invalid", "to=-1", "to=1.5"] {
+            let url =
+                Url::parse(&format!("https://example.com/api/v1/games/search?{query}")).unwrap();
+            assert!(parse_search_params(&url).is_err(), "query={query}");
+        }
     }
 
     #[test]

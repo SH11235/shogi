@@ -46,6 +46,85 @@ pub(crate) const META_SUFFIX: &str = ".meta.json";
 /// 経由で複数ページ一気に処理する案 (設計 v2 §5 (a)) を別 issue で検討する。
 pub(crate) const PAGE_SIZE: u32 = 1000;
 
+/// D1 state に保存する完了マーカー。R2 cursor と衝突しない予約値。
+const GAMES_SEARCH_BACKFILL_COMPLETE: &str = "__COMPLETE__";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchBackfillStart {
+    Scan,
+    ReturnComplete,
+}
+
+fn search_backfill_start(cursor: Option<&str>) -> SearchBackfillStart {
+    if cursor == Some(GAMES_SEARCH_BACKFILL_COMPLETE) {
+        SearchBackfillStart::ReturnComplete
+    } else {
+        SearchBackfillStart::Scan
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchBackfillItemOutcome {
+    PermanentSkip,
+    R2GetError,
+    R2BodyMissing,
+    R2BodyReadError,
+    D1UpsertError,
+    DeadlineExceeded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchBackfillItemControl {
+    Continue,
+    RetryPage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchBackfillStateOperation<'a> {
+    RetryPage,
+    CursorMissing,
+    UpdateCursor(&'a str),
+    MarkComplete,
+}
+
+#[derive(Debug, Default)]
+struct SearchBackfillPageState {
+    retry_page: bool,
+}
+
+impl SearchBackfillPageState {
+    fn record(&mut self, outcome: SearchBackfillItemOutcome) -> SearchBackfillItemControl {
+        match outcome {
+            SearchBackfillItemOutcome::PermanentSkip => SearchBackfillItemControl::Continue,
+            SearchBackfillItemOutcome::R2GetError
+            | SearchBackfillItemOutcome::R2BodyMissing
+            | SearchBackfillItemOutcome::R2BodyReadError
+            | SearchBackfillItemOutcome::D1UpsertError
+            | SearchBackfillItemOutcome::DeadlineExceeded => {
+                self.retry_page = true;
+                SearchBackfillItemControl::RetryPage
+            }
+        }
+    }
+
+    fn finish<'a>(
+        self,
+        truncated: bool,
+        next_cursor: Option<&'a str>,
+    ) -> SearchBackfillStateOperation<'a> {
+        if self.retry_page {
+            SearchBackfillStateOperation::RetryPage
+        } else if truncated {
+            next_cursor.map_or(
+                SearchBackfillStateOperation::CursorMissing,
+                SearchBackfillStateOperation::UpdateCursor,
+            )
+        } else {
+            SearchBackfillStateOperation::MarkComplete
+        }
+    }
+}
+
 /// `run_live_orphan_sweep` の 1 cron 内 pagination 上限 (https://github.com/SH11235/rshogi/issues/629)。
 ///
 /// Cloudflare Workers の cron 起動は wall-clock 30s 制限を持つため、安全側
@@ -168,14 +247,18 @@ pub(crate) fn live_entry_hard_ttl_expired(age_ms: u64) -> bool {
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use super::{
-        BackfillStats, KIFU_BY_ID_PREFIX, LIVE_ENTRY_HARD_TTL_MS, LiveEntryFields, META_SUFFIX,
-        MetaForIndexKey, PAGE_SIZE, SWEEP_DEADLINE_MS, SWEEP_MAX_PAGES, SweepStats,
-        live_entry_hard_ttl_expired,
+        BackfillStats, GAMES_SEARCH_BACKFILL_COMPLETE, KIFU_BY_ID_PREFIX, LIVE_ENTRY_HARD_TTL_MS,
+        LiveEntryFields, META_SUFFIX, MetaForIndexKey, PAGE_SIZE, SWEEP_DEADLINE_MS,
+        SWEEP_MAX_PAGES, SearchBackfillItemOutcome, SearchBackfillPageState, SearchBackfillStart,
+        SearchBackfillStateOperation, SweepStats, live_entry_hard_ttl_expired,
+        search_backfill_start,
     };
     use worker::{Date, Env, Result};
 
     use crate::config::ConfigKeys;
+    use crate::games_index::KEY_PREFIX as GAMES_INDEX_PREFIX;
     use crate::games_index::games_index_key;
+    use crate::games_search_index::{OwnedGamesIndexEntry, upsert_owned};
     use crate::live_games_index::LIVE_KEY_PREFIX;
     use crate::x1_paths::kifu_by_id_meta_key;
 
@@ -313,6 +396,151 @@ mod imp {
             skipped: stats.skipped,
             elapsed_ms: elapsed_ms,
         );
+        Ok(stats)
+    }
+
+    /// R2 `games-index/` をページングし、D1 検索 index を冪等 upsert する。
+    /// 1 cron で最大 25 秒だけ処理し、Workers の実行時間上限へ余裕を残す。
+    pub async fn run_games_search_backfill(env: &Env) -> Result<BackfillStats> {
+        const DEADLINE_MS: u64 = 25_000;
+        let started_at_ms = Date::now().as_millis();
+        let mut stats = BackfillStats::default();
+        let bucket = match env.bucket(ConfigKeys::KIFU_BUCKET_BINDING) {
+            Ok(bucket) => bucket,
+            Err(e) => {
+                crate::structured_log!(event: "games_search_backfill_bucket_failed", component: "backfill", err: format!("{e:?}"));
+                return Ok(stats);
+            }
+        };
+        let db = match env.d1(ConfigKeys::GAMES_SEARCH_DB_BINDING) {
+            Ok(db) => db,
+            Err(e) => {
+                crate::structured_log!(event: "games_search_backfill_d1_failed", component: "backfill", err: format!("{e:?}"));
+                return Ok(stats);
+            }
+        };
+        let mut cursor = match db
+            .prepare("SELECT r2_cursor FROM games_search_backfill_state WHERE singleton = 1")
+            .first::<String>(Some("r2_cursor"))
+            .await
+        {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                crate::structured_log!(event: "games_search_backfill_state_read_failed", component: "backfill", err: format!("{e:?}"));
+                return Ok(stats);
+            }
+        };
+        if search_backfill_start(cursor.as_deref()) == SearchBackfillStart::ReturnComplete {
+            return Ok(stats);
+        }
+        loop {
+            if Date::now().as_millis().saturating_sub(started_at_ms) >= DEADLINE_MS {
+                break;
+            }
+            let mut builder = bucket.list().prefix(GAMES_INDEX_PREFIX).limit(PAGE_SIZE);
+            if let Some(value) = cursor.as_deref() {
+                builder = builder.cursor(value);
+            }
+            let page = match builder.execute().await {
+                Ok(page) => page,
+                Err(e) => {
+                    crate::structured_log!(event: "games_search_backfill_list_failed", component: "backfill", err: format!("{e:?}"));
+                    break;
+                }
+            };
+            let mut page_state = SearchBackfillPageState::default();
+            for object in page.objects() {
+                if Date::now().as_millis().saturating_sub(started_at_ms) >= DEADLINE_MS {
+                    page_state.record(SearchBackfillItemOutcome::DeadlineExceeded);
+                    break;
+                }
+                let key = object.key();
+                stats.listed = stats.listed.saturating_add(1);
+                let fetched = match bucket.get(&key).execute().await {
+                    Ok(Some(object)) => object,
+                    Ok(None) => {
+                        crate::structured_log!(event: "games_search_backfill_get_missing", component: "backfill", key: key);
+                        stats.skipped = stats.skipped.saturating_add(1);
+                        continue;
+                    }
+                    Err(e) => {
+                        crate::structured_log!(event: "games_search_backfill_get_failed", component: "backfill", key: key, err: format!("{e:?}"));
+                        page_state.record(SearchBackfillItemOutcome::R2GetError);
+                        stats.skipped = stats.skipped.saturating_add(1);
+                        break;
+                    }
+                };
+                let Some(body) = fetched.body() else {
+                    crate::structured_log!(event: "games_search_backfill_body_missing", component: "backfill", key: key);
+                    page_state.record(SearchBackfillItemOutcome::R2BodyMissing);
+                    stats.skipped = stats.skipped.saturating_add(1);
+                    break;
+                };
+                let bytes = match body.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        crate::structured_log!(event: "games_search_backfill_read_failed", component: "backfill", key: key, err: format!("{e:?}"));
+                        page_state.record(SearchBackfillItemOutcome::R2BodyReadError);
+                        stats.skipped = stats.skipped.saturating_add(1);
+                        break;
+                    }
+                };
+                let entry = match serde_json::from_slice::<OwnedGamesIndexEntry>(&bytes) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        // JSON 破損は恒久エラーとしてこの object だけを skip する。
+                        crate::structured_log!(event: "games_search_backfill_parse_failed", component: "backfill", key: key, err: format!("{e:?}"));
+                        stats.skipped = stats.skipped.saturating_add(1);
+                        page_state.record(SearchBackfillItemOutcome::PermanentSkip);
+                        continue;
+                    }
+                };
+                match upsert_owned(env, &entry).await {
+                    Ok(()) => stats.put = stats.put.saturating_add(1),
+                    Err(e) => {
+                        crate::structured_log!(event: "games_search_backfill_upsert_failed", component: "backfill", game_id: entry.game_id, err: format!("{e:?}"));
+                        stats.skipped = stats.skipped.saturating_add(1);
+                        page_state.record(SearchBackfillItemOutcome::D1UpsertError);
+                        break;
+                    }
+                }
+                if Date::now().as_millis().saturating_sub(started_at_ms) >= DEADLINE_MS {
+                    page_state.record(SearchBackfillItemOutcome::DeadlineExceeded);
+                    break;
+                }
+            }
+            let next_cursor = page.cursor();
+            let operation = page_state.finish(page.truncated(), next_cursor.as_deref());
+            let state_value = match operation {
+                SearchBackfillStateOperation::RetryPage => break,
+                SearchBackfillStateOperation::CursorMissing => {
+                    crate::structured_log!(event: "games_search_backfill_cursor_missing", component: "backfill");
+                    break;
+                }
+                SearchBackfillStateOperation::UpdateCursor(value) => value,
+                SearchBackfillStateOperation::MarkComplete => GAMES_SEARCH_BACKFILL_COMPLETE,
+            };
+            let bind = [worker::wasm_bindgen::JsValue::from_str(state_value)];
+            let state_statement = match db
+                .prepare("INSERT INTO games_search_backfill_state (singleton, r2_cursor) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET r2_cursor=excluded.r2_cursor")
+                .bind(&bind)
+            {
+                Ok(statement) => statement,
+                Err(e) => {
+                    crate::structured_log!(event: "games_search_backfill_state_prepare_failed", component: "backfill", err: format!("{e:?}"));
+                    break;
+                }
+            };
+            if let Err(e) = state_statement.run().await {
+                crate::structured_log!(event: "games_search_backfill_state_write_failed", component: "backfill", err: format!("{e:?}"));
+                break;
+            }
+            if operation == SearchBackfillStateOperation::MarkComplete {
+                break;
+            }
+            cursor = Some(state_value.to_owned());
+        }
+        crate::structured_log!(event: "games_search_backfill_progress", component: "backfill", listed: stats.listed, put: stats.put, skipped: stats.skipped);
         Ok(stats)
     }
 
@@ -610,7 +838,7 @@ mod imp {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use imp::{run_games_index_backfill, run_live_orphan_sweep};
+pub use imp::{run_games_index_backfill, run_games_search_backfill, run_live_orphan_sweep};
 
 #[cfg(test)]
 mod tests {
@@ -698,6 +926,55 @@ mod tests {
                 put: 0,
                 skipped: 0
             }
+        );
+    }
+
+    #[test]
+    fn search_backfill_deadline_selects_retry_page_and_keeps_cursor() {
+        let mut state = SearchBackfillPageState::default();
+        assert_eq!(
+            state.record(SearchBackfillItemOutcome::DeadlineExceeded),
+            SearchBackfillItemControl::RetryPage
+        );
+        assert_eq!(state.finish(true, Some("next")), SearchBackfillStateOperation::RetryPage);
+    }
+
+    #[test]
+    fn search_backfill_temporary_io_failures_keep_cursor() {
+        for failure in [
+            SearchBackfillItemOutcome::R2GetError,
+            SearchBackfillItemOutcome::R2BodyMissing,
+            SearchBackfillItemOutcome::R2BodyReadError,
+            SearchBackfillItemOutcome::D1UpsertError,
+        ] {
+            let mut state = SearchBackfillPageState::default();
+            assert_eq!(state.record(failure), SearchBackfillItemControl::RetryPage, "{failure:?}");
+            assert_eq!(
+                state.finish(true, Some("next")),
+                SearchBackfillStateOperation::RetryPage,
+                "{failure:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_backfill_json_parse_failure_advances_cursor() {
+        let mut state = SearchBackfillPageState::default();
+        assert_eq!(
+            state.record(SearchBackfillItemOutcome::PermanentSkip),
+            SearchBackfillItemControl::Continue
+        );
+        assert_eq!(
+            state.finish(true, Some("next")),
+            SearchBackfillStateOperation::UpdateCursor("next")
+        );
+    }
+
+    #[test]
+    fn search_backfill_completion_marker_causes_early_return() {
+        assert_eq!(
+            search_backfill_start(Some(GAMES_SEARCH_BACKFILL_COMPLETE)),
+            SearchBackfillStart::ReturnComplete
         );
     }
 

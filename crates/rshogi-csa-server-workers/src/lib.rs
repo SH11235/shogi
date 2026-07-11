@@ -43,6 +43,7 @@ pub mod datetime;
 pub mod export_retry;
 pub mod floodgate_history;
 pub mod games_index;
+pub mod games_search_index;
 // `handle_auth` は `WORKERS_HANDLE_AUTH` whitelist の parse + password SHA256
 // 比較を担う。`HandleAuthRegistry` + `verify` は I/O 非依存の
 // pure helper でホスト target からテストできるよう `pub mod` で公開する。
@@ -186,6 +187,14 @@ pub async fn scheduled(
         if let Err(e) = backfill::run_games_index_backfill(&env).await {
             crate::structured_log!(
                 event: "games_index_backfill_failed",
+                component: "scheduled",
+                cron: cron,
+                err: format!("{e:?}"),
+            );
+        }
+        if let Err(e) = backfill::run_games_search_backfill(&env).await {
+            crate::structured_log!(
+                event: "games_search_backfill_failed",
                 component: "scheduled",
                 cron: cron,
                 err: format!("{e:?}"),

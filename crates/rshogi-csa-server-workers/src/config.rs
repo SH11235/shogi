@@ -230,6 +230,12 @@ impl ConfigKeys {
         Self::FLOODGATE_HISTORY_BUCKET_BINDING,
     ];
 
+    /// 終局済棋譜の検索用 D1 database binding。
+    pub const GAMES_SEARCH_DB_BINDING: &'static str = "GAMES_SEARCH_DB";
+
+    /// Wrangler に宣言する D1 binding の網羅列挙。
+    pub const ALL_D1_BINDINGS: &'static [&'static str] = &[Self::GAMES_SEARCH_DB_BINDING];
+
     /// `wrangler.toml` の `[[durable_objects.bindings]] name = "..."` で宣言される
     /// べき名前の網羅列挙。新規 DO binding 定数を追加したら必ず本配列にも追加する。
     pub const ALL_DO_BINDINGS: &'static [&'static str] = &[

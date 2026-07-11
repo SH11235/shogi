@@ -27,6 +27,7 @@ struct EnvironmentBindings {
     /// 失敗 message に出す toml ファイル名。
     file_name: &'static str,
     r2_bindings: Vec<String>,
+    d1_bindings: Vec<String>,
     do_bindings: Vec<String>,
     vars_keys: Vec<String>,
     compatibility_date: Option<String>,
@@ -56,6 +57,16 @@ fn load_environment_bindings(label: &'static str, file_name: &'static str) -> En
 
     let r2_bindings = doc
         .get("r2_buckets")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.get("binding").and_then(|v| v.as_str()).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let d1_bindings = doc
+        .get("d1_databases")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -103,6 +114,7 @@ fn load_environment_bindings(label: &'static str, file_name: &'static str) -> En
         label,
         file_name,
         r2_bindings,
+        d1_bindings,
         do_bindings,
         vars_keys,
         compatibility_date,
@@ -142,6 +154,10 @@ fn assert_bidirectional(
 
 fn assert_r2_bindings_match(env: &EnvironmentBindings) {
     assert_bidirectional(env, "r2_bindings", ConfigKeys::ALL_R2_BINDINGS, &env.r2_bindings);
+}
+
+fn assert_d1_bindings_match(env: &EnvironmentBindings) {
+    assert_bidirectional(env, "d1_bindings", ConfigKeys::ALL_D1_BINDINGS, &env.d1_bindings);
 }
 
 fn assert_do_bindings_match(env: &EnvironmentBindings) {
@@ -346,6 +362,11 @@ fn wrangler_production_r2_bindings_match_config_keys() {
 }
 
 #[test]
+fn wrangler_production_d1_bindings_match_config_keys() {
+    assert_d1_bindings_match(&PRODUCTION);
+}
+
+#[test]
 fn wrangler_production_do_bindings_match_config_keys() {
     assert_do_bindings_match(&PRODUCTION);
 }
@@ -380,6 +401,11 @@ fn wrangler_production_declares_scheduled_cron_trigger() {
 #[test]
 fn wrangler_staging_r2_bindings_match_config_keys() {
     assert_r2_bindings_match(&STAGING);
+}
+
+#[test]
+fn wrangler_staging_d1_bindings_match_config_keys() {
+    assert_d1_bindings_match(&STAGING);
 }
 
 #[test]

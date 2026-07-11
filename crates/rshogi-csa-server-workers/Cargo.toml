@@ -39,7 +39,7 @@ sha2 = { version = "0.10", default-features = false }
 # `wasm-bindgen-futures` / `js-sys` / `async-trait` / `futures-util` を内部で
 # 引き込むが、`futures_util::future::join_all` (viewer_api の R2 get 並列化) を
 # 本 crate から直接使うため `futures-util` は明示的な直接依存にしている。
-worker = { version = "0.8", features = ["http"] }
+worker = { version = "0.8", features = ["d1", "http"] }
 worker-macros = { version = "0.8", features = ["http"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
