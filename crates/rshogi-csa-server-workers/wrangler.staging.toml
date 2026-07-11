@@ -112,11 +112,10 @@ bucket_name = "rshogi-csa-kifu-staging"
 binding = "FLOODGATE_HISTORY_BUCKET"
 bucket_name = "rshogi-csa-floodgate-history-staging"
 
-# `wrangler d1 create rshogi-csa-games-search-staging` の出力で database_id を置換する。
 [[d1_databases]]
 binding = "GAMES_SEARCH_DB"
 database_name = "rshogi-csa-games-search-staging"
-database_id = "REPLACE_WITH_STAGING_D1_DATABASE_ID"
+database_id = "b2756925-389d-468c-bb11-aba64cad9ec7"
 migrations_dir = "migrations"
 
 # --- Cron triggers ---
