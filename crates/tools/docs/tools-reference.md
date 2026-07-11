@@ -25,6 +25,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `bench_nnue_eval` | NNUE 推論単体の性能測定（cycles/eval, instructions/eval） |
 | `search_only_ab` | Linux perf ベースの search-only A/B ベンチマーク。起動・ロード時間を除外して正確計測 |
 | `eval_sfens` | SFEN 局面を LayerStacks NNUE で静的評価（`score` は歩=90 の内部スケール、`score_cp` は cp） |
+| `nnue_saturation` | LayerStacks NNUE の活性飽和率（u8 127 張り付き）を実局面で計測（[詳細](nnue_saturation.md)） |
 | `ek_testset` | held-out CSA から入玉評価テストセットを構築し、native NNUE 評価で DT/OC 指標を採点（[詳細](ek_testset.md)） |
 | `compare_eval_nnue` | 教師 NNUE と生徒 NNUE の評価値一致度を検証（MAE・相関係数・スコア帯別誤差） |
 | `dump_effect_bucket_golden` | 形式一致 golden 用に effect bucket active index を config 別に dump（[詳細](dump_effect_bucket_golden.md)） |

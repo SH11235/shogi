@@ -50,6 +50,7 @@ pub mod dlshogi_features;
 pub mod ek_testset;
 pub mod eval_sfens_tool;
 pub mod kif;
+pub mod nnue_saturation_tool;
 #[cfg(feature = "dlshogi-onnx")]
 pub mod onnx_value;
 pub mod packed_sfen;

@@ -88,6 +88,12 @@ name = "eval_sfens"
 path = "src/bin/eval_sfens.rs"
 required-features = ["nnue-arch"]
 
+# nnue_saturation は LayerStacks NNUE 前提のため nnue-arch に gate する。
+[[bin]]
+name = "nnue_saturation"
+path = "src/bin/nnue_saturation.rs"
+required-features = ["nnue-arch"]
+
 # ek_testset は CSA replay に依存する（TUI は不要）ため csa-replay に gate する。
 [[bin]]
 name = "ek_testset"
