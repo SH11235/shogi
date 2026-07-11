@@ -77,6 +77,10 @@ ONNX 静的評価モードでも評価対象は同じく子局面です。ply �
 - USI 探索モード: エンジン探索込みの評価値・親局面 bestmove agreement を取りたい場合。
 - ONNX 静的評価モード: 大量の定跡候補を探索なしで高速に DL value head で粗く並べ替えたい場合。
 
+## 終了動作（ONNX 静的評価モード）
+
+ONNX 静的評価モードの正常終了は、出力 `.db` / report / journal を flush した後に通常のプロセス teardown を踏まず即時終了します（`_exit`）。ONNX Runtime（TensorRT EP）をロードしたプロセスは exit 時のライブラリデストラクタ連鎖が glibc ヒープを壊し、正常完了後に `corrupted double-linked list` abort（exit code 134）を間欠的に起こすため、その回避です。出力は即時終了前に書き終わっており欠けません。USI 探索モードの終了動作は変わりません。
+
 ## journal と決定性
 
 出力 `.db` の局面行は、入力の full SFEN（末尾 ply を含む）単位で保持します。同じ盤面・手番でも末尾 ply が異なる `sfen` 行は別 entry として出力されます。

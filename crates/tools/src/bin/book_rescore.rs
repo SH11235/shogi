@@ -207,6 +207,10 @@ fn main() -> Result<()> {
     if let Some(path) = &cli.report {
         write_report(&book, &journal.child, &journal.parent, path, mode == RunMode::UsiSearch)?;
     }
+    #[cfg(feature = "dlshogi-onnx")]
+    if mode == RunMode::StaticOnnx {
+        tools::ort_teardown::exit_skipping_ort_teardown(0);
+    }
     Ok(())
 }
 

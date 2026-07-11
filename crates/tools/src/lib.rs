@@ -53,6 +53,7 @@ pub mod kif;
 pub mod nnue_saturation_tool;
 #[cfg(feature = "dlshogi-onnx")]
 pub mod onnx_value;
+pub mod ort_teardown;
 pub mod packed_sfen;
 pub mod positions;
 pub mod progress;
