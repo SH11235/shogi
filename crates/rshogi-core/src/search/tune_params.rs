@@ -89,6 +89,10 @@ pub struct SearchTuneParams {
     pub lmr_step16_capture_stat_scale_num: i32,
     /// LMR Step16: stat_score 補正の分子（/8192）
     pub lmr_step16_stat_score_scale_num: i32,
+    /// allNode では合成済みの reduction を深さに応じて増幅する。
+    pub lmr_all_node_scale_num: i32,
+    /// allNode reduction 増幅率の深さ依存を調整する。
+    pub lmr_all_node_scale_offset: i32,
     /// LMR再探索: deeper判定のベース値（43 + 2*depth の43）
     pub lmr_research_deeper_base: i32,
     /// LMR再探索: deeper判定の depth 係数（43 + 2*depth の2）
@@ -192,6 +196,8 @@ pub struct SearchTuneParams {
     pub stat_bonus_max: i32,
     /// stat bonus: TT手一致時の加算（375）
     pub stat_bonus_tt_bonus: i32,
+    /// stat bonus に親ノードの statScore を還流する分子（/8192、0 で無効）。
+    pub stat_bonus_parent_stat_num: i32,
     /// stat malus: depth 係数（825）
     pub stat_malus_depth_mult: i32,
     /// stat malus: オフセット（-196）
@@ -244,6 +250,10 @@ pub struct SearchTuneParams {
     pub update_all_stats_quiet_bonus_scale_num: i32,
     /// update_all_stats: quiet malus更新のスケール分子（/1024）
     pub update_all_stats_quiet_malus_scale_num: i32,
+    /// quiet malus を適用手ごとに減衰させる分子（/1024）。
+    pub update_all_stats_quiet_malus_decay_num: i32,
+    /// 非PVノードで探索済み手数を bonus に反映する分子（/(256*1024)、0 で無効）。
+    pub update_all_stats_searched_count_num: i32,
     /// update_all_stats: capture best更新のスケール分子（/1024）
     pub update_all_stats_capture_bonus_scale_num: i32,
     /// update_all_stats: capture malus更新のスケール分子（/1024）
@@ -584,6 +594,18 @@ const SPSA_OPTION_SPECS: &[SearchTuneOptionSpec] = &[
         max: 8192,
     },
     SearchTuneOptionSpec {
+        usi_name: "SPSA_LMR_ALL_NODE_SCALE_NUM",
+        default: 272,
+        min: 0,
+        max: 4096,
+    },
+    SearchTuneOptionSpec {
+        usi_name: "SPSA_LMR_ALL_NODE_SCALE_OFFSET",
+        default: 285,
+        min: 1,
+        max: 8192,
+    },
+    SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_RESEARCH_DEEPER_BASE",
         default: 43,
         min: -1024,
@@ -872,6 +894,12 @@ const SPSA_OPTION_SPECS: &[SearchTuneOptionSpec] = &[
         max: 4096,
     },
     SearchTuneOptionSpec {
+        usi_name: "SPSA_STAT_BONUS_PARENT_STAT_NUM",
+        default: 273,
+        min: 0,
+        max: 8192,
+    },
+    SearchTuneOptionSpec {
         usi_name: "SPSA_STAT_MALUS_DEPTH_MULT",
         default: 825,
         min: 0,
@@ -1026,6 +1054,18 @@ const SPSA_OPTION_SPECS: &[SearchTuneOptionSpec] = &[
         default: 1083,
         min: 0,
         max: 4096,
+    },
+    SearchTuneOptionSpec {
+        usi_name: "SPSA_UPDATE_ALL_QUIET_MALUS_DECAY_NUM",
+        default: 956,
+        min: 0,
+        max: 1024,
+    },
+    SearchTuneOptionSpec {
+        usi_name: "SPSA_UPDATE_ALL_SEARCHED_COUNT_NUM",
+        default: 1024,
+        min: 0,
+        max: 16_384,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_UPDATE_ALL_CAPTURE_BONUS_SCALE_NUM",
@@ -1443,6 +1483,8 @@ impl Default for SearchTuneParams {
             lmr_step16_tt_move_penalty: 2018,
             lmr_step16_capture_stat_scale_num: 803,
             lmr_step16_stat_score_scale_num: 794,
+            lmr_all_node_scale_num: 272,
+            lmr_all_node_scale_offset: 285,
             lmr_research_deeper_base: 43,
             lmr_research_deeper_depth_mul: 2,
             lmr_research_shallower_threshold: 9,
@@ -1491,6 +1533,7 @@ impl Default for SearchTuneParams {
             stat_bonus_offset: -77,
             stat_bonus_max: 1633,
             stat_bonus_tt_bonus: 375,
+            stat_bonus_parent_stat_num: 273,
             stat_malus_depth_mult: 825,
             stat_malus_offset: -196,
             stat_malus_max: 2159,
@@ -1517,6 +1560,8 @@ impl Default for SearchTuneParams {
             pawn_history_neg_multiplier: 550,
             update_all_stats_quiet_bonus_scale_num: 881,
             update_all_stats_quiet_malus_scale_num: 1083,
+            update_all_stats_quiet_malus_decay_num: 956,
+            update_all_stats_searched_count_num: 1024,
             update_all_stats_capture_bonus_scale_num: 1482,
             update_all_stats_capture_malus_scale_num: 1397,
             update_all_stats_early_refutation_penalty_scale_num: 614,
@@ -1671,6 +1716,8 @@ impl SearchTuneParams {
             0,
             8192
         );
+        try_apply!("SPSA_LMR_ALL_NODE_SCALE_NUM", lmr_all_node_scale_num, 0, 4096);
+        try_apply!("SPSA_LMR_ALL_NODE_SCALE_OFFSET", lmr_all_node_scale_offset, 1, 8192);
         try_apply!("SPSA_LMR_RESEARCH_DEEPER_BASE", lmr_research_deeper_base, -1024, 1024);
         try_apply!("SPSA_LMR_RESEARCH_DEEPER_DEPTH_MUL", lmr_research_deeper_depth_mul, -64, 64);
         try_apply!(
@@ -1779,6 +1826,7 @@ impl SearchTuneParams {
         try_apply!("SPSA_STAT_BONUS_OFFSET", stat_bonus_offset, -4096, 4096);
         try_apply!("SPSA_STAT_BONUS_MAX", stat_bonus_max, 1, 8192);
         try_apply!("SPSA_STAT_BONUS_TT_BONUS", stat_bonus_tt_bonus, -4096, 4096);
+        try_apply!("SPSA_STAT_BONUS_PARENT_STAT_NUM", stat_bonus_parent_stat_num, 0, 8192);
         try_apply!("SPSA_STAT_MALUS_DEPTH_MULT", stat_malus_depth_mult, 0, 4096);
         try_apply!("SPSA_STAT_MALUS_OFFSET", stat_malus_offset, -4096, 4096);
         try_apply!("SPSA_STAT_MALUS_MAX", stat_malus_max, 1, 8192);
@@ -1824,6 +1872,18 @@ impl SearchTuneParams {
             update_all_stats_quiet_malus_scale_num,
             0,
             4096
+        );
+        try_apply!(
+            "SPSA_UPDATE_ALL_QUIET_MALUS_DECAY_NUM",
+            update_all_stats_quiet_malus_decay_num,
+            0,
+            1024
+        );
+        try_apply!(
+            "SPSA_UPDATE_ALL_SEARCHED_COUNT_NUM",
+            update_all_stats_searched_count_num,
+            0,
+            16_384
         );
         try_apply!(
             "SPSA_UPDATE_ALL_CAPTURE_BONUS_SCALE_NUM",
@@ -2002,6 +2062,23 @@ mod tests {
         assert!(res.clamped);
         assert_eq!(res.applied, 1);
         assert_eq!(params.nmp_reduction_depth_div, 1);
+    }
+
+    #[test]
+    fn sf_gap_params_round_trip() {
+        let mut params = SearchTuneParams::default();
+
+        params.set_from_usi_name("SPSA_STAT_BONUS_PARENT_STAT_NUM", 274).unwrap();
+        params.set_from_usi_name("SPSA_UPDATE_ALL_SEARCHED_COUNT_NUM", 1025).unwrap();
+        params.set_from_usi_name("SPSA_UPDATE_ALL_QUIET_MALUS_DECAY_NUM", 955).unwrap();
+        params.set_from_usi_name("SPSA_LMR_ALL_NODE_SCALE_NUM", 273).unwrap();
+        params.set_from_usi_name("SPSA_LMR_ALL_NODE_SCALE_OFFSET", 286).unwrap();
+
+        assert_eq!(params.stat_bonus_parent_stat_num, 274);
+        assert_eq!(params.update_all_stats_searched_count_num, 1025);
+        assert_eq!(params.update_all_stats_quiet_malus_decay_num, 955);
+        assert_eq!(params.lmr_all_node_scale_num, 273);
+        assert_eq!(params.lmr_all_node_scale_offset, 286);
     }
 
     #[test]

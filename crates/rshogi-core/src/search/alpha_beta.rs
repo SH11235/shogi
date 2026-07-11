@@ -1501,10 +1501,14 @@ impl SearchWorker {
 
                         // quiets_triedはbestMove追加段階で除外済みのため
                         // ペナルティループでの重複チェックは不要
+                        // (適用手ごとに decay_num/1024 で幾何減衰、非rootの経路と同一)
+                        let mut actual_malus = scaled_malus;
                         for &m in quiets_tried.iter() {
-                            h.main_history.update(us, m, -scaled_malus);
+                            actual_malus =
+                                actual_malus * tune.update_all_stats_quiet_malus_decay_num / 1024;
+                            h.main_history.update(us, m, -actual_malus);
 
-                            let low_ply_malus = low_ply_history_bonus(-scaled_malus, &tune);
+                            let low_ply_malus = low_ply_history_bonus(-actual_malus, &tune);
                             h.low_ply_history.update(0, m, low_ply_malus);
 
                             // ContinuationHistory: ply=0ではスキップ
@@ -1517,7 +1521,7 @@ impl SearchWorker {
                             };
                             let to = m.to();
 
-                            let pawn_malus = pawn_history_bonus(-scaled_malus, &tune);
+                            let pawn_malus = pawn_history_bonus(-actual_malus, &tune);
                             h.pawn_history.update(pawn_key_idx, cont_pc, to, pawn_malus);
                         }
                     }
@@ -2826,6 +2830,11 @@ impl SearchWorker {
             st.stack[ply as usize].stat_score = stat_score;
             r -= stat_score * ctx.tune_params.lmr_step16_stat_score_scale_num / 8192;
 
+            if all_node {
+                r += r * ctx.tune_params.lmr_all_node_scale_num
+                    / (256 * depth + ctx.tune_params.lmr_all_node_scale_offset);
+            }
+
             // =============================================================
             // 探索
             // =============================================================
@@ -3198,7 +3207,21 @@ impl SearchWorker {
             let is_best_capture = pos.capture_stage(best_move);
             let is_tt_move = best_move == tt_move;
             // bonus = min(121*depth-77, 1633) + 375*(bestMove==ttMove)
-            let bonus = stat_bonus(depth, is_tt_move, ctx.tune_params);
+            //         + parentStatScore * num/8192、非PVではさらに探索済み手数でスケール
+            let parent_stat_score = if ply >= 1 {
+                st.stack[(ply - 1) as usize].stat_score
+            } else {
+                0
+            };
+            let mut bonus = stat_bonus(depth, is_tt_move, ctx.tune_params)
+                + parent_stat_score * ctx.tune_params.stat_bonus_parent_stat_num / 8192;
+            if !pv_node {
+                let searched_count = quiets_tried.len() + captures_tried.len();
+                bonus += ((bonus as i64)
+                    * searched_count as i64
+                    * ctx.tune_params.update_all_stats_searched_count_num as i64
+                    / (256 * 1024)) as i32;
+            }
             // malus = min(825*depth-196, 2159) - 16*moveCount
             let malus = stat_malus(depth, move_count, ctx.tune_params);
             let us = pos.side_to_move();
@@ -3222,7 +3245,7 @@ impl SearchWorker {
                 let scaled_bonus =
                     bonus * ctx.tune_params.update_all_stats_quiet_bonus_scale_num / 1024;
 
-                // 他のquiet手にはペナルティ
+                // 他のquiet手にはペナルティ (適用手ごとに decay_num/1024 で幾何減衰)
                 // update_quiet_histories(move, -quietMalus * 1083 / 1024)
                 let scaled_malus =
                     malus * ctx.tune_params.update_all_stats_quiet_malus_scale_num / 1024;
@@ -3284,14 +3307,18 @@ impl SearchWorker {
 
                     // quiets_triedはbestMove追加段階で除外済みのため
                     // ペナルティループでの重複チェックは不要
+                    let mut actual_malus = scaled_malus;
                     for &m in quiets_tried.iter() {
+                        actual_malus = actual_malus
+                            * ctx.tune_params.update_all_stats_quiet_malus_decay_num
+                            / 1024;
                         // MainHistory
-                        h.main_history.update(us, m, -scaled_malus);
+                        h.main_history.update(us, m, -actual_malus);
 
                         // LowPlyHistory
                         if ply < LOW_PLY_HISTORY_SIZE as i32 {
                             let low_ply_malus =
-                                low_ply_history_bonus(-scaled_malus, ctx.tune_params);
+                                low_ply_history_bonus(-actual_malus, ctx.tune_params);
                             h.low_ply_history.update(ply as usize, m, low_ply_malus);
                         }
 
@@ -3305,9 +3332,9 @@ impl SearchWorker {
                         let to = m.to();
 
                         // ContinuationHistoryへのペナルティ
-                        // -malus * 1083/1024 * 955/1024 * weight/1024 + 88*(i<2)
+                        // -actualMalus * 955/1024 * weight/1024 + 88*(i<2) (actualMalus は幾何減衰済み)
                         let cont_scaled_malus =
-                            -scaled_malus * ctx.tune_params.continuation_history_multiplier / 1024;
+                            -actual_malus * ctx.tune_params.continuation_history_multiplier / 1024;
                         for ply_back in 1..=6 {
                             if ply_back > max_ply_back {
                                 continue;
@@ -3342,7 +3369,7 @@ impl SearchWorker {
                         }
 
                         // PawnHistoryへのペナルティ
-                        let pawn_malus = pawn_history_bonus(-scaled_malus, ctx.tune_params);
+                        let pawn_malus = pawn_history_bonus(-actual_malus, ctx.tune_params);
                         h.pawn_history.update(pawn_key_idx, cont_pc, to, pawn_malus);
                     }
                 }
