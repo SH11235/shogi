@@ -187,7 +187,11 @@ enum Outcome {
 fn main() -> Result<()> {
     install_fatal_panic_hook();
     let cli = Cli::parse();
-    run(&cli)
+    run(&cli)?;
+    if cli.onnx_model.is_some() {
+        tools::ort_teardown::exit_skipping_ort_teardown(0);
+    }
+    Ok(())
 }
 
 /// worker スレッドの探索パニックでプロセス全体を loud に終了させる（致命バグを黙って

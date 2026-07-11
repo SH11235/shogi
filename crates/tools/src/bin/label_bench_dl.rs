@@ -229,7 +229,7 @@ fn main() -> anyhow::Result<()> {
         "Done. written={written} parse_errors={parse_errors} sfen_errors={sfen_errors} \
          non_object={non_object}"
     );
-    Ok(())
+    tools::ort_teardown::exit_skipping_ort_teardown(0)
 }
 
 #[cfg(test)]

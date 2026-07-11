@@ -1127,6 +1127,10 @@ fn main() -> Result<()> {
         eprintln!("All {} file(s) processed successfully", total_files);
     }
 
+    if use_onnx || use_dlshogi_onnx {
+        tools::ort_teardown::exit_skipping_ort_teardown(0);
+    }
+
     Ok(())
 }
 

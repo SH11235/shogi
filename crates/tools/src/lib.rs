@@ -52,6 +52,7 @@ pub mod eval_sfens_tool;
 pub mod kif;
 #[cfg(feature = "dlshogi-onnx")]
 pub mod onnx_value;
+pub mod ort_teardown;
 pub mod packed_sfen;
 pub mod positions;
 pub mod progress;
