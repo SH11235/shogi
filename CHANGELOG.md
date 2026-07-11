@@ -7,6 +7,149 @@ marker として `vX.Y.Z` を打つ。crates.io 上の `rshogi-core` は別系�
 運用しており、library API の互換性は core のバージョンで判断する
 (`crates/rshogi-core/Cargo.toml`)。
 
+crates.io への `rshogi-core` publish は (v1.3.0 リリース以降) `vX.Y.Z` リリース時に、
+そのタグの commit から行う。release PR では前回 publish 以降に core へ変更があれば必ず
+バージョンを bump する (publish される tarball とタグの内容を常に一致させ、「バージョン
+番号が動いていない = core 変更なし」という誤推定を防ぐため)。
+
+## v1.3.0 — 2026-07-11
+
+v1.2.0 後の機能追加リリース。定跡 (opening book) 機構一式 — 新規クレート `rshogi-book`
+と定跡の生成・評価・展開・逆伝播ツール群 — と、floodgate 運用のための観戦・戦績ツール
+(kifu_player ライブ観戦 / live-mirror / floodgate_record)、入玉教師データ生成基盤
+(gensfen 終局メタ + nyugyoku_gensfen / ek_testset / relabel_psv) が新規追加の中心。
+NNUE は effect-bucket 特徴量 (推論側第一段階) と threat full-symdedup profile を追加。
+
+`rshogi-core` 0.4.0 を crates.io へ publish した (2026-07-11)。publish 元ソースは
+commit 411f7f33 = 本リリースタグの直前 commit で、タグとの差分は本 CHANGELOG 追記のみ。
+過去記録の訂正 2 点: (1) v1.1.0 セクションは「0.3.0 → 0.4.0 として publish」と記載
+しているが、実際は bump のみで crates.io への publish は行われておらず、0.4.0 の公開は
+今回が初 (公開内容には v1.1.0〜本リリースの core 変更を含む)。(2) v1.2.0 の GitHub
+Release ノートおよび release commit の「rshogi-core は v1.1.0 (0.4.0) から変更なし」は
+誤りで、実際には v1.1.0→v1.2.0 でも core に変更が入っていた (バージョン番号を変更有無の
+根拠にしていたことによる誤記)。冒頭の publish 規約はこれらの再発防止。
+
+### 定跡 (opening book) 機構
+
+- **rshogi-book クレート (Phase 1)** (#849): YANEURAOU-DB2016 形式の定跡 DB リーダと
+  probe を新規追加。先後反転局面を単一エントリで共有する FlippedBook 対応。
+  workspace 内クレート (crates.io へは publish しない)。
+- **BookSelectValue** (#901): 評価値フィルタ生存候補から value 最大手を決定的に選択する
+  USI オプションを追加 (同値は count 降順 → USI 昇順)。count 比例抽選が value 最高手を
+  持ちながら劣る手を引く母集団バイアス (floodgate 実害あり) への対策。既定 false で
+  既存挙動は不変。
+- **BookEvalDiff の基準修正** (#892): 許容評価値差の基準を count 筆頭手でなく候補中の
+  最大 value に変更。
+- **定跡ツール群 (crates/tools)**:
+  - `book_from_csa` (#868): CSA 棋譜コーパスから定跡 .db を生成。
+  - `book_rescore` (#869, #870): 定跡 .db の各指し手に USI エンジン評価値または
+    ONNX 静的評価値を付与 (journal/resume・work-stealing・決定性担保)。
+  - `book_extend` (#902, #903): エンジン最善手が候補に無いノード (実測 39%) にのみ
+    count=0 で bestmove を追加する展開パス。既存手は不変。--book/--out/--journal/
+    --report 全ペアのパス衝突を拒否。
+  - `book_backprop` (#900): 定跡 .db の評価値を negamax 逆伝播。既定 --merge min で
+    下方向にのみ伝播し max 連鎖の上方バイアスを排除、千日手ループは SCC 縮約 +
+    draw-value 下界の値反復で処理。
+  - `book_kachi_label` (#905): (ノード, 指し手) ごとの入玉宣言決着率を棋譜コーパスから
+    集計する政策層 sidecar (真値 .db と分離)。
+
+### floodgate 運用・観戦ツール
+
+- **kifu_player の観戦強化** (#847, #882, #887, #889, #890, #891): `--live` 追記監視
+  (ライブ追従モード)・`--ratings` レート併記・`rate:`/`date:`/`sfen:` 検索・wdoor 形式
+  CSA の評価値/消費時間読み取り・進行中対局の一覧表示・消費時間の秒表示など。
+- **live-mirror** (#883, #904): wdoor 当日対局をローカルへミラーし kifu_player --live で
+  観戦。`--push` は MONITOR2 broadcast を着手通知 (ドアベル) に、HTTP 公開 CSA を正本に
+  使うハイブリッド構成で、評価値込みミラーを手単位遅延 (~1s) に短縮。TCP 断時は
+  ポーリングへ自動フォールバック。
+- **floodgate_record** (#877, #878, #879, #880): csa_client JSONL から 1 エンジンの
+  戦績を集計。csa_client config 連動、`--fetch-ratings` による現在レート併記と
+  鮮度キャッシュ・履歴記録、後手勝ち統計・負け/引分分離。
+- **csa-client live_jsonl** (#884, #885): 対局中に JSONL へ手単位追記し自局を
+  リアルタイム観戦 (kifu_player 連携)。rename リトライと失敗時の tmp パス明示。
+- **運用スクリプト例・doc** (#886, #888, #871, #893): watch/stats/tui/rebuild スクリプト
+  一式 (watch.ps1 込み)、floodgate config 完全サンプル、password の
+  `<game_name>,<trip>` 形式の明記、rebuild_tools.sh の非ログインシェル対応。
+
+### NNUE
+
+- **effect-bucket 特徴量 (推論側第一段階)** (#907): 盤上駒の base index を物理マスの
+  利き数バケットで拡張する特徴量 (`EffectBucket=` arch token、2x2/3x3 × kingfixed/
+  kingbucketed config)。engine load (arch/dims/config 照合と mismatch reject)・
+  full-refresh 評価・差分バケット更新・cross-repo golden dumper
+  (`dump_effect_bucket_golden`) まで。accumulator は correctness 優先で常に full refresh
+  (差分更新の NPS 最適化は次段階)。大 FT 対応で leb128 圧縮サイズ上限を 256MB → 2GiB に
+  拡大。preset edition は 512/1024 幅の 2x2_kingfixed (#907) と 1024 幅の
+  3x3_kingfixed (#908)。
+- **threat full-symdedup profile (id 4)** (#899): profile 0 と同一 index 空間のまま、
+  necessarily-mutual な cross-class 対称 edge の片側を列挙時に drop する compile-time
+  profile。edition `…-1536x16x32-threat_symdedup` を追加。tatara 側と id/規則/index
+  layout を一致させ、startpos golden で固定。
+- **LayerStack size variant**: `3072x16x32` arch (#850)、preset edition
+  `…-768x16x32-threat` (#863) を追加。
+
+### 入玉教師データ生成基盤 (tools)
+
+- **gensfen の終局メタ・来歴記録** (#906): 終局時の 27 点法点数・玉侵入・敵陣内駒数を
+  JSONL result 行に記録 (裁定は不変)。random-multi-pv / random_move で PV1 以外を選んだ
+  ply・手・score_gap_cp を diversions 配列に記録 (後段 deblunder 用)。
+  `--emit-game-id-sidecar` で PSV レコードと 1:1 の game_id sidecar を出力 (#918)。
+  native + LayerStacks (num_buckets>1) で `--progress-file` 未指定なら起動エラーにし、
+  progress 重みゼロフォールバックのサイレント品質バグを修正。--resume 時はパスと
+  内容 SHA-256 の両方を照合。
+- **nyugyoku_gensfen** (#906): 入玉譜 manifest から玉の敵陣初侵入 ply にアンカーした
+  開始局面集を抽出 (entry-40/-20/0/+20)。direct-mapped 固定サイズ dedup・partition 分割で
+  数億局面規模でもピークメモリ入力非依存、checkpoint resume 対応。
+- **ek_testset** (#909, #916): held-out floodgate 棋譜から入玉局面の評価テストセットを
+  build し native NNUE で採点。DT (宣言真値: declaration_win を ground truth) と
+  OC (勝敗較正: sign_acc / WDL cross-entropy / Brier / calibration) の 2 系統。
+  draw を期待スコア 0.5 で算入、cp→勝率の `--scale` 既定は 600。全段 streaming。
+- **relabel_psv** (#918): PSV の score を game_result 由来の飽和値へ上書きし勝敗信号
+  ベース化 (λ=0 レシピでの弱評価の循環ラベル対策)。`--declaration-override` /
+  `--deblunder` (game_id sidecar + diversions 来歴で乱択汚染対局を除外)。全体 streaming、
+  入出力の同一実体 (symlink/hardlink 含む) を検出し原本破壊を防止。
+- **eval_sfens** (#916): score_cp 列の追加と bin エントリポイントの復元。
+- **core の公開 API 化** (#906): 宣言点数計算を `Position::entering_king_point_info`
+  として公開し declaration_win と共有。progress 係数ローダーを core へ移動し
+  usi / tools で共用。
+
+### CSA server / client の修正
+
+- **fischer 時計の修正** (#857〜#861): server 側 time_margin_ms を課金から外し deadline
+  猶予のみに限定、client 側 btime 二重計上の解消と margin の fischer 適用、再接続時の
+  台帳膨張退行の修正。
+- **csa-server-workers**: cold-start の計時起点張り直しを廃止し幽霊 TimeUp を解消 +
+  復元不能時の安全網 (#852/#854)、finalize の live-index delete を config 欠落に強く
+  (#853/#855)、viewer 経路の DO/ライフサイクル欠陥 4 件を修正し観戦者へ評価値を配信
+  (#856)、終局済み対局への spectate 初回応答と観戦 slot リーク修正 (#866)、live-orphan
+  sweep の zombie 件数サマリ (#873)、結果コード契約マニフェスト + generate-and-compare
+  テスト (#875)、短時間 Fischer プリセット fischer-60-5F (#851)。
+- **csa-client**: floodgate へ送る PV コメントの欠落・破損を修正 (#896)。
+- **csa-server-tcp**: send_line を write_all 1 回に統合 (アプリ層での分割送信を排除)
+  (#897)。
+
+### パフォーマンス / スケーラビリティ
+
+- **rescore_psv: --search-depth / --engine のチャンクストリーミング化** (#910):
+  全レコード load-all を解消しピークメモリを入力件数非依存に (100 万件チャンク方式)。
+  エンジン死亡時は同一チャンク内で生存エンジンへ再割り当てし入力順を維持、全滅は
+  エラー終了で部分出力を成功扱いしない。中断時の部分出力は入力の連続 prefix を保証。
+  --threads 1 / 単一エンジンで旧実装と出力 bit 一致。
+- **ek_testset / nyugyoku_gensfen / relabel_psv**: いずれも入力件数非依存のピーク
+  メモリで設計 (上記参照)。
+
+### その他 (fix / refactor / docs / ci)
+
+- test(csa-client): mock USI engine 起因の flake 修正 — write/spawn fork の同一 lock
+  直列化で ETXTBSY を解消 (#912)、info→bestmove 順序と終局レースの決定化 (#915)。
+- ci: Test job のビルドで thin LTO を無効化しフルビルド 10m55s → 2m16s、push トリガーを
+  main に限定 (#913)。worker-build の version 固定 (#872)。Security Audit
+  RUSTSEC-2026-0204/0205 対応 (#898)。GitHub Actions グループ更新 (#848, #917)。
+- refactor(tools): 進捗表示を tools::progress に共通化し book_rescore に進捗を追加
+  (#876)。CSA replay を TUI 非依存の csa-replay feature に分離 (#909)。
+- docs(tools): rescore_psv doc をユーザー導線中心に再編 (クイックスタート新設、実装詳細
+  を internals へ分離) (#911)。nyugyoku_gensfen doc も同様の構成で追加 (#906)。
+
 ## v1.2.0 — 2026-07-03
 
 v1.1.0 後の機能追加 + パフォーマンス改善リリース。教師データ品質パイプライン
