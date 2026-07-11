@@ -37,7 +37,6 @@ target/release/rescore_psv \
   --dlshogi-onnx-model DL_suisho.onnx \
   --onnx-tensorrt \
   --onnx-tensorrt-cache trt_cache/ \
-  --onnx-batch-size 1024 \
   --onnx-eval-scale 600
 ```
 
@@ -156,9 +155,9 @@ ort は load-dynamic のためビルド時に libonnxruntime は不要（実行�
 |---|---|---|
 | `--dlshogi-onnx-model` | — | dlshogi 系 ONNX モデルパス |
 | `--onnx-model` | — | AobaZero 系 ONNX モデルパス（`aobazero-onnx` feature） |
-| `--onnx-batch-size` | 256 | 推論バッチサイズ |
+| `--onnx-batch-size` | 1024 | 推論バッチサイズ（チューニング指針参照） |
 | `--onnx-gpu-id` | 0 | GPU 番号（複数 GPU 時の選択。`-1` で CPU 推論） |
-| `--onnx-sessions` | 2 | GPU 推論の多重化数（1〜4、CPU 推論では常に 1）。既定 2 が実測最適。VRAM は増えるが出力は bit 一致 |
+| `--onnx-sessions` | 2 | GPU 推論の多重化数（1〜4、CPU 推論では常に 1）。VRAM は増える（チューニング指針参照） |
 | `--onnx-tensorrt` | false | TensorRT EP（FP16）を使用 |
 | `--onnx-tensorrt-cache` | — | TensorRT エンジンキャッシュ保存先（実質必須） |
 | `--onnx-eval-scale` | 600.0 | 勝率→cp 変換スケール（正の有限値） |
@@ -191,13 +190,26 @@ ort は load-dynamic のためビルド時に libonnxruntime は不要（実行�
 
 ### チューニング指針
 
-- `--onnx-batch-size`: 大きくすると GPU 呼び出し回数が減り利用率が上がる。VRAM
-  に余裕があれば 1024 以上を試す（バッファはバッチサイズに比例して増える）。
+- `--onnx-batch-size`: GPU 推論では既定 1024 のままでよい。実測（RTX 3080 Ti /
+  RTX 5090、DL水匠 + TensorRT FP16、1M 局面）では 512〜2048 はスループットが
+  ほぼフラットで、256 以下だけ明確に遅い（3080 Ti で −3%、5090 で −10〜15%。
+  `--onnx-sessions 1` だと差はさらに開く）。「VRAM の許す限り大きく」しても
+  単調には速くならず、メモリを余分に食うだけの領域がある（参考: 3080 Ti /
+  sessions=2 の VRAM peak は batch 1024 で約 1.5GiB、2048 で約 1.7GiB）。
+  最適点は GPU / モデル / EP でずれるため、大規模 rescore の前に数十万局面の
+  サンプルで 512/1024/2048 を振って pos/s を比べるのが確実。この計測条件では
+  出力がバッチサイズ / セッション数に依らず sha256 一致することを確認済み
+  （一般保証ではないので、厳密な再現性が要る場合は同一設定で流し切る）。
+  ホスト RAM 側も特徴量バッファがバッチサイズ × セッション数に比例して増える
+  （既定 1024 × 2 で百数十 MiB 規模）ため、CPU 推論（`--onnx-gpu-id -1`）や
+  省メモリ環境では 256/512 も含めて計測して選ぶ。
 - `--threads`: 特徴量構築（CPU 前処理）の並列数。GPU 推論とオーバーラップされる
   ため、重いモデルではデフォルトで足りる。軽量モデル + 高速 GPU で前処理が律速
   になる場合のみ増やす。
-- `--onnx-sessions`: 既定 2 が実測最適。GPU が電力上限に達している環境では 3 以上
-  に増やしても伸びない。
+- `--onnx-sessions`: 上記実測（2 GPU / DL水匠）では既定 2 が最適（sessions=1
+  比 +13〜36% @3080 Ti、+3〜10% @5090）。多重化がバッチ間の GPU アイドルを
+  埋めるため、バッチサイズへの感度も下がる。GPU が電力上限に達している環境
+  では 3 以上に増やしても伸びない。
 
 ## ユースケース別レシピ
 
