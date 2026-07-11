@@ -8,7 +8,7 @@ SqrClippedReLU 系の活性は u8 [0,127] に clamp されるため、127 到達
 
 | 段 | 内容 |
 |---|---|
-| `ft` | FT 出力（SqrClippedReLU 後の L1 次元 u8） |
+| `ft` | FT accumulator の因子 clamp(acc, 0, 127) の 127 到達率（両視点 2×L1 因子。SqrClippedReLU の出力は `(a*b) >> 7` で最大 126 のため、飽和は pairing 前の因子側で観測する） |
 | `l1_act` | L1→L2 activation（SqrClippedReLU + ClippedReLU の 2×main_dim 要素） |
 | `l2_act` | L2→output activation（ClippedReLU の 32 要素） |
 

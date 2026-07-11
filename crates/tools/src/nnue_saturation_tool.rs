@@ -2,7 +2,9 @@
 //!
 //! ClippedReLU / SqrClippedReLU 系の活性は u8 [0,127] に clamp されるため、
 //! 127 到達率が高いほど量子化天井で情報が落ちている（評価値インフレの副作用の計器）。
-//! FT 出力 / L1→L2 / L2→output の 3 段を bucket 別に集計する。
+//! FT accumulator / L1→L2 / L2→output の 3 段を bucket 別に集計する。
+//! FT 段は SqrClippedReLU の pairing 前の因子 clamp(acc, 0, 127) が 127 に到達した割合
+//! （出力は `(a*b) >> 7` で最大 126 のため、出力側では飽和を観測できない）。
 //!
 //! 重み側の i8/i16 飽和は rshogi-nnue (tatara) の
 //! `crates/nnue-format/examples/clamp_stats.rs` が担当する（export 時量子化の話のため）。
@@ -68,7 +70,7 @@ struct BucketReport {
     rates: StageRates,
 }
 
-/// 活性 3 段の飽和率（127 到達数 / 総数）。
+/// 活性 3 段の飽和率（127 到達数 / 総数）。ft は accumulator 因子側で数える。
 #[derive(Debug, Serialize)]
 struct StageRates {
     ft_sat: u64,
@@ -82,8 +84,16 @@ struct StageRates {
     l2_act_rate: f64,
 }
 
+/// bucket ごとの集計（core の活性カウント + tool 側で数える FT 因子カウント）。
+#[derive(Debug, Default, Clone, Copy)]
+struct BucketCounts {
+    ft_sat: u64,
+    ft_total: u64,
+    act: LsSaturationCounts,
+}
+
 impl StageRates {
-    fn from_counts(c: &LsSaturationCounts) -> Self {
+    fn from_counts(c: &BucketCounts) -> Self {
         let rate = |sat: u64, total: u64| {
             if total == 0 {
                 0.0
@@ -95,23 +105,28 @@ impl StageRates {
             ft_sat: c.ft_sat,
             ft_total: c.ft_total,
             ft_rate: rate(c.ft_sat, c.ft_total),
-            l1_act_sat: c.l1_act_sat,
-            l1_act_total: c.l1_act_total,
-            l1_act_rate: rate(c.l1_act_sat, c.l1_act_total),
-            l2_act_sat: c.l2_act_sat,
-            l2_act_total: c.l2_act_total,
-            l2_act_rate: rate(c.l2_act_sat, c.l2_act_total),
+            l1_act_sat: c.act.l1_act_sat,
+            l1_act_total: c.act.l1_act_total,
+            l1_act_rate: rate(c.act.l1_act_sat, c.act.l1_act_total),
+            l2_act_sat: c.act.l2_act_sat,
+            l2_act_total: c.act.l2_act_total,
+            l2_act_rate: rate(c.act.l2_act_sat, c.act.l2_act_total),
         }
     }
 }
 
-fn merge(acc: &mut LsSaturationCounts, c: &LsSaturationCounts) {
+fn merge(acc: &mut BucketCounts, c: &BucketCounts) {
     acc.ft_sat += c.ft_sat;
     acc.ft_total += c.ft_total;
-    acc.l1_act_sat += c.l1_act_sat;
-    acc.l1_act_total += c.l1_act_total;
-    acc.l2_act_sat += c.l2_act_sat;
-    acc.l2_act_total += c.l2_act_total;
+    acc.act.l1_act_sat += c.act.l1_act_sat;
+    acc.act.l1_act_total += c.act.l1_act_total;
+    acc.act.l2_act_sat += c.act.l2_act_sat;
+    acc.act.l2_act_total += c.act.l2_act_total;
+}
+
+/// SqrClippedReLU の因子 clamp(acc, 0, 127) が 127 に到達した数を数える。
+fn count_ft_factor_saturation(acc: &[i16]) -> u64 {
+    acc.iter().filter(|&&v| v >= 127).count() as u64
 }
 
 fn run_for_network<
@@ -130,7 +145,7 @@ fn run_for_network<
 
     let mut pos = Position::new();
     let mut acc = AccumulatorLayerStacks::<L1>::new();
-    let mut bucket_counts = vec![LsSaturationCounts::default(); network.num_buckets];
+    let mut bucket_counts = vec![BucketCounts::default(); network.num_buckets];
     let mut bucket_positions = vec![0u64; network.num_buckets];
     let limit = cli.count.unwrap_or(usize::MAX);
 
@@ -158,12 +173,15 @@ fn run_for_network<
             get_layer_stack_progress_kpabs_weights(),
             network.num_buckets,
         );
+        let bc = &mut bucket_counts[bucket_index];
+        bc.ft_sat += count_ft_factor_saturation(us_acc) + count_ft_factor_saturation(them_acc);
+        bc.ft_total += 2 * L1 as u64;
         network.layer_stacks.buckets[bucket_index]
-            .propagate_counting_saturation(&transformed, &mut bucket_counts[bucket_index]);
+            .propagate_counting_saturation(&transformed, &mut bc.act);
         bucket_positions[bucket_index] += 1;
     }
 
-    let mut total = LsSaturationCounts::default();
+    let mut total = BucketCounts::default();
     for c in &bucket_counts {
         merge(&mut total, c);
     }
