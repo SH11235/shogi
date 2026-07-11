@@ -34,6 +34,7 @@
 //!
 //! 1 リクエストで `bucket.list` (1 RTT) + 各 entry `bucket.get` (最大 N=100 RTT)
 //! を消費する N+1 パターンを Cloudflare の `caches.default` で短期キャッシュする。
+//! cache miss 時は各 entry の `bucket.get` を並列実行し、R2 待ち時間を重ねる。
 //! cache key は **request URL 完全一致** (= path + query + method)。同一 cursor +
 //! 同一 limit の重複アクセスのみが hit する。
 //!
@@ -448,8 +449,8 @@ async fn collect_index_page(
         }
     };
 
-    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(page.objects().len());
-    for obj in page.objects() {
+    let objects = page.objects();
+    let fetches = objects.iter().map(|obj| async {
         let key = obj.key();
         // 各 entry を取得 → bytes → JSON value。bytes 経由なのは本文が
         // そのまま `*IndexEntry` の JSON 形式である契約のため。
@@ -461,18 +462,16 @@ async fn collect_index_page(
                     client_kind,
                     &format!("key={key} err={e}"),
                 );
-                continue;
+                return None;
             }
         };
         let Some(fetched) = fetched else {
             // list と get の間に削除されたケース。live entry の場合は終局
             // (delete) と list のレースに該当する。pagination 整合の観点で
             // 落としても問題ない (= live は entry が瞬間的に消えうる契約)。
-            continue;
+            return None;
         };
-        let Some(body) = fetched.body() else {
-            continue;
-        };
+        let body = fetched.body()?;
         let bytes = match body.bytes().await {
             Ok(b) => b,
             Err(e) => {
@@ -481,11 +480,11 @@ async fn collect_index_page(
                     client_kind,
                     &format!("key={key} err={e}"),
                 );
-                continue;
+                return None;
             }
         };
         match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(v) => entries.push(v),
+            Ok(v) => Some(v),
             Err(e) => {
                 log_viewer_api_failed(
                     &format!("{event_root}_parse"),
@@ -493,9 +492,12 @@ async fn collect_index_page(
                     &format!("key={key} err={e}"),
                 );
                 // 1 件壊れても他を返す (best-effort)。
+                None
             }
         }
-    }
+    });
+    // `join_all` は結果を入力順で返すため、失敗 entry を除いても R2 list 順を保つ。
+    let entries = futures_util::future::join_all(fetches).await.into_iter().flatten().collect();
 
     let next_cursor = if page.truncated() {
         page.cursor()

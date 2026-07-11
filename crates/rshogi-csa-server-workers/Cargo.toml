@@ -35,11 +35,13 @@ sha2 = { version = "0.10", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # wasm32-unknown-unknown 以外では参照しない。worker-build / wrangler dev から
-# ビルドされる経路のみで有効化される。`worker` 0.8 が `wasm-bindgen` /
+# ビルドされる経路のみで有効化される。`worker` 0.8 は `wasm-bindgen` /
 # `wasm-bindgen-futures` / `js-sys` / `async-trait` / `futures-util` を内部で
-# 引き込むので、本 crate からは worker のみを直接参照すればよい。
+# 引き込むが、`futures_util::future::join_all` (viewer_api の R2 get 並列化) を
+# 本 crate から直接使うため `futures-util` は明示的な直接依存にしている。
 worker = { version = "0.8", features = ["http"] }
 worker-macros = { version = "0.8", features = ["http"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [features]
 default = []
