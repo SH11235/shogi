@@ -30,6 +30,23 @@ fn sqr_clipped_relu_explicit<const DIM: usize>(input: &[i32; DIM], output: &mut 
     }
 }
 
+/// 活性段ごとの 127 飽和カウント（診断用）。
+///
+/// ClippedReLU / SqrClippedReLU 系の活性は u8 [0,127] に clamp されるため、
+/// 127 到達率が高いほど量子化天井で情報が落ちている。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LsSaturationCounts {
+    /// FT 出力 (SqrClippedReLU 後 u8) の 127 到達数
+    pub ft_sat: u64,
+    pub ft_total: u64,
+    /// L1→L2 activation (SqrClippedReLU + ClippedReLU) の 127 到達数
+    pub l1_act_sat: u64,
+    pub l1_act_total: u64,
+    /// L2→output activation (ClippedReLU) の 127 到達数
+    pub l2_act_sat: u64,
+    pub l2_act_total: u64,
+}
+
 // =============================================================================
 // LayerStack 単一バケット
 // =============================================================================
@@ -124,6 +141,42 @@ impl<
         self.output.propagate(&l2_relu.0, &mut output_arr);
 
         // Skip connection
+        output_arr[0] + l1_skip
+    }
+
+    /// 順伝播しつつ各活性段の 127 飽和を数える（診断用、ホットパス外）。
+    ///
+    /// スコアは `propagate` と bit 一致する。カウント対象:
+    /// - FT 出力 (SqrClippedReLU 後の入力 `input` そのもの)
+    /// - L1→L2 activation (SqrClippedReLU + ClippedReLU の `LS_L2_IN` 要素)
+    /// - L2→output activation (ClippedReLU の 32 要素)
+    pub fn propagate_counting_saturation(
+        &self,
+        input: &[u8; L1],
+        counts: &mut LsSaturationCounts,
+    ) -> i32 {
+        let mut l1_out = [0i32; LS_L1_OUT];
+        let mut l2_input = Aligned([0u8; LS_L2_PADDED_INPUT]);
+        let mut l2_out = [0i32; NNUE_PYTORCH_L3];
+        let mut l2_relu = Aligned([0u8; OUTPUT_PADDED_INPUT]);
+        let mut output_arr = [0i32; 1];
+
+        counts.ft_sat += input.iter().filter(|&&v| v == 127).count() as u64;
+        counts.ft_total += L1 as u64;
+
+        self.l1.propagate(input, &mut l1_out);
+        let l1_skip = l1_out[Self::MAIN_DIM];
+        l1_sqr_clipped_relu_activation::<LS_L1_OUT, LS_L2_IN>(&l1_out, &mut l2_input.0);
+        counts.l1_act_sat += l2_input.0[..LS_L2_IN].iter().filter(|&&v| v == 127).count() as u64;
+        counts.l1_act_total += LS_L2_IN as u64;
+
+        self.l2.propagate(&l2_input.0, &mut l2_out);
+        clipped_relu_i32_to_u8(&l2_out, &mut l2_relu.0);
+        counts.l2_act_sat +=
+            l2_relu.0[..NNUE_PYTORCH_L3].iter().filter(|&&v| v == 127).count() as u64;
+        counts.l2_act_total += NNUE_PYTORCH_L3 as u64;
+
+        self.output.propagate(&l2_relu.0, &mut output_arr);
         output_arr[0] + l1_skip
     }
 
@@ -830,6 +883,28 @@ mod tests {
         // ゼロ weights でパニックしないことを確認
         let _ = result;
         let _ = bucket; // suppress unused warning
+    }
+
+    #[test]
+    fn propagate_counting_saturation_matches_propagate_and_counts() {
+        let mut bucket = TestLayerStackBucket::new();
+        bucket.l1.biases[0] = 8192; // sqr=(8192^2)>>19=128→127 / clipped=8192>>6=128→127 で両方飽和
+        bucket.l1.biases[1] = 8000; // sqr=122 / clipped=125 で非飽和
+
+        let mut input = Aligned([0u8; TEST_L1]);
+        input.0[0] = 127;
+        input.0[1] = 126;
+
+        let mut counts = LsSaturationCounts::default();
+        let score = bucket.propagate_counting_saturation(&input.0, &mut counts);
+        assert_eq!(score, bucket.propagate(&input.0));
+
+        assert_eq!(counts.ft_sat, 1);
+        assert_eq!(counts.ft_total, TEST_L1 as u64);
+        assert_eq!(counts.l1_act_sat, 2);
+        assert_eq!(counts.l1_act_total, TEST_LS_L2_IN as u64);
+        assert_eq!(counts.l2_act_sat, 0);
+        assert_eq!(counts.l2_act_total, NNUE_PYTORCH_L3 as u64);
     }
 
     #[test]
