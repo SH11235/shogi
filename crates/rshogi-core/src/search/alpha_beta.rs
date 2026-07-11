@@ -1501,10 +1501,14 @@ impl SearchWorker {
 
                         // quiets_triedはbestMove追加段階で除外済みのため
                         // ペナルティループでの重複チェックは不要
+                        // (適用手ごとに decay_num/1024 で幾何減衰、非rootの経路と同一)
+                        let mut actual_malus = scaled_malus;
                         for &m in quiets_tried.iter() {
-                            h.main_history.update(us, m, -scaled_malus);
+                            actual_malus =
+                                actual_malus * tune.update_all_stats_quiet_malus_decay_num / 1024;
+                            h.main_history.update(us, m, -actual_malus);
 
-                            let low_ply_malus = low_ply_history_bonus(-scaled_malus, &tune);
+                            let low_ply_malus = low_ply_history_bonus(-actual_malus, &tune);
                             h.low_ply_history.update(0, m, low_ply_malus);
 
                             // ContinuationHistory: ply=0ではスキップ
@@ -1517,7 +1521,7 @@ impl SearchWorker {
                             };
                             let to = m.to();
 
-                            let pawn_malus = pawn_history_bonus(-scaled_malus, &tune);
+                            let pawn_malus = pawn_history_bonus(-actual_malus, &tune);
                             h.pawn_history.update(pawn_key_idx, cont_pc, to, pawn_malus);
                         }
                     }
