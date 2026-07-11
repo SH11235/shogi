@@ -2532,6 +2532,7 @@ name = "rshogi-csa-server-workers"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures-util",
  "rshogi-core",
  "rshogi-csa-server",
  "serde",
