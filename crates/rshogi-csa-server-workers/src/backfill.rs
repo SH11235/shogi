@@ -1,28 +1,27 @@
 //! viewer 配信用 R2 prefix の補完 / orphan 掃除を担う cron ジョブ群。
 //!
-//! https://github.com/SH11235/rshogi/issues/551 設計 v3 に従い、以下 2 つの best-effort ジョブを実装する:
+//! 以下 3 つの best-effort ジョブを実装する:
 //!
-//! - [`run_games_index_backfill`]: `kifu-by-id/<id>.meta.json` を 1 ページ
-//!   (1000 件) 単位で list し、各 meta 本文から `games-index/<inv>-<id>.json`
-//!   key を再生成して上書き put する (派生 index 補完)。1 cron = 1 page のみ。
+//! - [`run_games_index_backfill`]: `kifu-by-id/` を 256 件単位で巡回し、meta 本文から
+//!   `games-index/<inv>-<id>.json` key を再生成して上書き put する (派生 index 補完)。
+//! - [`run_games_search_backfill`]: `games-index/` を巡回し、D1 検索 index を補完する。
 //! - [`run_live_orphan_sweep`]: `live-games-index/` を pagination loop で list
 //!   し、対応する `kifu-by-id/<id>.meta.json` (= 終局済 primary 判定キー、設計
 //!   v3 §3) が存在する live entry を delete する (orphan 掃除)。https://github.com/SH11235/rshogi/issues/629 で
 //!   1 page → 複数 page (共有 deadline 内) に拡張した。
 //!
-//! `run_games_index_backfill` は 1 page (1000 件) のみ処理し、cursor の持ち越し
-//! は行わない (= 次回 cron で続行する eventual semantics)。
-//! games-search backfill と `run_live_orphan_sweep` は cron 30s 制限の安全側
-//! (`SCHEDULED_WORK_DEADLINE_MS`) を共有し、
-//! 複数 page を処理し、超過分は次回 cron に持ち越す (cursor は再開しない =
-//! 先頭から再走査するが、live key は新しい対局順なので大きな問題にならない)。
+//! index backfill は D1 に R2 cursor を永続化し、1 cron につき 1 page ずつ進む。
+//! prefix 末尾まで到達したら cursor をリセットし、将来追加された entry も拾えるよう
+//! 先頭から巡回を再開する。3 ジョブは cron 30s 制限の安全側
+//! (`SCHEDULED_WORK_DEADLINE_MS`) を共有する。
 //! admin invoke endpoint や 1 万件超の bulk 並列化はスコープ外
 //! (設計 v3 §10)。
 //!
 //! 進捗ログは [`structured_log!`](crate::structured_log) で JSON 化して
 //! Cloudflare Workers の Logs / tail へ流す (Cloudflare Workers Logs Phase A)。
-//! いかなる失敗 (R2 binding 解決失敗 / list 失敗 / get 失敗 / put 失敗 /
-//! parse 失敗) も `Err` を返さず ログのみ残して `Ok` で抜ける契約。
+//! いかなる失敗 (R2/D1 binding 解決失敗 / state 読み書き失敗 / list 失敗 /
+//! get 失敗 / put 失敗 / parse 失敗) も `Err` を返さずログのみ残して
+//! `Ok` で抜ける契約。
 //! `scheduled` handler が次回 cron 起動を妨げないようにするため、伝播禁止。
 //!
 //! # ホスト target でのテスト境界
@@ -217,6 +216,69 @@ pub struct BackfillStats {
     pub put: u64,
     /// key 生成失敗 / parse 失敗 / 必須フィールド欠如等で put を skip した件数。
     pub skipped: u64,
+    /// deadline により、list で観測した meta を全件処理しなかった場合に `true`。
+    /// cursor は進めず、未処理ページ全体を次回 cron で再試行する。
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GamesIndexBackfillItemOutcome {
+    Put,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GamesIndexBackfillStateOperation<'a> {
+    RetryPage,
+    CursorMissing,
+    UpdateCursor(&'a str),
+    ResetCursor,
+}
+
+fn games_index_backfill_state_operation(
+    page_fully_processed: bool,
+    truncated: bool,
+    next_cursor: Option<&str>,
+) -> GamesIndexBackfillStateOperation<'_> {
+    if !page_fully_processed {
+        GamesIndexBackfillStateOperation::RetryPage
+    } else if truncated {
+        next_cursor.map_or(
+            GamesIndexBackfillStateOperation::CursorMissing,
+            GamesIndexBackfillStateOperation::UpdateCursor,
+        )
+    } else {
+        GamesIndexBackfillStateOperation::ResetCursor
+    }
+}
+
+impl BackfillStats {
+    fn record_games_index_outcome(&mut self, outcome: GamesIndexBackfillItemOutcome) {
+        match outcome {
+            GamesIndexBackfillItemOutcome::Put => {
+                self.put = self.put.saturating_add(1);
+            }
+            GamesIndexBackfillItemOutcome::Skipped => {
+                self.skipped = self.skipped.saturating_add(1);
+            }
+        }
+    }
+
+    fn mark_games_index_truncated_if_unprocessed(&mut self) {
+        self.truncated = self.put.saturating_add(self.skipped) < self.listed;
+    }
+}
+
+/// Workers の同時オープン接続数 6 本を前提に、1 バッチを cron 契約の deadline
+/// margin 5 秒以内に収めつつ、バッチ間で後続ジョブへ共有予算を譲る。
+const GAMES_INDEX_BACKFILL_BATCH_SIZE: usize = 16;
+
+/// get + put の subrequest 予算を後続ジョブにも残すため、R2 list と 1 invocation
+/// の処理対象を同じ 256 件に制限する。
+const GAMES_INDEX_BACKFILL_MAX_ITEMS: u32 = 256;
+
+fn games_index_backfill_batch_should_start(started_at_ms: u64, now_ms: u64) -> bool {
+    !shared_deadline_reached(started_at_ms, now_ms)
 }
 
 /// `run_live_orphan_sweep` の進捗統計。
@@ -300,10 +362,13 @@ pub(crate) fn live_entry_hard_ttl_expired(age_ms: u64) -> bool {
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use super::{
-        BackfillStats, GAMES_SEARCH_BACKFILL_COMPLETE, KIFU_BY_ID_PREFIX, LIVE_ENTRY_HARD_TTL_MS,
+        BackfillStats, GAMES_INDEX_BACKFILL_BATCH_SIZE, GAMES_INDEX_BACKFILL_MAX_ITEMS,
+        GAMES_SEARCH_BACKFILL_COMPLETE, GamesIndexBackfillItemOutcome,
+        GamesIndexBackfillStateOperation, KIFU_BY_ID_PREFIX, LIVE_ENTRY_HARD_TTL_MS,
         LiveEntryFields, META_SUFFIX, MetaForIndexKey, PAGE_SIZE, SWEEP_MAX_PAGES,
         SearchBackfillItemOutcome, SearchBackfillPageState, SearchBackfillStateOperation,
-        SweepStats, live_entry_hard_ttl_expired, search_backfill_start, shared_deadline_reached,
+        SweepStats, games_index_backfill_batch_should_start, games_index_backfill_state_operation,
+        live_entry_hard_ttl_expired, search_backfill_start, shared_deadline_reached,
     };
     use worker::{Date, Env, Result};
 
@@ -314,16 +379,19 @@ mod imp {
     use crate::live_games_index::LIVE_KEY_PREFIX;
     use crate::x1_paths::kifu_by_id_meta_key;
 
-    /// `kifu-by-id/*.meta.json` を 1 ページ list し、各 meta 本文から
+    /// `kifu-by-id/` を 256 件で 1 ページ list し、各 meta 本文から
     /// `games-index/<inv>-<id>.json` を再生成して上書き put する。
     ///
     /// 上書き put は冪等 (R2 strongly consistent 上書き、設計 v2 §2)。head
-    /// による存在チェックは行わない。cursor の持ち越しは「次回 cron で続行」
-    /// する eventual semantics (設計 v2 §5)。
+    /// による存在チェックは行わない。D1 に cursor を保存して次回 cron で続行し、
+    /// prefix 末尾まで走査したら cursor をリセットして先頭から巡回し直す。
     ///
     /// 各失敗 (binding 失敗 / list 失敗 / get 失敗 / parse 失敗 / key 生成失敗
     /// / put 失敗) は logfmt で記録し `Err` を伝播しない。集計結果のみを返す。
-    pub async fn run_games_index_backfill(env: &Env) -> Result<BackfillStats> {
+    pub async fn run_games_index_backfill(
+        env: &Env,
+        scheduled_started_at_ms: u64,
+    ) -> Result<BackfillStats> {
         let started_at_ms = Date::now().as_millis();
         let mut stats = BackfillStats::default();
 
@@ -339,7 +407,31 @@ mod imp {
             }
         };
 
-        let page = match bucket.list().prefix(KIFU_BY_ID_PREFIX).limit(PAGE_SIZE).execute().await {
+        let db = match env.d1(ConfigKeys::GAMES_SEARCH_DB_BINDING) {
+            Ok(db) => db,
+            Err(e) => {
+                crate::structured_log!(event: "games_index_backfill_d1_failed", component: "backfill", err: format!("{e:?}"));
+                return Ok(stats);
+            }
+        };
+        let saved_cursor = match db
+            .prepare("SELECT r2_cursor FROM games_index_backfill_state WHERE singleton = 1")
+            .first::<String>(Some("r2_cursor"))
+            .await
+        {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                crate::structured_log!(event: "games_index_backfill_state_read_failed", component: "backfill", err: format!("{e:?}"));
+                None
+            }
+        };
+
+        let mut list =
+            bucket.list().prefix(KIFU_BY_ID_PREFIX).limit(GAMES_INDEX_BACKFILL_MAX_ITEMS);
+        if let Some(cursor) = saved_cursor.as_deref() {
+            list = list.cursor(cursor);
+        }
+        let page = match list.execute().await {
             Ok(p) => p,
             Err(e) => {
                 crate::structured_log!(
@@ -351,92 +443,141 @@ mod imp {
             }
         };
 
-        for obj in page.objects() {
-            let key = obj.key();
-            // `kifu-by-id/<id>.csa` も同 prefix に出るため、`.meta.json` 拡張子で
-            // 絞り込む。`.csa` は無視 (legacy fallback は本 issue Non-goals)。
-            if !key.ends_with(META_SUFFIX) {
-                continue;
+        // `kifu-by-id/<id>.csa` も同 prefix に出るため、`.meta.json` 拡張子で
+        // 絞り込む。`.csa` は無視 (legacy fallback は本 issue Non-goals)。
+        let keys: Vec<_> = page
+            .objects()
+            .into_iter()
+            .filter_map(|obj| {
+                let key = obj.key();
+                key.ends_with(META_SUFFIX).then_some(key)
+            })
+            .collect();
+        stats.listed = keys.len() as u64;
+        for keys in keys.chunks(GAMES_INDEX_BACKFILL_BATCH_SIZE) {
+            if !games_index_backfill_batch_should_start(
+                scheduled_started_at_ms,
+                Date::now().as_millis(),
+            ) {
+                break;
             }
-            stats.listed = stats.listed.saturating_add(1);
 
-            let fetched = match bucket.get(&key).execute().await {
-                Ok(o) => o,
-                Err(e) => {
-                    crate::structured_log!(
-                        event: "games_index_backfill_get_failed",
-                        component: "backfill",
-                        key: key,
-                        err: format!("{e:?}"),
-                    );
-                    stats.skipped = stats.skipped.saturating_add(1);
-                    continue;
-                }
-            };
-            let Some(fetched) = fetched else {
-                // list と get の間に削除されたケース。skip 集計。
-                stats.skipped = stats.skipped.saturating_add(1);
-                continue;
-            };
-            let Some(body) = fetched.body() else {
-                stats.skipped = stats.skipped.saturating_add(1);
-                continue;
-            };
-            let bytes = match body.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    crate::structured_log!(
-                        event: "games_index_backfill_read_failed",
-                        component: "backfill",
-                        key: key,
-                        err: format!("{e:?}"),
-                    );
-                    stats.skipped = stats.skipped.saturating_add(1);
-                    continue;
-                }
-            };
-            let meta: MetaForIndexKey = match serde_json::from_slice(&bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    crate::structured_log!(
-                        event: "games_index_backfill_parse_failed",
-                        component: "backfill",
-                        key: key,
-                        err: format!("{e:?}"),
-                    );
-                    stats.skipped = stats.skipped.saturating_add(1);
-                    continue;
-                }
-            };
+            let futures = keys.iter().map(|key| {
+                let bucket = &bucket;
+                async move {
+                    let fetched = match bucket.get(key).execute().await {
+                        Ok(o) => o,
+                        Err(e) => {
+                            crate::structured_log!(
+                                event: "games_index_backfill_get_failed",
+                                component: "backfill",
+                                key: key,
+                                err: format!("{e:?}"),
+                            );
+                            return GamesIndexBackfillItemOutcome::Skipped;
+                        }
+                    };
+                    let Some(fetched) = fetched else {
+                        // list と get の間に削除されたケース。skip 集計。
+                        return GamesIndexBackfillItemOutcome::Skipped;
+                    };
+                    let Some(body) = fetched.body() else {
+                        return GamesIndexBackfillItemOutcome::Skipped;
+                    };
+                    let bytes = match body.bytes().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            crate::structured_log!(
+                                event: "games_index_backfill_read_failed",
+                                component: "backfill",
+                                key: key,
+                                err: format!("{e:?}"),
+                            );
+                            return GamesIndexBackfillItemOutcome::Skipped;
+                        }
+                    };
+                    let meta: MetaForIndexKey = match serde_json::from_slice(&bytes) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            crate::structured_log!(
+                                event: "games_index_backfill_parse_failed",
+                                component: "backfill",
+                                key: key,
+                                err: format!("{e:?}"),
+                            );
+                            return GamesIndexBackfillItemOutcome::Skipped;
+                        }
+                    };
 
-            let index_key = match games_index_key(meta.ended_at_ms, &meta.game_id) {
-                Ok(k) => k,
-                Err(e) => {
-                    crate::structured_log!(
-                        event: "games_index_backfill_key_failed",
-                        component: "backfill",
-                        game_id: meta.game_id,
-                        err: format!("{e:?}"),
-                    );
-                    stats.skipped = stats.skipped.saturating_add(1);
-                    continue;
-                }
-            };
+                    let index_key = match games_index_key(meta.ended_at_ms, &meta.game_id) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            crate::structured_log!(
+                                event: "games_index_backfill_key_failed",
+                                component: "backfill",
+                                game_id: meta.game_id,
+                                err: format!("{e:?}"),
+                            );
+                            return GamesIndexBackfillItemOutcome::Skipped;
+                        }
+                    };
 
-            // body は meta の wire そのまま。`GamesIndexEntry` の wire と等価
-            // (両方とも export_kifu_to_r2 で同一 JSON を put している)。
-            if let Err(e) = bucket.put(&index_key, bytes).execute().await {
-                crate::structured_log!(
-                    event: "games_index_backfill_put_failed",
-                    component: "backfill",
-                    game_id: meta.game_id,
-                    index_key: index_key,
-                    err: format!("{e:?}"),
-                );
-                stats.skipped = stats.skipped.saturating_add(1);
-                continue;
+                    // body は meta の wire そのまま。`GamesIndexEntry` の wire と等価
+                    // (両方とも export_kifu_to_r2 で同一 JSON を put している)。
+                    if let Err(e) = bucket.put(&index_key, bytes).execute().await {
+                        crate::structured_log!(
+                            event: "games_index_backfill_put_failed",
+                            component: "backfill",
+                            game_id: meta.game_id,
+                            index_key: index_key,
+                            err: format!("{e:?}"),
+                        );
+                        return GamesIndexBackfillItemOutcome::Skipped;
+                    }
+                    GamesIndexBackfillItemOutcome::Put
+                }
+            });
+
+            for outcome in futures_util::future::join_all(futures).await {
+                stats.record_games_index_outcome(outcome);
             }
-            stats.put = stats.put.saturating_add(1);
+        }
+
+        stats.mark_games_index_truncated_if_unprocessed();
+
+        let next_cursor = page.cursor();
+        let state_operation = games_index_backfill_state_operation(
+            !stats.truncated,
+            page.truncated(),
+            next_cursor.as_deref(),
+        );
+        let state_statement = match state_operation {
+            GamesIndexBackfillStateOperation::RetryPage => None,
+            GamesIndexBackfillStateOperation::CursorMissing => {
+                crate::structured_log!(event: "games_index_backfill_cursor_missing", component: "backfill");
+                None
+            }
+            GamesIndexBackfillStateOperation::UpdateCursor(cursor) => {
+                let bind = [worker::wasm_bindgen::JsValue::from_str(cursor)];
+                match db
+                    .prepare("INSERT INTO games_index_backfill_state (singleton, r2_cursor) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET r2_cursor=excluded.r2_cursor")
+                    .bind(&bind)
+                {
+                    Ok(statement) => Some(statement),
+                    Err(e) => {
+                        crate::structured_log!(event: "games_index_backfill_state_prepare_failed", component: "backfill", err: format!("{e:?}"));
+                        None
+                    }
+                }
+            }
+            GamesIndexBackfillStateOperation::ResetCursor => {
+                Some(db.prepare("DELETE FROM games_index_backfill_state WHERE singleton = 1"))
+            }
+        };
+        if let Some(statement) = state_statement {
+            if let Err(e) = statement.run().await {
+                crate::structured_log!(event: "games_index_backfill_state_write_failed", component: "backfill", err: format!("{e:?}"));
+            }
         }
 
         let elapsed_ms = Date::now().as_millis().saturating_sub(started_at_ms);
@@ -446,6 +587,7 @@ mod imp {
             listed: stats.listed,
             put: stats.put,
             skipped: stats.skipped,
+            truncated: stats.truncated,
             elapsed_ms: elapsed_ms,
         );
         Ok(stats)
@@ -984,9 +1126,114 @@ mod tests {
             BackfillStats {
                 listed: 0,
                 put: 0,
-                skipped: 0
+                skipped: 0,
+                truncated: false,
             }
         );
+    }
+
+    #[test]
+    fn games_index_backfill_best_effort_records_each_item_independently() {
+        let mut stats = BackfillStats {
+            listed: 3,
+            ..BackfillStats::default()
+        };
+
+        for outcome in [
+            GamesIndexBackfillItemOutcome::Put,
+            GamesIndexBackfillItemOutcome::Skipped,
+            GamesIndexBackfillItemOutcome::Put,
+        ] {
+            stats.record_games_index_outcome(outcome);
+        }
+
+        assert_eq!(
+            stats,
+            BackfillStats {
+                listed: 3,
+                put: 2,
+                skipped: 1,
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn games_index_backfill_does_not_start_batch_after_shared_deadline() {
+        let started_at_ms = 1_000;
+        assert!(games_index_backfill_batch_should_start(
+            started_at_ms,
+            started_at_ms + SCHEDULED_WORK_DEADLINE_MS - 1
+        ));
+        assert!(!games_index_backfill_batch_should_start(
+            started_at_ms,
+            started_at_ms + SCHEDULED_WORK_DEADLINE_MS
+        ));
+    }
+
+    #[test]
+    fn games_index_backfill_limits_are_fixed_for_workers_budgets() {
+        assert_eq!(GAMES_INDEX_BACKFILL_BATCH_SIZE, 16);
+        assert_eq!(GAMES_INDEX_BACKFILL_MAX_ITEMS, 256);
+        const _: () = assert!(GAMES_INDEX_BACKFILL_MAX_ITEMS < PAGE_SIZE);
+        assert_eq!(GAMES_INDEX_BACKFILL_MAX_ITEMS as usize % GAMES_INDEX_BACKFILL_BATCH_SIZE, 0);
+    }
+
+    #[test]
+    fn games_index_backfill_stats_marks_unprocessed_items_as_truncated() {
+        let mut stats = BackfillStats {
+            listed: 300,
+            put: 255,
+            skipped: 1,
+            ..BackfillStats::default()
+        };
+
+        stats.mark_games_index_truncated_if_unprocessed();
+
+        assert!(stats.truncated);
+    }
+
+    #[test]
+    fn games_index_backfill_cursor_rotates_after_last_page() {
+        assert_eq!(
+            games_index_backfill_state_operation(true, true, Some("next")),
+            GamesIndexBackfillStateOperation::UpdateCursor("next")
+        );
+        assert_eq!(
+            games_index_backfill_state_operation(true, false, None),
+            GamesIndexBackfillStateOperation::ResetCursor
+        );
+        assert_eq!(
+            games_index_backfill_state_operation(false, true, Some("next")),
+            GamesIndexBackfillStateOperation::RetryPage
+        );
+        assert_eq!(
+            games_index_backfill_state_operation(true, true, None),
+            GamesIndexBackfillStateOperation::CursorMissing
+        );
+    }
+
+    #[test]
+    fn games_index_backfill_reaches_backlog_larger_than_one_cron_page() {
+        let backlog: Vec<_> = (0..700).collect();
+        let mut reached = Vec::new();
+        let mut offset = 0;
+
+        loop {
+            let end = (offset + GAMES_INDEX_BACKFILL_MAX_ITEMS as usize).min(backlog.len());
+            reached.extend_from_slice(&backlog[offset..end]);
+            let truncated = end < backlog.len();
+            let operation =
+                games_index_backfill_state_operation(true, truncated, truncated.then_some("next"));
+            match operation {
+                GamesIndexBackfillStateOperation::UpdateCursor(_) => offset = end,
+                GamesIndexBackfillStateOperation::ResetCursor => break,
+                other => panic!("unexpected state operation: {other:?}"),
+            }
+        }
+
+        assert_eq!(reached, backlog);
+        assert_eq!(reached.len().div_ceil(GAMES_INDEX_BACKFILL_MAX_ITEMS as usize), 3);
     }
 
     #[test]

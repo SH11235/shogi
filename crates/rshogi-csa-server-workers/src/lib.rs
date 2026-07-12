@@ -162,8 +162,8 @@ fn minute_of_hour(epoch_ms: f64) -> i64 {
 /// ミリ秒なので、起動が数秒遅延しても分判定は予定どおり安定する:
 ///
 /// - 分が [`BACKFILL_MINUTE`] (0 分) のとき: `run_games_index_backfill` →
-///   `run_games_search_backfill` → `run_live_orphan_sweep` を順次実行する。後二者は
-///   cron 発火直後の時刻を共有し、合わせて 25 秒以内に打ち切る。
+///   `run_games_search_backfill` → `run_live_orphan_sweep` を順次実行する。3 者は
+///   cron 発火直後の時刻を共有し、3 ジョブ合わせて 25 秒以内に打ち切る。
 /// - それ以外 (15 / 30 / 45 分) のとき: `run_live_orphan_sweep` のみ。
 ///   delete best-effort 失敗時の復旧遅延を 15 分以内に詰めるための高頻度経路
 ///   (https://github.com/SH11235/rshogi/issues/629)。
@@ -186,7 +186,7 @@ pub async fn scheduled(
     let run_backfill = minute == BACKFILL_MINUTE;
 
     if run_backfill {
-        if let Err(e) = backfill::run_games_index_backfill(&env).await {
+        if let Err(e) = backfill::run_games_index_backfill(&env, started_at_ms).await {
             crate::structured_log!(
                 event: "games_index_backfill_failed",
                 component: "scheduled",
