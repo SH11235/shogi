@@ -27,7 +27,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use tools::packed_sfen::{PackedSfenValue, move16_to_usi, unpack_sfen};
+use tools::packed_sfen::{PackedSfenValue, psv_move16_to_usi, unpack_sfen};
 
 #[derive(Parser)]
 #[command(
@@ -180,7 +180,7 @@ fn main() -> Result<()> {
         };
 
         // Move16をUSI形式に変換
-        let best_move = move16_to_usi(psv.move16);
+        let best_move = psv_move16_to_usi(psv.move16);
 
         // TrainingRecordを作成
         let record = TrainingRecord {

@@ -13,7 +13,7 @@ use rshogi_core::position::Position;
 use rshogi_core::types::{Color, Move};
 
 use crate::kif::format_move_label;
-use crate::packed_sfen::{PackedSfenValue, move16_to_move, unpack_sfen};
+use crate::packed_sfen::{PackedSfenValue, psv_move16_to_move, unpack_sfen};
 
 use super::model::{
     EvalAccumulator, EvalMetrics, GameIndex, GameIndexEntry, GameOutcomeView, GameRecord,
@@ -149,7 +149,7 @@ impl GameSource for PsvSource {
             let (mv, kif_label) = if psv.move16 == 0 {
                 (Move::NONE, format!("{:>4} (終局局面)", psv.game_ply))
             } else {
-                let mv = move16_to_move(psv.move16);
+                let mv = psv_move16_to_move(psv.move16);
                 // 破損 move16 は合法手生成に一致しない → 通常手にせず生表示にフォールバック。
                 // `format_move_label`（空マス発で `piece_type()` panic）や `render_board` の
                 // `do_move`（成り不正で `promote().unwrap()` panic）が合法手前提のため。

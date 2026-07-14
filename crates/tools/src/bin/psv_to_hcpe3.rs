@@ -40,8 +40,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use tools::packed_sfen::{
-    PackedSfenValue, pack_hcp_from_parts, psv_move16_to_hcpe, stm_result_to_hcpe,
-    unpack_sfen_to_parts,
+    PackedSfenValue, PsvMove16Class, classify_psv_move16, pack_hcp_from_parts, psv_move16_to_hcpe,
+    stm_result_to_hcpe, unpack_sfen_to_parts,
 };
 use tools::teacher_labeler::HCPE_RECORD_SIZE;
 
@@ -52,6 +52,7 @@ const HCPE3_SIZE: usize = 46;
 const RECORD_BUF: usize = HCPE3_SIZE;
 
 const IO_BUF_SIZE: usize = 1 << 20;
+const MOVE16_GUARD_RECORDS: u64 = 100_000;
 
 /// 非TTY 実行時にテキスト進捗を出す最小間隔（秒）。
 const PROGRESS_LOG_SECS: u64 = 5;
@@ -215,6 +216,23 @@ fn write_results(
     Ok((written, errors))
 }
 
+fn validate_psv_move16_format(path: &PathBuf, records: u64) -> Result<()> {
+    let file = File::open(path).with_context(|| format!("{} を開けません", path.display()))?;
+    let mut reader = BufReader::with_capacity(IO_BUF_SIZE, file);
+    let mut record = [0u8; PackedSfenValue::SIZE];
+    for index in 0..records.min(MOVE16_GUARD_RECORDS) {
+        reader.read_exact(&mut record)?;
+        let move16 = u16::from_le_bytes([record[34], record[35]]);
+        if classify_psv_move16(move16) == PsvMove16Class::LegacyOrHcpe {
+            anyhow::bail!(
+                "レコード {} の move16=0x{move16:04x} は旧リポジトリ形式 (B) または hcpe 形式 (C) です。Issue #930 の migrate_psv_move16 で A 形式へ移行してください",
+                index + 1
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
@@ -263,6 +281,7 @@ fn main() -> Result<()> {
 
     let file_size = std::fs::metadata(&cli.input)?.len();
     let estimated_records = file_size / PackedSfenValue::SIZE as u64;
+    validate_psv_move16_format(&cli.input, estimated_records)?;
     let total = if cli.limit > 0 {
         estimated_records.min(cli.limit as u64)
     } else {

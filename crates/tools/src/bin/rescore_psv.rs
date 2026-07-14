@@ -67,7 +67,9 @@ use std::time::Instant;
 use rshogi_core::nnue::init_nnue;
 use rshogi_core::position::Position;
 use rshogi_core::search::{LimitsType, Search};
-use tools::packed_sfen::{PackedSfenValue, pack_position, unpack_sfen, unpack_sfen_to_parts};
+use tools::packed_sfen::{
+    PackedSfenValue, move_to_psv_move16, pack_position, unpack_sfen, unpack_sfen_to_parts,
+};
 use tools::progress::{FileProgress, MultiFileProgress};
 // UnpackedSfen は ONNX 経路専用。ONNX 無効ビルドの unused import を避けるため cfg で囲う。
 #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
@@ -107,6 +109,10 @@ struct Cli {
     /// 指定した深さでalpha-beta探索を実行し、その結果をスコアとして使用
     #[arg(long)]
     search_depth: Option<i32>,
+
+    /// 深さ指定探索の最善手を実 YaneuraOu PSV 形式 (A) で move16 に出力
+    #[arg(long)]
+    emit_bestmove: bool,
 
     /// 置換表サイズ（MB）、--search-depth使用時のみ有効
     #[arg(long, default_value_t = 64)]
@@ -643,6 +649,9 @@ fn main() -> Result<()> {
     }
     if cli.use_qsearch && cli.search_depth.is_some() {
         anyhow::bail!("--use-qsearch and --search-depth are mutually exclusive");
+    }
+    if cli.emit_bestmove && cli.search_depth.is_none() {
+        anyhow::bail!("--emit-bestmove requires --search-depth");
     }
     if !use_engine && !use_onnx && !use_dlshogi_onnx && cli.nnue.is_none() {
         anyhow::bail!(
@@ -1329,7 +1338,7 @@ fn process_record(
     }
 
     // qsearch leaf置換を適用する場合
-    let (final_sfen, stm_changed) = if apply_leaf && !pos.in_check() {
+    let (final_sfen, stm_changed, position_replaced) = if apply_leaf && !pos.in_check() {
         let result = qsearch_with_pv_nnue(
             &mut pos,
             stacks,
@@ -1342,9 +1351,9 @@ fn process_record(
         // PV に沿って葉局面まで進める。STM 反転有無も同時に得る。
         let stm_changed = apply_pv(&mut pos, &result.pv);
         let new_sfen = pack_position(&pos);
-        (new_sfen, stm_changed)
+        (new_sfen, stm_changed, true)
     } else {
-        (psv.sfen, false)
+        (psv.sfen, false, false)
     };
 
     // NNUEで評価
@@ -1387,7 +1396,7 @@ fn process_record(
     let new_psv = PackedSfenValue {
         sfen: final_sfen,
         score: new_score,
-        move16: 0, // 無効値
+        move16: if position_replaced { 0 } else { psv.move16 },
         game_ply: psv.game_ply,
         game_result: new_game_result,
         padding: 0,
@@ -1514,6 +1523,7 @@ fn process_file_with_search(
                                     skip_in_check,
                                     source_fv_scale,
                                     target_fv_scale,
+                                    cli.emit_bestmove,
                                 ));
                                 progress.inc(1);
                             }
@@ -1591,6 +1601,7 @@ fn process_record_with_search(
     skip_in_check: bool,
     source_fv_scale: i32,
     target_fv_scale: i32,
+    emit_bestmove: bool,
 ) -> ProcessResult {
     // PackedSfenValueを読み込み
     let psv = match PackedSfenValue::from_bytes(record) {
@@ -1641,7 +1652,11 @@ fn process_record_with_search(
     let new_psv = PackedSfenValue {
         sfen: psv.sfen,
         score: new_score,
-        move16: 0, // 無効値
+        move16: if emit_bestmove {
+            move_to_psv_move16(search_result.best_move)
+        } else {
+            psv.move16
+        },
         game_ply: psv.game_ply,
         game_result: psv.game_result,
         padding: 0,
@@ -2014,7 +2029,7 @@ fn process_file_with_engine(
             let new_psv = PackedSfenValue {
                 sfen: psv.sfen,
                 score: raw_score.clamp(-(score_clip as i32), score_clip as i32) as i16,
-                move16: 0,
+                move16: psv.move16,
                 game_ply: psv.game_ply,
                 game_result: psv.game_result,
                 padding: 0,
@@ -3341,7 +3356,7 @@ where
                     let new_psv = PackedSfenValue {
                         sfen: psv.sfen,
                         score: new_score,
-                        move16: 0,
+                        move16: psv.move16,
                         game_ply: psv.game_ply,
                         game_result: psv.game_result,
                         padding: 0,

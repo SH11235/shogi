@@ -36,7 +36,7 @@ cargo run --release -p tools --bin hcpe_to_psv -- \
 |---|---|---|
 | `hcp` (HuffmanCodedPos, Apery/cshogi 形式) | `sfen` (PackedSfen, YaneuraOu 形式) | Huffman テーブルが異なるため `unpack_hcp_to_parts` → `pack_sfen_from_parts` で直接再パック |
 | `eval` (手番側視点 cp) | `score` | そのままコピー（視点は両形式で同一規約）。詰み帯の数値表現は生成系依存で、値変換は行わない |
-| `bestMove16` (cshogi Move16) | `move16` (**実 YaneuraOu Move16**: bit14=駒打ち/bit15=成り) | `hcpe_move16_to_psv` で再エンコード。リポジトリ内部表現 `move_to_move16` とは別形式 |
+| `bestMove16` (cshogi Move16) | `move16` (**実 YaneuraOu Move16**: bit14=駒打ち/bit15=成り) | `hcpe_move16_to_psv` で再エンコード。旧リポジトリ内部形式 (B) とは別形式 |
 | `gameResult` (絶対視点 0=draw / 1=black_win / 2=white_win) | `game_result` (手番側視点 1=win / -1=loss / 0=draw) | 手番で符号を決定 |
 | （なし） | `game_ply` | hcpe に手数情報が無いため 1 固定 |
 

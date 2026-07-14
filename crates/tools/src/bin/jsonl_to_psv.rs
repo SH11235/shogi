@@ -19,7 +19,7 @@ use rshogi_core::types::{Color, Move};
 use serde::Deserialize;
 use serde_json::Value;
 use tools::common::dedup::collect_input_paths;
-use tools::packed_sfen::{PackedSfenValue, move_to_move16, pack_position};
+use tools::packed_sfen::{PackedSfenValue, move_to_psv_move16, pack_position};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -330,7 +330,7 @@ fn convert_move(mv: &MoveLog, missing_score: MissingScoreMode) -> Result<Option<
     Ok(Some(PendingRecord {
         packed_sfen: pack_position(&pos),
         score,
-        move16: move_to_move16(best_move),
+        move16: move_to_psv_move16(best_move),
         game_ply: pos.game_ply().clamp(0, u16::MAX as i32) as u16,
         side_to_move,
     }))
