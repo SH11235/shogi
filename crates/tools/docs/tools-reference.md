@@ -10,7 +10,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `gensfen` | NNUE 学習用 PSV/pack/hcpe3 教師局面の生成（PSV move16 は実 YaneuraOu 形式、engine vs engine／NativeBackend、native LS progress 係数、千日手裁定、異常終局の全局破棄、宣言勝ち PSV 終端局面、乱択来歴 JSONL 記録。[詳細](gensfen.md)） |
 | `nyugyoku_gensfen` | CSA manifest から入玉アンカー局面を disk-partition exact dedup で抽出し、checkpoint/resume 付きで gensfen 用 `startpos.txt` と provenance を生成（[詳細](nyugyoku_gensfen.md)） |
 | `csa_client` | USI エンジンを floodgate 等の CSA サーバーに接続して連続対局 |
-| `analyze_selfplay` | 自己対局の JSONL ログを集計。勝率・Elo 差・NPS 等を表示 |
+| `analyze_selfplay` | 自己対局の JSONL ログを集計。勝率・Elo 差・NPS 等を表示（[詳細](analyze_selfplay.md)） |
 | `floodgate_record` | csa_client の per-game JSONL から 1 エンジンの戦績を集計（先後別勝率・相手別・後手勝ち/負け/引分・実戦 NPS、`--config` で csa_client 設定から入力導出、`--fetch-ratings` で wdoor 現在レート併記・履歴記録。floodgate 連続対局向け、[詳細](floodgate_record.md)） |
 | `jsonl_to_kif` | tournament 等の JSONL 対局ログから KIF 棋譜を生成（id/skip/limit でフィルタ可） |
 | `kifu_player` | PSV / tournament JSONL / CSA を同じ TUI で再生・閲覧（評価値グラフ・検索/絞り込み（SFEN 局面検索含む）・`--live` 追記監視 (live-mirror と組で wdoor 観戦、csa_client の `live_jsonl` と組で自局の手単位リアルタイム観戦)・`--ratings` レート併記付き。[詳細](kifu_player.md)） |
@@ -22,7 +22,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | ツール | 説明 |
 |--------|------|
 | `benchmark` | YaneuraOu bench 互換の標準ベンチマーク。マルチスレッド対応 |
-| `bench_nnue_eval` | NNUE 推論単体の性能測定（cycles/eval, instructions/eval） |
+| `bench_nnue_eval` | NNUE 推論単体の性能測定（cycles/eval, instructions/eval）。LayerStacks は progress8kpabs / kingrank9 の bucket 分布を計測可能 |
 | `search_only_ab` | Linux perf ベースの search-only A/B ベンチマーク。起動・ロード時間を除外して正確計測 |
 | `eval_sfens` | SFEN 局面を LayerStacks NNUE で静的評価（`score` は歩=90 の内部スケール、`score_cp` は cp） |
 | `nnue_saturation` | LayerStacks NNUE の活性飽和率（u8 127 張り付き）を実局面で計測（[詳細](nnue_saturation.md)） |
@@ -54,7 +54,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `shuffle_psv` | PSV ファイル内のレコード（40バイト単位）をシャッフル |
 | `split_psv` | PSV ファイルを局面数または容量で複数ファイルへ分割 |
 | `merge_psv` | 複数の PSV ファイルを順序どおりストリーミング結合 |
-| `relabel_psv` | PSV の score を手番側視点の game_result 由来値へ streaming 置換し、任意で宣言勝ち override / diversions deblunder（[詳細](relabel_psv.md)） |
+| `relabel_psv` | PSV の score を game_result 由来値へ置換し、宣言勝ち override / diversion 整合性 deblunder / dry-run / verdict sidecar に対応（[詳細](relabel_psv.md)） |
 | `rescore_psv` | PSV 評価値を NNUE / 外部エンジン / ONNX (dlshogi・AobaZero, GPU/TensorRT) で再計算。qsearch-leaf ラベル・policy 展開・レジューム対応（[詳細](rescore_psv.md)） |
 | `rescore_hcpe` | hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（局面/結果は保持）。共有コア `teacher_labeler` 経由で `yardstick_label` とラベル bit 一致。fresh-per-position で分散ラベリング可、チャンク単位 + 途中（intra-chunk）resume 対応 |
 | `preprocess_psv` | PSV ファイルに qsearch leaf 置換を適用。チャンクストリーミング処理対応 |

@@ -9,7 +9,7 @@
 | ツール | 説明 |
 |--------|------|
 | `tournament` | 複数エンジンの round-robin 並列トーナメント、SPRT 検定 |
-| `analyze_selfplay` | tournament 出力の集計・Elo/nElo 算出・SPRT post-hoc 判定 |
+| `analyze_selfplay` | tournament 出力の集計・Elo/nElo 算出・SPRT post-hoc 判定（[詳細](docs/analyze_selfplay.md)） |
 | `floodgate_record` | csa_client の per-game JSONL から 1 エンジンの戦績を集計（先後別勝率・相手別・後手勝ち/負け/引分・実戦 NPS、`--config` で csa_client 設定から入力導出、`--fetch-ratings` で wdoor 現在レート併記・履歴記録。floodgate 連続対局向け、[詳細](docs/floodgate_record.md)） |
 | `gensfen` | NNUE 学習用 PSV/pack/hcpe3 教師局面の生成（PSV move16 は実 YaneuraOu 形式、USI engine vs engine／NativeBackend、native LS progress 係数、千日手裁定、異常終局の全局破棄、宣言勝ち PSV 終端局面、乱択来歴 JSONL 記録） |
 | `floodgate_pipeline` | Floodgate棋譜のダウンロード・変換・`live-mirror --push` MONITOR2 着手通知付きリアルタイムミラー（[詳細](docs/floodgate_pipeline.md)） |
@@ -33,7 +33,7 @@
 | `shuffle_psv` | PSV ファイルのシャッフル |
 | `split_psv` | PSV ファイルを局面数または容量で分割 |
 | `merge_psv` | 複数の PSV ファイルを順序どおり結合 |
-| `relabel_psv` | PSV の score を手番側視点の game_result 由来値へ streaming 置換し、任意で宣言勝ち override / diversions deblunder（[詳細](docs/relabel_psv.md)） |
+| `relabel_psv` | PSV の score を game_result 由来値へ置換し、宣言勝ち override / diversion 整合性 deblunder / dry-run / verdict sidecar に対応（[詳細](docs/relabel_psv.md)） |
 | `rescore_psv` | 局面の再評価（探索スコア付与） |
 | `rescore_hcpe` | hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（分散ラベリング・チャンク単位 + 途中 resume 対応） |
 | `preprocess_psv` | PSV ファイルの前処理（qsearch leaf置換等） |
@@ -108,7 +108,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 - [ek_testset](docs/ek_testset.md) - held-out CSA から入玉評価テストセットを構築し、native NNUE 評価で DT/OC 指標を採点
 - [nnue_saturation](docs/nnue_saturation.md) - LayerStacks NNUE の活性飽和率（u8 127 張り付き）を実局面で計測
 - [rescore_psv](docs/rescore_psv.md) - PSV 評価値の再スコアリング（推奨: dlshogi ONNX + TensorRT FP16。qsearch-leaf ラベル / policy 展開 / レジューム対応）
-- [relabel_psv](docs/relabel_psv.md) - PSV score の勝敗ラベル置換と任意の宣言勝ち override / diversions deblunder
+- [relabel_psv](docs/relabel_psv.md) - PSV score の勝敗ラベル置換、宣言勝ち override、diversion 整合性 deblunder
 - [rescore_hcpe](docs/rescore_hcpe.md) - hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（共有コアで yardstick とラベル bit 一致、分散ラベリング・チャンク単位 + 途中 resume 対応）
 - [psv_to_hcpe3](docs/psv_to_hcpe3.md) - PSV → dlshogi 学習用 hcpe3 / hcpe 変換（cshogi 互換、streaming、`move16=0` の有効な着手なしレコードを件数付きスキップ、`--evalfix-a` 対応）
 - [migrate_psv_move16](docs/migrate_psv_move16.md) - 旧 PSV move16 の実 YaneuraOu 形式への移行

@@ -182,6 +182,8 @@ tournament の出力 JSONL を読み込み、勝率・Elo 差・NPS 等を集計
 - **直接対決**（Elo 差 ± CI、nElo 差 ± CI）
   - Elo 差: trinomial（1 局ごとの WDL）ベース
   - nElo: pentanomial（ペア単位）ベース。開始局面・先後の交絡を除去した、より正確な推定
+  - 通常はエンジンラベルの辞書順で左側の視点。`--sprt` 時は SPRT
+    対象ペアを test vs base の順にし、Elo/nElo の符号も test 視点に揃える
 - **追加統計**（平均手数、先手勝率、NPS、depth、seldepth 等）
 
 ### SPRT post-hoc 判定
@@ -197,8 +199,9 @@ tournament の出力 JSONL を読み込み、勝率・Elo 差・NPS 等を集計
 
 - `--sprt`: SPRT 判定モードを有効化
 - `--sprt-base-label` / `--sprt-test-label`: pentanomial の集計方向を指定する（どちらが test 側か）。
-  nelo の符号は test 視点で決まるため、**両方とも省略不可**。
-  値は tournament 実行時の `--engine-label` で指定したラベルと一致させること
+  nelo の符号は test 視点で決まる。省略時は tournament が記録した SPRT meta / base
+  label 等から自動推定し、推定根拠を標準エラー出力に表示する。自動推定の役割が意図と
+  異なる場合は、tournament 実行時の `--engine-label` と一致する値を明示する
 - `--sprt-nelo0` / `--sprt-nelo1`: tournament 実行時と異なる閾値を指定して
   「この閾値なら何局で打ち切れたか」を事後検証できる
 
