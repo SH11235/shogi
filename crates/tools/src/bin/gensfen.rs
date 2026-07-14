@@ -1,9 +1,11 @@
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -15,7 +17,8 @@ use rand::seq::SliceRandom;
 use rshogi_core::movegen::{MoveList, generate_legal, is_legal_with_pass};
 use rshogi_core::nnue::{
     compute_layer_stack_progress8kpabs_bucket_index, get_layer_stack_progress_kpabs_weights,
-    get_network, load_progress_coeff_kpabs_from_bytes, set_layer_stack_progress_kpabs_weights,
+    get_network, init_nnue_from_bytes, load_progress_coeff_kpabs_from_bytes,
+    set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::{EnteringKingPointInfo, Position};
 use rshogi_core::types::{Color, EnteringKingRule, Move};
@@ -204,6 +207,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     flush_each_move: bool,
 
+    /// 完了対局を永続化する fsync 間隔。1 は毎対局、0 は fsync 無効。
+    #[arg(long, default_value_t = 1)]
+    fsync_interval_games: u32,
+
     /// 評価値行を別ファイルに書き出す（startpos moves 行 + 評価値列）
     #[arg(long, default_value_t = false)]
     emit_eval_file: bool,
@@ -262,6 +269,11 @@ struct Cli {
     /// --out で指定した出力ファイルが存在する場合、完了済み対局数を検出して続きから実行する。
     #[arg(long, default_value_t = false)]
     resume: bool,
+
+    /// 残留した out-dir lock を削除して取得し直す。
+    /// lock 内の PID のプロセスが終了済みであることを確認してから指定する。
+    #[arg(long, default_value_t = false)]
+    force_unlock: bool,
 
     // =========================================================================
     // gensfen 重複回避オプション
@@ -346,6 +358,8 @@ struct MetaLog {
     start_positions: Vec<String>,
     output: String,
     info_log: Option<String>,
+    /// resume 時に教師データの生成条件が同一であることを検証する。
+    fingerprint: Value,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -439,6 +453,7 @@ struct ResolvedEnginePaths {
 struct ResultLog<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
+    worker_id: usize,
     game_id: u32,
     start_pos_index: usize,
     start_sfen: &'a str,
@@ -453,6 +468,60 @@ struct ResultLog<'a> {
     enemy_zone_pieces_black: u32,
     enemy_zone_pieces_white: u32,
     diversions: &'a [DiversionLog],
+    /// この result より先にコミット済みの worker 教師ファイル長。
+    training_bytes: u64,
+    /// この result より先にコミット済みの worker sidecar 長。
+    sidecar_bytes: Option<u64>,
+    /// この result より先にコミット済みの worker info log 長。
+    info_bytes: Option<u64>,
+    /// この result より先にコミット済みの worker eval file 長。
+    eval_bytes: Option<u64>,
+    /// この result より先にコミット済みの worker metrics 長。
+    metrics_bytes: Option<u64>,
+    /// ファイル長だけでは電源断前に永続化済みだった世代を識別できないため記録する。
+    fsync_boundary: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CheckpointLengths {
+    training: u64,
+    sidecar: Option<u64>,
+    info: Option<u64>,
+    eval: Option<u64>,
+    metrics: Option<u64>,
+}
+
+fn write_committed_result<W, F>(
+    writer: &mut W,
+    result: ResultLog<'_>,
+    fsync_boundary: bool,
+    persist_training: F,
+) -> Result<()>
+where
+    W: Write,
+    F: FnOnce() -> Result<CheckpointLengths>,
+{
+    let lengths = persist_training()?;
+    if injected_fault("before_result") {
+        bail!("injected failure before result write");
+    }
+    if injected_fault("result_partial") {
+        writer.write_all(b"{\"type\":\"result\"")?;
+        writer.flush()?;
+        bail!("injected partial result write");
+    }
+    let committed = ResultLog {
+        training_bytes: lengths.training,
+        sidecar_bytes: lengths.sidecar,
+        info_bytes: lengths.info,
+        eval_bytes: lengths.eval,
+        metrics_bytes: lengths.metrics,
+        fsync_boundary,
+        ..result
+    };
+    serde_json::to_writer(&mut *writer, &committed)?;
+    writer.write_all(b"\n")?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -719,6 +788,7 @@ struct TrainingDataCollector {
 }
 
 impl TrainingDataCollector {
+    #[cfg(test)]
     fn new(
         path: &Path,
         skip_initial_ply: u32,
@@ -728,6 +798,28 @@ impl TrainingDataCollector {
         policy_temp: f64,
         game_id_path: Option<&Path>,
     ) -> Result<Self> {
+        Self::open(
+            path,
+            skip_initial_ply,
+            skip_in_check,
+            format,
+            policy_total,
+            policy_temp,
+            game_id_path,
+            false,
+        )
+    }
+
+    fn open(
+        path: &Path,
+        skip_initial_ply: u32,
+        skip_in_check: bool,
+        format: TrainingFormat,
+        policy_total: u16,
+        policy_temp: f64,
+        game_id_path: Option<&Path>,
+        append: bool,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -735,13 +827,13 @@ impl TrainingDataCollector {
                 format!("failed to create training data directory: {}", parent.display())
             })?;
         }
-        let file = File::create(path)
-            .with_context(|| format!("failed to create training data file: {}", path.display()))?;
+        let file = open_worker_checkpoint(path, append)
+            .with_context(|| format!("failed to open training data file: {}", path.display()))?;
         let game_id_writer = game_id_path
             .map(|game_id_path| {
-                File::create(game_id_path).map(BufWriter::new).with_context(|| {
-                    format!("failed to create game_id sidecar: {}", game_id_path.display())
-                })
+                open_worker_checkpoint(game_id_path, append).map(BufWriter::new).with_context(
+                    || format!("failed to open game_id sidecar: {}", game_id_path.display()),
+                )
             })
             .transpose()?;
 
@@ -964,6 +1056,10 @@ impl TrainingDataCollector {
                 .with_context(|| format!("failed to write position {idx} of game"))?;
             // PSV と sidecar の 1:1・同順を構造的に保つため、同じループで連続して書く。
             if let Some(writer) = self.game_id_writer.as_mut() {
+                if injected_fault("sidecar_partial") {
+                    writer.write_all(&game_id.to_le_bytes()[..2])?;
+                    bail!("injected partial sidecar write");
+                }
                 writer.write_all(&game_id.to_le_bytes()).with_context(|| {
                     format!("failed to write game_id for position {idx} of game")
                 })?;
@@ -1071,6 +1167,26 @@ impl TrainingDataCollector {
         self.writer.flush()?;
         if let Some(writer) = self.game_id_writer.as_mut() {
             writer.flush()?;
+        }
+        Ok(())
+    }
+
+    fn committed_lengths(&mut self) -> Result<(u64, Option<u64>)> {
+        self.flush()?;
+        let training = self.writer.get_ref().metadata()?.len();
+        let sidecar = self
+            .game_id_writer
+            .as_ref()
+            .map(|writer| writer.get_ref().metadata().map(|meta| meta.len()))
+            .transpose()?;
+        Ok((training, sidecar))
+    }
+
+    fn sync_all(&mut self) -> Result<()> {
+        self.flush()?;
+        self.writer.get_ref().sync_all()?;
+        if let Some(writer) = self.game_id_writer.as_mut() {
+            writer.get_ref().sync_all()?;
         }
         Ok(())
     }
@@ -1322,6 +1438,20 @@ fn has_entering_king_rule_option(options: &[String]) -> bool {
     })
 }
 
+fn has_explicit_usi_model_option(options: &[String]) -> bool {
+    options.iter().any(|option| {
+        option.split_once('=').is_some_and(|(name, value)| {
+            let name = name.trim().to_ascii_lowercase();
+            !value.trim().is_empty()
+                && (name.contains("evalfile")
+                    || name.contains("evaldir")
+                    || name.contains("nnue")
+                    || name.contains("modelfile")
+                    || name.contains("modeldir"))
+        })
+    })
+}
+
 fn winner_for_side(side: Color) -> GameOutcome {
     match side {
         Color::Black => GameOutcome::BlackWin,
@@ -1558,7 +1688,7 @@ struct InfoLogger {
 }
 
 impl InfoLogger {
-    fn new(path: &Path) -> Result<Self> {
+    fn new(path: &Path, append: bool) -> Result<Self> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -1566,8 +1696,8 @@ impl InfoLogger {
                 format!("failed to create info-log directory {}", parent.display())
             })?;
         }
-        let file = File::create(path)
-            .with_context(|| format!("failed to create info log {}", path.display()))?;
+        let file = open_worker_checkpoint(path, append)
+            .with_context(|| format!("failed to open info log {}", path.display()))?;
         Ok(Self {
             writer: BufWriter::new(file),
         })
@@ -1582,6 +1712,56 @@ impl InfoLogger {
     fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
         Ok(())
+    }
+
+    fn committed_len(&mut self, sync: bool) -> Result<u64> {
+        self.writer.flush()?;
+        if sync {
+            self.writer.get_ref().sync_all()?;
+        }
+        Ok(self.writer.get_ref().metadata()?.len())
+    }
+}
+
+fn committed_writer_len(writer: &mut BufWriter<File>, sync: bool) -> Result<u64> {
+    writer.flush()?;
+    if sync {
+        writer.get_ref().sync_all()?;
+    }
+    Ok(writer.get_ref().metadata()?.len())
+}
+
+struct FaultSpec {
+    point: String,
+    occurrence: Option<u64>,
+}
+
+static FAULT_SPEC: OnceLock<Option<FaultSpec>> = OnceLock::new();
+static FAULT_MATCHES: AtomicU64 = AtomicU64::new(0);
+
+fn fault_spec() -> Option<&'static FaultSpec> {
+    FAULT_SPEC
+        .get_or_init(|| {
+            let value = std::env::var("RSHOGI_GENSFEN_FAULT").ok()?;
+            let (point, occurrence) = match value.rsplit_once(':') {
+                Some((point, occurrence)) => {
+                    let occurrence = occurrence.parse::<u64>().ok().filter(|value| *value > 0)?;
+                    (point.to_string(), Some(occurrence))
+                }
+                None => (value, None),
+            };
+            Some(FaultSpec { point, occurrence })
+        })
+        .as_ref()
+}
+
+fn injected_fault(point: &str) -> bool {
+    let Some(spec) = fault_spec().filter(|spec| spec.point == point) else {
+        return false;
+    };
+    match spec.occurrence {
+        Some(target) => FAULT_MATCHES.fetch_add(1, Ordering::Relaxed) + 1 == target,
+        None => true,
     }
 }
 
@@ -1613,6 +1793,7 @@ fn make_game_ticket<R: Rng + ?Sized>(
 }
 
 struct WorkerGameResult {
+    game_id: u32,
     outcome: GameOutcome,
     outcome_reason: OutcomeReason,
 }
@@ -1663,6 +1844,9 @@ struct WorkerConfig {
     game_id_sidecar_path: Option<PathBuf>,
     // Output flags
     flush_each_move: bool,
+    fsync_interval_games: u32,
+    append_checkpoints: bool,
+    run_seed: u64,
     // Training
     skip_initial_ply: u32,
     skip_in_check: bool,
@@ -1698,7 +1882,7 @@ fn worker_main(
     rx: chan::Receiver<Option<GameTicket>>,
     tx: chan::Sender<WorkerGameResult>,
     shutdown: Arc<AtomicBool>,
-) -> WorkerOutput {
+) -> Result<WorkerOutput> {
     let run = || -> Result<WorkerOutput> {
         // Create game engines (NativeBackend or UsiBackend)
         let mut engines = if cfg.native_mode {
@@ -1753,26 +1937,28 @@ fn worker_main(
         };
 
         // Open temp output files
-        let mut writer = BufWriter::new(File::create(&cfg.jsonl_path).with_context(|| {
-            format!("worker {}: failed to create {}", cfg.worker_id, cfg.jsonl_path.display())
-        })?);
+        let mut writer = BufWriter::new(
+            open_worker_checkpoint(&cfg.jsonl_path, cfg.append_checkpoints).with_context(|| {
+                format!("worker {}: failed to open {}", cfg.worker_id, cfg.jsonl_path.display())
+            })?,
+        );
         let mut info_logger = if let Some(ref path) = cfg.info_path {
-            Some(InfoLogger::new(path)?)
+            Some(InfoLogger::new(path, cfg.append_checkpoints)?)
         } else {
             None
         };
         let mut eval_writer = if let Some(ref path) = cfg.eval_path {
-            Some(BufWriter::new(File::create(path)?))
+            Some(BufWriter::new(open_checkpoint(path, cfg.append_checkpoints)?))
         } else {
             None
         };
         let mut metrics_writer = if let Some(ref path) = cfg.metrics_path {
-            Some(BufWriter::new(File::create(path)?))
+            Some(BufWriter::new(open_checkpoint(path, cfg.append_checkpoints)?))
         } else {
             None
         };
         let mut training_data_collector = if let Some(ref path) = cfg.training_data_path {
-            Some(TrainingDataCollector::new(
+            Some(TrainingDataCollector::open(
                 path,
                 cfg.skip_initial_ply,
                 cfg.skip_in_check,
@@ -1780,13 +1966,26 @@ fn worker_main(
                 cfg.hcpe3_policy_total,
                 cfg.hcpe3_policy_temp,
                 cfg.game_id_sidecar_path.as_deref(),
+                cfg.append_checkpoints,
             )?)
         } else {
             None
         };
+        for path in [
+            Some(cfg.jsonl_path.as_path()),
+            cfg.info_path.as_deref(),
+            cfg.eval_path.as_deref(),
+            cfg.metrics_path.as_deref(),
+            cfg.training_data_path.as_deref(),
+            cfg.game_id_sidecar_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            sync_parent(path)?;
+        }
 
         let dedup_hash = cfg.dedup_hash.clone();
-        let mut rng = rand::rng();
         let mut dedup_hits = 0u64;
         let mut dedup_discarded = 0u64;
         let mut multipv_diversions = 0u64;
@@ -1795,6 +1994,7 @@ fn worker_main(
         let mut interval_games = 0u32;
         let mut interval_dedup_hits = 0u64;
         let mut interval_positions_checked = 0u64;
+        let mut committed_games = 0u32;
         let progress_weights =
             cfg.layer_stack_num_buckets.map(|_| get_layer_stack_progress_kpabs_weights());
         let mut progress_bucket_counts = cfg
@@ -1809,6 +2009,10 @@ fn worker_main(
             }
 
             let game_idx = ticket.game_idx;
+            use rand::SeedableRng;
+            let mut rng = rand::rngs::StdRng::seed_from_u64(
+                cfg.run_seed ^ u64::from(game_idx + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            );
             engines.prepare_game(cfg.keep_tt)?;
 
             let parsed = &cfg.start_defs[ticket.startpos_idx];
@@ -2146,6 +2350,9 @@ fn worker_main(
 
                 if cfg.flush_each_move {
                     writer.flush()?;
+                    if let Some(logger) = info_logger.as_mut() {
+                        logger.flush()?;
+                    }
                 }
 
                 if terminal || outcome != GameOutcome::InProgress {
@@ -2161,6 +2368,7 @@ fn worker_main(
             let final_meta = final_entering_king_meta(&pos);
             let result = ResultLog {
                 kind: "result",
+                worker_id: cfg.worker_id,
                 game_id: game_idx + 1,
                 start_pos_index,
                 start_sfen: &start_sfen,
@@ -2175,10 +2383,13 @@ fn worker_main(
                 enemy_zone_pieces_black: final_meta.black.enemy_zone_pieces,
                 enemy_zone_pieces_white: final_meta.white.enemy_zone_pieces,
                 diversions: &diversions,
+                training_bytes: 0,
+                sidecar_bytes: None,
+                info_bytes: None,
+                eval_bytes: None,
+                metrics_bytes: None,
+                fsync_boundary: false,
             };
-            serde_json::to_writer(&mut writer, &result)?;
-            writer.write_all(b"\n")?;
-
             if let Some(w) = eval_writer.as_mut() {
                 let start_cmd = &cfg.start_commands[ticket.startpos_idx];
                 let moves_text = if move_list.is_empty() {
@@ -2222,9 +2433,47 @@ fn worker_main(
             {
                 pending_dedup_keys.publish(dedup_hash);
             }
+            committed_games += 1;
+            let sync_due = cfg.fsync_interval_games > 0
+                && committed_games.is_multiple_of(cfg.fsync_interval_games);
+            write_committed_result(&mut writer, result, sync_due, || {
+                let (training, sidecar) = if let Some(collector) = training_data_collector.as_mut()
+                {
+                    if sync_due {
+                        collector.sync_all()?;
+                    }
+                    collector.committed_lengths()?
+                } else {
+                    (0, None)
+                };
+                let info = info_logger
+                    .as_mut()
+                    .map(|logger| logger.committed_len(sync_due))
+                    .transpose()?;
+                let eval = eval_writer
+                    .as_mut()
+                    .map(|writer| committed_writer_len(writer, sync_due))
+                    .transpose()?;
+                let metrics = metrics_writer
+                    .as_mut()
+                    .map(|writer| committed_writer_len(writer, sync_due))
+                    .transpose()?;
+                Ok(CheckpointLengths {
+                    training,
+                    sidecar,
+                    info,
+                    eval,
+                    metrics,
+                })
+            })?;
             writer.flush()?;
 
+            if sync_due {
+                writer.get_ref().sync_all()?;
+            }
+
             let _ = tx.send(WorkerGameResult {
+                game_id: game_idx + 1,
                 outcome,
                 outcome_reason,
             });
@@ -2278,6 +2527,12 @@ fn worker_main(
         if let Some(w) = metrics_writer.as_mut() {
             w.flush()?;
         }
+        if cfg.fsync_interval_games > 0 {
+            if let Some(collector) = training_data_collector.as_mut() {
+                collector.sync_all()?;
+            }
+            writer.get_ref().sync_all()?;
+        }
 
         // gensfen 統計
         if dedup_hits > 0 || random_moves_played > 0 || multipv_diversions > 0 {
@@ -2304,16 +2559,16 @@ fn worker_main(
         Ok(WorkerOutput { training_stats })
     };
 
-    match run() {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("worker {}: error: {e}", cfg.worker_id);
-            shutdown.store(true, Ordering::Relaxed);
-            WorkerOutput {
-                training_stats: TrainingStats::default(),
-            }
-        }
+    let output = run().with_context(|| format!("worker {} failed", cfg.worker_id));
+    if output.is_err() {
+        shutdown.store(true, Ordering::Relaxed);
     }
+    output
+}
+
+fn open_checkpoint(path: &Path, append: bool) -> Result<File> {
+    open_worker_checkpoint(path, append)
+        .with_context(|| format!("failed to open checkpoint {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2321,9 +2576,71 @@ fn worker_main(
 // ---------------------------------------------------------------------------
 
 /// 前回中断した教師局面生成セッションの進捗状態
+#[derive(Clone, Debug, Default)]
+struct CompletedGames {
+    words: Vec<u64>,
+    len: u32,
+}
+
+impl CompletedGames {
+    fn insert(&mut self, game_id: u32) -> bool {
+        if game_id == 0 {
+            return false;
+        }
+        let index = (game_id - 1) as usize;
+        let word = index / 64;
+        if self.words.len() <= word {
+            self.words.resize(word + 1, 0);
+        }
+        let mask = 1u64 << (index % 64);
+        if self.words[word] & mask != 0 {
+            return false;
+        }
+        self.words[word] |= mask;
+        self.len += 1;
+        true
+    }
+
+    fn contains(&self, game_id: u32) -> bool {
+        if game_id == 0 {
+            return false;
+        }
+        let index = (game_id - 1) as usize;
+        self.words
+            .get(index / 64)
+            .is_some_and(|word| word & (1u64 << (index % 64)) != 0)
+    }
+
+    fn len(&self) -> u32 {
+        self.len
+    }
+
+    fn max_id(&self) -> Option<u32> {
+        self.words.iter().rposition(|word| *word != 0).map(|word_index| {
+            let word = self.words[word_index];
+            (word_index * 64 + (64 - word.leading_zeros() as usize)) as u32
+        })
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        for (word_index, &word) in other.words.iter().enumerate() {
+            let mut remaining = word;
+            while remaining != 0 {
+                let bit = remaining.trailing_zeros() as usize;
+                let game_id = (word_index * 64 + bit + 1) as u32;
+                if !self.insert(game_id) {
+                    bail!("duplicate completed game_id {game_id} across resume checkpoints");
+                }
+                remaining &= remaining - 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ResumeState {
-    /// 完了済み対局数（max game_id ベース）
-    completed_games: u32,
+    completed_games: CompletedGames,
     black_wins: u32,
     white_wins: u32,
     draws: u32,
@@ -2333,24 +2650,23 @@ struct ResumeState {
     progress_file: Option<String>,
     /// meta 行に保存された progress_file 内容の SHA-256（存在しない場合は None）
     progress_file_sha256: Option<String>,
+    fingerprint: Option<Value>,
 }
 
-/// 既存の JSONL 出力ファイルを解析し、完了済み対局数と勝敗を取得する。
-/// ワーカー並行実行で result 行の順序が保証されないため、game_id の最大値を
-/// completed_games とする。
-fn parse_resume_state(path: &Path) -> Result<ResumeState> {
-    let file = File::open(path)
+/// 既存の最終 JSONL を解析し、完了済み game_id の集合と勝敗を取得する。
+fn parse_resume_state(path: &Path, max_game_id: u32) -> Result<ResumeState> {
+    let file = open_regular_file_nofollow(path)
         .with_context(|| format!("failed to open {} for resume", path.display()))?;
     let reader = BufReader::new(file);
 
-    let mut max_game_id: u32 = 0;
+    let mut completed_games = CompletedGames::default();
     let mut black_wins: u32 = 0;
     let mut white_wins: u32 = 0;
     let mut draws: u32 = 0;
     let mut shuffle_seed: Option<u64> = None;
     let mut progress_file: Option<String> = None;
     let mut progress_file_sha256: Option<String> = None;
-    let mut last_parse_error = false;
+    let mut fingerprint = None;
 
     for line in reader.lines() {
         let line = line?;
@@ -2358,17 +2674,8 @@ fn parse_resume_state(path: &Path) -> Result<ResumeState> {
         if trimmed.is_empty() {
             continue;
         }
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => {
-                last_parse_error = false;
-                v
-            }
-            Err(_) => {
-                // 最終行の不完全な書き込みを許容
-                last_parse_error = true;
-                continue;
-            }
-        };
+        let value: Value = serde_json::from_str(trimmed)
+            .with_context(|| format!("invalid JSONL in resume file {}", path.display()))?;
         match value.get("type").and_then(|v| v.as_str()) {
             Some("meta") => {
                 // meta 行から resume に必要な設定を復元
@@ -2383,39 +2690,547 @@ fn parse_resume_state(path: &Path) -> Result<ResumeState> {
                         .and_then(|v| v.as_str())
                         .map(ToString::to_string);
                 }
+                fingerprint = value.get("fingerprint").cloned();
             }
             Some("result") => {
-                if let Some(gid) = value.get("game_id").and_then(|v| v.as_u64()) {
-                    max_game_id = max_game_id.max(gid as u32);
+                let gid: u32 = value
+                    .get("game_id")
+                    .and_then(Value::as_u64)
+                    .context("result without game_id")?
+                    .try_into()
+                    .context("game_id exceeds u32")?;
+                if gid == 0 || gid > max_game_id {
+                    bail!(
+                        "result game_id {gid} is outside 1..={max_game_id} in {}",
+                        path.display()
+                    );
                 }
                 match value.get("outcome").and_then(|v| v.as_str()) {
                     Some("black_win") => black_wins += 1,
                     Some("white_win") => white_wins += 1,
                     Some("draw") => draws += 1,
-                    _ => {}
+                    _ => bail!("invalid result outcome in {}", path.display()),
+                }
+                if !completed_games.insert(gid) {
+                    bail!("duplicate result game_id {gid} in {}", path.display());
                 }
             }
             _ => {}
         }
     }
 
-    // 最終行以外でパースエラーが起きた場合の警告は不要（last_parse_error は最終行のみ）
-    let _ = last_parse_error;
-
     Ok(ResumeState {
-        completed_games: max_game_id,
+        completed_games,
         black_wins,
         white_wins,
         draws,
         shuffle_seed,
         progress_file,
         progress_file_sha256,
+        fingerprint,
     })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file =
+        File::open(path).with_context(|| format!("failed to hash {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn sha256_path_content(path: &Path) -> Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => return sha256_file(path).map(Some),
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            bail!("USI option path is neither a file nor a directory: {}", path.display())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect USI option path {}", path.display()));
+        }
+    }
+    let mut hasher = Sha256::new();
+    let entries = walkdir::WalkDir::new(path).follow_links(true).sort_by_file_name().into_iter();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("failed to walk {}", path.display()))?;
+        if entry.path() == path || entry.file_type().is_dir() {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(path)?;
+        let relative = relative.to_string_lossy();
+        hasher.update((relative.len() as u64).to_le_bytes());
+        hasher.update(relative.as_bytes());
+        let mut file = File::open(entry.path())?;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    Ok(Some(format!("{:x}", hasher.finalize())))
+}
+
+fn usi_option_path_fingerprints(options: &[String]) -> Result<Vec<Value>> {
+    let engine_cwd =
+        std::env::current_dir().context("failed to resolve engine working directory")?;
+    let mut fingerprints = Vec::new();
+    for option in options {
+        let Some((name, value)) = option.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        let normalized: String = name
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .flat_map(char::to_lowercase)
+            .collect();
+        if !(normalized.ends_with("file")
+            || normalized.ends_with("dir")
+            || normalized.ends_with("path")
+            || normalized == "ls_progress_coeff")
+        {
+            continue;
+        }
+        let path = Path::new(value);
+        let resolved_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            engine_cwd.join(path)
+        };
+        fingerprints.push(serde_json::json!({
+            "name": name,
+            "value": value,
+            "resolved_path": resolved_path,
+            "content_sha256": sha256_path_content(&resolved_path).with_context(|| {
+                format!("failed to fingerprint path-valued USI option {name}={value}")
+            })?,
+        }));
+    }
+    Ok(fingerprints)
+}
+
+fn validate_resume_fingerprint(meta: Option<&Value>, current: &Value) -> Result<()> {
+    let meta = meta.context(
+        "--resume: meta has no generation fingerprint; move existing outputs aside and start a new run",
+    )?;
+    if meta == current {
+        return Ok(());
+    }
+    let mut differences = Vec::new();
+    collect_json_differences("", meta, current, &mut differences);
+    differences.sort();
+    bail!(
+        "--resume: generation fingerprint mismatch in fields: {}",
+        differences.join(", ")
+    )
+}
+
+fn collect_json_differences(prefix: &str, left: &Value, right: &Value, out: &mut Vec<String>) {
+    match (left.as_object(), right.as_object()) {
+        (Some(left), Some(right)) => {
+            for key in left.keys().chain(right.keys()) {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                if out.iter().any(|existing| existing == &path) {
+                    continue;
+                }
+                match (left.get(key), right.get(key)) {
+                    (Some(a), Some(b)) if a != b => collect_json_differences(&path, a, b, out),
+                    (Some(_), Some(_)) => {}
+                    _ => out.push(path),
+                }
+            }
+        }
+        _ => out.push(prefix.to_string()),
+    }
+}
+
+fn recover_worker_checkpoint(
+    jsonl_path: &Path,
+    training_path: Option<&Path>,
+    sidecar_path: Option<&Path>,
+    info_path: Option<&Path>,
+    eval_path: Option<&Path>,
+    metrics_path: Option<&Path>,
+    format: TrainingFormat,
+    worker_id: usize,
+    max_game_id: u32,
+) -> Result<ResumeState> {
+    let jsonl_file = checkpoint_file_state(Some(jsonl_path))?;
+    let training_file = checkpoint_file_state(training_path)?;
+    let sidecar_file = checkpoint_file_state(sidecar_path)?;
+    let info_file = checkpoint_file_state(info_path)?;
+    let eval_file = checkpoint_file_state(eval_path)?;
+    let metrics_file = checkpoint_file_state(metrics_path)?;
+    if !jsonl_file.exists {
+        if [
+            training_file,
+            sidecar_file,
+            info_file,
+            eval_file,
+            metrics_file,
+        ]
+        .into_iter()
+        .any(|file| file.len > 0)
+        {
+            bail!(
+                "resume checkpoint {} is missing while training data remains; move the worker temp files aside before retrying",
+                jsonl_path.display()
+            );
+        }
+        return Ok(empty_resume_state());
+    }
+
+    let mut state = empty_resume_state();
+    let mut parsed_state = empty_resume_state();
+    let mut committed = CheckpointLengths {
+        training: 0,
+        sidecar: sidecar_path.map(|_| 0),
+        info: info_path.map(|_| 0),
+        eval: eval_path.map(|_| 0),
+        metrics: metrics_path.map(|_| 0),
+    };
+    let mut reader = BufReader::new(open_regular_file_nofollow(jsonl_path)?);
+    let mut line = Vec::new();
+    let mut parsed = committed;
+    let mut committed_jsonl_len = 0u64;
+    let mut complete_len = 0u64;
+    let mut line_index = 0usize;
+    let mut durable_prefix_ended = false;
+    let mut results_after_boundary = 0u64;
+    let mut seen_games = CompletedGames::default();
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        complete_len += read as u64;
+        line_index += 1;
+        let line = &line[..line.len() - 1];
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(line).with_context(|| {
+            format!("invalid JSON in {} at line {}", jsonl_path.display(), line_index)
+        })?;
+        if value.get("type").and_then(Value::as_str) != Some("result") {
+            bail!("unexpected non-result line in worker checkpoint {}", jsonl_path.display());
+        }
+        let game_id: u32 = value
+            .get("game_id")
+            .and_then(Value::as_u64)
+            .context("worker result has no game_id")?
+            .try_into()
+            .context("worker game_id exceeds u32")?;
+        if game_id == 0 || game_id > max_game_id {
+            bail!(
+                "worker game_id {game_id} is outside 1..={max_game_id} in {}",
+                jsonl_path.display()
+            );
+        }
+        let row_worker_id = value
+            .get("worker_id")
+            .and_then(Value::as_u64)
+            .context("worker result has no worker_id")? as usize;
+        if row_worker_id != worker_id {
+            bail!("worker_id mismatch in {}", jsonl_path.display());
+        }
+        let next_training = value
+            .get("training_bytes")
+            .and_then(Value::as_u64)
+            .with_context(|| {
+                format!(
+                    "{} has legacy result without training_bytes; move temp files aside rather than overwriting them",
+                    jsonl_path.display()
+                )
+            })?;
+        let read_optional_offset =
+            |field: &str, enabled: bool| -> Result<Option<u64>> {
+                if enabled {
+                    Ok(Some(value.get(field).and_then(Value::as_u64).with_context(|| {
+                        format!("{} result has no {field}", jsonl_path.display())
+                    })?))
+                } else if value.get(field).is_some_and(|offset| !offset.is_null()) {
+                    bail!("{} unexpectedly has {field}", jsonl_path.display())
+                } else {
+                    Ok(None)
+                }
+            };
+        let next = CheckpointLengths {
+            training: next_training,
+            sidecar: read_optional_offset("sidecar_bytes", sidecar_path.is_some())?,
+            info: read_optional_offset("info_bytes", info_path.is_some())?,
+            eval: read_optional_offset("eval_bytes", eval_path.is_some())?,
+            metrics: read_optional_offset("metrics_bytes", metrics_path.is_some())?,
+        };
+        validate_referenced_files_exist(
+            next,
+            [
+                ("training data", training_path, training_file),
+                ("game_id sidecar", sidecar_path, sidecar_file),
+                ("info log", info_path, info_file),
+                ("eval file", eval_path, eval_file),
+                ("metrics", metrics_path, metrics_file),
+            ],
+            jsonl_path,
+        )?;
+        validate_checkpoint_monotonic(parsed, next, jsonl_path)?;
+        validate_checkpoint_record_boundaries(next, format, jsonl_path)?;
+        parsed = next;
+        let outcome = value
+            .get("outcome")
+            .and_then(Value::as_str)
+            .with_context(|| format!("invalid result outcome in {}", jsonl_path.display()))?;
+        if !matches!(outcome, "black_win" | "white_win" | "draw") {
+            bail!("invalid result outcome in {}", jsonl_path.display());
+        }
+        if !seen_games.insert(game_id) {
+            bail!("duplicate game_id {game_id} in {}", jsonl_path.display());
+        }
+        let fsync_boundary = value
+            .get("fsync_boundary")
+            .and_then(Value::as_bool)
+            .with_context(|| {
+                format!(
+                    "{} has legacy result without fsync_boundary; move temp files aside rather than overwriting them",
+                    jsonl_path.display()
+                )
+            })?;
+        match outcome {
+            "black_win" => parsed_state.black_wins += 1,
+            "white_win" => parsed_state.white_wins += 1,
+            "draw" => parsed_state.draws += 1,
+            _ => unreachable!(),
+        }
+        parsed_state.completed_games.insert(game_id);
+        results_after_boundary += 1;
+        if durable_prefix_ended || !fsync_boundary {
+            continue;
+        }
+        if !checkpoint_fits_files(
+            next,
+            training_file.len,
+            sidecar_file.len,
+            info_file.len,
+            eval_file.len,
+            metrics_file.len,
+        ) {
+            durable_prefix_ended = true;
+            continue;
+        }
+        state = parsed_state.clone();
+        committed = next;
+        committed_jsonl_len = complete_len;
+        results_after_boundary = 0;
+    }
+
+    // ここまでの検証で全成果物を同じ result 境界へ戻せることが確定している。
+    truncate_if_needed(jsonl_path, committed_jsonl_len, jsonl_file.len)?;
+    if let Some(path) = training_path {
+        truncate_if_needed(path, committed.training, training_file.len)?;
+    }
+    if let (Some(path), Some(len)) = (sidecar_path, committed.sidecar) {
+        truncate_if_needed(path, len, sidecar_file.len)?;
+    }
+    if let (Some(path), Some(len)) = (info_path, committed.info) {
+        truncate_if_needed(path, len, info_file.len)?;
+    }
+    if let (Some(path), Some(len)) = (eval_path, committed.eval) {
+        truncate_if_needed(path, len, eval_file.len)?;
+    }
+    if let (Some(path), Some(len)) = (metrics_path, committed.metrics) {
+        truncate_if_needed(path, len, metrics_file.len)?;
+    }
+    if results_after_boundary > 0 {
+        eprintln!(
+            "warning: recovered {} by discarding {results_after_boundary} result row(s) after the last proven fsync boundary",
+            jsonl_path.display()
+        );
+    }
+    Ok(state)
+}
+
+fn checkpoint_fits_files(
+    lengths: CheckpointLengths,
+    training_len: u64,
+    sidecar_len: u64,
+    info_len: u64,
+    eval_len: u64,
+    metrics_len: u64,
+) -> bool {
+    lengths.training <= training_len
+        && lengths.sidecar.is_none_or(|len| len <= sidecar_len)
+        && lengths.info.is_none_or(|len| len <= info_len)
+        && lengths.eval.is_none_or(|len| len <= eval_len)
+        && lengths.metrics.is_none_or(|len| len <= metrics_len)
+}
+
+fn validate_checkpoint_record_boundaries(
+    lengths: CheckpointLengths,
+    format: TrainingFormat,
+    path: &Path,
+) -> Result<()> {
+    if format != TrainingFormat::Psv {
+        return Ok(());
+    }
+    if !lengths.training.is_multiple_of(PackedSfenValue::SIZE as u64) {
+        bail!(
+            "committed PSV length in {} is not on a {}-byte record boundary",
+            path.display(),
+            PackedSfenValue::SIZE
+        );
+    }
+    if let Some(sidecar) = lengths.sidecar {
+        if !sidecar.is_multiple_of(4) {
+            bail!(
+                "committed game_id sidecar length in {} is not on a 4-byte record boundary",
+                path.display()
+            );
+        }
+        if sidecar / 4 != lengths.training / PackedSfenValue::SIZE as u64 {
+            bail!("PSV and game_id sidecar committed record counts differ in {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_monotonic(
+    previous: CheckpointLengths,
+    next: CheckpointLengths,
+    path: &Path,
+) -> Result<()> {
+    let fields = [
+        ("training_bytes", Some(previous.training), Some(next.training)),
+        ("sidecar_bytes", previous.sidecar, next.sidecar),
+        ("info_bytes", previous.info, next.info),
+        ("eval_bytes", previous.eval, next.eval),
+        ("metrics_bytes", previous.metrics, next.metrics),
+    ];
+    for (name, previous, next) in fields {
+        if let (Some(previous), Some(next)) = (previous, next)
+            && next < previous
+        {
+            bail!("non-monotonic {name} in {}: {next} < {previous}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn truncate_if_needed(path: &Path, committed: u64, actual: u64) -> Result<()> {
+    if committed != actual {
+        truncate_file(path, committed)?;
+    }
+    Ok(())
+}
+
+fn empty_resume_state() -> ResumeState {
+    ResumeState {
+        completed_games: CompletedGames::default(),
+        black_wins: 0,
+        white_wins: 0,
+        draws: 0,
+        shuffle_seed: None,
+        progress_file: None,
+        progress_file_sha256: None,
+        fingerprint: None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CheckpointFileState {
+    exists: bool,
+    len: u64,
+}
+
+fn checkpoint_file_state(path: Option<&Path>) -> Result<CheckpointFileState> {
+    match path {
+        Some(path) => match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() => Ok(CheckpointFileState {
+                exists: true,
+                len: meta.len(),
+            }),
+            Ok(_) => bail!("worker checkpoint {} is not a regular file", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(CheckpointFileState {
+                exists: false,
+                len: 0,
+            }),
+            Err(error) => Err(error).with_context(|| format!("failed to stat {}", path.display())),
+        },
+        None => Ok(CheckpointFileState {
+            exists: false,
+            len: 0,
+        }),
+    }
+}
+
+fn validate_referenced_files_exist(
+    lengths: CheckpointLengths,
+    files: [(&str, Option<&Path>, CheckpointFileState); 5],
+    jsonl_path: &Path,
+) -> Result<()> {
+    let offsets = [
+        Some(lengths.training),
+        lengths.sidecar,
+        lengths.info,
+        lengths.eval,
+        lengths.metrics,
+    ];
+    for ((label, path, file), offset) in files.into_iter().zip(offsets) {
+        if offset.is_some_and(|offset| offset > 0) && !file.exists {
+            bail!(
+                "resume checkpoint {} references missing {label} {} at non-zero offset; no files were truncated",
+                jsonl_path.display(),
+                path.context("enabled checkpoint path missing")?.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn file_len_or_zero(path: Option<&Path>) -> Result<u64> {
+    Ok(checkpoint_file_state(path)?.len)
+}
+
+fn truncate_file(path: &Path, len: u64) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        bail!("worker checkpoint {} is not a regular file", path.display());
+    }
+    file.set_len(len)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn validate_resume_progress_file(
@@ -2457,29 +3272,641 @@ fn validate_resume_progress_content(
     }
 }
 
-/// Concatenate worker temp files.
-/// `append=true`: append to existing file (for JSONL with meta line).
-/// `append=false`: create new file.
-fn concatenate_temp_files(final_path: &Path, temp_paths: &[PathBuf], append: bool) -> Result<()> {
-    let mut out: File = if append {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(final_path)
-            .with_context(|| format!("failed to open {} for appending", final_path.display()))?
-    } else {
-        File::create(final_path)
-            .with_context(|| format!("failed to create {}", final_path.display()))?
-    };
-    for tmp in temp_paths {
-        match File::open(tmp) {
-            Ok(mut f) => {
-                std::io::copy(&mut f, &mut out)?;
-                std::fs::remove_file(tmp)?;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FinalizationOutput {
+    final_path: PathBuf,
+    staged_path: PathBuf,
+    len: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FinalizationJournal {
+    schema: u32,
+    outputs: Vec<FinalizationOutput>,
+    worker_temps: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FinalizedState {
+    schema: u32,
+    outputs: Vec<FinalizedOutput>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FinalizedOutput {
+    path: PathBuf,
+    len: u64,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+struct RunLockInfo {
+    pid: u32,
+}
+
+#[derive(Debug)]
+struct RunDirLock {
+    path: PathBuf,
+    body: Vec<u8>,
+}
+
+impl RunDirLock {
+    fn acquire(output_path: &Path, force_unlock: bool) -> Result<Self> {
+        let path = output_path.with_file_name(".gensfen.lock");
+        if force_unlock {
+            match std::fs::remove_file(&path) {
+                Ok(()) => eprintln!("--force-unlock: 残留 lock {} を削除しました", path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to remove stale lock {}", path.display())
+                    });
+                }
             }
+        }
+
+        let body = serde_json::to_vec(&RunLockInfo {
+            pid: std::process::id(),
+        })?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        let mut file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner = read_regular_file_nofollow(&path)
+                    .and_then(|bytes| String::from_utf8(bytes).map_err(Into::into))
+                    .unwrap_or_else(|_| "<read error>".into());
+                bail!(
+                    "out-dir is locked by another gensfen process: {}\n  lock: {}\n  process が終了済みなら --force-unlock を指定してください",
+                    path.display(),
+                    owner.trim()
+                );
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to create lock {}", path.display()));
+            }
+        };
+        file.write_all(&body)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        sync_parent(&path)?;
+        let mut stored_body = body;
+        stored_body.push(b'\n');
+        Ok(Self {
+            path,
+            body: stored_body,
+        })
+    }
+}
+
+impl Drop for RunDirLock {
+    fn drop(&mut self) {
+        if read_regular_file_nofollow(&self.path).ok().as_deref() == Some(self.body.as_slice()) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = sync_parent(&self.path);
+        }
+    }
+}
+
+fn finalization_journal_path(output_path: &Path) -> PathBuf {
+    output_path.with_file_name(".gensfen.finalization.json")
+}
+
+fn finalized_state_path(output_path: &Path) -> PathBuf {
+    output_path.with_file_name("gensfen.finalized.json")
+}
+
+fn atomic_temp_path(path: &Path) -> PathBuf {
+    path.with_extension("json.tmp")
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn open_regular_file_nofollow(path: &Path) -> Result<File> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    Ok(file)
+}
+
+fn create_new_file_nofollow(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))
+}
+
+fn open_worker_checkpoint(path: &Path, append: bool) -> Result<File> {
+    if append {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => bail!("worker checkpoint {} is not a regular file", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    open_worker_checkpoint_after_type_check(path, append)
+}
+
+fn open_worker_checkpoint_after_type_check(path: &Path, append: bool) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if append {
+        options.create(true).append(true);
+    } else {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open worker checkpoint {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!("worker checkpoint {} is not a regular file", path.display());
+    }
+    Ok(file)
+}
+
+fn read_regular_file_nofollow(path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    open_regular_file_nofollow(path)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let tmp = atomic_temp_path(path);
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => bail!("{} is not a regular file", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut file = create_new_file_nofollow(&tmp)?;
+    serde_json::to_writer(&mut file, value)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    drop(file);
+    let is_finalization_journal =
+        path.file_name().is_some_and(|name| name == ".gensfen.finalization.json");
+    if is_finalization_journal && injected_fault("before_journal_rename") {
+        bail!("injected failure before finalization journal rename");
+    }
+    std::fs::rename(&tmp, path)?;
+    if is_finalization_journal && injected_fault("after_journal_rename") {
+        std::process::abort();
+    }
+    sync_parent(path)
+}
+
+fn finalized_state(journal: &FinalizationJournal) -> FinalizedState {
+    FinalizedState {
+        schema: 1,
+        outputs: journal
+            .outputs
+            .iter()
+            .map(|output| FinalizedOutput {
+                path: output.final_path.clone(),
+                len: output.len,
+                sha256: output.sha256.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn validate_file_identity(path: &Path, expected_len: u64, expected_sha256: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut file = open_regular_file_nofollow(path)
+        .with_context(|| format!("missing finalized output {}", path.display()))?;
+    let actual_len = file.metadata()?.len();
+    if actual_len != expected_len {
+        bail!(
+            "finalized output {} has unexpected length: {actual_len} != {expected_len}",
+            path.display()
+        );
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if actual_sha256 != expected_sha256 {
+        bail!("finalized output {} has unexpected content hash", path.display());
+    }
+    Ok(())
+}
+
+fn complete_finalization(
+    output_path: &Path,
+    journal: &FinalizationJournal,
+    verify_staged: bool,
+) -> Result<()> {
+    for (index, output) in journal.outputs.iter().enumerate() {
+        match std::fs::symlink_metadata(&output.staged_path) {
+            Ok(metadata) if metadata.is_file() => {
+                if verify_staged {
+                    validate_file_identity(&output.staged_path, output.len, &output.sha256)?;
+                }
+                std::fs::rename(&output.staged_path, &output.final_path).with_context(|| {
+                    format!("failed to atomically replace {}", output.final_path.display())
+                })?;
+                sync_parent(&output.final_path)?;
+                if injected_fault(&format!("after_final_rename_{}", index + 1)) {
+                    std::process::abort();
+                }
+            }
+            Ok(_) => bail!("{} is not a regular file", output.staged_path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                validate_file_identity(&output.final_path, output.len, &output.sha256)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    write_json_atomic(&finalized_state_path(output_path), &finalized_state(journal))?;
+    for (index, temp) in journal.worker_temps.iter().enumerate() {
+        match std::fs::remove_file(temp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if injected_fault(&format!("after_worker_temp_delete_{}", index + 1)) {
+            std::process::abort();
+        }
+    }
+    sync_parent(output_path)?;
+    let journal_path = finalization_journal_path(output_path);
+    std::fs::remove_file(&journal_path)?;
+    sync_parent(&journal_path)
+}
+
+fn recover_pending_finalization(output_path: &Path) -> Result<()> {
+    let path = finalization_journal_path(output_path);
+    let tmp_path = atomic_temp_path(&path);
+    let bytes = match read_regular_file_nofollow(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if is_not_found(&error) => match read_regular_file_nofollow(&tmp_path) {
+            Ok(bytes) => {
+                match serde_json::from_slice::<FinalizationJournal>(&bytes) {
+                    Ok(journal) if journal.schema == 1 => {}
+                    Ok(journal) => {
+                        eprintln!(
+                            "warning: discarding finalization journal temporary file {} with unsupported schema {}",
+                            tmp_path.display(),
+                            journal.schema
+                        );
+                        std::fs::remove_file(&tmp_path)?;
+                        sync_parent(&tmp_path)?;
+                        return Ok(());
+                    }
+                    Err(parse_error) => {
+                        eprintln!(
+                            "warning: discarding invalid finalization journal temporary file {}: {parse_error}",
+                            tmp_path.display()
+                        );
+                        std::fs::remove_file(&tmp_path)?;
+                        sync_parent(&tmp_path)?;
+                        return Ok(());
+                    }
+                }
+                std::fs::rename(&tmp_path, &path)?;
+                sync_parent(&path)?;
+                bytes
+            }
+            Err(error) if is_not_found(&error) => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        },
+        Err(error) => return Err(error),
+    };
+    let journal: FinalizationJournal = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid finalization journal {}", path.display()))?;
+    if journal.schema != 1 {
+        bail!("unsupported finalization journal schema {}", journal.schema);
+    }
+    let state_tmp = atomic_temp_path(&finalized_state_path(output_path));
+    match std::fs::symlink_metadata(&state_tmp) {
+        Ok(metadata) if metadata.is_file() => std::fs::remove_file(&state_tmp)?,
+        Ok(_) => bail!("{} is not a regular file", state_tmp.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    eprintln!("recovering interrupted gensfen finalization");
+    complete_finalization(output_path, &journal, true)
+}
+
+fn validate_finalized_outputs(
+    output_path: &Path,
+    required_paths: &[PathBuf],
+    training_path: Option<&Path>,
+    sidecar_path: Option<&Path>,
+    format: TrainingFormat,
+    has_results: bool,
+) -> Result<Option<FinalizedState>> {
+    let state_path = finalized_state_path(output_path);
+    let bytes = match read_regular_file_nofollow(&state_path) {
+        Ok(bytes) => bytes,
+        Err(error) if is_not_found(&error) && !has_results => {
+            for path in [training_path, sidecar_path].into_iter().flatten() {
+                if std::fs::metadata(path).is_ok_and(|meta| meta.len() > 0) {
+                    bail!("final output {} exists without finalized state", path.display());
+                }
+            }
+            return Ok(None);
+        }
+        Err(error) if is_not_found(&error) => {
+            bail!("resume results exist but {} is missing", state_path.display())
+        }
+        Err(error) => return Err(error),
+    };
+    let state: FinalizedState = serde_json::from_slice(&bytes)?;
+    if state.schema != 1 {
+        bail!("unsupported finalized state schema {}", state.schema);
+    }
+    for output in &state.outputs {
+        let actual = open_regular_file_nofollow(&output.path)
+            .with_context(|| format!("missing final output {}", output.path.display()))?
+            .metadata()?
+            .len();
+        if actual != output.len {
+            bail!(
+                "final output {} length differs from finalized state: {actual} != {}",
+                output.path.display(),
+                output.len
+            );
+        }
+    }
+    for required in required_paths {
+        if !state.outputs.iter().any(|output| output.path == required.as_path()) {
+            bail!("finalized state has no entry for {}", required.display());
+        }
+    }
+    if format == TrainingFormat::Psv {
+        let training_len = file_len_or_zero(training_path)?;
+        if !training_len.is_multiple_of(PackedSfenValue::SIZE as u64) {
+            bail!("final PSV is not on a {}-byte record boundary", PackedSfenValue::SIZE);
+        }
+        if let Some(sidecar_path) = sidecar_path {
+            let sidecar_len = file_len_or_zero(Some(sidecar_path))?;
+            if !sidecar_len.is_multiple_of(4) {
+                bail!("final game_id sidecar is not on a 4-byte record boundary");
+            }
+            if training_len / PackedSfenValue::SIZE as u64 != sidecar_len / 4 {
+                bail!("final PSV and game_id sidecar record counts differ");
+            }
+        }
+    }
+    Ok(Some(state))
+}
+
+/// worker temp を同一ディレクトリの一時ファイルへ連結し、rename 前の状態まで永続化する。
+fn stage_concatenated_file(
+    final_path: &Path,
+    temp_paths: &[PathBuf],
+    append: bool,
+    regenerate_existing: bool,
+    expected_prefix: Option<&FinalizedOutput>,
+) -> Result<FinalizationOutput> {
+    use sha2::{Digest, Sha256};
+    let merge_path = merge_temp_path(final_path);
+    if regenerate_existing {
+        match std::fs::symlink_metadata(&merge_path) {
+            Ok(metadata) if metadata.is_file() => std::fs::remove_file(&merge_path)?,
+            Ok(_) => bail!("{} is not a regular file", merge_path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut out = create_new_file_nofollow(&merge_path)
+        .with_context(|| format!("failed to create merge temp {}", merge_path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut len = 0u64;
+    if append {
+        match std::fs::symlink_metadata(final_path) {
+            Ok(_) => {
+                append_file_to_stage(final_path, &mut out, &mut hasher, &mut len)?;
+                if let Some(expected) = expected_prefix
+                    && (len != expected.len
+                        || format!("{:x}", hasher.clone().finalize()) != expected.sha256)
+                {
+                    bail!(
+                        "final output {} content differs from finalized state while staging",
+                        final_path.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    for tmp in temp_paths {
+        match std::fs::symlink_metadata(tmp) {
+            Ok(_) => append_file_to_stage(tmp, &mut out, &mut hasher, &mut len)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
+    }
+    out.sync_all()?;
+    drop(out);
+    sync_parent(&merge_path)?;
+    Ok(FinalizationOutput {
+        final_path: final_path.to_path_buf(),
+        staged_path: merge_path,
+        len,
+        sha256: format!("{:x}", hasher.finalize()),
+    })
+}
+
+fn finalized_output_for<'a>(
+    state: Option<&'a FinalizedState>,
+    path: &Path,
+) -> Option<&'a FinalizedOutput> {
+    state?.outputs.iter().find(|output| output.path == path)
+}
+
+fn validate_worker_outputs_exist(paths: &[(&str, &Path)]) -> Result<()> {
+    for (label, path) in paths {
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("worker {label} output {} is missing", path.display()))?;
+        if !metadata.is_file() {
+            bail!("worker {label} output {} is not a regular file", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn validate_completed_worker_outputs(
+    jsonl_path: &Path,
+    training_path: &Path,
+    sidecar_path: Option<&Path>,
+    info_path: Option<&Path>,
+    eval_path: Option<&Path>,
+    metrics_path: Option<&Path>,
+    format: TrainingFormat,
+    worker_id: usize,
+    max_game_id: u32,
+) -> Result<()> {
+    let mut required = vec![("JSONL", jsonl_path), ("training data", training_path)];
+    required.extend(
+        [
+            sidecar_path.map(|path| ("game_id sidecar", path)),
+            info_path.map(|path| ("info log", path)),
+            eval_path.map(|path| ("eval file", path)),
+            metrics_path.map(|path| ("metrics", path)),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    validate_worker_outputs_exist(&required)?;
+
+    let mut lengths = CheckpointLengths {
+        sidecar: sidecar_path.map(|_| 0),
+        info: info_path.map(|_| 0),
+        eval: eval_path.map(|_| 0),
+        metrics: metrics_path.map(|_| 0),
+        ..CheckpointLengths::default()
+    };
+    let mut reader = BufReader::new(open_regular_file_nofollow(jsonl_path)?);
+    let mut line = Vec::new();
+    let mut line_index = 0usize;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        line_index += 1;
+        if !line.ends_with(b"\n") {
+            bail!("incomplete JSON in {} at line {line_index}", jsonl_path.display());
+        }
+        let value: Value = serde_json::from_slice(&line[..line.len() - 1]).with_context(|| {
+            format!("invalid JSON in {} at line {line_index}", jsonl_path.display())
+        })?;
+        if value.get("type").and_then(Value::as_str) != Some("result") {
+            bail!("unexpected non-result line in worker checkpoint {}", jsonl_path.display());
+        }
+        if value.get("worker_id").and_then(Value::as_u64) != Some(worker_id as u64) {
+            bail!("worker_id mismatch in {}", jsonl_path.display());
+        }
+        let game_id = value
+            .get("game_id")
+            .and_then(Value::as_u64)
+            .context("worker result has no game_id")?;
+        if game_id == 0 || game_id > u64::from(max_game_id) {
+            bail!("worker game_id {game_id} is outside 1..={max_game_id}");
+        }
+        let read_offset =
+            |field: &str, enabled: bool| -> Result<Option<u64>> {
+                if enabled {
+                    Ok(Some(value.get(field).and_then(Value::as_u64).with_context(|| {
+                        format!("{} result has no {field}", jsonl_path.display())
+                    })?))
+                } else if value.get(field).is_some_and(|offset| !offset.is_null()) {
+                    bail!("{} unexpectedly has {field}", jsonl_path.display())
+                } else {
+                    Ok(None)
+                }
+            };
+        let next = CheckpointLengths {
+            training: value.get("training_bytes").and_then(Value::as_u64).with_context(|| {
+                format!("{} result has no training_bytes", jsonl_path.display())
+            })?,
+            sidecar: read_offset("sidecar_bytes", sidecar_path.is_some())?,
+            info: read_offset("info_bytes", info_path.is_some())?,
+            eval: read_offset("eval_bytes", eval_path.is_some())?,
+            metrics: read_offset("metrics_bytes", metrics_path.is_some())?,
+        };
+        validate_checkpoint_monotonic(lengths, next, jsonl_path)?;
+        validate_checkpoint_record_boundaries(next, format, jsonl_path)?;
+        lengths = next;
+    }
+
+    let actual = CheckpointLengths {
+        training: checkpoint_file_state(Some(training_path))?.len,
+        sidecar: sidecar_path
+            .map(|path| checkpoint_file_state(Some(path)).map(|file| file.len))
+            .transpose()?,
+        info: info_path
+            .map(|path| checkpoint_file_state(Some(path)).map(|file| file.len))
+            .transpose()?,
+        eval: eval_path
+            .map(|path| checkpoint_file_state(Some(path)).map(|file| file.len))
+            .transpose()?,
+        metrics: metrics_path
+            .map(|path| checkpoint_file_state(Some(path)).map(|file| file.len))
+            .transpose()?,
+    };
+    if lengths.training != actual.training
+        || lengths.sidecar != actual.sidecar
+        || lengths.info != actual.info
+        || lengths.eval != actual.eval
+        || lengths.metrics != actual.metrics
+    {
+        bail!(
+            "worker checkpoint {} output lengths do not match its final result",
+            jsonl_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn merge_temp_path(final_path: &Path) -> PathBuf {
+    let file_name = final_path.file_name().and_then(|name| name.to_str()).unwrap_or("output");
+    final_path.with_file_name(format!(".{file_name}.merge.tmp"))
+}
+
+fn append_file_to_stage(
+    source: &Path,
+    out: &mut File,
+    hasher: &mut sha2::Sha256,
+    len: &mut u64,
+) -> Result<()> {
+    use sha2::Digest;
+    let mut input = open_regular_file_nofollow(source)?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        out.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+        *len += read as u64;
     }
     Ok(())
 }
@@ -2487,12 +3914,7 @@ fn concatenate_temp_files(final_path: &Path, temp_paths: &[PathBuf], append: boo
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
     validate_cli(&cli)?;
-
-    // 既存 run には sidecar が無い可能性があり、PSV だけへの追記は 1:1 対応を壊す。
-    // 既存 PSV/sidecar の全件検証を暗黙に行わず、安全側で併用を禁止する。
-    if cli.resume && cli.emit_game_id_sidecar.is_some() {
-        bail!("--emit-game-id-sidecar cannot be used with --resume");
-    }
+    let _ = fault_spec();
 
     // 時間制限のバリデーション: depth/nodes 指定がなく時間制御もない場合はデフォルト byoyomi を設定
     let has_limit = cli.depth.is_some() || cli.nodes.is_some();
@@ -2542,52 +3964,20 @@ fn main() -> Result<()> {
             "--engine-path* requires --native=false. NativeBackend does not spawn external USI engines."
         );
     }
+    if cli.native == Some(false)
+        && (!has_explicit_usi_model_option(&black_usi_opts_early)
+            || !has_explicit_usi_model_option(&white_usi_opts_early))
+    {
+        eprintln!(
+            "warning: USI engine model is not explicit for both sides; specify EvalFile/EvalDir/NNUE/ModelFile options so resume can fingerprint model contents"
+        );
+    }
 
     let (start_defs, start_commands) =
         load_start_positions(cli.startpos_file.as_deref(), cli.sfen.as_deref(), None, None)?;
     let timestamp = Local::now();
     let output_path = resolve_output_path(cli.out_dir.as_deref(), &timestamp);
     let info_path = output_path.with_extension("info.jsonl");
-
-    // --resume バリデーションと進捗読み取り
-    let resume_state = if cli.resume {
-        if cli.out_dir.is_none() {
-            bail!(
-                "--resume には --out-dir の指定が必要です（自動生成パスでは前回のディレクトリを特定できません）"
-            );
-        }
-        if !output_path.exists() {
-            bail!("--resume: 出力ファイルが見つかりません: {}", output_path.display());
-        }
-        let state = parse_resume_state(&output_path)?;
-        validate_resume_progress_file(
-            state.progress_file.as_deref(),
-            cli.progress_file.as_deref(),
-        )?;
-        if state.completed_games >= cli.games {
-            println!(
-                "全{}局が完了済みです（black {} / white {} / draw {}）。再開は不要です。",
-                state.completed_games, state.black_wins, state.white_wins, state.draws,
-            );
-            return Ok(());
-        }
-        println!(
-            "Resuming: {}/{}局完了済み（black {} / white {} / draw {}）",
-            state.completed_games, cli.games, state.black_wins, state.white_wins, state.draws,
-        );
-        Some(state)
-    } else {
-        None
-    };
-    let resume_offset = resume_state.as_ref().map_or(0, |s| s.completed_games);
-
-    if let Some(parent) = output_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    // 学習データ出力形式のパース
     let training_format = match cli.training_data_format.as_str() {
         "psv" => TrainingFormat::Psv,
         "pack" => TrainingFormat::Pack,
@@ -2599,46 +3989,110 @@ fn main() -> Result<()> {
     if cli.emit_game_id_sidecar.is_some() && training_format != TrainingFormat::Psv {
         bail!("--emit-game-id-sidecar requires --training-data-format psv");
     }
-
     validate_hcpe3_opts(
         training_format,
         cli.skip_in_check,
         cli.hcpe3_policy_total,
         cli.hcpe3_policy_temp,
     )?;
-
-    // 学習データ出力の初期化（デフォルトで有効、--no-training-data で無効化）
     let training_data_ext = match training_format {
         TrainingFormat::Psv => "psv",
         TrainingFormat::Pack => "pack",
         TrainingFormat::Hcpe3 => "hcpe3",
     };
-    let training_data_path = Some(
-        cli.output_training_data
-            .clone()
-            .unwrap_or_else(|| default_training_data_path(&output_path, training_data_ext)),
-    );
-    let training_data_enabled = training_data_path.is_some();
+    let training_data_path = cli
+        .output_training_data
+        .clone()
+        .unwrap_or_else(|| default_training_data_path(&output_path, training_data_ext));
     let game_id_sidecar_path = cli.emit_game_id_sidecar.clone();
-    if let Some(sidecar_path) = game_id_sidecar_path.as_deref() {
-        validate_game_id_sidecar_path(
-            sidecar_path,
-            &output_path,
-            training_data_path.as_deref(),
-            training_data_ext,
-            cli.concurrency,
-            cli.log_info,
-            cli.emit_eval_file,
-            cli.emit_metrics,
-        )?;
+    validate_output_paths_unique(
+        &output_path,
+        &training_data_path,
+        game_id_sidecar_path.as_deref(),
+        training_data_ext,
+        cli.concurrency,
+        cli.log_info,
+        cli.emit_eval_file,
+        cli.emit_metrics,
+    )?;
+    let mut final_paths = vec![output_path.clone(), training_data_path.clone()];
+    if cli.log_info {
+        final_paths.push(info_path.clone());
     }
+    if cli.emit_eval_file {
+        final_paths.push(default_eval_path(&output_path));
+    }
+    if cli.emit_metrics {
+        final_paths.push(default_metrics_path(&output_path));
+    }
+    final_paths.extend(game_id_sidecar_path.iter().cloned());
+    validate_output_entry_types(
+        &output_path,
+        &final_paths,
+        training_data_ext,
+        cli.concurrency,
+        cli.log_info,
+        cli.emit_eval_file,
+        cli.emit_metrics,
+        game_id_sidecar_path.is_some(),
+        cli.resume,
+    )?;
+    if !cli.resume {
+        validate_fresh_output_paths(&final_paths)?;
+    }
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let _run_dir_lock = RunDirLock::acquire(&output_path, cli.force_unlock)?;
+    recover_pending_finalization(&output_path)?;
+    // --resume バリデーションと進捗読み取り
+    let mut resume_state = if cli.resume {
+        if cli.out_dir.is_none() {
+            bail!(
+                "--resume には --out-dir の指定が必要です（自動生成パスでは前回のディレクトリを特定できません）"
+            );
+        }
+        if !output_path.exists() {
+            bail!("--resume: 出力ファイルが見つかりません: {}", output_path.display());
+        }
+        let state = parse_resume_state(&output_path, cli.games)?;
+        validate_resume_progress_file(
+            state.progress_file.as_deref(),
+            cli.progress_file.as_deref(),
+        )?;
+        println!(
+            "Resuming: {}/{}局完了済み（black {} / white {} / draw {}）",
+            state.completed_games.len(),
+            cli.games,
+            state.black_wins,
+            state.white_wins,
+            state.draws,
+        );
+        Some(state)
+    } else {
+        None
+    };
+    let prior_finalized_state = if cli.resume {
+        validate_finalized_outputs(
+            &output_path,
+            &final_paths,
+            Some(&training_data_path),
+            game_id_sidecar_path.as_deref(),
+            training_format,
+            resume_state.as_ref().is_some_and(|state| state.completed_games.len() > 0),
+        )?
+    } else {
+        None
+    };
     if let Some(parent) = game_id_sidecar_path.as_deref().and_then(Path::parent)
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-
     let engine_paths = resolve_engine_paths(&cli);
     let threads_black = cli.threads_black.unwrap_or(cli.threads);
     let threads_white = cli.threads_white.unwrap_or(cli.threads);
@@ -2737,9 +4191,8 @@ fn main() -> Result<()> {
         }
     }
 
-    // shuffle_seed の解決: CLI 指定 > meta から復元 > ランダム生成
-    // resume 時は meta の seed と CLI の seed が不一致ならエラー（順列が変わるため）
-    let shuffle_seed_resolved: Option<u64> = if startpos_no_repeat_resolved {
+    // seed は開始局面選択と各 game_id の乱択を再現するため、全モードで固定する。
+    let shuffle_seed_resolved: Option<u64> = {
         if let Some(ref state) = resume_state {
             // resume: meta から seed を復元
             let meta_seed = state.shuffle_seed;
@@ -2753,45 +4206,31 @@ fn main() -> Result<()> {
                     meta_seed
                 );
             }
-            if meta_seed.is_none() {
-                bail!(
-                    "Cannot resume with --startpos-no-repeat: \
-                     the original session did not save shuffle_seed in meta. \
-                     Re-run without --startpos-no-repeat or start a new session."
-                );
-            }
-            meta_seed
+            Some(meta_seed.context("resume meta has no shuffle_seed; start a new run")?)
         } else if let Some(seed) = cli.shuffle_seed {
             Some(seed)
         } else {
             Some(rand::random::<u64>())
         }
-    } else {
-        None
     };
+    let keep_tt_resolved = cli.keep_tt.unwrap_or(false);
+    let dedup_hash_size_resolved = cli.dedup_hash_size.unwrap_or(64 * 1024 * 1024);
+    let random_multi_pv_resolved = cli.random_multi_pv.unwrap_or(0);
+    let random_multi_pv_diff_resolved = cli.random_multi_pv_diff.unwrap_or(0);
 
-    // NativeBackend 使用時に NNUE 評価関数の初期化。
-    // meta 行の書き込みより前に行い、--progress-file の必須検証や係数ロードの失敗時に
-    // 出力 JSONL（progress_file を欠いた meta）が残って以後の --resume を壊さないようにする。
     let mut native_layer_stack_buckets = None;
+    let mut native_eval_file_sha256 = None;
     let mut native_progress_file_sha256 = None;
+    let mut native_eval_bytes = None;
+    let mut native_progress_bytes = None;
     if native_mode {
         let eval_file =
             cli.eval_file.as_ref().ok_or_else(|| anyhow!("--native requires --eval-file"))?;
-        rshogi_core::nnue::init_nnue(eval_file).map_err(|e| anyhow!("NNUE init failed: {e}"))?;
-        eprintln!("NativeBackend: NNUE loaded from {}", eval_file.display());
-        let layer_stack_buckets =
-            get_network().as_deref().and_then(|network| network.layer_stack_num_buckets());
-        native_layer_stack_buckets = layer_stack_buckets;
-        if native_progress_file_required(layer_stack_buckets) && cli.progress_file.is_none() {
-            bail!(
-                "--native LayerStacks NNUE with num_buckets={} requires --progress-file",
-                layer_stack_buckets.unwrap_or_default()
-            );
-        }
+        let eval_bytes = std::fs::read(eval_file)
+            .with_context(|| format!("failed to read --eval-file {}", eval_file.display()))?;
+        native_eval_file_sha256 = Some(sha256_hex(&eval_bytes));
+        native_eval_bytes = Some(eval_bytes);
         if let Some(path) = &cli.progress_file {
-            // 一度読んだバイト列からハッシュと重みの両方を作り、
-            // 検証したものと異なる内容がロードされる読み直しの隙を作らない
             let bytes = std::fs::read(path)
                 .with_context(|| format!("failed to read --progress-file {}", path.display()))?;
             let loaded_sha256 = sha256_hex(&bytes);
@@ -2801,22 +4240,150 @@ fn main() -> Result<()> {
                     &loaded_sha256,
                 )?;
             }
-            let weights = load_progress_coeff_kpabs_from_bytes(&bytes)
-                .map_err(|e| anyhow!("failed to load --progress-file {}: {e}", path.display()))?;
-            set_layer_stack_progress_kpabs_weights(weights)
-                .map_err(|e| anyhow!("failed to set --progress-file weights: {e}"))?;
             native_progress_file_sha256 = Some(loaded_sha256);
-            eprintln!("NativeBackend: progress file loaded from {}", path.display());
+            native_progress_bytes = Some(bytes);
         }
-        if let Some(num_buckets) = native_layer_stack_buckets {
-            eprintln!("NativeBackend: LayerStacks num_buckets={num_buckets}");
+        if !cli.resume {
+            // 新規 run は初期化失敗で不完全な meta を残さないよう、meta 永続化より先に検証する。
+            native_layer_stack_buckets = initialize_native_backend(
+                eval_file,
+                native_eval_bytes.as_deref().context("native eval bytes missing")?,
+                cli.progress_file.as_deref().zip(native_progress_bytes.as_deref()),
+            )?;
+        }
+    }
+
+    let eval_file_sha256 = if native_mode {
+        native_eval_file_sha256
+    } else {
+        cli.eval_file.as_deref().map(sha256_file).transpose()?
+    };
+    let startpos_file_sha256 = cli.startpos_file.as_deref().map(sha256_file).transpose()?;
+    let start_positions_sha256 = sha256_hex(&serde_json::to_vec(&start_commands)?);
+    let native_executable_sha256 = native_mode
+        .then(|| std::env::current_exe().context("failed to resolve current executable"))
+        .transpose()?
+        .map(|path| sha256_file(&path))
+        .transpose()?;
+    let engine_black_sha256 = if native_mode {
+        native_executable_sha256.clone()
+    } else {
+        Some(sha256_file(&engine_paths.black.path)?)
+    };
+    let engine_white_sha256 = if native_mode {
+        native_executable_sha256
+    } else {
+        Some(sha256_file(&engine_paths.white.path)?)
+    };
+    let usi_path_options_black = if native_mode {
+        Vec::new()
+    } else {
+        usi_option_path_fingerprints(&black_usi_opts)?
+    };
+    let usi_path_options_white = if native_mode {
+        Vec::new()
+    } else {
+        usi_option_path_fingerprints(&white_usi_opts)?
+    };
+    let generation_fingerprint = serde_json::json!({
+        "schema": 2,
+        "model": serde_json::json!({
+            "native": native_mode,
+            "eval_file": cli.eval_file.as_ref().map(|path| path.display().to_string()),
+            "eval_file_sha256": eval_file_sha256,
+            "progress_file": cli.progress_file.as_ref().map(|path| path.display().to_string()),
+            "progress_file_sha256": native_progress_file_sha256,
+        }),
+        "engine": serde_json::json!({
+            "path_black": engine_paths.black.path.display().to_string(),
+            "path_white": engine_paths.white.path.display().to_string(),
+            "sha256_black": engine_black_sha256,
+            "sha256_white": engine_white_sha256,
+            "args_black": black_args,
+            "args_white": white_args,
+            "usi_options_black": black_usi_opts,
+            "usi_options_white": white_usi_opts,
+            "usi_path_options_black": usi_path_options_black,
+            "usi_path_options_white": usi_path_options_white,
+            "threads_black": threads_black,
+            "threads_white": threads_white,
+            "hash_mb": cli.hash_mb,
+            "keep_tt": keep_tt_resolved,
+        }),
+        "search": serde_json::json!({
+            "max_moves": cli.max_moves,
+            "btime": cli.btime,
+            "wtime": cli.wtime,
+            "binc": cli.binc,
+            "winc": cli.winc,
+            "byoyomi": cli.byoyomi,
+            "depth": cli.depth,
+            "nodes": cli.nodes,
+            "timeout_margin_ms": cli.timeout_margin_ms,
+            "network_delay": cli.network_delay,
+            "network_delay2": cli.network_delay2,
+            "minimum_thinking_time": cli.minimum_thinking_time,
+            "slowmover": cli.slowmover,
+            "ponder": cli.ponder,
+            "concurrency": cli.concurrency,
+        }),
+        "start": serde_json::json!({
+            "file": cli.startpos_file.as_ref().map(|path| path.display().to_string()),
+            "file_sha256": startpos_file_sha256,
+            "sfen": cli.sfen,
+            "positions_sha256": start_positions_sha256,
+            "random_startpos": cli.random_startpos,
+            "no_repeat": startpos_no_repeat_resolved,
+            "seed": shuffle_seed_resolved,
+        }),
+        "training": serde_json::json!({
+            "skip_initial_ply": cli.skip_initial_ply,
+            "skip_in_check": cli.skip_in_check,
+            "format": cli.training_data_format,
+            "hcpe3_policy_total": cli.hcpe3_policy_total,
+            "hcpe3_policy_temp": cli.hcpe3_policy_temp,
+            "game_id_sidecar": game_id_sidecar_path.is_some(),
+            "dedup_hash_size": dedup_hash_size_resolved,
+        }),
+        "auxiliary_outputs": serde_json::json!({
+            "info": cli.log_info,
+            "eval": cli.emit_eval_file,
+            "metrics": cli.emit_metrics,
+        }),
+        "randomization": serde_json::json!({
+            "multi_pv": random_multi_pv_resolved,
+            "multi_pv_diff": random_multi_pv_diff_resolved,
+            "move_count": cli.random_move_count,
+            "move_min_ply": cli.random_move_min_ply,
+            "move_max_ply": cli.random_move_max_ply,
+        }),
+    });
+    if let Some(state) = &resume_state {
+        validate_resume_fingerprint(state.fingerprint.as_ref(), &generation_fingerprint)?;
+    }
+
+    if !cli.resume {
+        let output_stem =
+            output_path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("output");
+        let output_parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+        let prefix = format!("{output_stem}.w");
+        for entry in std::fs::read_dir(output_parent)? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with(&prefix)
+                && std::fs::symlink_metadata(entry.path())?.len() > 0
+            {
+                bail!(
+                    "worker temp {} already exists and is non-empty; use --resume or move it aside",
+                    entry.path().display()
+                );
+            }
         }
     }
 
     // Write meta line to final JSONL (resume時はスキップ: 既にメタ行が存在する)
     if !cli.resume {
         let mut writer = BufWriter::new(
-            File::create(&output_path)
+            create_new_file_nofollow(&output_path)
                 .with_context(|| format!("failed to open {}", output_path.display()))?,
         );
         let meta = MetaLog {
@@ -2848,7 +4415,7 @@ fn main() -> Result<()> {
                 startpos_file: cli.startpos_file.as_ref().map(|p| p.display().to_string()),
                 sfen: cli.sfen.clone(),
                 random_startpos: cli.random_startpos,
-                output_training_data: training_data_path.as_ref().map(|p| p.display().to_string()),
+                output_training_data: Some(training_data_path.display().to_string()),
                 game_id_sidecar: game_id_sidecar_path.as_ref().map(|p| p.display().to_string()),
                 skip_initial_ply: cli.skip_initial_ply,
                 skip_in_check: cli.skip_in_check,
@@ -2869,16 +4436,13 @@ fn main() -> Result<()> {
             start_positions: start_commands.clone(),
             output: output_path.display().to_string(),
             info_log: cli.log_info.then(|| info_path.display().to_string()),
+            fingerprint: generation_fingerprint,
         };
         serde_json::to_writer(&mut writer, &meta)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
+        writer.get_ref().sync_all()?;
     }
-
-    let keep_tt_resolved = cli.keep_tt.unwrap_or(false);
-    let dedup_hash_size_resolved = cli.dedup_hash_size.unwrap_or(64 * 1024 * 1024);
-    let random_multi_pv_resolved = cli.random_multi_pv.unwrap_or(0);
-    let random_multi_pv_diff_resolved = cli.random_multi_pv_diff.unwrap_or(0);
 
     // gensfen: 共有ハッシュ重複検出テーブル（全ワーカーで1つ共有、tanuki-と同じ構成）
     let shared_dedup_hash = if dedup_hash_size_resolved > 0 {
@@ -2891,13 +4455,21 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    if cli.resume && shared_dedup_hash.is_some() {
+        eprintln!(
+            "warning: --resume starts with an empty dedup table; duplicates against data committed before the restart are not detected"
+        );
+    }
 
     // dedup 警告の重複抑制フラグ（全ワーカー共有）
     let dedup_warn_emitted = Arc::new(AtomicBool::new(false));
 
     // ゲームチケットは逐次生成する。
     // `--games` が極端に大きい場合でも O(1) メモリで dispatch できるようにする。
-    let mut rng = rand::rng();
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(
+        shuffle_seed_resolved.context("run seed missing")? ^ 0x5354_4152_5450_4f53,
+    );
     let startpos_count = start_defs.len();
 
     // Compute temp file paths per worker
@@ -2954,11 +4526,8 @@ fn main() -> Result<()> {
         } else {
             None
         };
-        let w_training_path = if training_data_enabled {
-            Some(output_parent.join(format!("{output_stem}.w{w}.{training_data_ext}")))
-        } else {
-            None
-        };
+        let w_training_path =
+            Some(output_parent.join(format!("{output_stem}.w{w}.{training_data_ext}")));
         let w_game_id_path = game_id_sidecar_path
             .as_ref()
             .map(|_| output_parent.join(format!("{output_stem}.w{w}.game_ids.bin")));
@@ -2980,80 +4549,133 @@ fn main() -> Result<()> {
             temp_game_id_paths.push(p.clone());
         }
 
-        let cfg = WorkerConfig {
-            worker_id: w,
-            engine_path_black: engine_paths.black.path.clone(),
-            engine_path_white: engine_paths.white.path.clone(),
-            black_args: black_args.clone(),
-            white_args: white_args.clone(),
-            threads_black,
-            threads_white,
-            hash_mb: cli.hash_mb,
-            network_delay: cli.network_delay,
-            network_delay2: cli.network_delay2,
-            minimum_thinking_time: cli.minimum_thinking_time,
-            slowmover: cli.slowmover,
-            ponder: cli.ponder,
-            black_usi_opts: black_usi_opts.clone(),
-            white_usi_opts: white_usi_opts.clone(),
-            entering_king_rule_black,
-            entering_king_rule_white,
-            max_moves: cli.max_moves,
-            timeout_margin_ms: cli.timeout_margin_ms,
-            btime: cli.btime,
-            wtime: cli.wtime,
-            binc: cli.binc,
-            winc: cli.winc,
-            byoyomi: cli.byoyomi,
-            go_depth: cli.depth,
-            go_nodes: cli.nodes,
-            start_defs: Arc::clone(&shared_start_defs),
-            start_commands: Arc::clone(&shared_start_commands),
-            jsonl_path,
-            info_path: w_info_path,
-            eval_path: w_eval_path,
-            metrics_path: w_metrics_path,
-            training_data_path: w_training_path,
-            game_id_sidecar_path: w_game_id_path,
-            flush_each_move: cli.flush_each_move,
-            skip_initial_ply: cli.skip_initial_ply,
-            skip_in_check: cli.skip_in_check,
-            training_format,
-            hcpe3_policy_total: cli.hcpe3_policy_total,
-            hcpe3_policy_temp: cli.hcpe3_policy_temp,
-            native_mode,
-            usi_single,
-            eval_hash_size_mb: DEFAULT_EVAL_HASH_SIZE_MB,
-            layer_stack_num_buckets: native_layer_stack_buckets,
-            keep_tt: keep_tt_resolved,
-            dedup_hash: shared_dedup_hash.clone(),
-            random_multi_pv: random_multi_pv_resolved,
-            random_multi_pv_diff: random_multi_pv_diff_resolved,
-            random_move_count: cli.random_move_count,
-            random_move_min_ply: cli.random_move_min_ply,
-            random_move_max_ply: cli.random_move_max_ply,
-            dedup_warn_interval_per_worker: (cli.dedup_warn_interval / cli.concurrency as u32)
-                .max(1),
-            dedup_warn_rate: cli.dedup_warn_rate,
-            dedup_warn_emitted: Arc::clone(&dedup_warn_emitted),
-        };
+        if cli.resume {
+            let recovered = recover_worker_checkpoint(
+                &jsonl_path,
+                w_training_path.as_deref(),
+                w_game_id_path.as_deref(),
+                w_info_path.as_deref(),
+                w_eval_path.as_deref(),
+                w_metrics_path.as_deref(),
+                training_format,
+                w,
+                cli.games,
+            )?;
+            let state = resume_state.as_mut().context("resume state missing")?;
+            state.completed_games.merge(&recovered.completed_games)?;
+            state.black_wins += recovered.black_wins;
+            state.white_wins += recovered.white_wins;
+            state.draws += recovered.draws;
+        }
+    }
 
-        let rx = ticket_rx.clone();
-        let tx = result_tx.clone();
-        let sd = shutdown.clone();
-        if native_mode {
-            // NativeBackend は SearchWorker の再帰的 alpha-beta 探索で大きなスタックを使うため
-            // 64MB スタックが必要（rshogi-usi の SEARCH_STACK_SIZE と同じ値）
-            let builder = thread::Builder::new()
-                .name(format!("gensfen-worker-{w}"))
-                .stack_size(64 * 1024 * 1024);
-            handles.push(
-                builder
-                    .spawn(move || worker_main(cfg, rx, tx, sd))
-                    .expect("failed to spawn worker thread"),
-            );
-        } else {
-            handles.push(thread::spawn(move || worker_main(cfg, rx, tx, sd)));
+    let all_games_completed = resume_state.as_ref().is_some_and(|state| {
+        state.completed_games.len() >= cli.games
+            && (1..=cli.games).all(|game_id| state.completed_games.contains(game_id))
+    });
+    if let Some(state) = &resume_state {
+        if all_games_completed {
+            println!("全{}局が checkpoint 上で完了済みです。成果物を連結します。", cli.games);
+        }
+        println!(
+            "resume checkpoints restored: {}/{} games (black {} / white {} / draw {})",
+            state.completed_games.len(),
+            cli.games,
+            state.black_wins,
+            state.white_wins,
+            state.draws
+        );
+    }
+
+    if !all_games_completed {
+        if native_mode && cli.resume {
+            // checkpoint だけで完了できる resume では大きな NNUE をロードする必要がない。
+            native_layer_stack_buckets = initialize_native_backend(
+                cli.eval_file.as_deref().context("native eval path missing")?,
+                native_eval_bytes.as_deref().context("native eval bytes missing")?,
+                cli.progress_file.as_deref().zip(native_progress_bytes.as_deref()),
+            )?;
+        }
+        for w in 0..cli.concurrency {
+            let cfg = WorkerConfig {
+                worker_id: w,
+                engine_path_black: engine_paths.black.path.clone(),
+                engine_path_white: engine_paths.white.path.clone(),
+                black_args: black_args.clone(),
+                white_args: white_args.clone(),
+                threads_black,
+                threads_white,
+                hash_mb: cli.hash_mb,
+                network_delay: cli.network_delay,
+                network_delay2: cli.network_delay2,
+                minimum_thinking_time: cli.minimum_thinking_time,
+                slowmover: cli.slowmover,
+                ponder: cli.ponder,
+                black_usi_opts: black_usi_opts.clone(),
+                white_usi_opts: white_usi_opts.clone(),
+                entering_king_rule_black,
+                entering_king_rule_white,
+                max_moves: cli.max_moves,
+                timeout_margin_ms: cli.timeout_margin_ms,
+                btime: cli.btime,
+                wtime: cli.wtime,
+                binc: cli.binc,
+                winc: cli.winc,
+                byoyomi: cli.byoyomi,
+                go_depth: cli.depth,
+                go_nodes: cli.nodes,
+                start_defs: Arc::clone(&shared_start_defs),
+                start_commands: Arc::clone(&shared_start_commands),
+                jsonl_path: temp_jsonl_paths[w].clone(),
+                info_path: cli.log_info.then(|| temp_info_paths[w].clone()),
+                eval_path: cli.emit_eval_file.then(|| temp_eval_paths[w].clone()),
+                metrics_path: cli.emit_metrics.then(|| temp_metrics_paths[w].clone()),
+                training_data_path: Some(temp_pack_paths[w].clone()),
+                game_id_sidecar_path: game_id_sidecar_path
+                    .as_ref()
+                    .map(|_| temp_game_id_paths[w].clone()),
+                flush_each_move: cli.flush_each_move,
+                fsync_interval_games: cli.fsync_interval_games,
+                append_checkpoints: cli.resume,
+                run_seed: shuffle_seed_resolved.context("run seed missing")?,
+                skip_initial_ply: cli.skip_initial_ply,
+                skip_in_check: cli.skip_in_check,
+                training_format,
+                hcpe3_policy_total: cli.hcpe3_policy_total,
+                hcpe3_policy_temp: cli.hcpe3_policy_temp,
+                native_mode,
+                usi_single,
+                eval_hash_size_mb: DEFAULT_EVAL_HASH_SIZE_MB,
+                layer_stack_num_buckets: native_layer_stack_buckets,
+                keep_tt: keep_tt_resolved,
+                dedup_hash: shared_dedup_hash.clone(),
+                random_multi_pv: random_multi_pv_resolved,
+                random_multi_pv_diff: random_multi_pv_diff_resolved,
+                random_move_count: cli.random_move_count,
+                random_move_min_ply: cli.random_move_min_ply,
+                random_move_max_ply: cli.random_move_max_ply,
+                dedup_warn_interval_per_worker: (cli.dedup_warn_interval / cli.concurrency as u32)
+                    .max(1),
+                dedup_warn_rate: cli.dedup_warn_rate,
+                dedup_warn_emitted: Arc::clone(&dedup_warn_emitted),
+            };
+            let rx = ticket_rx.clone();
+            let tx = result_tx.clone();
+            let sd = shutdown.clone();
+            if native_mode {
+                // NativeBackend は SearchWorker の再帰的 alpha-beta 探索で大きなスタックを使うため
+                // 64MB スタックが必要（rshogi-usi の SEARCH_STACK_SIZE と同じ値）
+                let builder = thread::Builder::new()
+                    .name(format!("gensfen-worker-{w}"))
+                    .stack_size(64 * 1024 * 1024);
+                handles.push(
+                    builder
+                        .spawn(move || worker_main(cfg, rx, tx, sd))
+                        .expect("failed to spawn worker thread"),
+                );
+            } else {
+                handles.push(thread::spawn(move || worker_main(cfg, rx, tx, sd)));
+            }
         }
     }
     // Main thread doesn't send results
@@ -3061,9 +4683,7 @@ fn main() -> Result<()> {
 
     // Main loop: dispatch tickets and collect results
     //
-    // --startpos-no-repeat: seed 固定の StdRng でシャッフルし、resume 時は
-    // 同じ seed + completed_games 回の next() で順列位置を復元する。
-    // seed は meta 行に shuffle_seed として保存される。
+    // game_id ごとに開始局面を決定し、完了済み ID も乱数列だけは消費する。
     let mut shuffled_startpos = if startpos_no_repeat_resolved {
         let seed = if let Some(s) = shuffle_seed_resolved {
             s
@@ -3071,46 +4691,60 @@ fn main() -> Result<()> {
             // 新規セッションなのに seed が無い = バグ（上流で必ず設定される）
             bail!("internal error: shuffle_seed not set for --startpos-no-repeat");
         };
-        let mut s = ShuffledStartpos::new(startpos_count, seed);
-        // resume 時は完了済み対局分だけ消費して同一位置まで進める
-        for _ in 0..resume_offset {
-            s.next();
-        }
-        if resume_offset > 0 {
-            eprintln!(
-                "resume: restored startpos-no-repeat position (seed={}, skip={})",
-                seed, resume_offset
-            );
-        }
-        Some(s)
+        Some(ShuffledStartpos::new(startpos_count, seed))
     } else {
         None
     };
-    let mut next_game_idx = resume_offset;
-    let make_ticket = |game_idx: u32,
-                       rng: &mut rand::rngs::ThreadRng,
-                       shuffled: &mut Option<ShuffledStartpos>| {
-        if let Some(s) = shuffled.as_mut() {
-            GameTicket {
-                game_idx,
-                startpos_idx: s.next(),
+    let mut completed_games = resume_state
+        .as_ref()
+        .map_or_else(CompletedGames::default, |state| state.completed_games.clone());
+    if completed_games.max_id().is_some_and(|max_id| max_id > cli.games) {
+        bail!("--games is smaller than an already completed game_id");
+    }
+    let mut next_game_idx = 0u32;
+    let next_incomplete_ticket =
+        |next_game_idx: &mut u32,
+         rng: &mut rand::rngs::StdRng,
+         shuffled: &mut Option<ShuffledStartpos>,
+         completed_games: &CompletedGames| {
+            while *next_game_idx < cli.games {
+                let game_idx = *next_game_idx;
+                *next_game_idx += 1;
+                let ticket = if let Some(s) = shuffled.as_mut() {
+                    GameTicket {
+                        game_idx,
+                        startpos_idx: s.next(),
+                    }
+                } else {
+                    make_game_ticket(game_idx, cli.random_startpos, startpos_count, rng)
+                };
+                if !completed_games.contains(game_idx + 1) {
+                    return Some(ticket);
+                }
             }
-        } else {
-            make_game_ticket(game_idx, cli.random_startpos, startpos_count, rng)
-        }
-    };
-    let mut next_ticket = (next_game_idx < cli.games)
-        .then(|| make_ticket(next_game_idx, &mut rng, &mut shuffled_startpos));
-    let mut completed = resume_offset;
+            None
+        };
+    let mut next_ticket = next_incomplete_ticket(
+        &mut next_game_idx,
+        &mut rng,
+        &mut shuffled_startpos,
+        &completed_games,
+    );
+    let mut completed = completed_games.len();
     let mut black_wins = resume_state.as_ref().map_or(0, |s| s.black_wins);
     let mut white_wins = resume_state.as_ref().map_or(0, |s| s.white_wins);
     let mut draws = resume_state.as_ref().map_or(0, |s| s.draws);
 
     let handle_result = |result: WorkerGameResult,
+                         completed_games: &mut CompletedGames,
                          black_wins: &mut u32,
                          white_wins: &mut u32,
                          draws: &mut u32,
-                         completed: &mut u32| {
+                         completed: &mut u32|
+     -> Result<()> {
+        if !completed_games.insert(result.game_id) {
+            bail!("worker returned duplicate completed game_id {}", result.game_id);
+        }
         match result.outcome {
             GameOutcome::BlackWin => *black_wins += 1,
             GameOutcome::WhiteWin => *white_wins += 1,
@@ -3128,6 +4762,7 @@ fn main() -> Result<()> {
             white_wins,
             draws
         );
+        Ok(())
     };
 
     while completed < cli.games && !shutdown.load(Ordering::Relaxed) {
@@ -3138,11 +4773,12 @@ fn main() -> Result<()> {
                     Ok(result) => {
                         handle_result(
                             result,
+                            &mut completed_games,
                             &mut black_wins,
                             &mut white_wins,
                             &mut draws,
                             &mut completed,
-                        );
+                        )?;
                     }
                     Err(_) => break,
                 }
@@ -3151,17 +4787,19 @@ fn main() -> Result<()> {
                 chan::select! {
                     send(ticket_tx, Some(t.clone())) -> res => {
                         if res.is_ok() {
-                            next_game_idx += 1;
-                            next_ticket = (next_game_idx < cli.games).then(|| {
-                                make_ticket(next_game_idx, &mut rng, &mut shuffled_startpos)
-                            });
+                            next_ticket = next_incomplete_ticket(
+                                &mut next_game_idx,
+                                &mut rng,
+                                &mut shuffled_startpos,
+                                &completed_games,
+                            );
                         }
                     }
                     recv(result_rx) -> result => {
                         // Put the ticket back since we received a result instead of sending
                         next_ticket = Some(t);
                         if let Ok(result) = result {
-                            handle_result(result, &mut black_wins, &mut white_wins, &mut draws, &mut completed);
+                            handle_result(result, &mut completed_games, &mut black_wins, &mut white_wins, &mut draws, &mut completed)?;
                         }
                     }
                 }
@@ -3171,7 +4809,7 @@ fn main() -> Result<()> {
 
     // Signal workers to stop
     for _ in 0..cli.concurrency {
-        let _ = ticket_tx.send(None);
+        let _ = ticket_tx.try_send(None);
     }
     drop(ticket_tx); // チャネル閉鎖でワーカーの recv が終了する
 
@@ -3179,42 +4817,146 @@ fn main() -> Result<()> {
     // Ctrl-C 後もワーカーは進行中のゲームを完了させるため、
     // メインスレッドのカウンタがずれないようここで drain する。
     while let Ok(result) = result_rx.recv() {
-        handle_result(result, &mut black_wins, &mut white_wins, &mut draws, &mut completed);
+        handle_result(
+            result,
+            &mut completed_games,
+            &mut black_wins,
+            &mut white_wins,
+            &mut draws,
+            &mut completed,
+        )?;
     }
 
     // Join workers and collect training stats
     let mut training_stats = TrainingStats::default();
-    for h in handles {
-        if let Ok(output) = h.join() {
-            training_stats.merge(output.training_stats);
+    let mut worker_errors = Vec::new();
+    for (worker_id, handle) in handles.into_iter().enumerate() {
+        match handle.join() {
+            Ok(Ok(output)) => training_stats.merge(output.training_stats),
+            Ok(Err(error)) => worker_errors.push(format!("worker {worker_id}: {error:#}")),
+            Err(_) => worker_errors.push(format!("worker {worker_id}: thread panicked")),
         }
     }
 
-    // Concatenate temp files into final outputs
-    // resume時は既存ファイルに追記する
-    let append_mode = cli.resume;
-    concatenate_temp_files(&output_path, &temp_jsonl_paths, true)?;
+    if worker_errors.is_empty() && !all_games_completed {
+        for worker_id in 0..cli.concurrency {
+            validate_completed_worker_outputs(
+                &temp_jsonl_paths[worker_id],
+                &temp_pack_paths[worker_id],
+                game_id_sidecar_path.as_ref().map(|_| temp_game_id_paths[worker_id].as_path()),
+                cli.log_info.then(|| temp_info_paths[worker_id].as_path()),
+                cli.emit_eval_file.then(|| temp_eval_paths[worker_id].as_path()),
+                cli.emit_metrics.then(|| temp_metrics_paths[worker_id].as_path()),
+                training_format,
+                worker_id,
+                cli.games,
+            )?;
+        }
+    } else if !worker_errors.is_empty() {
+        for worker_id in 0..cli.concurrency {
+            recover_worker_checkpoint(
+                &temp_jsonl_paths[worker_id],
+                Some(temp_pack_paths[worker_id].as_path()),
+                game_id_sidecar_path.as_ref().map(|_| temp_game_id_paths[worker_id].as_path()),
+                cli.log_info.then(|| temp_info_paths[worker_id].as_path()),
+                cli.emit_eval_file.then(|| temp_eval_paths[worker_id].as_path()),
+                cli.emit_metrics.then(|| temp_metrics_paths[worker_id].as_path()),
+                training_format,
+                worker_id,
+                cli.games,
+            )?;
+        }
+    }
 
+    // worker checkpoint から全成果物を staging し、journal に固定してから置換する。
+    let append_mode = cli.resume;
+    let mut staged_outputs = Vec::new();
     if cli.log_info && !temp_info_paths.is_empty() {
-        concatenate_temp_files(&info_path, &temp_info_paths, append_mode)?;
+        let staged = stage_concatenated_file(
+            &info_path,
+            &temp_info_paths,
+            append_mode,
+            cli.resume,
+            finalized_output_for(prior_finalized_state.as_ref(), &info_path),
+        )?;
+        staged_outputs.push(staged);
     }
     if cli.emit_eval_file && !temp_eval_paths.is_empty() {
         let eval_path = default_eval_path(&output_path);
-        concatenate_temp_files(&eval_path, &temp_eval_paths, append_mode)?;
+        let staged = stage_concatenated_file(
+            &eval_path,
+            &temp_eval_paths,
+            append_mode,
+            cli.resume,
+            finalized_output_for(prior_finalized_state.as_ref(), &eval_path),
+        )?;
+        staged_outputs.push(staged);
     }
     if cli.emit_metrics && !temp_metrics_paths.is_empty() {
         let metrics_path = default_metrics_path(&output_path);
-        concatenate_temp_files(&metrics_path, &temp_metrics_paths, append_mode)?;
+        let staged = stage_concatenated_file(
+            &metrics_path,
+            &temp_metrics_paths,
+            append_mode,
+            cli.resume,
+            finalized_output_for(prior_finalized_state.as_ref(), &metrics_path),
+        )?;
+        staged_outputs.push(staged);
     }
-    if training_data_enabled && !temp_pack_paths.is_empty() {
-        let pack_path = training_data_path
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| default_training_data_path(&output_path, training_data_ext));
-        concatenate_temp_files(&pack_path, &temp_pack_paths, append_mode)?;
+    if !temp_pack_paths.is_empty() {
+        let staged = stage_concatenated_file(
+            &training_data_path,
+            &temp_pack_paths,
+            append_mode,
+            cli.resume,
+            finalized_output_for(prior_finalized_state.as_ref(), &training_data_path),
+        )?;
+        staged_outputs.push(staged);
     }
     if let Some(sidecar_path) = game_id_sidecar_path.as_deref() {
-        concatenate_temp_files(sidecar_path, &temp_game_id_paths, false)?;
+        let staged = stage_concatenated_file(
+            sidecar_path,
+            &temp_game_id_paths,
+            append_mode,
+            cli.resume,
+            finalized_output_for(prior_finalized_state.as_ref(), sidecar_path),
+        )?;
+        staged_outputs.push(staged);
+    }
+    let staged_jsonl = stage_concatenated_file(
+        &output_path,
+        &temp_jsonl_paths,
+        true,
+        cli.resume,
+        finalized_output_for(prior_finalized_state.as_ref(), &output_path),
+    )?;
+    staged_outputs.push(staged_jsonl);
+    let worker_temps = temp_jsonl_paths
+        .iter()
+        .chain(&temp_info_paths)
+        .chain(&temp_eval_paths)
+        .chain(&temp_metrics_paths)
+        .chain(&temp_pack_paths)
+        .chain(&temp_game_id_paths)
+        .cloned()
+        .collect();
+    let journal = FinalizationJournal {
+        schema: 1,
+        outputs: staged_outputs,
+        worker_temps,
+    };
+    if injected_fault("before_journal_write") {
+        bail!("injected failure before finalization journal write");
+    }
+    write_json_atomic(&finalization_journal_path(&output_path), &journal)?;
+    complete_finalization(&output_path, &journal, false)?;
+
+    if !worker_errors.is_empty() {
+        eprintln!("gensfen stopped because worker errors occurred:");
+        for error in &worker_errors {
+            eprintln!("  - {error}");
+        }
+        bail!("{} worker(s) failed; committed game data was preserved", worker_errors.len());
     }
 
     // 最終サマリー
@@ -3242,10 +4984,10 @@ fn main() -> Result<()> {
     println!();
 
     // 学習データサマリー出力
-    if training_data_enabled {
+    {
         println!();
         println!("--- Training Data ---");
-        println!("Total positions written: {}", training_stats.total_written);
+        println!("Positions written in this invocation: {}", training_stats.total_written);
         println!(
             "Skipped (initial ply 1-{}): {}",
             cli.skip_initial_ply, training_stats.skipped_initial
@@ -3271,10 +5013,7 @@ fn main() -> Result<()> {
                 training_stats.declaration_win_dedup_skipped_games
             );
         }
-        println!(
-            "Output: {}",
-            training_data_path.as_ref().map_or("-".to_string(), |p| p.display().to_string())
-        );
+        println!("Output: {}", training_data_path.display());
         if let Some(path) = game_id_sidecar_path.as_deref() {
             println!("Game ID sidecar: {}", path.display());
         }
@@ -3314,67 +5053,250 @@ fn default_training_data_path(jsonl: &Path, ext: &str) -> PathBuf {
     parent.join(format!("{stem}.{ext}"))
 }
 
-fn validate_game_id_sidecar_path(
-    sidecar: &Path,
+fn validate_fresh_output_paths(paths: &[PathBuf]) -> Result<()> {
+    for path in paths {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                let kind = if metadata.file_type().is_symlink() {
+                    "symbolic link"
+                } else if metadata.is_dir() {
+                    "directory"
+                } else if metadata.is_file() {
+                    "file"
+                } else {
+                    "filesystem entry"
+                };
+                bail!(
+                    "final output {} already exists as a {kind}; move it aside before starting a new run",
+                    path.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect final output {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_output_entry_types(
     output_jsonl: &Path,
-    training_data: Option<&Path>,
+    final_paths: &[PathBuf],
+    training_data_ext: &str,
+    concurrency: usize,
+    log_info: bool,
+    emit_eval_file: bool,
+    emit_metrics: bool,
+    emit_sidecar: bool,
+    resume: bool,
+) -> Result<()> {
+    let journal = finalization_journal_path(output_jsonl);
+    let journal_tmp = atomic_temp_path(&journal);
+    let finalized = finalized_state_path(output_jsonl);
+    let finalized_tmp = atomic_temp_path(&finalized);
+    let journal_exists = std::fs::symlink_metadata(&journal).is_ok_and(|meta| meta.is_file());
+    for path in final_paths {
+        validate_existing_output_entry(path, resume, "final output")?;
+    }
+    for final_path in final_paths {
+        validate_existing_output_entry(
+            &merge_temp_path(final_path),
+            resume,
+            "merge temporary file",
+        )?;
+    }
+    for path in worker_checkpoint_paths(
+        output_jsonl,
+        training_data_ext,
+        concurrency,
+        log_info,
+        emit_eval_file,
+        emit_metrics,
+        emit_sidecar,
+    ) {
+        validate_existing_output_entry(&path, resume, "worker checkpoint")?;
+    }
+    validate_existing_output_entry(&journal, resume, "finalization journal")?;
+    validate_existing_output_entry(
+        &journal_tmp,
+        resume && !journal_exists,
+        "finalization journal temporary file",
+    )?;
+    validate_existing_output_entry(&finalized, resume, "finalized state")?;
+    validate_existing_output_entry(
+        &finalized_tmp,
+        resume && journal_exists,
+        "finalized state temporary file",
+    )?;
+    validate_existing_output_entry(
+        &output_jsonl.with_file_name(".gensfen.lock"),
+        true,
+        "run lock",
+    )?;
+    Ok(())
+}
+
+fn worker_checkpoint_paths(
+    output_jsonl: &Path,
+    training_data_ext: &str,
+    concurrency: usize,
+    log_info: bool,
+    emit_eval_file: bool,
+    emit_metrics: bool,
+    emit_sidecar: bool,
+) -> Vec<PathBuf> {
+    let parent = output_jsonl.parent().unwrap_or_else(|| Path::new("."));
+    let stem = output_jsonl.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let mut paths = Vec::new();
+    for worker in 0..concurrency {
+        paths.push(parent.join(format!("{stem}.w{worker}.jsonl")));
+        paths.push(parent.join(format!("{stem}.w{worker}.{training_data_ext}")));
+        if emit_sidecar {
+            paths.push(parent.join(format!("{stem}.w{worker}.game_ids.bin")));
+        }
+        if log_info {
+            paths.push(parent.join(format!("{stem}.w{worker}.info.jsonl")));
+        }
+        if emit_eval_file {
+            paths.push(parent.join(format!("{stem}.w{worker}.eval.txt")));
+        }
+        if emit_metrics {
+            paths.push(parent.join(format!("{stem}.w{worker}.metrics.jsonl")));
+        }
+    }
+    paths
+}
+
+fn validate_existing_output_entry(path: &Path, allow_regular: bool, label: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && allow_regular => Ok(()),
+        Ok(metadata) => {
+            let kind = if metadata.file_type().is_symlink() {
+                "symbolic link"
+            } else if metadata.is_dir() {
+                "directory"
+            } else if metadata.is_file() {
+                "file"
+            } else {
+                "special filesystem entry"
+            };
+            bail!("{label} {} already exists as a {kind}", path.display())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect {label} {}", path.display()))
+        }
+    }
+}
+
+fn validate_output_paths_unique(
+    output_jsonl: &Path,
+    training_data: &Path,
+    sidecar: Option<&Path>,
     training_data_ext: &str,
     concurrency: usize,
     log_info: bool,
     emit_eval_file: bool,
     emit_metrics: bool,
 ) -> Result<()> {
-    let normalized_sidecar = normalize_output_path(sidecar)?;
-    let mut final_paths = vec![output_jsonl.to_path_buf()];
-    final_paths.extend(training_data.map(Path::to_path_buf));
+    let mut paths = vec![("final JSONL".to_string(), output_jsonl.to_path_buf())];
+    paths.push(("final training data".to_string(), training_data.to_path_buf()));
     if log_info {
-        final_paths.push(output_jsonl.with_extension("info.jsonl"));
+        paths.push(("final info log".to_string(), output_jsonl.with_extension("info.jsonl")));
     }
     if emit_eval_file {
-        final_paths.push(default_eval_path(output_jsonl));
+        paths.push(("final eval file".to_string(), default_eval_path(output_jsonl)));
     }
     if emit_metrics {
-        final_paths.push(default_metrics_path(output_jsonl));
+        paths.push(("final metrics".to_string(), default_metrics_path(output_jsonl)));
     }
-    if final_paths
-        .iter()
-        .map(|path| normalize_output_path(path))
-        .collect::<Result<Vec<_>>>()?
-        .contains(&normalized_sidecar)
-    {
-        bail!(
-            "--emit-game-id-sidecar path conflicts with a final output path: {}",
-            sidecar.display()
-        );
+    if let Some(sidecar) = sidecar {
+        paths.push(("final game_id sidecar".to_string(), sidecar.to_path_buf()));
     }
 
     let parent = output_jsonl.parent().unwrap_or_else(|| Path::new("."));
     let stem = output_jsonl.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
     for worker in 0..concurrency {
-        let mut internal_paths = vec![
+        paths.push((
+            format!("worker {worker} JSONL"),
             parent.join(format!("{stem}.w{worker}.jsonl")),
+        ));
+        paths.push((
+            format!("worker {worker} training data"),
             parent.join(format!("{stem}.w{worker}.{training_data_ext}")),
-            parent.join(format!("{stem}.w{worker}.game_ids.bin")),
-        ];
+        ));
+        if sidecar.is_some() {
+            paths.push((
+                format!("worker {worker} game_id sidecar"),
+                parent.join(format!("{stem}.w{worker}.game_ids.bin")),
+            ));
+        }
         if log_info {
-            internal_paths.push(parent.join(format!("{stem}.w{worker}.info.jsonl")));
+            paths.push((
+                format!("worker {worker} info log"),
+                parent.join(format!("{stem}.w{worker}.info.jsonl")),
+            ));
         }
         if emit_eval_file {
-            internal_paths.push(parent.join(format!("{stem}.w{worker}.eval.txt")));
+            paths.push((
+                format!("worker {worker} eval file"),
+                parent.join(format!("{stem}.w{worker}.eval.txt")),
+            ));
         }
         if emit_metrics {
-            internal_paths.push(parent.join(format!("{stem}.w{worker}.metrics.jsonl")));
+            paths.push((
+                format!("worker {worker} metrics"),
+                parent.join(format!("{stem}.w{worker}.metrics.jsonl")),
+            ));
         }
-        if internal_paths
-            .iter()
-            .map(|path| normalize_output_path(path))
-            .collect::<Result<Vec<_>>>()?
-            .contains(&normalized_sidecar)
+    }
+
+    let final_paths: Vec<PathBuf> = paths
+        .iter()
+        .filter(|(label, _)| label.starts_with("final "))
+        .map(|(_, path)| path.clone())
+        .collect();
+    for (index, path) in final_paths.iter().enumerate() {
+        paths.push((format!("staging file {index}"), merge_temp_path(path)));
+    }
+    let journal = finalization_journal_path(output_jsonl);
+    let finalized = finalized_state_path(output_jsonl);
+    paths.extend([
+        ("finalization journal".to_string(), journal.clone()),
+        ("finalization journal temporary file".to_string(), atomic_temp_path(&journal)),
+        ("finalized state".to_string(), finalized.clone()),
+        ("finalized state temporary file".to_string(), atomic_temp_path(&finalized)),
+        ("run lock".to_string(), output_jsonl.with_file_name(".gensfen.lock")),
+    ]);
+
+    let mut normalized = std::collections::HashMap::<PathBuf, (String, PathBuf)>::new();
+    #[cfg(unix)]
+    let mut file_ids = std::collections::HashMap::<(u64, u64), (String, PathBuf)>::new();
+    for (label, path) in paths {
+        let identity = normalize_output_path(&path)?;
+        if let Some((other_label, other_path)) =
+            normalized.insert(identity, (label.clone(), path.clone()))
         {
             bail!(
-                "--emit-game-id-sidecar path conflicts with an internal worker path: {}",
-                sidecar.display()
+                "output path collision: {label} {} conflicts with {other_label} {}",
+                path.display(),
+                other_path.display()
             );
+        }
+        #[cfg(unix)]
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            use std::os::unix::fs::MetadataExt;
+            if let Some((other_label, other_path)) =
+                file_ids.insert((metadata.dev(), metadata.ino()), (label.clone(), path.clone()))
+            {
+                bail!(
+                    "output file collision: {label} {} is the same file as {other_label} {}",
+                    path.display(),
+                    other_path.display()
+                );
+            }
         }
     }
     Ok(())
@@ -3383,7 +5305,15 @@ fn validate_game_id_sidecar_path(
 /// 未生成の出力ファイル同士を比較できるよう、存在する最深の祖先を canonicalize し、
 /// 残りの未生成コンポーネントを実体パスに対して正規化する。
 fn normalize_output_path(path: &Path) -> Result<PathBuf> {
+    normalize_output_path_inner(path, 0)
+}
+
+fn normalize_output_path_inner(path: &Path, symlink_depth: usize) -> Result<PathBuf> {
     use std::path::Component;
+
+    if symlink_depth > 40 {
+        bail!("too many symlinks while normalizing output path {}", path.display());
+    }
 
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -3395,8 +5325,19 @@ fn normalize_output_path(path: &Path) -> Result<PathBuf> {
     let mut ancestor_len = components.len();
     let ancestor = loop {
         let candidate: PathBuf = components[..ancestor_len].iter().collect();
-        if candidate.try_exists()? {
-            break candidate.canonicalize()?;
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&candidate)?;
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    candidate.parent().unwrap_or_else(|| Path::new(".")).join(target)
+                };
+                break normalize_output_path_inner(&target, symlink_depth + 1)?;
+            }
+            Ok(_) => break candidate.canonicalize()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         ancestor_len -= 1;
     };
@@ -3418,6 +5359,34 @@ fn normalize_output_path(path: &Path) -> Result<PathBuf> {
 
 fn native_progress_file_required(layer_stack_num_buckets: Option<usize>) -> bool {
     layer_stack_num_buckets.is_some_and(|n| n > 1)
+}
+
+fn initialize_native_backend(
+    eval_path: &Path,
+    eval_bytes: &[u8],
+    progress: Option<(&Path, &[u8])>,
+) -> Result<Option<usize>> {
+    init_nnue_from_bytes(eval_bytes).map_err(|e| anyhow!("NNUE init failed: {e}"))?;
+    eprintln!("NativeBackend: NNUE loaded from {}", eval_path.display());
+    let layer_stack_buckets =
+        get_network().as_deref().and_then(|network| network.layer_stack_num_buckets());
+    if native_progress_file_required(layer_stack_buckets) && progress.is_none() {
+        bail!(
+            "--native LayerStacks NNUE with num_buckets={} requires --progress-file",
+            layer_stack_buckets.unwrap_or_default()
+        );
+    }
+    if let Some((path, bytes)) = progress {
+        let weights = load_progress_coeff_kpabs_from_bytes(bytes)
+            .map_err(|e| anyhow!("failed to load --progress-file {}: {e}", path.display()))?;
+        set_layer_stack_progress_kpabs_weights(weights)
+            .map_err(|e| anyhow!("failed to set --progress-file weights: {e}"))?;
+        eprintln!("NativeBackend: progress file loaded from {}", path.display());
+    }
+    if let Some(num_buckets) = layer_stack_buckets {
+        eprintln!("NativeBackend: LayerStacks num_buckets={num_buckets}");
+    }
+    Ok(layer_stack_buckets)
 }
 
 fn resolve_engine_paths(cli: &Cli) -> ResolvedEnginePaths {
@@ -4170,17 +6139,328 @@ mod tests {
         )
         .expect("write resume jsonl");
 
-        let state = parse_resume_state(&path).expect("parse resume state");
-        assert_eq!(state.completed_games, 3);
+        let state = parse_resume_state(&path, 10).expect("parse resume state");
+        assert_eq!(state.completed_games.len(), 1);
+        assert!(state.completed_games.contains(3));
         assert_eq!(state.shuffle_seed, Some(7));
         assert_eq!(state.progress_file.as_deref(), Some("/tmp/progress.bin"));
         assert_eq!(state.progress_file_sha256.as_deref(), Some("abcd"));
     }
 
     #[test]
+    fn resume_completed_games_preserves_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gaps.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"meta","settings":{}}"#,
+                "\n",
+                r#"{"type":"result","game_id":1,"outcome":"draw"}"#,
+                "\n",
+                r#"{"type":"result","game_id":3,"outcome":"draw"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let state = parse_resume_state(&path, 10).unwrap();
+        assert!(state.completed_games.contains(1));
+        assert!(!state.completed_games.contains(2));
+        assert!(state.completed_games.contains(3));
+        assert_eq!(state.completed_games.len(), 2);
+    }
+
+    #[test]
+    fn final_resume_rejects_invalid_outcome_before_completing_game() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid-outcome.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"meta\",\"settings\":{}}\n{\"type\":\"result\",\"game_id\":1,\"outcome\":\"unknown\"}\n",
+        )
+        .unwrap();
+        assert!(parse_resume_state(&path, 1).unwrap_err().to_string().contains("outcome"));
+    }
+
+    #[test]
+    fn final_resume_rejects_out_of_range_game_id_before_bitset_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge-id.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"meta\",\"settings\":{{}}}}\n{{\"type\":\"result\",\"game_id\":{},\"outcome\":\"draw\"}}\n",
+                u32::MAX
+            ),
+        )
+        .unwrap();
+        let error = parse_resume_state(&path, 10).unwrap_err().to_string();
+        assert!(error.contains("outside 1..=10"));
+    }
+
+    #[test]
+    fn resume_gap_keeps_start_position_bound_to_original_game_id() {
+        let expected: Vec<usize> = {
+            let mut shuffled = ShuffledStartpos::new(8, 99);
+            (0..4).map(|_| shuffled.next()).collect()
+        };
+        let mut completed = CompletedGames::default();
+        completed.insert(1);
+        completed.insert(3);
+        let mut resumed = ShuffledStartpos::new(8, 99);
+        let missing: Vec<(u32, usize)> = (1..=4)
+            .filter_map(|game_id| {
+                let startpos = resumed.next();
+                (!completed.contains(game_id)).then_some((game_id, startpos))
+            })
+            .collect();
+        assert_eq!(missing, vec![(2, expected[1]), (4, expected[3])]);
+    }
+
+    #[test]
+    fn worker_checkpoint_truncates_uncommitted_psv_sidecar_and_json_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("gensfen.w0.jsonl");
+        let psv = dir.path().join("gensfen.w0.psv");
+        let sidecar = dir.path().join("gensfen.w0.game_ids.bin");
+        let committed = serde_json::json!({
+            "type": "result",
+            "worker_id": 0,
+            "game_id": 2,
+            "outcome": "draw",
+            "training_bytes": 40,
+            "sidecar_bytes": 4,
+            "fsync_boundary": true,
+        });
+        std::fs::write(&jsonl, format!("{committed}\n{{\"type\":\"res")).unwrap();
+        std::fs::write(&psv, vec![0u8; 47]).unwrap();
+        std::fs::write(&sidecar, vec![0u8; 7]).unwrap();
+
+        let state = recover_worker_checkpoint(
+            &jsonl,
+            Some(&psv),
+            Some(&sidecar),
+            None,
+            None,
+            None,
+            TrainingFormat::Psv,
+            0,
+            10,
+        )
+        .unwrap();
+        assert!(state.completed_games.contains(2));
+        assert_eq!(std::fs::metadata(psv).unwrap().len(), 40);
+        assert_eq!(std::fs::metadata(sidecar).unwrap().len(), 4);
+        assert!(std::fs::read_to_string(jsonl).unwrap().ends_with('\n'));
+    }
+
+    #[test]
+    fn worker_checkpoint_without_commit_discards_only_uncommitted_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("gensfen.w0.jsonl");
+        let psv = dir.path().join("gensfen.w0.psv");
+        std::fs::write(&jsonl, b"").unwrap();
+        std::fs::write(&psv, vec![0u8; 40]).unwrap();
+        let state = recover_worker_checkpoint(
+            &jsonl,
+            Some(&psv),
+            None,
+            None,
+            None,
+            None,
+            TrainingFormat::Psv,
+            0,
+            10,
+        )
+        .unwrap();
+        assert_eq!(state.completed_games.len(), 0);
+        assert_eq!(std::fs::metadata(psv).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn worker_checkpoint_discards_results_ahead_of_durable_teacher_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("gensfen.w0.jsonl");
+        let psv = dir.path().join("gensfen.w0.psv");
+        let sidecar = dir.path().join("gensfen.w0.game_ids.bin");
+        let first = "{\"type\":\"result\",\"worker_id\":0,\"game_id\":1,\"outcome\":\"draw\",\"training_bytes\":40,\"sidecar_bytes\":4,\"fsync_boundary\":true}\n";
+        let second = "{\"type\":\"result\",\"worker_id\":0,\"game_id\":2,\"outcome\":\"black_win\",\"training_bytes\":80,\"sidecar_bytes\":8,\"fsync_boundary\":true}\n";
+        std::fs::write(&jsonl, format!("{first}{second}")).unwrap();
+        std::fs::write(&psv, vec![0u8; PackedSfenValue::SIZE]).unwrap();
+        std::fs::write(&sidecar, vec![0u8; 8]).unwrap();
+
+        let state = recover_worker_checkpoint(
+            &jsonl,
+            Some(&psv),
+            Some(&sidecar),
+            None,
+            None,
+            None,
+            TrainingFormat::Psv,
+            0,
+            2,
+        )
+        .unwrap();
+
+        assert!(state.completed_games.contains(1));
+        assert!(!state.completed_games.contains(2));
+        assert_eq!(state.draws, 1);
+        assert_eq!(state.black_wins, 0);
+        assert_eq!(std::fs::read_to_string(jsonl).unwrap(), first);
+        assert_eq!(std::fs::metadata(psv).unwrap().len(), PackedSfenValue::SIZE as u64);
+        assert_eq!(std::fs::metadata(sidecar).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn worker_checkpoint_rejects_invalid_result_record_boundary_before_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("gensfen.w0.jsonl");
+        let psv = dir.path().join("gensfen.w0.psv");
+        let row = "{\"type\":\"result\",\"worker_id\":0,\"game_id\":1,\"outcome\":\"draw\",\"training_bytes\":41,\"fsync_boundary\":true}\n";
+        std::fs::write(&jsonl, row).unwrap();
+        std::fs::write(&psv, vec![0u8; PackedSfenValue::SIZE]).unwrap();
+
+        let error = recover_worker_checkpoint(
+            &jsonl,
+            Some(&psv),
+            None,
+            None,
+            None,
+            None,
+            TrainingFormat::Psv,
+            0,
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("record boundary"));
+        assert_eq!(std::fs::read_to_string(jsonl).unwrap(), row);
+        assert_eq!(std::fs::metadata(psv).unwrap().len(), PackedSfenValue::SIZE as u64);
+    }
+
+    #[test]
+    fn legacy_worker_checkpoint_fails_closed_without_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("gensfen.w0.jsonl");
+        let psv = dir.path().join("gensfen.w0.psv");
+        std::fs::write(
+            &jsonl,
+            b"{\"type\":\"result\",\"worker_id\":0,\"game_id\":1,\"outcome\":\"draw\"}\n",
+        )
+        .unwrap();
+        std::fs::write(&psv, vec![0u8; 40]).unwrap();
+        let error = recover_worker_checkpoint(
+            &jsonl,
+            Some(&psv),
+            None,
+            None,
+            None,
+            None,
+            TrainingFormat::Psv,
+            0,
+            10,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("move temp files aside"));
+        assert_eq!(std::fs::metadata(psv).unwrap().len(), 40);
+    }
+
+    #[test]
+    fn worker_checkpoint_validates_all_offsets_before_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("gensfen.w0.jsonl");
+        let psv = dir.path().join("gensfen.w0.psv");
+        let rows = concat!(
+            "{\"type\":\"result\",\"worker_id\":0,\"game_id\":1,\"outcome\":\"draw\",\"training_bytes\":80,\"fsync_boundary\":true}\n",
+            "{\"type\":\"result\",\"worker_id\":0,\"game_id\":2,\"outcome\":\"draw\",\"training_bytes\":40,\"fsync_boundary\":true}\n"
+        );
+        std::fs::write(&jsonl, rows).unwrap();
+        std::fs::write(&psv, vec![0u8; 120]).unwrap();
+        let error = recover_worker_checkpoint(
+            &jsonl,
+            Some(&psv),
+            None,
+            None,
+            None,
+            None,
+            TrainingFormat::Psv,
+            0,
+            2,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("non-monotonic training_bytes"));
+        assert_eq!(std::fs::metadata(&psv).unwrap().len(), 120);
+    }
+
+    #[test]
+    fn path_valued_usi_option_hashes_file_and_directory_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let eval_file = dir.path().join("eval.bin");
+        let eval_dir = dir.path().join("eval-dir");
+        std::fs::create_dir(&eval_dir).unwrap();
+        std::fs::write(&eval_file, b"first").unwrap();
+        std::fs::write(eval_dir.join("model.bin"), b"model-a").unwrap();
+        let options = vec![
+            format!("EvalFile={}", eval_file.display()),
+            format!("EvalDir={}", eval_dir.display()),
+            "Hash=16".to_string(),
+        ];
+        let first = usi_option_path_fingerprints(&options).unwrap();
+        assert_eq!(first.len(), 2);
+        std::fs::write(&eval_file, b"second").unwrap();
+        std::fs::write(eval_dir.join("model.bin"), b"model-b").unwrap();
+        let second = usi_option_path_fingerprints(&options).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn fingerprint_reports_each_changed_field() {
+        let meta = serde_json::json!({"search": {"nodes": 10}, "training": {"format": "psv"}});
+        let current = serde_json::json!({"search": {"nodes": 20}, "training": {"format": "pack"}});
+        let error = validate_resume_fingerprint(Some(&meta), &current).unwrap_err().to_string();
+        assert!(error.contains("search.nodes"));
+        assert!(error.contains("training.format"));
+    }
+
+    #[test]
+    fn failed_training_commit_does_not_write_result() {
+        let result = ResultLog {
+            kind: "result",
+            worker_id: 0,
+            game_id: 1,
+            start_pos_index: 1,
+            start_sfen: "startpos",
+            outcome: "draw",
+            reason: OutcomeReason::MaxMoves,
+            adopted: true,
+            plies: 0,
+            final_points_black: 0,
+            final_points_white: 0,
+            king_in_enemy_black: false,
+            king_in_enemy_white: false,
+            enemy_zone_pieces_black: 0,
+            enemy_zone_pieces_white: 0,
+            diversions: &[],
+            training_bytes: 0,
+            sidecar_bytes: None,
+            info_bytes: None,
+            eval_bytes: None,
+            metrics_bytes: None,
+            fsync_boundary: false,
+        };
+        let mut jsonl = Vec::new();
+        assert!(write_committed_result(&mut jsonl, result, false, || bail!("disk full")).is_err());
+        assert!(jsonl.is_empty());
+    }
+
+    #[test]
     fn result_log_serializes_empty_diversions() {
         let result = ResultLog {
             kind: "result",
+            worker_id: 0,
             game_id: 1,
             start_pos_index: 1,
             start_sfen: "lnsgkgsnl/1r5b1/p1ppppppp/9/1p7/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL b - 1",
@@ -4195,6 +6475,12 @@ mod tests {
             enemy_zone_pieces_black: 0,
             enemy_zone_pieces_white: 0,
             diversions: &[],
+            training_bytes: 0,
+            sidecar_bytes: None,
+            info_bytes: None,
+            eval_bytes: None,
+            metrics_bytes: None,
+            fsync_boundary: false,
         };
         let value = serde_json::to_value(result).unwrap();
         assert_eq!(value["diversions"], serde_json::json!([]));
@@ -4347,10 +6633,10 @@ mod tests {
             "run/./gensfen.psv",
             "run/nested/../gensfen.psv",
         ] {
-            let error = validate_game_id_sidecar_path(
-                Path::new(collision),
+            let error = validate_output_paths_unique(
                 output,
-                Some(training),
+                training,
+                Some(Path::new(collision)),
                 "psv",
                 2,
                 true,
@@ -4358,12 +6644,12 @@ mod tests {
                 true,
             )
             .unwrap_err();
-            assert!(error.to_string().contains("conflicts"), "{error:#}");
+            assert!(error.to_string().contains("collision"), "{error:#}");
         }
-        validate_game_id_sidecar_path(
-            Path::new("run/ids.bin"),
+        validate_output_paths_unique(
             output,
-            Some(training),
+            training,
+            Some(Path::new("run/ids.bin")),
             "psv",
             2,
             true,
@@ -5058,5 +7344,57 @@ mod tests {
         // 破棄により書き出されるのは欠落後の 1 手だけで、起点 HCP は局面C（取り直し局面）
         assert_eq!(u16::from_le_bytes([bytes[32], bytes[33]]), 1);
         assert_eq!(&bytes[0..32], &expected_hcp);
+    }
+
+    #[test]
+    fn run_dir_lock_rejects_second_owner_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("gensfen.jsonl");
+        let lock = RunDirLock::acquire(&output, false).unwrap();
+        let error = RunDirLock::acquire(&output, false).unwrap_err().to_string();
+        assert!(error.contains("out-dir is locked"));
+        assert!(error.contains(&std::process::id().to_string()));
+        drop(lock);
+        assert!(!dir.path().join(".gensfen.lock").exists());
+    }
+
+    #[test]
+    fn run_dir_lock_force_unlock_replaces_stale_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("gensfen.jsonl");
+        std::fs::write(dir.path().join(".gensfen.lock"), b"{\"pid\":999999}\n").unwrap();
+        let _lock = RunDirLock::acquire(&output, true).unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".gensfen.lock")).unwrap();
+        assert!(body.contains(&std::process::id().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_checkpoint_open_after_type_check_does_not_follow_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let checkpoint = dir.path().join("checkpoint");
+        std::fs::write(&target, b"preserve").unwrap();
+        symlink(&target, &checkpoint).unwrap();
+
+        assert!(open_worker_checkpoint_after_type_check(&checkpoint, true).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_checkpoint_truncate_does_not_follow_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let checkpoint = dir.path().join("checkpoint");
+        std::fs::write(&target, b"preserve").unwrap();
+        symlink(&target, &checkpoint).unwrap();
+
+        assert!(truncate_file(&checkpoint, 0).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve");
     }
 }

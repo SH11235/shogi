@@ -144,6 +144,18 @@ fn real_native_gensfen_concatenates_psv_and_game_id_sidecar_in_lockstep() {
     assert_eq!(result_ids, HashSet::from([1, 2]));
     assert!(game_ids.iter().all(|game_id| result_ids.contains(game_id)));
 
+    let meta: Value = serde_json::from_str(
+        std::fs::read_to_string(out_dir.join("gensfen.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let native_sha = meta["fingerprint"]["engine"]["sha256_black"].as_str().unwrap();
+    assert_eq!(native_sha.len(), 64);
+    assert_eq!(native_sha, meta["fingerprint"]["engine"]["sha256_white"].as_str().unwrap());
+
     for worker in 0..2 {
         assert!(!out_dir.join(format!("gensfen.w{worker}.jsonl")).exists());
         assert!(!out_dir.join(format!("gensfen.w{worker}.psv")).exists());

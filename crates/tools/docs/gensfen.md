@@ -33,7 +33,7 @@ cargo build -p tools --bin gensfen --release
 
 ```
 runs/gensfen/20260317-120000/
-  gensfen.jsonl          # 対局結果ログ（result 行のみの JSONL）
+  gensfen.jsonl          # 実行条件 meta と対局結果 result の JSONL
   gensfen.psv            # 学習データ（PackedSfenValue, 40バイト/局面）
   gensfen.info.jsonl     # info ログ（--log-info 指定時のみ）
   gensfen.eval.txt       # 評価値推移（--emit-eval-file 指定時のみ）
@@ -188,6 +188,7 @@ position sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1
 | `--emit-eval-file` | false | 評価値推移を `gensfen.eval.txt` に出力 |
 | `--emit-metrics` | false | 対局メトリクス JSONL を出力 |
 | `--flush-each-move` | false | 毎手フラッシュ（安全だが低速） |
+| `--fsync-interval-games N` | 1 | worker ごとの fsync 間隔。1 は毎対局、0 は fsync 無効 |
 
 ### 中断・再開
 
@@ -195,9 +196,11 @@ position sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1
 |-----------|------|
 | `--out-dir DIR` | 出力ディレクトリ（resume 時必須） |
 | `--resume` | 前回中断したセッションを再開する |
+| `--force-unlock` | 残留した out-dir lock を削除して取得し直す。記録 PID の終了確認後だけ使用する |
 
-`--emit-game-id-sidecar` と `--resume` は併用できない。既存 run に sidecar が無い場合の
-PSV との 1:1 対応を壊さないため、明示的にエラーとする。sidecar のパスは meta 行の
+`--emit-game-id-sidecar` と `--resume` は併用できる。sidecar の有無は生成条件 fingerprint で
+照合し、PSV と sidecar のコミット済みレコード数が一致しない checkpoint は再開を拒否する。
+sidecar のパスは meta 行の
 `settings.game_id_sidecar` にも記録される。並行実行時は PSV と sidecar の両方をワーカー別の
 一時ファイルへ書き、同じワーカー順で最終ファイルへ連結する。sidecar には JSONL・PSV・
 info log・eval file・metrics の最終出力パス、およびそれらと sidecar の内部ワーカーパスを
@@ -216,6 +219,11 @@ canonicalize してから残りの未存在コンポーネントを正規化す�
 `timeout`、`illegal_move`、`no_bestmove` で破棄した対局の pending 集合はそのまま捨てるため、
 後続の正常対局から未出力局面を除外しない。pending のメモリ使用量は 1 対局の手数に比例し、
 対局終了時に解放される。
+
+dedup テーブル自体は checkpoint に永続化しない。数千万局面の既存 PSV を走査しても元の
+Zobrist key を復元できず、direct-map テーブルの完全な再構築には別 sidecar が必要になるためである。
+`--resume` は空の dedup テーブルから再開し、中断前のデータとの重複を検出できない旨を stderr に
+警告する。同一プロセス内と resume 後それぞれの重複検出は有効で、教師レコード自体は破損しない。
 
 通常手の局面で重複検出した場合は:
 1. それまでに蓄積した学習エントリを全クリア
@@ -404,18 +412,187 @@ policy の票数は各候補の eval を温度 `--hcpe3-policy-temp` の softmax
 
 ### 仕組み
 
-1. Ctrl-C で中断すると、進行中の対局の完了を待ってからグレースフルに終了する
-2. 完了済みの対局データはすべて出力ファイルに書き込まれる
-3. `--resume` 付きで同じコマンドを再実行すると、出力 JSONL から完了済み対局数を
-   自動検出して続きから実行する
+1. 各 worker は `.wN.jsonl` と `.wN.psv` / `.wN.pack` / `.wN.hcpe3`、必要なら
+   `.wN.game_ids.bin` を checkpoint として追記する。既存の非空 checkpoint を新規実行で
+   truncate せず、`--resume` なしなら退避を求めて停止する。
+2. 1 対局の教師データ、sidecar、info、eval、metrics を先に書き、各ファイルの byte offset と
+   `fsync_boundary` を含む JSONL result を最後に書く。`fsync_boundary=true` は、その result までの
+   全 worker 成果物を fsync した後に result を書き、worker JSONL も fsync する境界を表す。
+3. `--resume` は最終 JSONL と全 worker JSONL の `game_id` を bitset に復元する。最大 ID ではなく
+   集合で判定するため、並列中断で `100` が欠け `101` が完了していても `100` を再実行する。
+   bitset は 1 対局 1 bit（100万局で約 122 KiB）で、result 全体をメモリに保持しない。
+4. 全 result に記録された offset の単調性、PSV 40 byte / sidecar 4 byte 境界、PSV と sidecar の
+   1:1 件数を先に検証する。全成果物に存在し、かつ `fsync_boundary=true` の最後の result までを
+   復旧境界とし、それ以降の result suffix と各成果物を truncate し、
+   その game_id を未完了へ戻す。result は全成果物の後に書かれ、offset は単調増加するため、同じ境界へ
+   戻してから再対局すれば教師レコードは二重化も欠落もしない。
+   各 offset は worker checkpoint 内のコミット境界で worker ごとに 0 から始まる。最終 JSONL は
+   監査用に result をそのまま連結するため、最終 PSV / sidecar / 補助出力内の offset ではない。
+5. 今回 worker を起動して正常終了した場合は、JSONL、教師データ、有効な sidecar / info / eval /
+   metrics が全 worker 分存在することと、各ファイル長が最後の result の offset に一致することを
+   journal 作成前に検証する。全局完了済み resume は worker を起動しないため checkpoint を要求しない。
+6. worker エラー時も、全 worker checkpoint を手順 4 で復旧してから staging する。このため result
+   書き込み、flush/fsync、sidecar 部分書き込みの途中で失敗しても、未コミット末尾は最終成果物へ
+   入らない。コミット済み分を最終化した後、worker 別エラーを表示して非ゼロ終了する。
+   エラー原因には部分書き込みや fsync 失敗も含まれ、flush 済みの整合状態と安全に区別できないため、
+   `--fsync-interval-games N` が `N > 1` なら worker ごとに最大 `N - 1` 局、`0` ならその worker が
+   今回の起動で完了した全局を破棄する。破棄した `game_id` は次の `--resume` で再対局する。
+7. resume 開始時は `gensfen.finalized.json` の確定長と最終成果物の実長を照合する。PSV と sidecar は
+   最終成果物同士のレコード件数も照合する。短縮、欠落、件数不一致は worker を起動する前に停止する。
+
+self-heal するのは、不完全な JSON 末尾、result のない成果物末尾、または最後の fsync 境界より後の
+末尾 result の連続 suffix である。result が非ゼロ offset で参照する成果物自体が欠落している場合は、
+電源断による短い末尾とは区別して、どのファイルも truncate せず停止する。完全な JSON 行の構文/必須フィールド不正、offset の後退、PSV の
+`PackedSfenValue::SIZE` 境界不正、sidecar の 4-byte 境界不正、PSV と sidecar の件数不一致、確定済み
+final の不一致、旧形式で offset がない checkpoint は安全な切り戻し境界を証明できないため停止する。
+
+### finalization journal
+
+複数成果物の rename は単独ではトランザクションにならないため、次の journal 方式で冪等化する。
+
+1. 既存 final と全 worker checkpoint から同一ディレクトリの `.merge.tmp` を生成する。既存 final の
+   コピー中に prefix の SHA-256 と長さを旧 `gensfen.finalized.json` と照合し、不一致なら worker
+   checkpoint を追加せず停止する。続けて完成内容の SHA-256 と長さを計算し、各 merge file を fsync する。
+2. final path、merge path、SHA-256、長さ、削除対象 worker checkpoint を
+   `.gensfen.finalization.json` に書き、file と親 directory を fsync する。
+3. 各 merge file を final へ rename して親 directory を fsync する。通常経路では手順 1 でコピーと
+   同時に確定した長さと SHA-256 を使い、merge file を再読込しない。起動時に journal があれば、
+   merge が残る項目は長さと SHA-256 を検証して rename を再実行し、merge が無い項目は final の長さと
+   SHA-256 が journal と一致することを確認して rename 済みと判定する。
+4. 全項目の確定後、最終成果物の確定長と SHA-256 を `gensfen.finalized.json` へ atomic に更新する。
+   worker checkpoint を削除・directory fsync した後、最後に journal を削除する。
+
+クラッシュ点ごとの復旧動作は次のとおり。
+
+- journal 永続化前: final は未変更。worker checkpoint から merge を再生成する。
+- journal 永続化後、最初の rename 前: journal の全 rename を実行する。
+- 任意の rename 間: merge の有無と SHA-256 で各項目の完了を識別し、未完了項目だけ rename する。
+  既に final へ入った worker checkpoint を再連結しないため、二重化しない。
+- 全 rename 後、finalized state 更新前: 全 final の SHA-256 を確認して state 更新から続行する。
+- finalized state 更新後、worker checkpoint 削除中: final を確認し、残った checkpoint だけ削除する。
+- worker checkpoint 削除後、journal 削除前: final を確認して journal を削除する。checkpoint の欠落は
+  正常な cleanup 済みとして扱う。
+- journal 削除後: `gensfen.finalized.json` が確定世代を表す。resume は確定長を事前検証し、staging の
+  既存 final コピー中に確定 SHA-256 も検証してから追記する。
+
+通常の resume は確定長を事前検証し、staging に必要な既存 final の read と同時に確定 SHA-256 を検証する。
+検証専用の追加 read は行わない。rename 途中からの復旧で「merge が無い = rename 済み」を判定するときも、
+該当 final を SHA-256 検証する。
+staging 中のピーク追加ディスクは「既存 final 全体 + 今回の worker checkpoint 全体」と同量になる。
+PSV は 1 局面 40 bytes、game_id sidecar は 1 局面 4 bytes なので、補助出力を除く固定費は 1 億局面で
+4,400,000,000 bytes（約 4.10 GiB）の空きと 8,800,000,000 bytes の read+write、10 億局面では
+44,000,000,000 bytes（約 40.98 GiB）の空きと 88,000,000,000 bytes の read+write である。aggregate の
+実効 I/O 帯域を 100〜500 MB/s と置くと、固定部分だけで 1 億局面は約 18〜88 秒、10 億局面は約
+3〜15 分を要する。JSONL、info、eval、metrics を有効にした場合は各実ファイル長をこの値へ加算する。
+通常時の I/O は各入力の逐次 read 1 回と merge への write 1 回で、SHA-256 はコピーと同時に計算するため
+追加 read はない。
+
+この実装は final への in-place append よりディスクを使うが、journal が固定した完全な merge を rename し、
+final 自体を途中状態へ変更しない復旧モデルを維持する。数日 run の障害復旧経路を同時に変更しないことを
+優先してフルコピーを採用している。必要な空き容量と finalization 時間を事前に確保できない構成では使用せず、
+補助出力を含む実長から上記の式で見積もる。
+
+### 生成条件 fingerprint
+
+meta の `fingerprint` には次を構造化して保存する。`--resume` では全フィールドを照合し、差がある
+フィールド名（例: `search.nodes`, `model.eval_file_sha256`）を列挙して停止する。条件変更を強制する
+上書きフラグは設けていない。
+
+- native/USI モード、native 自身の実行ファイル SHA-256、native eval file のパスと SHA-256、
+  progress file のパスと SHA-256
+- USI engine のパスと実行ファイル SHA-256、先後の args / USI options / threads、Hash、TT 設定
+- nodes/depth、時間制御、max_moves、timeout と USI 時間管理設定、ponder、concurrency
+- startpos file のパスと SHA-256、読み込み後の開始局面列 SHA-256、単一 SFEN、選択方式、seed
+- skip 条件、training format、hcpe3 policy 条件、sidecar の有無、dedup table size
+- info / eval / metrics の有無（worker checkpoint の復旧対象を固定するため）
+- MultiPV/random move の全条件
+
+`--games` は合計目標を増やして続きを生成できるよう fingerprint から除外する。ただし既存の最大
+`game_id` より小さい値への変更は拒否する。ログ flush/fsync 頻度は教師ラベルを変えないため fingerprint
+には含めない。`--output-training-data` と `--emit-game-id-sidecar` の出力パスは fingerprint ではなく、
+`gensfen.finalized.json` の確定出力 path として resume 時に照合する。
+
+起動時は JSONL、training、sidecar、info、eval、metrics の全 final path、全 worker checkpoint、
+全 `.merge.tmp`、finalization journal と atomic temporary file、finalized state、lock を、存在する
+最深の親まで canonicalize して比較する。symlink や `..` を介した別表記を含め、同じ実体 path を二つの
+用途へ割り当てた構成はディレクトリ作成や lock 取得より前に拒否する。final path と internal path は
+`symlink_metadata` で検査し、dangling symlink、directory、特殊ファイルをリンク先へ辿らず拒否する。
+atomic temporary file と新規 `.merge.tmp` は create-new で作成する。journal と journal temporary file が
+無い resume で残っている通常ファイルの `.merge.tmp` は、journal 永続化前の中断物として削除して worker
+checkpoint から再生成する。journal 本体が無い状態で不完全・不正な journal temporary file が残っている場合も、
+final は未変更なので temporary file を削除し、worker checkpoint から staging と journal を再生成する。
+worker checkpoint の存在検査は `symlink_metadata`、読み書き・追記・truncate は
+`O_NOFOLLOW` 付き open を使い、journal、finalized state、復旧対象 `.merge.tmp` を読む場合も symlink を辿らない。
+
+USI option は `名前=値` の形式を解析し、名前を大小文字を無視して判定する。名前が `File`、`Dir`、
+`Path` で終わる option、または `LS_PROGRESS_COEFF` は値をファイルまたはディレクトリのパスとして扱う。
+相対パスは USI engine が継承する gensfen の起動時 working directory を基準に絶対化する。実在する
+ファイルは内容、ディレクトリは相対パス順のファイル名と全内容を SHA-256 化する。`BookFile=no_book`
+のように実在しない値は `content_sha256: null` として記録し、値文字列と解決先は引き続き fingerprint で
+照合する。したがって `EvalFile`、`EvalDir`、`BookFile` など同じパスの内容差し替えも resume を拒否する。別名の option、
+engine args に埋め込まれたパス、engine が内部で暗黙に読む資源までは識別できない。USI モードでは
+モデルを `EvalFile` / `EvalDir` / `NNUE` / `ModelFile` 系 option で必ず明示する。両側のいずれかに
+明示 option が無い場合は起動時に警告する。暗黙モデルを使った run は、engine binary が同一でも
+resume 前後のモデル同一性を証明できないため、本番の無人実行には使用しない。
+
+### flush / fsync 境界
+
+既定の `--fsync-interval-games 1` は、各対局で教師データ、sidecar、info、eval、metrics を
+`sync_all` し、その後に `fsync_boundary=true` の result JSONL を書いて `sync_all` する。worker
+checkpoint の新規作成後は親 directory も fsync するため、通常の fsync 契約を満たす filesystem では
+各完了対局までのファイル内容と directory entry を復旧境界として扱える。
+`N > 1` は worker ごとに N 局を一つの fsync 世代にまとめる。境界 result が確認できればその N 局を
+まとめて採用し、次の未完了世代はファイル長が残っていても全て rollback する。したがって最大 N-1 局を
+再対局する。`0` は実行中の対局単位 fsync 境界を一度も作らないため、クラッシュ後は worker checkpoint
+の全 result を未証明として rollback する。正常終了から finalization へ進む経路では flush 済み内容を
+使用するが、OS クラッシュ・電源断に対する途中進捗保証はない。
+ファイル長が短い状態は offset 検証で検出できるが、長さは正しく未永続ブロックだけがゼロ埋めされた状態は
+検出できない。既定の ext4 `data=ordered` では想定しない前提であり、異なる filesystem/mount option では
+耐障害性を別途確認する。
+
+`--flush-each-move` は、その時点までの result buffer と `--log-info` の info 行を OS buffer へ flush
+する。対局中の教師局面は勝敗確定までメモリ上にあるため、このフラグは進行中対局の教師データを保護せず、
+fsync も行わない。対局完了の耐久性は `--fsync-interval-games` が制御する。
+
+fsync コストの目安として、即時応答する mock USI engine、200局、1 worker、1手引き分け、NVMe 上の
+ext4 一時ディレクトリ（tmpfs ではない）で 3 回測定した wall time は、interval 0 が各 0.03 秒、
+interval 1 が 0.18〜0.19 秒、interval 10 が各 0.05 秒だった。これは同じ filesystem 内の比較であり、
+別 filesystem、controller cache、mount option では barrier コストが変わる。探索時間がほぼゼロの fsync
+最悪寄り測定で、実運用の比率は本番と同じ filesystem で再測定する。耐久性を優先して既定値は 1 とする。
+
+sidecar fault 判定のコストは、release ビルドの PSV + sidecar 書き出しループで 200 万 record を
+NVMe/ext4 上へ出力し、fault 無効で各 5 回測定した。判定ありは 49.794〜57.382 ns/record
+（中央値 52.308）、判定を除いた比較版は 47.995〜63.781 ns/record（中央値 52.895）で、除去による
+改善は測定できなかった。このため fault 点は現状の record loop 内に維持する。
 
 ### 注意事項
 
 - `--resume` には `--out-dir` の指定が必須
+- out-dir には PID を記録した `.gensfen.lock` を O_EXCL で作成し、二重起動を拒否する。正常終了と通常の
+  error/panic では削除するが、強制終了（Ctrl-C 2 回）・SIGKILL・電源断では残る。lock の PID が存在しないことを確認してから
+  `--force-unlock` で回収する。PID 再利用や同時回収の race を避けるため自動 stale 削除はしない
+- supervisor で無人再起動する場合は、再起動ラッパーを単一起動に制限し、`.gensfen.lock` の JSON に
+  記録された PID の生存を確認する。PID が存在する間は再起動せず、存在しない場合だけ同じ引数へ
+  `--resume --force-unlock` を追加して再起動する。PID の生存を確認せず常に `--force-unlock` すると、
+  稼働中プロセスの lock を奪って二重起動するため禁止する
 - `--games` は合計の目標対局数を指定する（追加分ではない）
-- `--shuffle-seed` は meta から自動復元される。CLI で異なる seed を指定するとエラー
-- 学習データ（.psv）、info ログ、eval ファイルなどもすべて追記される
+- `--resume` なしでは有効な全 final path にファイル、ディレクトリ、symlink のいずれかが既にあれば、
+  空でも上書きせず副作用前に停止する。worker checkpoint、`.merge.tmp`、journal、finalized state、
+  atomic temporary file も上書きしない。internal path に symlink、directory、特殊ファイルがあれば
+  `--resume` の有無にかかわらず停止する。前回分を続行する場合は同じ条件で `--resume`、別 run にする場合は
+  出力を退避する
+- seed は meta から自動復元される。開始局面選択と game_id ごとの MultiPV/random move を再現する。
+  CLI で異なる `--shuffle-seed` を指定するとエラー
+- native mode は gensfen 実行ファイル自身の SHA-256 も照合し、条件変更を強制する上書きフラグは設けない。
+  長時間 run は開始前に release バイナリを run 専用の固定パスへコピーし、初回と resume の両方をその
+  コピーから起動する。run 中の再ビルドや別バイナリへの差し替えは resume を fail-closed で拒否する
+- 学習データ（.psv）、info ログ、eval、metrics はすべて result と同じ offset 境界で追記・復旧される。
+  未完了対局の途中ログは resume 前に除去される
+- 終了時の `Positions written in this invocation` は今回のプロセスが新規に書いた局面数であり、resume 前に
+  確定済みだった局面を含まない。PSV の確定総局面数は最終ファイル長を 40 bytes で割って確認できる
 - Ctrl-C を 2 回押すと強制終了する（進行中の対局は破棄される）
+- 同一 seed の通し実行と resume は完了 `game_id` 集合と各 game_id の開始局面・乱択列を一致させる。
+  並列 scheduling と resume 時に空へ戻る共有 dedup table のため、成果物全体の bit 一致は保証しない
 
 ## 使用例
 
