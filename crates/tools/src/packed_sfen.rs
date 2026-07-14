@@ -1603,13 +1603,26 @@ pub fn move_to_hcpe_move16(mv: Move) -> u16 {
 /// 旧リポジトリ内部表現 (B) とは**別形式**である点に注意。
 #[inline]
 pub fn psv_move16_to_hcpe(yo_move16: u16) -> u16 {
+    if yo_move16 == 0 {
+        return 0;
+    }
     let to = yo_move16 & 0x7f;
+    // 移動先がマス番号 0..80 の範囲外なら破損レコード (hcpe_move16_to_psv と対称の検証)
+    if to > 80 {
+        return 0;
+    }
     let from_field = (yo_move16 >> 7) & 0x7f;
     if yo_move16 & 0x4000 != 0 {
-        // 駒打ち: from フィールドは駒種(1 始まり) → from = 81 + (駒種 - 1) = 80 + from_field
+        // 駒打ち: from フィールドは駒種(1 始まり、歩=1..金=7) → from = 81 + (駒種 - 1)
+        if !(1..=7).contains(&from_field) {
+            return 0;
+        }
         to | ((80 + from_field) << 7)
     } else {
-        // 盤上の手: 成りは YaneuraOu の bit15 → hcpe の bit14 へ移す
+        // 盤上の手: from もマス番号範囲内であること。成りは YaneuraOu の bit15 → hcpe の bit14 へ
+        if from_field > 80 {
+            return 0;
+        }
         let promote = if yo_move16 & 0x8000 != 0 { 0x4000 } else { 0 };
         to | (from_field << 7) | promote
     }
@@ -2301,6 +2314,12 @@ mod tests {
         // 移動先マスが範囲外 (to > 80) の破損レコードは 0 (盤上の手・駒打ちとも)
         assert_eq!(hcpe_move16_to_psv(85 | (60 << 7)), 0);
         assert_eq!(hcpe_move16_to_psv(127 | (81 << 7)), 0);
+        // psv→hcpe 方向も対称の検証を持つ: to 範囲外 / 打ちの駒種 0 や 8 以上 / 盤上の手の from 範囲外
+        assert_eq!(psv_move16_to_hcpe(85 | (60 << 7)), 0);
+        assert_eq!(psv_move16_to_hcpe(40 | 0x4000), 0); // 打ちで from=0 (駒種なし)
+        assert_eq!(psv_move16_to_hcpe(40 | (8 << 7) | 0x4000), 0); // 打ちで駒種 8
+        assert_eq!(psv_move16_to_hcpe(40 | (81 << 7)), 0); // 盤上の手で from=81 (B/C 系の破損)
+        assert_eq!(psv_move16_to_hcpe(0), 0);
     }
 
     #[test]
