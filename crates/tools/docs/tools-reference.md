@@ -7,7 +7,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | ツール | 説明 |
 |--------|------|
 | `tournament` | 複数エンジンの round-robin 並列トーナメント。JSONL 出力 |
-| `gensfen` | NNUE 学習用 PSV/pack/hcpe3 教師局面の生成（PSV move16 は実 YaneuraOu 形式、engine vs engine／NativeBackend、native LS progress 係数、千日手裁定、異常終局の全局破棄、宣言勝ち PSV 終端局面、乱択来歴 JSONL 記録） |
+| `gensfen` | NNUE 学習用 PSV/pack/hcpe3 教師局面の生成（PSV move16 は実 YaneuraOu 形式、engine vs engine／NativeBackend、native LS progress 係数、千日手裁定、異常終局の全局破棄、宣言勝ち PSV 終端局面、乱択来歴 JSONL 記録。[詳細](gensfen.md)） |
 | `nyugyoku_gensfen` | CSA manifest から入玉アンカー局面を disk-partition exact dedup で抽出し、checkpoint/resume 付きで gensfen 用 `startpos.txt` と provenance を生成（[詳細](nyugyoku_gensfen.md)） |
 | `csa_client` | USI エンジンを floodgate 等の CSA サーバーに接続して連続対局 |
 | `analyze_selfplay` | 自己対局の JSONL ログを集計。勝率・Elo 差・NPS 等を表示（[詳細](analyze_selfplay.md)） |

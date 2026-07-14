@@ -14,6 +14,13 @@ crates.io への `rshogi-core` publish は (v1.3.0 リリース以降) `vX.Y.Z` 
 
 ## Unreleased
 
+- **gensfen resume の互換性変更**: worker temp を永続 checkpoint として扱い、完了 `game_id` の
+  欠番再実行、全 worker 成果物の result 境界復旧、既定毎対局 fsync、journal による冪等な複数成果物
+  finalization、正常終了 worker 成果物の fail-closed 検証、final 長・staging 中 SHA-256・PSV/sidecar
+  件数検査、fresh run の全 final path 上書き拒否、worker エラーの非ゼロ終了を追加。meta に native/USI
+  実行ファイルと path-valued USI option を含む生成条件 fingerprint・内容 SHA-256 を記録する。従来の
+  fingerprint/commit offset を持たない worker checkpoint は安全に復元できないため resume を拒否する。
+  既存 temp は退避してから新規 run を開始する必要がある。
 - **relabel_psv**: 処理完了時の stderr 統計を human-readable な1行から JSON 1行へ変更。
 
 ## v1.3.0 — 2026-07-11
