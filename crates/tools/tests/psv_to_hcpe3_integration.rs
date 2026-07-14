@@ -131,6 +131,36 @@ fn limit_restricts_output_record_count() {
 }
 
 #[test]
+fn record_without_move_is_skipped_and_counted() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let input = dir.path().join("terminal.psv");
+    let out = dir.path().join("terminal.hcpe3");
+    let fixture_bytes = std::fs::read(fixture("psv_to_hcpe3_yaneuraou_sample.psv")).unwrap();
+    let mut terminal = fixture_bytes[..40].to_vec();
+    terminal[34..36].copy_from_slice(&0u16.to_le_bytes());
+    std::fs::write(&input, terminal).unwrap();
+
+    let output = Command::new(BIN)
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--format",
+            "hcpe3",
+        ])
+        .output()
+        .expect("failed to run psv_to_hcpe3");
+
+    assert!(output.status.success());
+    assert_eq!(std::fs::metadata(out).unwrap().len(), 0);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("有効な着手を持たないレコードをスキップ: 1 レコード (move16=0)")
+    );
+}
+
+#[test]
 fn output_is_thread_count_independent() {
     // 出力はスレッド数・チャンク境界に依らず bit 一致でなければならない。
     let input = fixture("psv_to_hcpe3_yaneuraou_sample.psv");

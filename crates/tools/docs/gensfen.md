@@ -24,7 +24,7 @@ cargo build -p tools --bin gensfen --release
 ./target/release/gensfen \
   --eval-file eval/model.bin \
   --startpos-file start_sfens_ply24.txt \
-  --games 100000 --nodes 80000 --concurrency 30 --max-moves 320 --hash-mb 128
+  --games 100000 --nodes 80000 --concurrency 30 --max-moves 512 --hash-mb 128
 ```
 
 ## 出力ファイル
@@ -60,6 +60,7 @@ KIF が必要な場合は `tournament` バイナリで対局を回し、その�
 | `final_points_black` / `final_points_white` | CSA 27点法の宣言点数 |
 | `king_in_enemy_black` / `king_in_enemy_white` | 自玉が敵陣三段内にいるか |
 | `enemy_zone_pieces_black` / `enemy_zone_pieces_white` | 敵陣三段内の自駒数（玉除く） |
+| `adopted` | 終局理由が教師データ採用対象か。異常終局では `false`。`true` でも dedup や出力形式の制約により書き出し局面数が 0 の場合がある |
 | `diversions` | `--random-multi-pv` / `--random-move-count` で PV1 以外を選んだ来歴配列 |
 
 `diversions` の各要素は次の形:
@@ -129,8 +130,8 @@ TT/履歴が共有されるため棋力評価には不向きだが、教師局�
 | `--engine-path PATH` | (USI 時必須) | エンジンバイナリパス |
 | `--engine-path-black/white PATH` | — | 先後別エンジン |
 | `--engine-args ARG...` | — | エンジンに渡す追加引数 |
-| `--usi-option "Name=Value"` | — | USI オプション（複数指定可） |
-| `--threads N` | 1 | Threads オプション |
+| `--usi-option "Name=Value"` | — | USI オプション（複数指定可）。NativeBackend では無視され、`EnteringKingRule` 指定時は警告 |
+| `--threads N` | 1 | USI モードの Threads オプション。NativeBackend では無視 |
 | `--hash-mb N` | 1024 | ハッシュサイズ（MiB） |
 | `--network-delay N` / `--network-delay2 N` | — | NetworkDelay USI オプション |
 | `--minimum-thinking-time N` | — | MinimumThinkingTime USI オプション |
@@ -172,7 +173,7 @@ position sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1
 |-----------|-----------|------|
 | `--dedup-hash-size N` | 67108864 (64M / 512MB) | 局面 Zobrist ハッシュ重複検出テーブル（0 で無効） |
 | `--random-multi-pv N` | 0（無効） | MultiPV ランダム選択の候補数 |
-| `--random-multi-pv-diff N` | 32000 | MultiPV 評価値差閾値（centipawns） |
+| `--random-multi-pv-diff N` | MultiPV 有効時に必須 | MultiPV 評価値差閾値（centipawns） |
 | `--random-move-count N` | 0 | ランダムムーブ回数 |
 | `--random-move-min-ply N` | 1 | ランダムムーブ開始手数 |
 | `--random-move-max-ply N` | 24 | ランダムムーブ終了手数 |
@@ -208,7 +209,7 @@ canonicalize してから残りの未存在コンポーネントを正規化す�
 
 ### ハッシュ重複検出（`--dedup-hash-size`）
 
-局面の Zobrist ハッシュをテーブルに記録し、既出局面を検出する。重複検出時は:
+局面の Zobrist ハッシュをテーブルに記録し、既出局面を検出する。通常手の局面で重複検出した場合は:
 1. それまでに蓄積した学習エントリを全クリア
 2. 重複局面自体は記録しない
 3. 対局は続行（以降のユニーク局面は通常通り記録）
@@ -231,6 +232,11 @@ seed で順列を再構築し、完了済み対局数分だけ進めることで
 ランダムに選択してプレイする。学習データには PV1 のスコアと手を記録する（局面の真の評価値）。
 多様な局面を自然に生成できる。
 PV1 以外が選ばれた手は result 行の `diversions` に `kind=multipv` として記録される。
+
+`--random-multi-pv` を 2 以上にする場合、`--random-multi-pv-diff` の明示指定が必須になる。
+局面・探索条件によって安全な評価値差が異なるため、危険な全候補許容値を暗黙に使わず
+fail-closed にする。たとえば 100 cp 以内だけを候補にする場合は
+`--random-multi-pv 8 --random-multi-pv-diff 100` と指定する。
 
 **推奨ユースケース**: 対局数が開始局面数を大幅に上回る場合（例: 50万局 vs 3万局面プール）。
 開始局面の no-repeat だけでは 2 周目以降に同一対局が再現されるため、MultiPV ランダム
@@ -292,7 +298,62 @@ PackedSfenValue 形式（40バイト/局面）で、Nodchip learner 互換。
 | 38 | 1 | game_result（1=勝ち, 0=引き分け, -1=負け、手番視点） |
 | 39 | 1 | padding |
 
-手数制限やタイムアウトで終了した対局（InProgress）の局面は含まれない。
+### 終局理由と教師データへの採否
+
+| `reason` | 裁定 | 教師データ |
+|----------|------|--------------|
+| `mate` | 詰まされた側の負け | 採用 |
+| `resign` | 投了側の負け | 採用 |
+| `win` | 宣言側の勝ち | 採用 |
+| `sennichite` | 通常千日手の引き分け | 採用（`game_result=0`） |
+| `perpetual_check` | 連続王手側の負け | 採用 |
+| `max_moves` | 最大手数到達の引き分け | 採用（`game_result=0`） |
+| `timeout` | 調査用ログでは相手勝ち | 対局全体を破棄 |
+| `illegal_move` | 調査用ログでは相手勝ち | 対局全体を破棄 |
+| `no_bestmove` | 合法手があるのに指し手なし。調査用ログでは相手勝ち | 対局全体を破棄 |
+
+破棄対象では、その対局中に収集済みの全局面を捨て、部分採用しない。result JSONL 行は
+調査用に残り、`adopted=false` で判別できる。終了時の Training Data stdout サマリには、
+異常終局が1局以上あった場合だけ `timeout`、`illegal_move`、`no_bestmove` ごとの破棄対局数と
+破棄局面数を出す。破棄局面数は `finish_game` 時点で収集器に残っていたエントリ数であり、
+途中の dedup hit やランダムムーブによって既に捨てられた局面は含まない。
+
+通常千日手は、対局開始局面を含む局内の全局面履歴を対象に、4回目の同一局面成立直後に
+終局する。周期の長さによる遡及制限はない。循環中に一方がすべての自手で王手を続けていた
+場合は連続王手千日手とし、王手側の負けとして裁定する。
+
+### 宣言勝ち局面
+
+PSV では `bestmove win` を受け取った現在局面を終端局面として追加する。`score` は探索値に
+よらず宣言側勝ちの飽和値 `+10000` に固定する。宣言勝ちはローカル検証で確定した勝ちであり、
+探索値より強い情報だからである。通常の指し手が存在しないため `move16=0`、`game_result=1` になる。
+通常局面と同じ共有 dedup を通すが、dedup hit 時は終端局面だけを記録せず、それまでに蓄積した
+局面は採用する。通常手の dedup hit 後は対局を続けて局面を再収集できるのに対し、終端では
+再収集の機会がなく、蓄積分まで破棄するとその入玉譜を丸ごと失うためである。終了時の
+Training Data stdout サマリには、終端局面が重複のため記録されなかった対局数を出す。
+
+`move16=0` は policy 手ではなく「有効な着手を持たないレコード」を表す。宣言勝ち終端のほか、
+局面置換によって元の指し手が無効になった既存 PSV でも使われる。局面単位で score / 勝敗を
+扱う `rescore_psv`、`relabel_psv`、フィルタ・検証・JSONL 変換・PSV replay 表示の各経路は
+この値を保持または着手なし表示として扱える。`psv_to_hcpe3` の hcpe3 / hcpe は有効な policy 手を
+必須とするため、有効な着手を持たないレコードを変換対象外としてスキップし、専用件数を
+サマリへ出す。
+
+pack / hcpe3 は move16 の手列を replay する形式なので、`win` という擬似着手は追加せず、
+記録しない終端局面の dedup 判定も行わない。したがって終端局面が共有テーブルに挿入されたり、
+その重複を理由に収集済みの対局局面が破棄されたりすることはない。
+終局以前の収集済み手列と勝敗は通常どおり出力する。native / USI のどちらでも `bestmove win` は
+同じ側のルール（native は CSA 27点法、USI は `EnteringKingRule` オプション、未指定時は
+CSA 27点法）を使って `Position::declaration_win()` で検証する。不成立なら `illegal_move` として
+対局全体を破棄する。`NoEnteringKing` では宣言勝ちが発生しない。`TryRule` は成立時に
+`Move::WIN` ではなく玉の実移動を返す。その成立手を実際に指した直後に着手側の勝ちとして
+終局し、終局前に記録した局面へ勝敗を付与する。`TryRule` で宣言可能でも `bestmove win` は
+正しい応答ではなく、`NoEnteringKing` の `bestmove win` と同様に `illegal_move` として対局全体を
+破棄する。
+
+NativeBackend の入玉ルールは CSA 27点法固定で、`--usi-option EnteringKingRule=...` は適用されない。
+NativeBackend でこの指定を検出した場合は stderr に警告する。別ルールを使う場合は
+`--native=false` で、そのルールを実装する USI エンジンに同オプションを渡す。
 
 ### pack 形式
 
@@ -360,7 +421,7 @@ policy の票数は各候補の eval を温度 `--hcpe3-policy-temp` の softmax
   --startpos-file start_sfens_ply24.txt \
   --games 100000 \
   --depth 9 --nodes 80000 \
-  --concurrency 30 --max-moves 320 --hash-mb 128
+  --concurrency 30 --max-moves 512 --hash-mb 128
 ```
 
 ### 再開可能な大規模生成
@@ -387,4 +448,7 @@ policy の票数は各候補の eval を温度 `--hcpe3-policy-temp` の softmax
 各行が独立した JSON オブジェクト。`type` フィールドで種別を判別:
 
 - `"meta"`: セッション設定（1行目に1回のみ）
-- `"result"`: 対局結果（`outcome`: `"black_win"` / `"white_win"` / `"draw"`）
+- `"result"`: 対局結果（`outcome`: `"black_win"` / `"white_win"` / `"draw"`、
+  `adopted`: 終局理由が教師データ採用対象なら `true`）。`adopted=true` は出力件数を保証せず、
+  dedup で蓄積局面が消えた対局、PSV の宣言勝ち終端が `--skip-initial-ply` の対象になった対局、
+  pack / hcpe3 で終局前の記録対象局面がない対局でも `true` になり得る。

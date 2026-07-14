@@ -5,7 +5,7 @@ dlshogi の学習で使う **hcpe3** / **hcpe** 形式へストリーミング�
 
 - 入力: PackedSfenValue 40 バイト固定長ファイル
 - 出力: `--format hcpe3`（既定, 46 バイト固定長）または `--format hcpe`（38 バイト固定長）
-- 特徴: cshogi 製変換スクリプトと **byte 完全一致**、チャンクストリーミングで
+- 特徴: 通常の着手レコードは cshogi 製変換スクリプトと **byte 完全一致**、チャンクストリーミングで
   ピークメモリを入力件数に非依存、スレッド数に依らず bit 一致
 
 入力の move16 は実 YaneuraOu 形式 (A: bit14=駒打ち、bit15=成り) が前提です。
@@ -16,6 +16,14 @@ dlshogi の `train.py` は学習データに hcpe3（対局単位 + 候補手 vi
 PSV は局面単位（棋譜構造を持ちません）。そこで各 PSV 局面を「1 局面 = 1 game」の
 退化した hcpe3（`moveNum=1` / `candidateNum=1` / `visitNum=1`）として書き出します。
 policy target は best move の one-hot、value は PSV の評価値から取ります。
+
+`move16=0` は有効な着手を持たないレコードを表します。宣言勝ち終端のほか、局面置換によって
+元の指し手が無効になった既存 PSV でも使われます。one-hot policy や hcpe の `bestMove16` を
+構成できないため、このツールは hcpe3 / hcpe のどちらでも該当レコードをスキップし、破損
+レコードとは分けて `有効な着手を持たないレコードをスキップ: N レコード (move16=0)` と
+サマリ表示します。
+着手なしを有効な候補手として出力すると replay と policy の規約を破るため、value だけを残す
+独自表現には変換しません。
 
 ## 出力形式
 
@@ -112,13 +120,15 @@ cargo run -p tools --release --bin psv_to_hcpe3 -- \
   一時ファイル（`<output>.partial`）に書き、正常完了時のみ最終パスへ `rename`
   します（中断時に壊れた出力を残さない）。**実行中は最終パスが存在しないのが正常**で、
   途中経過は `<output>.partial` を見ます。
+- `move16=0` の有効な着手を持たないレコードもスキップしますが、入力破損ではないため変換エラー件数とは
+  分けて集計します。ピークメモリと出力順の決定性には影響しません。
 - 進捗表示は TTY では progress bar、非 TTY（background / リダイレクト）では
   数秒ごとのテキスト行（処理件数・rec/s・ETA）で出力します（background 実行が
   「無反応」に見えないようにするため）。
 
 ## bit 一致の検証
 
-`tests/psv_to_hcpe3_integration.rs` が、cshogi 製オラクル（`psv_to_hcpe3.py` /
+`tests/psv_to_hcpe3_integration.rs` が、通常の着手レコードについて cshogi 製オラクル（`psv_to_hcpe3.py` /
 dlshogi `psv_to_hcpe.py`）の出力と byte 完全一致することを検証します。fixture は
 rshogi 自前の gensfen 自己対局 PSV から、通常手・駒打ち・成り × 先後 × 勝敗を
 網羅するよう抽出した 56 局面です（`tests/fixtures/psv_to_hcpe3_sample.*`）。
