@@ -24,11 +24,14 @@ ADR [`docs/decisions/2026-05-24-build-edition-flavor-design.md`][adr] を参照�
 - 並列探索を活かす場合は AVX2 以上の CPU
 - NNUE モデルは別途用意 (起動時 `setoption name EvalFile value <path>` で指定)
 - **LayerStack (LS) 系 preset** (`edition-layerstacks*` および `edition-universal`) を動かす
-  場合は加えて progress バケット重み (`progress.bin`) も必要:
+  場合、既定の `LS_BUCKET_MODE=progress8kpabs` では加えて progress バケット重み
+  (`progress.bin`) も必要:
   `setoption name LS_PROGRESS_COEFF value <progress.bin path>`。
-  `LS_BUCKET_MODE` の default が `progress8kpabs` で他選択肢が無いため、
-  `nnue-progress-diff` feature の有無に関わらず LS 系経路を通る binary は
-  すべて progress.bin 指定が必須。HalfKX 単一 preset (`edition-halfkp-*` /
+  両玉の相対段で 9 bucket を選ぶモデルでは
+  `setoption name LS_BUCKET_MODE value kingrank9` を指定し、この場合
+  `LS_PROGRESS_COEFF` は不要。`nnue-progress-diff` feature の有無に関わらず、
+  `progress8kpabs` を使う LS 系経路では progress.bin 指定が必須。HalfKX 単一 preset
+  (`edition-halfkp-*` /
   `edition-halfka_hm_merged-*` 等) は LS 経路を通らないので不要。
   現状 progress.bin は `eval/` 配下に同梱されていないため、学習側
   (bullet-shogi 等) で生成したものを参照する運用。

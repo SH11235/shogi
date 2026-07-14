@@ -10,7 +10,7 @@
 //! Feature Transformer (FT::DIMENSIONS 次元): → L1 (各視点)
 //! 視点結合: 両視点を連結 → L1*2
 //! SqrClippedReLU: L1*2 → L1
-//! LayerStacks (両玉の相対段ベースの9バケット選択後):
+//! LayerStacks (選択した bucket ごとのスタック):
 //!   L1: L1 → LS_L1_OUT
 //!   SqrReLU + concat: LS_L2_IN (= 2 * (LS_L1_OUT - 1))
 //!   L2: LS_L2_IN → 32
@@ -19,10 +19,7 @@
 //!
 //! ## バケット選択
 //!
-//! 両玉の相対段（0-8）に基づいて9個のバケットから1つを選択：
-//! - 味方玉の段: 0-2 → 0, 3-5 → 3, 6-8 → 6
-//! - 相手玉の段: 0-2 → 0, 3-5 → 1, 6-8 → 2
-//! - bucket = f_index + e_index (0-8)
+//! `LS_BUCKET_MODE` で `progress8kpabs` または両玉の相対段に基づく `kingrank9` を選ぶ。
 
 use super::accumulator::Aligned;
 use super::accumulator_layer_stacks::{AccumulatorLayerStacks, AccumulatorStackLayerStacks};
@@ -81,11 +78,43 @@ fn compute_layer_stacks_bucket_index(
     num_buckets: usize,
 ) -> usize {
     match get_layer_stack_bucket_mode() {
+        LayerStackBucketMode::KingRank9 => {
+            compute_layer_stack_kingrank9_bucket_index(pos, side_to_move, num_buckets)
+        }
         LayerStackBucketMode::Progress8KPAbs => {
             let weights = get_layer_stack_progress_kpabs_weights();
             compute_layer_stack_progress8kpabs_bucket_index(pos, side_to_move, weights, num_buckets)
         }
     }
+}
+
+/// YaneuraOu KingRank9 と同じ両玉の相対段から bucket index を計算する。
+///
+/// ネットワークの bucket 数が 9 未満なら、末尾 bucket へ clamp する。
+#[inline]
+pub fn compute_layer_stack_kingrank9_bucket_index(
+    pos: &Position,
+    side_to_move: Color,
+    num_buckets: usize,
+) -> usize {
+    const F_TO_INDEX: [usize; 9] = [0, 0, 0, 3, 3, 3, 6, 6, 6];
+    const E_TO_INDEX: [usize; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
+
+    let f_king = pos.king_square(side_to_move);
+    let e_king = pos.king_square(!side_to_move);
+    let f_rank = if side_to_move == Color::Black {
+        f_king.rank().index()
+    } else {
+        f_king.inverse().rank().index()
+    };
+    let e_rank = if side_to_move == Color::Black {
+        e_king.inverse().rank().index()
+    } else {
+        e_king.rank().index()
+    };
+    let bucket = F_TO_INDEX[f_rank] + E_TO_INDEX[e_rank];
+
+    bucket.min(num_buckets.saturating_sub(1))
 }
 
 /// i16 配列の要素和: dst[i] = a[i] + b[i] (SIMD 最適化)
@@ -649,7 +678,7 @@ impl<
         info!("[NNUE Eval] transformed first 32: {:?}", &transformed.0[0..32]);
 
         // バケットインデックスを計算（通常パスと同じ共通関数を使用）
-        let bucket_index = compute_layer_stacks_bucket_index(pos, side_to_move);
+        let bucket_index = compute_layer_stacks_bucket_index(pos, side_to_move, self.num_buckets);
         info!(
             "[NNUE Eval] bucket_mode={:?}, bucket_index={bucket_index}",
             get_layer_stack_bucket_mode()
@@ -2067,6 +2096,59 @@ mod tests {
     use crate::position::{Position, SFEN_HIRATE};
 
     const TEST_L1: usize = NNUE_PYTORCH_L1;
+
+    #[cfg(feature = "layerstack-arch")]
+    #[test]
+    fn test_kingrank9_oracle_fixtures() {
+        let fixtures = [
+            (
+                "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
+                8,
+                "先手番: 自玉5iは f_rank=8 で kF=6、敵玉5aは反転後 e_rank=8 で kE=2",
+            ),
+            (
+                "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL w - 1",
+                8,
+                "後手番: 自玉5aは反転後 f_rank=8 で kF=6、敵玉5iは e_rank=8 で kE=2",
+            ),
+            (
+                "4K4/9/9/9/9/9/4k4/9/9 b - 1",
+                0,
+                "先手番: 自玉5aは f_rank=0 で kF=0、敵玉5gは反転後 e_rank=2 で kE=0",
+            ),
+            (
+                "9/9/9/K8/8k/9/9/9/9 b - 1",
+                4,
+                "先手番: 自玉9dは f_rank=3 で kF=3、敵玉1eは反転後 e_rank=4 で kE=1",
+            ),
+        ];
+
+        for (sfen, expected, reason) in fixtures {
+            let mut pos = Position::new();
+            pos.set_sfen(sfen).expect("oracle SFEN should be valid");
+
+            // rshogi は段一=0、段九=8 で YO と同じ。inverse() が YO の Inv(sq) に対応する。
+            assert_eq!(
+                compute_layer_stack_kingrank9_bucket_index(
+                    &pos,
+                    pos.side_to_move(),
+                    DEFAULT_NUM_BUCKETS,
+                ),
+                expected,
+                "{reason}"
+            );
+        }
+    }
+
+    #[cfg(feature = "layerstack-arch")]
+    #[test]
+    fn test_kingrank9_clamps_to_network_bucket_count() {
+        let mut pos = Position::new();
+        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
+            .unwrap();
+
+        assert_eq!(compute_layer_stack_kingrank9_bucket_index(&pos, Color::Black, 4), 3);
+    }
 
     #[cfg(feature = "nnue-threat")]
     #[test]

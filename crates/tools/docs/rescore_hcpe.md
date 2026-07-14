@@ -67,8 +67,8 @@ rescore_hcpe \
 | `--out-dir <DIR>` | （必須） | 出力先。入力ファイル名と同名で hcpe を書く（= resume の単位） |
 | `--nnue <PATH>` | （必須） | labeler の NNUE モデル |
 | `--fv-scale <i32>` | 0 | FV_SCALE（0=ヘッダ自動、none/threat LayerStacks 系は 28） |
-| `--ls-bucket-mode <STR>` | — | LayerStacks bucket mode（LS ビルドでは既定なので通常不要） |
-| `--ls-progress-coeff <PATH>` | — | progress8kpabs 用係数（LS + progress8kpabs で必須） |
+| `--ls-bucket-mode <STR>` | — | LayerStacks bucket mode (`progress8kpabs` / `kingrank9`)。既定は `progress8kpabs` |
+| `--ls-progress-coeff <PATH>` | — | progress8kpabs 用係数（LS + progress8kpabs で必須、kingrank9 では不要） |
 | `--spsa-params <PATH>` | — | SPSA 探索 params（USI `SPSAParamsFile` 同形式）を各局面の探索へ適用。未指定は engine 既定値 |
 | `--depth <i32>` | 15 | 探索深さ（固定 depth ラベリング） |
 | `--nodes <u64>` | 0 | 探索ノード上限（0=無制限）。depth を binding にするなら 0 |

@@ -122,11 +122,10 @@ pub fn parse_nnue_architecture(value: &str) -> Option<NNUEArchitectureOverride> 
 }
 
 /// LayerStacks の bucket 選択モード
-///
-/// 現在は `Progress8KPAbs`（YaneuraOu 互換 progress.bin）のみをサポートする。
-/// enum として残しているのは将来の bucket mode 追加に備えた前方互換性のため。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerStackBucketMode {
+    /// 両玉の相対段で 9 バケットを選択する YaneuraOu 互換方式
+    KingRank9 = 0,
     /// 進行度方式(KP-absolute): YaneuraOu 互換 progress.bin で 8 バケットへ分割（bucket8は未使用）
     Progress8KPAbs = 4,
 }
@@ -134,6 +133,7 @@ pub enum LayerStackBucketMode {
 impl LayerStackBucketMode {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::KingRank9 => "kingrank9",
             Self::Progress8KPAbs => "progress8kpabs",
         }
     }
@@ -246,9 +246,10 @@ pub fn set_fv_scale_override(value: i32) {
 
 /// LayerStacks bucket mode を取得
 pub fn get_layer_stack_bucket_mode() -> LayerStackBucketMode {
-    // 現状は Progress8KPAbs のみ。int mapping は将来のモード追加用。
-    let _ = LAYER_STACK_BUCKET_MODE.load(Ordering::Relaxed);
-    LayerStackBucketMode::Progress8KPAbs
+    match LAYER_STACK_BUCKET_MODE.load(Ordering::Relaxed) {
+        0 => LayerStackBucketMode::KingRank9,
+        _ => LayerStackBucketMode::Progress8KPAbs,
+    }
 }
 
 /// LayerStacks bucket mode を設定
@@ -927,6 +928,7 @@ pub fn parse_fv_scale_from_arch(arch_str: &str) -> Option<i32> {
 /// LayerStacks bucket mode をパース
 pub fn parse_layer_stack_bucket_mode(value: &str) -> Option<LayerStackBucketMode> {
     match value.trim().to_ascii_lowercase().as_str() {
+        "kingrank9" => Some(LayerStackBucketMode::KingRank9),
         "progress8kpabs" => Some(LayerStackBucketMode::Progress8KPAbs),
         _ => None,
     }
@@ -2159,6 +2161,14 @@ mod tests {
     #[test]
     fn test_parse_layer_stack_bucket_mode() {
         assert_eq!(
+            parse_layer_stack_bucket_mode("kingrank9"),
+            Some(LayerStackBucketMode::KingRank9)
+        );
+        assert_eq!(
+            parse_layer_stack_bucket_mode(" KINGRANK9 "),
+            Some(LayerStackBucketMode::KingRank9)
+        );
+        assert_eq!(
             parse_layer_stack_bucket_mode("progress8kpabs"),
             Some(LayerStackBucketMode::Progress8KPAbs)
         );
@@ -2173,7 +2183,6 @@ mod tests {
         assert_eq!(parse_layer_stack_bucket_mode("unknown"), None);
         assert_eq!(parse_layer_stack_bucket_mode("progress8"), None);
         assert_eq!(parse_layer_stack_bucket_mode("progress8gikou"), None);
-        assert_eq!(parse_layer_stack_bucket_mode("kingrank9"), None);
         assert_eq!(parse_layer_stack_bucket_mode("ply9"), None);
     }
 
