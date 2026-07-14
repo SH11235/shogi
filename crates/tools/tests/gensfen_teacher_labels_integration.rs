@@ -25,6 +25,10 @@ mod unix {
         script
             .push_str("    go*)\n      go_count=$((go_count + 1))\n      case \"$go_count\" in\n");
         for (index, bestmove) in bestmoves.iter().enumerate() {
+            if *bestmove == "<timeout>" {
+                writeln!(script, "        {}) : ;;", index + 1).unwrap();
+                continue;
+            }
             let score = if *bestmove == "win" { -300 } else { 0 };
             writeln!(
                 script,
@@ -175,6 +179,37 @@ mod unix {
         let stdout = String::from_utf8_lossy(&run.output.stdout);
         assert!(stdout.contains("no_bestmove=1"));
         assert!(stdout.contains("1 collected positions discarded at game end"));
+    }
+
+    #[test]
+    fn abnormal_games_do_not_dedup_positions_from_following_normal_games() {
+        for (name, abnormal_move, extra_args) in [
+            (
+                "timeout-then-normal",
+                "<timeout>",
+                vec!["--byoyomi", "1", "--timeout-margin-ms", "1"],
+            ),
+            ("illegal-then-normal", "garbage", vec![]),
+            ("none-then-normal", "none", vec![]),
+        ] {
+            let run = run_gensfen_config(
+                name,
+                &["7g7f", abnormal_move, "7g7f", "3c3d"],
+                false,
+                2,
+                None,
+                2,
+                1024,
+                &extra_args,
+            );
+
+            assert_eq!(psv_records(&run).len(), 2, "{name}");
+            assert!(
+                !String::from_utf8_lossy(&run.output.stderr).contains("dedup_hits="),
+                "{name}: {}",
+                String::from_utf8_lossy(&run.output.stderr)
+            );
+        }
     }
 
     #[test]

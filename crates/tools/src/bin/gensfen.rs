@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -1115,13 +1116,22 @@ impl SharedDedupHash {
         }
     }
 
+    fn effective_key(key: u64) -> u64 {
+        // key=0 は未使用エントリと区別できないので特殊扱い
+        if key == 0 { 1 } else { key }
+    }
+
+    fn contains(&self, key: u64) -> bool {
+        let effective_key = Self::effective_key(key);
+        let idx = (effective_key & self.mask) as usize;
+        self.table[idx].load(Ordering::Relaxed) == effective_key
+    }
+
     /// 重複なら true を返し、新規なら挿入して false を返す
     fn check_and_insert(&self, key: u64) -> bool {
-        // key=0 は未使用エントリと区別できないので特殊扱い
-        let effective_key = if key == 0 { 1 } else { key };
+        let effective_key = Self::effective_key(key);
         let idx = (effective_key & self.mask) as usize;
-        let old = self.table[idx].load(Ordering::Relaxed);
-        if old == effective_key {
+        if self.table[idx].load(Ordering::Relaxed) == effective_key {
             return true;
         }
         self.table[idx].store(effective_key, Ordering::Relaxed);
@@ -1129,8 +1139,34 @@ impl SharedDedupHash {
     }
 }
 
+#[derive(Default)]
+struct PendingDedupKeys {
+    ordered: Vec<u64>,
+    unique: HashSet<u64>,
+}
+
+impl PendingDedupKeys {
+    fn check_and_stage(&mut self, dedup_hash: &SharedDedupHash, key: u64) -> bool {
+        let effective_key = SharedDedupHash::effective_key(key);
+        let shared_hit = dedup_hash.contains(effective_key);
+        let first_encounter = self.unique.insert(effective_key);
+        if first_encounter {
+            self.ordered.push(effective_key);
+        }
+        shared_hit || !first_encounter
+    }
+
+    fn publish(&self, dedup_hash: &SharedDedupHash) {
+        // 同じ対局からの反映順を初回遭遇順に固定するため、ordered をそのまま走査する。
+        for &key in &self.ordered {
+            dedup_hash.check_and_insert(key);
+        }
+    }
+}
+
 fn check_training_position_dedup(
     dedup_hash: Option<&SharedDedupHash>,
+    pending_keys: &mut PendingDedupKeys,
     key: u64,
     collector: Option<&mut TrainingDataCollector>,
     dedup_hits: &mut u64,
@@ -1143,7 +1179,7 @@ fn check_training_position_dedup(
     };
 
     *interval_positions_checked += 1;
-    if !dedup_hash.check_and_insert(key) {
+    if !pending_keys.check_and_stage(dedup_hash, key) {
         return false;
     }
 
@@ -1159,6 +1195,7 @@ fn check_training_position_dedup(
 fn check_declaration_win_position_dedup(
     format: TrainingFormat,
     dedup_hash: Option<&SharedDedupHash>,
+    pending_keys: &mut PendingDedupKeys,
     key: u64,
     collector: Option<&mut TrainingDataCollector>,
     dedup_hits: &mut u64,
@@ -1173,7 +1210,7 @@ fn check_declaration_win_position_dedup(
     };
 
     *interval_positions_checked += 1;
-    if !dedup_hash.check_and_insert(key) {
+    if !pending_keys.check_and_stage(dedup_hash, key) {
         return false;
     }
 
@@ -1787,6 +1824,7 @@ fn worker_main(
             let mut eval_list: Vec<String> = Vec::new();
             let mut diversions: Vec<DiversionLog> = Vec::new();
             let mut metrics = MetricsCollector::default();
+            let mut pending_dedup_keys = PendingDedupKeys::default();
 
             if let Some(ref mut collector) = training_data_collector {
                 collector.start_game();
@@ -1952,6 +1990,7 @@ fn worker_main(
                                 let skip_record = check_declaration_win_position_dedup(
                                     cfg.training_format,
                                     dedup_hash.as_deref(),
+                                    &mut pending_dedup_keys,
                                     pos.key(),
                                     training_data_collector.as_mut(),
                                     &mut dedup_hits,
@@ -1995,6 +2034,7 @@ fn worker_main(
                                     // 全ワーカーで共有するテーブルで重複チェック（tanuki-と同じ構成）
                                     let skip_record = check_training_position_dedup(
                                         dedup_hash.as_deref(),
+                                        &mut pending_dedup_keys,
                                         pos.key(),
                                         training_data_collector.as_mut(),
                                         &mut dedup_hits,
@@ -2176,6 +2216,11 @@ fn worker_main(
 
             if let Some(ref mut collector) = training_data_collector {
                 collector.finish_game(outcome, training_disposition, game_idx + 1)?;
+            }
+            if training_disposition.is_adopted()
+                && let Some(dedup_hash) = dedup_hash.as_deref()
+            {
+                pending_dedup_keys.publish(dedup_hash);
             }
             writer.flush()?;
 
@@ -3783,6 +3828,176 @@ mod tests {
     }
 
     #[test]
+    fn abnormal_games_do_not_publish_pending_dedup_keys() {
+        for reason in [
+            AbnormalEndReason::Timeout,
+            AbnormalEndReason::IllegalMove,
+            AbnormalEndReason::NoBestmove,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("abnormal.psv");
+            let mut collector =
+                TrainingDataCollector::new(&path, 0, false, TrainingFormat::Psv, 1000, 600.0, None)
+                    .unwrap();
+            let dedup = SharedDedupHash::new(1024);
+            let mut pending = PendingDedupKeys::default();
+            let mut hits = 0;
+            let mut discarded = 0;
+            let mut interval_hits = 0;
+            let mut interval_checked = 0;
+            let mut pos = Position::new();
+            pos.set_hirate();
+            let mv = Move::from_usi("7g7f").unwrap();
+
+            assert!(!check_training_position_dedup(
+                Some(&dedup),
+                &mut pending,
+                pos.key(),
+                Some(&mut collector),
+                &mut hits,
+                &mut discarded,
+                &mut interval_hits,
+                &mut interval_checked,
+            ));
+            collector.record_position(&pos, Some(10), None, Some(mv), mv, &[]);
+            collector
+                .finish_game(GameOutcome::WhiteWin, TrainingDisposition::Discard(reason), 1)
+                .unwrap();
+
+            let mut next_game_pending = PendingDedupKeys::default();
+            assert!(!check_training_position_dedup(
+                Some(&dedup),
+                &mut next_game_pending,
+                pos.key(),
+                Some(&mut collector),
+                &mut hits,
+                &mut discarded,
+                &mut interval_hits,
+                &mut interval_checked,
+            ));
+        }
+    }
+
+    #[test]
+    fn pending_dedup_keys_detect_duplicates_within_game() {
+        let dedup = SharedDedupHash::new(1024);
+        let mut pending = PendingDedupKeys::default();
+        let mut hits = 0;
+        let mut discarded = 0;
+        let mut interval_hits = 0;
+        let mut interval_checked = 0;
+
+        assert!(!check_training_position_dedup(
+            Some(&dedup),
+            &mut pending,
+            12345,
+            None,
+            &mut hits,
+            &mut discarded,
+            &mut interval_hits,
+            &mut interval_checked,
+        ));
+        assert!(check_training_position_dedup(
+            Some(&dedup),
+            &mut pending,
+            12345,
+            None,
+            &mut hits,
+            &mut discarded,
+            &mut interval_hits,
+            &mut interval_checked,
+        ));
+        assert_eq!((hits, discarded, interval_hits, interval_checked), (1, 0, 1, 2));
+        assert!(!dedup.contains(12345));
+    }
+
+    #[test]
+    fn pending_dedup_collision_keeps_exact_set_semantics_through_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collision.psv");
+        let mut collector =
+            TrainingDataCollector::new(&path, 0, false, TrainingFormat::Psv, 1000, 600.0, None)
+                .unwrap();
+        let dedup = SharedDedupHash::new(2);
+        let mut pending = PendingDedupKeys::default();
+        let mut hits = 0;
+        let mut discarded = 0;
+        let mut interval_hits = 0;
+        let mut interval_checked = 0;
+        let mut pos = Position::new();
+        pos.set_hirate();
+        let mv = Move::from_usi("7g7f").unwrap();
+
+        assert!(!check_training_position_dedup(
+            Some(&dedup),
+            &mut pending,
+            2,
+            Some(&mut collector),
+            &mut hits,
+            &mut discarded,
+            &mut interval_hits,
+            &mut interval_checked,
+        ));
+        collector.record_position(&pos, Some(10), None, Some(mv), mv, &[]);
+        assert!(!check_training_position_dedup(
+            Some(&dedup),
+            &mut pending,
+            4,
+            Some(&mut collector),
+            &mut hits,
+            &mut discarded,
+            &mut interval_hits,
+            &mut interval_checked,
+        ));
+        collector.record_position(&pos, Some(20), None, Some(mv), mv, &[]);
+        assert!(check_training_position_dedup(
+            Some(&dedup),
+            &mut pending,
+            2,
+            Some(&mut collector),
+            &mut hits,
+            &mut discarded,
+            &mut interval_hits,
+            &mut interval_checked,
+        ));
+        assert_eq!((hits, discarded, interval_hits, interval_checked), (1, 2, 1, 3));
+
+        pending.publish(&dedup);
+        assert!(!dedup.contains(2));
+        assert!(dedup.contains(4));
+    }
+
+    #[test]
+    fn shared_hit_remains_pending_after_colliding_publish() {
+        let dedup = SharedDedupHash::new(2);
+        assert!(!dedup.check_and_insert(2));
+
+        let mut game_pending = PendingDedupKeys::default();
+        assert!(game_pending.check_and_stage(&dedup, 2));
+        assert_eq!(game_pending.ordered, vec![2]);
+
+        let mut colliding_pending = PendingDedupKeys::default();
+        assert!(!colliding_pending.check_and_stage(&dedup, 4));
+        colliding_pending.publish(&dedup);
+        assert!(!dedup.contains(2));
+        assert!(dedup.contains(4));
+
+        assert!(game_pending.check_and_stage(&dedup, 2));
+        assert_eq!(game_pending.ordered, vec![2]);
+    }
+
+    #[test]
+    fn adopted_game_publishes_pending_dedup_keys() {
+        let dedup = SharedDedupHash::new(1024);
+        let mut first_game_pending = PendingDedupKeys::default();
+        assert!(!first_game_pending.check_and_stage(&dedup, 12345));
+        first_game_pending.publish(&dedup);
+
+        let mut next_game_pending = PendingDedupKeys::default();
+        assert!(next_game_pending.check_and_stage(&dedup, 12345));
+    }
+
+    #[test]
     fn shuffled_startpos_covers_all_indices() {
         let mut s = ShuffledStartpos::new(5, 42);
         let mut seen = std::collections::HashSet::new();
@@ -4281,10 +4496,12 @@ mod tests {
         let mut hits = 0;
         let mut interval_hits = 0;
         let mut interval_checked = 0;
+        let mut first_game_pending = PendingDedupKeys::default();
 
         let first_is_duplicate = check_declaration_win_position_dedup(
             TrainingFormat::Psv,
             Some(&dedup),
+            &mut first_game_pending,
             declaration_pos.key(),
             Some(&mut collector),
             &mut hits,
@@ -4296,8 +4513,10 @@ mod tests {
         collector
             .finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 1)
             .unwrap();
+        first_game_pending.publish(&dedup);
 
         collector.start_game();
+        let mut second_game_pending = PendingDedupKeys::default();
         let mut normal_pos = Position::new();
         normal_pos.set_hirate();
         let normal_move = Move::from_usi("7g7f").unwrap();
@@ -4312,6 +4531,7 @@ mod tests {
         let second_is_duplicate = check_declaration_win_position_dedup(
             TrainingFormat::Psv,
             Some(&dedup),
+            &mut second_game_pending,
             declaration_pos.key(),
             Some(&mut collector),
             &mut hits,
@@ -4367,10 +4587,12 @@ mod tests {
             let mut hits = 0;
             let mut interval_hits = 0;
             let mut interval_checked = 0;
+            let mut pending = PendingDedupKeys::default();
 
             assert!(!check_declaration_win_position_dedup(
                 format,
                 Some(&dedup),
+                &mut pending,
                 declaration_pos.key(),
                 Some(&mut collector),
                 &mut hits,
