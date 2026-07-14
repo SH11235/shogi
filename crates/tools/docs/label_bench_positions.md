@@ -43,7 +43,7 @@ target/release/label_bench_positions \
 | `--out <FILE>` | （必須） | 出力 jsonl（入力レコード + 探索結果フィールド） |
 | `--nnue <FILE>` | （必須） | ground truth 評価器の NNUE モデル |
 | `--fv-scale <i32>` | 0 | FV_SCALE オーバーライド（0=ヘッダ自動判定）。評価器に合わせ明示すること（v100 系=28） |
-| `--ls-bucket-mode <STR>` | — | LayerStacks bucket mode。LS ビルドの既定は `progress8kpabs` なので通常は指定不要 |
+| `--ls-bucket-mode <STR>` | — | LayerStacks bucket mode (`progress8kpabs` / `kingrank9`)。既定は `progress8kpabs` |
 | `--ls-progress-coeff <FILE>` | — | progress8kpabs 用の進行度係数（USI `LS_PROGRESS_COEFF` と同じ）。LayerStacks モデルをロードし bucket mode が progress8kpabs のとき必須（非 LS モデルでは不要） |
 | `--depth <i32>` | 25 | 探索深さ上限（0=無制限）。`--nodes` と両方 0 は不可 |
 | `--nodes <u64>` | 500000 | 探索ノード数上限（0=無制限）。深さと併用し先に到達した方で停止。`--depth` と両方 0 は不可 |
@@ -59,6 +59,8 @@ LayerStacks モデルは `init_nnue` のロードだけでは正しく評価で�
   `--ls-progress-coeff` を**必ず**指定してください。未指定だと bucket 選択が学習時と食い違って
   ラベルが静かに狂うため、ツールはエラーで停止します（安全側に倒す）。非 LayerStacks モデル
   （HalfKP 等）では係数は不要です。
+- `--ls-bucket-mode kingrank9` では両玉の相対段から bucket を選ぶため、
+  `--ls-progress-coeff` は不要です。
 - 係数ファイルはモデルごとに異なります。v100 系は `progress_hao_full_cuda.e1.bin`、
   v96 系は `nodchip_progress_e1_f1_cuda.bin` のように学習レシピに対応します。各モデルの
   `eval/<dir>/README.md` を確認してください。

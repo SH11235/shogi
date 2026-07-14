@@ -63,8 +63,9 @@ pub fn configure_eval(cfg: &LabelerEvalConfig) -> Result<()> {
         eprintln!("FV_SCALE: auto-detect (header)");
     }
     if let Some(mode_str) = cfg.ls_bucket_mode {
-        let mode = parse_layer_stack_bucket_mode(mode_str)
-            .with_context(|| format!("invalid --ls-bucket-mode '{mode_str}'"))?;
+        let mode = parse_layer_stack_bucket_mode(mode_str).with_context(|| {
+            format!("invalid --ls-bucket-mode '{mode_str}' (expected progress8kpabs or kingrank9)")
+        })?;
         set_layer_stack_bucket_mode(mode);
         eprintln!("LS_BUCKET_MODE: {}", mode.as_str());
     }

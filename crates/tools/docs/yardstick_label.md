@@ -86,8 +86,8 @@ depth を物差しの変数にするときは `--nodes 0` で depth を binding 
 | `--out <FILE>` | （必須） | 出力 jsonl（採点用フィールドのみ、入力順） |
 | `--nnue <FILE>` | — | labeler の NNUE モデル。**NNUE 探索モードでは必須**（`--onnx-model` 指定時は不要・無視） |
 | `--fv-scale <i32>` | 0 | FV_SCALE オーバーライド（0=ヘッダ自動判定）。評価器に合わせ明示（threat/none 系=28） |
-| `--ls-bucket-mode <STR>` | — | LayerStacks bucket mode。LS ビルド既定は `progress8kpabs` なので通常不要 |
-| `--ls-progress-coeff <FILE>` | — | progress8kpabs 用の進行度係数。LS モデル + progress8kpabs のとき必須 |
+| `--ls-bucket-mode <STR>` | — | LayerStacks bucket mode (`progress8kpabs` / `kingrank9`)。既定は `progress8kpabs` |
+| `--ls-progress-coeff <FILE>` | — | progress8kpabs 用の進行度係数。LS モデル + progress8kpabs のとき必須（kingrank9 では不要） |
 | `--depth <i32>` | 12 | 探索深さ上限（0 以下=無制限）。`--nodes` と両方 0 は不可 |
 | `--nodes <u64>` | 0 | 探索ノード数上限（0=無制限）。depth を変数にするなら 0 |
 | `--hash-mb <usize>` | 128 | worker ごとの置換表サイズ（MB）。局面ごとに作り直すため過大にしない |

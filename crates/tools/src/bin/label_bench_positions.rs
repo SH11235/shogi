@@ -405,7 +405,7 @@ fn configure_eval(cli: &Cli) -> Result<()> {
 
     if let Some(mode_str) = &cli.ls_bucket_mode {
         let mode = parse_layer_stack_bucket_mode(mode_str).with_context(|| {
-            format!("invalid --ls-bucket-mode '{mode_str}' (expected progress8kpabs)")
+            format!("invalid --ls-bucket-mode '{mode_str}' (expected progress8kpabs or kingrank9)")
         })?;
         set_layer_stack_bucket_mode(mode);
         eprintln!("LS_BUCKET_MODE: {}", mode.as_str());
@@ -424,8 +424,8 @@ fn configure_eval(cli: &Cli) -> Result<()> {
     eprintln!("NNUE model loaded: {}", cli.nnue.display());
 
     // progress bucket は LayerStacks のときだけ使う。非 LS モデル (HalfKP 等) では係数不要なので、
-    // USI エンジンと同じく LS ロード時のみ係数必須を課す（bucket mode の getter は値に依らず
-    // Progress8KPAbs を返すため、is_layer_stacks_loaded で実ネットワークを判定する）。
+    // USI エンジンと同じく LS ロード時のみ係数必須を課す（bucket mode は net の種別を表さない
+    // グローバル設定なので、実ネットワークの判定には is_layer_stacks_loaded を使う）。
     if is_layer_stacks_loaded()
         && get_layer_stack_bucket_mode() == LayerStackBucketMode::Progress8KPAbs
         && !coeff_loaded

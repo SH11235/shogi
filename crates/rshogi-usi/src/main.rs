@@ -252,7 +252,7 @@ impl UsiEngine {
         // 水匠5等は24、YaneuraOuデフォルトは16
         println!("option name FV_SCALE type spin default 0 min 0 max 100");
         println!(
-            "option name LS_BUCKET_MODE type combo default {} var progress8kpabs",
+            "option name LS_BUCKET_MODE type combo default {} var progress8kpabs var kingrank9",
             LayerStackBucketMode::Progress8KPAbs.as_str()
         );
         println!("option name LS_PROGRESS_COEFF type string default <empty>");
@@ -347,13 +347,16 @@ impl UsiEngine {
         // 使われないため、ロード済みネットワークが LayerStacks のときだけ検査する。
         {
             use rshogi_core::nnue::{
-                LayerStackBucketMode, get_layer_stack_bucket_mode,
-                get_layer_stack_progress_kpabs_weights,
+                get_layer_stack_bucket_mode, get_layer_stack_progress_kpabs_weights,
             };
             let is_layer_stacks = get_network().as_deref().is_some_and(|n| n.is_layer_stacks());
+            let weights_all_zero =
+                get_layer_stack_progress_kpabs_weights().iter().all(|&w| w == 0.0);
             if is_layer_stacks
-                && get_layer_stack_bucket_mode() == LayerStackBucketMode::Progress8KPAbs
-                && get_layer_stack_progress_kpabs_weights().iter().all(|&w| w == 0.0)
+                && ls_bucket_mode_requires_progress_coeff(
+                    get_layer_stack_bucket_mode(),
+                    weights_all_zero,
+                )
             {
                 panic!(
                     "LS_BUCKET_MODE=progress8kpabs requires LS_PROGRESS_COEFF to be set. \
@@ -849,7 +852,7 @@ impl UsiEngine {
                 }
                 None => {
                     eprintln!(
-                        "info string Warning: invalid LS_BUCKET_MODE '{}', expected progress8kpabs",
+                        "info string Warning: invalid LS_BUCKET_MODE '{}', expected progress8kpabs or kingrank9",
                         value
                     );
                 }
@@ -1489,6 +1492,16 @@ impl UsiEngine {
     }
 }
 
+/// LayerStacks ロード時に isready で LS_PROGRESS_COEFF を必須とするか。
+/// 進行度重みを参照するのは progress8kpabs のみで、kingrank9 は玉位置だけから
+/// bucket を決めるため係数不要。
+fn ls_bucket_mode_requires_progress_coeff(
+    mode: rshogi_core::nnue::LayerStackBucketMode,
+    weights_all_zero: bool,
+) -> bool {
+    mode == rshogi_core::nnue::LayerStackBucketMode::Progress8KPAbs && weights_all_zero
+}
+
 fn main() -> Result<()> {
     // ロガー初期化（標準エラー出力）
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -1638,6 +1651,15 @@ mod tests {
                     "progress8kpabs",
                 ]);
                 assert_eq!(get_layer_stack_bucket_mode(), LayerStackBucketMode::Progress8KPAbs);
+
+                engine.cmd_setoption(&[
+                    "setoption",
+                    "name",
+                    "LS_BUCKET_MODE",
+                    "value",
+                    "kingrank9",
+                ]);
+                assert_eq!(get_layer_stack_bucket_mode(), LayerStackBucketMode::KingRank9);
 
                 let tmp_path_bin =
                     std::env::temp_dir().join("rshogi_progress_coeff_kpabs_test.bin");

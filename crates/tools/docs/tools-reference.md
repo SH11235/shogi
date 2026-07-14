@@ -22,7 +22,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | ツール | 説明 |
 |--------|------|
 | `benchmark` | YaneuraOu bench 互換の標準ベンチマーク。マルチスレッド対応 |
-| `bench_nnue_eval` | NNUE 推論単体の性能測定（cycles/eval, instructions/eval） |
+| `bench_nnue_eval` | NNUE 推論単体の性能測定（cycles/eval, instructions/eval）。LayerStacks は progress8kpabs / kingrank9 の bucket 分布を計測可能 |
 | `search_only_ab` | Linux perf ベースの search-only A/B ベンチマーク。起動・ロード時間を除外して正確計測 |
 | `eval_sfens` | SFEN 局面を LayerStacks NNUE で静的評価（`score` は歩=90 の内部スケール、`score_cp` は cp） |
 | `nnue_saturation` | LayerStacks NNUE の活性飽和率（u8 127 張り付き）を実局面で計測（[詳細](nnue_saturation.md)） |
