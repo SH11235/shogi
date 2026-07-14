@@ -40,6 +40,8 @@ runs/gensfen/20260317-120000/
   gensfen.metrics.jsonl  # 対局メトリクス（--emit-metrics 指定時のみ）
 ```
 
+`gensfen.psv` の move16 は実 YaneuraOu 形式 (A: bit14=駒打ち、bit15=成り) で出力されます。
+
 `--out-dir path/to/dir` を指定した場合は、そのディレクトリ内に上記ファイルが生成される。
 
 棋譜（KIF）・サマリファイル・全手 move ログは出力されない（教師局面生成に不要なため）。

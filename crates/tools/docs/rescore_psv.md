@@ -177,6 +177,7 @@ ort は load-dynamic のためビルド時に libonnxruntime は不要（実行�
 | `--nnue` | — | NNUE モデル（ONNX / `--engine` 未使用時に必須） |
 | `--use-qsearch` | false | 静的評価の代わりに qsearch 評価を使用 |
 | `--search-depth` | — | 指定深さの alpha-beta 探索スコアを使用（`--use-qsearch` と排他） |
+| `--emit-bestmove` | false | `--search-depth` の探索結果の最善手を実 YaneuraOu PSV 形式 (A) で move16 に出力 |
 | `--hash-mb` | 64 | スレッドごとの置換表サイズ MB（`--search-depth` 時） |
 | `--max-nodes` / `--max-time` | 0（無制限） | 1 局面あたりの探索ノード / ミリ秒上限（`--search-depth` 時のみ有効）。探索爆発ガード |
 | `--max-ply` | 16 | qsearch の最大深さ |

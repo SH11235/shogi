@@ -85,7 +85,7 @@ impl EvalAccumulator {
 
 /// `pos` の合法手集合に `mv` が含まれるか。合法手生成は `pos` からのみ手を作るので、CSA/PSV
 /// 由来の非合法手（空マス発・成り不正）を渡しても panic せず判定できる。`Move::raw()` は下位
-/// 16bit（from/to/成り/打ち）で、`from_usi`/`move16_to_move` が埋めない上位ビット（移動後の駒）
+/// 16bit（from/to/成り/打ち）で、`from_usi`/PSV move16 復号が埋めない上位ビット（移動後の駒）
 /// を含まないため、`==` ではなく `raw()` 一致で意味比較する。
 pub fn move_is_legal(pos: &Position, mv: Move) -> bool {
     let mut list = MoveList::new();

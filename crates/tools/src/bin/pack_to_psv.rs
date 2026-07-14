@@ -37,7 +37,7 @@ use rshogi_core::movegen::{MoveList, generate_legal_all};
 use rshogi_core::position::Position;
 use rshogi_core::types::Color;
 use tools::common::dedup::collect_input_paths;
-use tools::packed_sfen::{PackedSfenValue, hcpe_move16_to_move, pack_position};
+use tools::packed_sfen::{PackedSfenValue, hcpe_move16_to_move, hcpe_move16_to_psv, pack_position};
 
 #[derive(Parser, Debug)]
 #[command(name = "pack_to_psv")]
@@ -225,7 +225,7 @@ fn process_game(
         let psv = PackedSfenValue {
             sfen: packed_sfen,
             score: eval,
-            move16,
+            move16: hcpe_move16_to_psv(move16),
             game_ply,
             game_result,
             padding: 0,

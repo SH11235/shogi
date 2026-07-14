@@ -22,8 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::AtomicU64;
 use tools::packed_sfen::{
-    PackedSfenValue, move_to_hcpe_move16, move_to_move16, move16_to_move, pack_position,
-    pack_position_hcp,
+    PackedSfenValue, move_to_psv_move16, pack_position, pack_position_hcp, psv_move16_to_hcpe,
 };
 use tools::selfplay::{
     EngineConfig, EngineProcess, EvalLog, GameEngines, GameOutcome, MultiPvCandidate,
@@ -717,7 +716,7 @@ impl TrainingDataCollector {
         };
 
         // 最善手をMove16形式に変換
-        let move16 = best_move.map_or(0, move_to_move16);
+        let move16 = best_move.map_or(0, move_to_psv_move16);
 
         // PackedSfenを生成
         let packed_sfen = pack_position(pos);
@@ -734,7 +733,7 @@ impl TrainingDataCollector {
 
         // hcpe3 形式は replay 整合のため selectedMove16 を実着手にし、各手に MultiPV policy を持たせる
         let hcpe3 = if self.format == TrainingFormat::Hcpe3 {
-            let selected_move16 = move_to_move16(played_move);
+            let selected_move16 = move_to_psv_move16(played_move);
             let eval = score_mate.map_or(score, mate_to_eval);
             let policy = if candidates.is_empty() {
                 vec![(selected_move16, 1u16)]
@@ -853,9 +852,7 @@ impl TrainingDataCollector {
 
         // 2. 各エントリの指し手とスコア
         for entry in &self.entries {
-            // rshogi の move16 → Move → hcpe move16
-            let mv = move16_to_move(entry.move16);
-            let hcpe_move16 = move_to_hcpe_move16(mv);
+            let hcpe_move16 = psv_move16_to_hcpe(entry.move16);
             self.writer.write_all(&hcpe_move16.to_le_bytes())?;
             self.writer.write_all(&entry.score.to_le_bytes())?;
             self.total_written += 1;
@@ -909,7 +906,7 @@ impl TrainingDataCollector {
                 .hcpe3
                 .as_ref()
                 .ok_or_else(|| anyhow!("hcpe3 format: entry has no policy data"))?;
-            let selected = move_to_hcpe_move16(move16_to_move(h.selected_move16));
+            let selected = psv_move16_to_hcpe(h.selected_move16);
             let candidate_num: u16 =
                 h.policy.len().try_into().map_err(|_| {
                     anyhow!("hcpe3 format: too many candidates ({})", h.policy.len())
@@ -918,7 +915,7 @@ impl TrainingDataCollector {
             self.writer.write_all(&h.eval.to_le_bytes())?;
             self.writer.write_all(&candidate_num.to_le_bytes())?;
             for (move16, visit) in &h.policy {
-                let hcpe_move16 = move_to_hcpe_move16(move16_to_move(*move16));
+                let hcpe_move16 = psv_move16_to_hcpe(*move16);
                 self.writer.write_all(&hcpe_move16.to_le_bytes())?;
                 self.writer.write_all(&visit.to_le_bytes())?;
             }
@@ -1108,7 +1105,7 @@ fn multipv_to_policy(candidates: &[MultiPvCandidate], total: u16, temp: f64) -> 
     let mut out: Vec<(u16, u16)> = Vec::with_capacity(sorted.len());
     for (c, &v) in sorted.iter().zip(&visits) {
         if v > 0 {
-            out.push((move_to_move16(c.first_move), v as u16));
+            out.push((move_to_psv_move16(c.first_move), v as u16));
         }
     }
     out
@@ -3421,7 +3418,7 @@ mod tests {
     #[test]
     fn multipv_to_policy_sorts_and_keeps_pv1() {
         use rshogi_core::types::Move;
-        use tools::packed_sfen::move_to_move16;
+        use tools::packed_sfen::move_to_psv_move16;
         use tools::selfplay::MultiPvCandidate;
 
         let m1 = Move::from_usi("7g7f").unwrap();
@@ -3451,7 +3448,7 @@ mod tests {
         let policy = multipv_to_policy(&candidates, 1000, 600.0);
         assert!(!policy.is_empty());
         // PV1 (m1) が先頭で 1 票以上
-        assert_eq!(policy[0].0, move_to_move16(m1));
+        assert_eq!(policy[0].0, move_to_psv_move16(m1));
         assert!(policy[0].1 >= 1);
         let sum: i32 = policy.iter().map(|(_, v)| *v as i32).sum();
         // largest-remainder で総票数は total に厳密一致する
@@ -3739,7 +3736,7 @@ mod tests {
 
     #[test]
     fn multipv_to_policy_visits_sum_to_total() {
-        use tools::packed_sfen::move_to_move16;
+        use tools::packed_sfen::move_to_psv_move16;
         let candidates = vec![
             legal_candidate(1, 100, "7g7f"),
             legal_candidate(2, 63, "2g2f"),
@@ -3751,7 +3748,7 @@ mod tests {
             let policy = multipv_to_policy(&candidates, total, 600.0);
             let sum: u32 = policy.iter().map(|(_, v)| *v as u32).sum();
             assert_eq!(sum, total as u32, "total={total}");
-            assert_eq!(policy[0].0, move_to_move16(candidates[0].first_move));
+            assert_eq!(policy[0].0, move_to_psv_move16(candidates[0].first_move));
             assert!(policy[0].1 >= 1);
         }
     }
@@ -3771,7 +3768,7 @@ mod tests {
     #[test]
     fn multipv_to_policy_downweights_losing_mate() {
         use rshogi_core::types::Move;
-        use tools::packed_sfen::move_to_move16;
+        use tools::packed_sfen::move_to_psv_move16;
         use tools::selfplay::MultiPvCandidate;
 
         let good = Move::from_usi("7g7f").unwrap();
@@ -3792,9 +3789,14 @@ mod tests {
             },
         ];
         let policy = multipv_to_policy(&candidates, 1000, 600.0);
-        let good_v = policy.iter().find(|(m, _)| *m == move_to_move16(good)).map_or(0, |(_, v)| *v);
-        let losing_v =
-            policy.iter().find(|(m, _)| *m == move_to_move16(losing)).map_or(0, |(_, v)| *v);
+        let good_v = policy
+            .iter()
+            .find(|(m, _)| *m == move_to_psv_move16(good))
+            .map_or(0, |(_, v)| *v);
+        let losing_v = policy
+            .iter()
+            .find(|(m, _)| *m == move_to_psv_move16(losing))
+            .map_or(0, |(_, v)| *v);
         // 符号付き score_cp で負け詰みは大きく減点され、PV1 を上回らない
         assert!(good_v > losing_v);
     }

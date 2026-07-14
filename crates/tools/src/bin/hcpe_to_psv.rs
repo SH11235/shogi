@@ -17,7 +17,7 @@
 //! - eval: 手番側視点 cp（両形式で同一規約）をそのままコピー。詰み帯の数値表現は
 //!   生成系により異なる（例: gensfen は PSV 詰みを ±10000 帯で保存）が、値変換は行わない。
 //! - bestMove16: cshogi 形式 → **実 YaneuraOu Move16** 形式（bit14=駒打ち/bit15=成り。
-//!   リポジトリ内部表現 `move_to_move16` とは別形式）。
+//!   旧リポジトリ内部形式 (B) とは別形式）。
 //! - gameResult: 絶対視点（0=draw / 1=black_win / 2=white_win）→ 手番側視点
 //!   （1=win / -1=loss / 0=draw）。
 //! - game_ply: hcpe には手数が無いため 1 固定。

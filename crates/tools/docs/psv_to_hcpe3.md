@@ -8,6 +8,10 @@ dlshogi の学習で使う **hcpe3** / **hcpe** 形式へストリーミング�
 - 特徴: cshogi 製変換スクリプトと **byte 完全一致**、チャンクストリーミングで
   ピークメモリを入力件数に非依存、スレッド数に依らず bit 一致
 
+入力の move16 は実 YaneuraOu 形式 (A: bit14=駒打ち、bit15=成り) が前提です。
+変換前に先頭10万レコードを検査し、旧リポジトリ形式 (B) または hcpe 形式 (C) の
+確定シグネチャがあれば停止します。B 形式の既存 PSV は `migrate_psv_move16` で移行してください。
+
 dlshogi の `train.py` は学習データに hcpe3（対局単位 + 候補手 visits）を要求しますが、
 PSV は局面単位（棋譜構造を持ちません）。そこで各 PSV 局面を「1 局面 = 1 game」の
 退化した hcpe3（`moveNum=1` / `candidateNum=1` / `visitNum=1`）として書き出します。
@@ -17,7 +21,7 @@ policy target は best move の one-hot、value は PSV の評価値から取り
 
 局面の盤面は cshogi `Board.to_hcp` 互換の HuffmanCodedPos（32 バイト）で表現します。
 指し手は hcpe 形式の move16 へ変換します。YaneuraOu PSV の move16 は
-**bit14=駒打ちフラグ（from フィールド=駒種, 歩=1..飛=7）・bit15=成りフラグ**で、
+**bit14=駒打ちフラグ（from フィールド=駒種, 歩=1..金=7）・bit15=成りフラグ**で、
 これを hcpe 形式（駒打ち `from = 81 + (駒種 - 1)`、成り `bit14`）へ意味的に復号します
 （参照実装 cshogi `move16_from_psv` と一致）。勝敗は手番側視点 ±1/0 を
 `0:DRAW / 1:BLACK_WIN / 2:WHITE_WIN` に変換します。

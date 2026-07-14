@@ -10,7 +10,7 @@
 //! # 使用例
 //!
 //! ```rust,ignore
-//! use tools::packed_sfen::{PackedSfenValue, unpack_sfen, move16_to_usi};
+//! use tools::packed_sfen::{PackedSfenValue, unpack_sfen, psv_move16_to_usi};
 //!
 //! // バイト列からPackedSfenValueを読み込み
 //! let bytes = [0u8; 40]; // 実際のデータ
@@ -21,7 +21,7 @@
 //! println!("SFEN: {}", sfen);
 //!
 //! // 指し手をUSI形式に変換
-//! let usi_move = move16_to_usi(psv.move16);
+//! let usi_move = psv_move16_to_usi(psv.move16);
 //! println!("Move: {}", usi_move);
 //! ```
 //!
@@ -1040,7 +1040,9 @@ fn generate_hand_sfen(black_hand: &Hand, white_hand: &Hand) -> String {
     result
 }
 
-/// Move16形式をUSI形式の指し手文字列に変換
+/// 旧リポジトリ内部形式 (B) の Move16 を USI 形式へ変換する。
+///
+/// 新規データでは使わず、既存 B データの読み出し・移行専用とする。
 ///
 /// ## Move16形式
 /// - bits 0-6:  移動先マス (to)
@@ -1063,7 +1065,7 @@ fn generate_hand_sfen(black_hand: &Hand, white_hand: &Hand) -> String {
 /// // P*5e の場合: to=40, piece=1(歩)
 /// // move16 = 40 | (82 << 7) = 0x2928
 /// ```
-pub fn move16_to_usi(move16: u16) -> String {
+pub fn legacy_move16_to_usi(move16: u16) -> String {
     if move16 == 0 {
         return "none".to_string();
     }
@@ -1103,8 +1105,10 @@ pub fn move16_to_usi(move16: u16) -> String {
     }
 }
 
-/// Move16形式をMove型に変換
-pub fn move16_to_move(move16: u16) -> Move {
+/// 旧リポジトリ内部形式 (B) の Move16 を Move 型へ変換する。
+///
+/// 新規データでは使わず、既存 B データの読み出し・移行専用とする。
+pub fn legacy_move16_to_move(move16: u16) -> Move {
     if move16 == 0 {
         return Move::NONE;
     }
@@ -1139,6 +1143,45 @@ pub fn move16_to_move(move16: u16) -> Move {
         } else {
             Move::NONE
         }
+    }
+}
+
+/// 実 YaneuraOu PSV 形式 (A) の Move16 を Move 型へ変換する。
+pub fn psv_move16_to_move(move16: u16) -> Move {
+    if move16 == 0 {
+        return Move::NONE;
+    }
+
+    let to = (move16 & 0x7f) as u8;
+    let from_or_pt = ((move16 >> 7) & 0x7f) as u8;
+
+    if move16 & 0x4000 != 0 {
+        let pt = match from_or_pt {
+            1 => PieceType::Pawn,
+            2 => PieceType::Lance,
+            3 => PieceType::Knight,
+            4 => PieceType::Silver,
+            5 => PieceType::Bishop,
+            6 => PieceType::Rook,
+            7 => PieceType::Gold,
+            _ => return Move::NONE,
+        };
+        Square::from_u8(to).map_or(Move::NONE, |to_sq| Move::new_drop(pt, to_sq))
+    } else {
+        match (Square::from_u8(from_or_pt), Square::from_u8(to)) {
+            (Some(from_sq), Some(to_sq)) => Move::new_move(from_sq, to_sq, move16 & 0x8000 != 0),
+            _ => Move::NONE,
+        }
+    }
+}
+
+/// 実 YaneuraOu PSV 形式 (A) の Move16 を USI 形式へ変換する。
+pub fn psv_move16_to_usi(move16: u16) -> String {
+    let mv = psv_move16_to_move(move16);
+    if mv.is_none() {
+        "none".to_string()
+    } else {
+        mv.to_usi()
     }
 }
 
@@ -1453,13 +1496,15 @@ pub fn pack_sfen_from_parts(parts: &UnpackedSfen) -> [u8; 32] {
     stream.finish()
 }
 
-/// Move を Move16形式に変換
+/// Move を旧リポジトリ内部形式 (B) の Move16 へ変換する。
 ///
-/// ## Move16形式
+/// 新規データでは使わず、既存 B データの読み出し・移行専用とする。
+///
+/// ## 旧 Move16 形式
 /// - bits 0-6:  移動先マス (to)
 /// - bits 7-13: 移動元マス (from) または打つ駒種+81
 /// - bit 14:    成りフラグ
-pub fn move_to_move16(mv: Move) -> u16 {
+pub fn move_to_legacy_move16(mv: Move) -> u16 {
     if mv == Move::NONE || mv == Move::NULL {
         return 0;
     }
@@ -1484,6 +1529,34 @@ pub fn move_to_move16(mv: Move) -> u16 {
         // 通常の移動
         let from = mv.from().index() as u16;
         let promote = if mv.is_promotion() { 0x4000 } else { 0 };
+        to | (from << 7) | promote
+    }
+}
+
+/// Move を実 YaneuraOu PSV 形式 (A) の Move16 へ変換する。
+///
+/// 駒打ちは bit14 と from フィールドの駒種 (歩=1..金=7)、成りは bit15 で表す。
+pub fn move_to_psv_move16(mv: Move) -> u16 {
+    if mv == Move::NONE || mv == Move::NULL {
+        return 0;
+    }
+
+    let to = mv.to().index() as u16;
+    if mv.is_drop() {
+        let pt = match mv.drop_piece_type() {
+            PieceType::Pawn => 1,
+            PieceType::Lance => 2,
+            PieceType::Knight => 3,
+            PieceType::Silver => 4,
+            PieceType::Bishop => 5,
+            PieceType::Rook => 6,
+            PieceType::Gold => 7,
+            _ => return 0,
+        };
+        to | (pt << 7) | 0x4000
+    } else {
+        let from = mv.from().index() as u16;
+        let promote = if mv.is_promotion() { 0x8000 } else { 0 };
         to | (from << 7) | promote
     }
 }
@@ -1527,16 +1600,29 @@ pub fn move_to_hcpe_move16(mv: Move) -> u16 {
 /// 実 YaneuraOu の Move16 は bit14=駒打ちフラグ（from フィールド=駒種, 歩=1..金=7）、
 /// bit15=成りフラグ。hcpe 形式は駒打ちを `from = 81 + (駒種 - 1)` で表し、成りを
 /// bit14 で表す。形式の参照実装 cshogi `move16_from_psv` と一致する。
-/// リポジトリ内部表現 (`move_to_move16` / `move16_to_move`) とは**別形式**である点に注意。
+/// 旧リポジトリ内部表現 (B) とは**別形式**である点に注意。
 #[inline]
 pub fn psv_move16_to_hcpe(yo_move16: u16) -> u16 {
+    if yo_move16 == 0 {
+        return 0;
+    }
     let to = yo_move16 & 0x7f;
+    // 移動先がマス番号 0..80 の範囲外なら破損レコード (hcpe_move16_to_psv と対称の検証)
+    if to > 80 {
+        return 0;
+    }
     let from_field = (yo_move16 >> 7) & 0x7f;
     if yo_move16 & 0x4000 != 0 {
-        // 駒打ち: from フィールドは駒種(1 始まり) → from = 81 + (駒種 - 1) = 80 + from_field
+        // 駒打ち: from フィールドは駒種(1 始まり、歩=1..金=7) → from = 81 + (駒種 - 1)
+        if !(1..=7).contains(&from_field) {
+            return 0;
+        }
         to | ((80 + from_field) << 7)
     } else {
-        // 盤上の手: 成りは YaneuraOu の bit15 → hcpe の bit14 へ移す
+        // 盤上の手: from もマス番号範囲内であること。成りは YaneuraOu の bit15 → hcpe の bit14 へ
+        if from_field > 80 {
+            return 0;
+        }
         let promote = if yo_move16 & 0x8000 != 0 { 0x4000 } else { 0 };
         to | (from_field << 7) | promote
     }
@@ -1567,6 +1653,31 @@ pub fn hcpe_move16_to_psv(hcpe_move16: u16) -> u16 {
         // 盤上の手: 成りは hcpe の bit14 → YO の bit15 へ移す
         let promote = if hcpe_move16 & 0x4000 != 0 { 0x8000 } else { 0 };
         to | (from_field << 7) | promote
+    }
+}
+
+/// PSV move16 の分類結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsvMove16Class {
+    /// 指し手なし。
+    None,
+    /// 通常手、または実 YaneuraOu PSV 形式 (A) として解釈できる値。
+    NormalOrA,
+    /// 旧リポジトリ内部形式 (B) または hcpe 形式 (C) と確定できる値。
+    LegacyOrHcpe,
+}
+
+/// move16 に B/C 形式の確定シグネチャが含まれるか分類する。
+pub fn classify_psv_move16(move16: u16) -> PsvMove16Class {
+    if move16 == 0 {
+        return PsvMove16Class::None;
+    }
+    let from = (move16 >> 7) & 0x7f;
+    let drop_bit = move16 & 0x4000 != 0;
+    if (!drop_bit && (81..=88).contains(&from)) || (drop_bit && (8..=80).contains(&from)) {
+        PsvMove16Class::LegacyOrHcpe
+    } else {
+        PsvMove16Class::NormalOrA
     }
 }
 
@@ -1765,24 +1876,24 @@ mod tests {
     }
 
     #[test]
-    fn test_move16_to_usi() {
+    fn test_legacy_move16_to_usi() {
         // 通常の移動: 7g(60) -> 7f(59)
         // File7=6, Rank7=6 → sq=6*9+6=60
         // File7=6, Rank6=5 → sq=6*9+5=59
         let move16 = 59 | (60 << 7);
-        assert_eq!(move16_to_usi(move16), "7g7f");
+        assert_eq!(legacy_move16_to_usi(move16), "7g7f");
 
         // 成り: 2c(11) -> 2b(10)
         // File2=1, Rank3=2 → sq=1*9+2=11
         // File2=1, Rank2=1 → sq=1*9+1=10
         let move16 = 10 | (11 << 7) | 0x4000;
-        assert_eq!(move16_to_usi(move16), "2c2b+");
+        assert_eq!(legacy_move16_to_usi(move16), "2c2b+");
 
         // 駒打ち: P*5e (歩を5五に打つ)
         // File5=4, Rank5=4 → sq=4*9+4=40
         // 打ち駒: from = 81 + piece_type (歩=1)
         let move16 = 40 | (82 << 7);
-        assert_eq!(move16_to_usi(move16), "P*5e");
+        assert_eq!(legacy_move16_to_usi(move16), "P*5e");
     }
 
     #[test]
@@ -1890,17 +2001,17 @@ mod tests {
     }
 
     #[test]
-    fn test_move16_to_usi_invalid() {
+    fn test_legacy_move16_to_usi_invalid() {
         // move16 = 0 は "none" を返す
-        assert_eq!(move16_to_usi(0), "none");
+        assert_eq!(legacy_move16_to_usi(0), "none");
 
         // 不正な駒種インデックス (81 + 0 = 81, pt_index = 0)
         let move16 = 40 | (81 << 7);
-        assert_eq!(move16_to_usi(move16), "none");
+        assert_eq!(legacy_move16_to_usi(move16), "none");
 
         // 不正な駒種インデックス (81 + 8 = 89)
         let move16 = 40 | (89 << 7);
-        assert_eq!(move16_to_usi(move16), "none");
+        assert_eq!(legacy_move16_to_usi(move16), "none");
     }
 
     #[test]
@@ -2056,7 +2167,7 @@ mod tests {
     }
 
     #[test]
-    fn test_move_to_move16_and_back() {
+    fn test_legacy_move16_roundtrip() {
         // 7七(file=7, rank=7)のマス番号 = (7-1)*9 + (7-1) = 54 + 6 = 60
         // 7六(file=7, rank=6)のマス番号 = (7-1)*9 + (6-1) = 54 + 5 = 59
         let sq_77 = Square::from_u8(60).unwrap();
@@ -2064,8 +2175,8 @@ mod tests {
 
         // 通常の移動
         let mv = Move::new_move(sq_77, sq_76, false);
-        let move16 = move_to_move16(mv);
-        let mv_back = move16_to_move(move16);
+        let move16 = move_to_legacy_move16(mv);
+        let mv_back = legacy_move16_to_move(move16);
         assert_eq!(mv, mv_back);
 
         // 2三(file=2, rank=3)のマス番号 = (2-1)*9 + (3-1) = 9 + 2 = 11
@@ -2075,15 +2186,48 @@ mod tests {
 
         // 成り
         let mv = Move::new_move(sq_23, sq_22, true);
-        let move16 = move_to_move16(mv);
-        let mv_back = move16_to_move(move16);
+        let move16 = move_to_legacy_move16(mv);
+        let mv_back = legacy_move16_to_move(move16);
         assert_eq!(mv, mv_back);
 
         // 駒打ち
         let mv = Move::new_drop(PieceType::Pawn, Square::SQ_55);
-        let move16 = move_to_move16(mv);
-        let mv_back = move16_to_move(move16);
+        let move16 = move_to_legacy_move16(mv);
+        let mv_back = legacy_move16_to_move(move16);
         assert_eq!(mv, mv_back);
+    }
+
+    #[test]
+    fn psv_move16_roundtrip_and_oracles() {
+        let cases = [
+            (
+                Move::new_move(Square::from_u8(60).unwrap(), Square::from_u8(59).unwrap(), false),
+                0x1e3b,
+            ),
+            (
+                Move::new_move(Square::from_u8(11).unwrap(), Square::from_u8(10).unwrap(), true),
+                0x858a,
+            ),
+            (Move::new_drop(PieceType::Pawn, Square::from_u8(37).unwrap()), 0x40a5),
+        ];
+        for (mv, oracle) in cases {
+            assert_eq!(move_to_psv_move16(mv), oracle);
+            assert_eq!(psv_move16_to_move(oracle), mv);
+        }
+        assert_eq!(move_to_psv_move16(Move::NONE), 0);
+        assert_eq!(move_to_psv_move16(Move::NULL), 0);
+        assert_eq!(psv_move16_to_move(0), Move::NONE);
+        assert_eq!(psv_move16_to_usi(0x40a5), "P*5b");
+    }
+
+    #[test]
+    fn classify_psv_move16_signatures() {
+        assert_eq!(classify_psv_move16(0), PsvMove16Class::None);
+        assert_eq!(classify_psv_move16(0x40a5), PsvMove16Class::NormalOrA);
+        assert_eq!(classify_psv_move16(0x858a), PsvMove16Class::NormalOrA);
+        assert_eq!(classify_psv_move16(37 | (81 << 7)), PsvMove16Class::LegacyOrHcpe);
+        assert_eq!(classify_psv_move16(37 | (88 << 7)), PsvMove16Class::LegacyOrHcpe);
+        assert_eq!(classify_psv_move16(37 | (8 << 7) | 0x4000), PsvMove16Class::LegacyOrHcpe);
     }
 
     #[test]
@@ -2170,6 +2314,12 @@ mod tests {
         // 移動先マスが範囲外 (to > 80) の破損レコードは 0 (盤上の手・駒打ちとも)
         assert_eq!(hcpe_move16_to_psv(85 | (60 << 7)), 0);
         assert_eq!(hcpe_move16_to_psv(127 | (81 << 7)), 0);
+        // psv→hcpe 方向も対称の検証を持つ: to 範囲外 / 打ちの駒種 0 や 8 以上 / 盤上の手の from 範囲外
+        assert_eq!(psv_move16_to_hcpe(85 | (60 << 7)), 0);
+        assert_eq!(psv_move16_to_hcpe(40 | 0x4000), 0); // 打ちで from=0 (駒種なし)
+        assert_eq!(psv_move16_to_hcpe(40 | (8 << 7) | 0x4000), 0); // 打ちで駒種 8
+        assert_eq!(psv_move16_to_hcpe(40 | (81 << 7)), 0); // 盤上の手で from=81 (B/C 系の破損)
+        assert_eq!(psv_move16_to_hcpe(0), 0);
     }
 
     #[test]
