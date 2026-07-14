@@ -185,16 +185,20 @@ fn main() -> Result<()> {
         anyhow::bail!("入力ファイルが見つかりません");
     }
 
-    // 入力と出力が同一パスだと File::create が読み取り前に入力を truncate してしまうため拒否する。
-    let out_canonical = args.output.canonicalize().ok();
+    // 入力と出力が同一実体だと File::create が読み取り前に入力を truncate してしまうため拒否する。
+    // パス比較 (canonicalize) では hardlink (別パス・同一 inode) を検出できないので (dev, ino) で判定する。
+    let file_id = |p: &std::path::Path| -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
+    };
+    let out_id = file_id(&args.output);
     let mut total_records = 0u64;
-    let mut in_canonicals = Vec::with_capacity(paths.len());
+    let mut in_ids = Vec::with_capacity(paths.len());
     for p in &paths {
-        let canonical = p
-            .canonicalize()
-            .with_context(|| format!("入力パスの正規化に失敗: {}", p.display()))?;
-        if Some(&canonical) == out_canonical.as_ref() {
-            anyhow::bail!("入力と出力が同一ファイルです: {}", canonical.display());
+        let id =
+            file_id(p).with_context(|| format!("入力のメタデータ取得に失敗: {}", p.display()))?;
+        if out_id.is_some() && out_id == Some(id) {
+            anyhow::bail!("入力と出力が同一ファイルです: {}", p.display());
         }
         let len = std::fs::metadata(p)?.len();
         if len % HCPE_RECORD_SIZE as u64 != 0 {
@@ -204,7 +208,7 @@ fn main() -> Result<()> {
             );
         }
         total_records += len / HCPE_RECORD_SIZE as u64;
-        in_canonicals.push(canonical);
+        in_ids.push(id);
     }
 
     if args.threads > 0 {
@@ -227,13 +231,10 @@ fn main() -> Result<()> {
         s.push(".partial");
         PathBuf::from(s)
     };
-    if tmp_output.exists() {
-        let tmp_canonical = tmp_output
-            .canonicalize()
-            .with_context(|| format!("一時パスの正規化に失敗: {}", tmp_output.display()))?;
-        if in_canonicals.contains(&tmp_canonical) {
-            anyhow::bail!("一時ファイル {} が入力と同一です", tmp_output.display());
-        }
+    if let Some(tmp_id) = file_id(&tmp_output)
+        && in_ids.contains(&tmp_id)
+    {
+        anyhow::bail!("一時ファイル {} が入力と同一です", tmp_output.display());
     }
     let out_file = File::create(&tmp_output)
         .with_context(|| format!("{} を作成できません", tmp_output.display()))?;

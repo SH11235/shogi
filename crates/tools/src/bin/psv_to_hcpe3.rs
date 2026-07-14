@@ -8,9 +8,9 @@
 //!
 //! 盤面の hcp（HuffmanCodedPos, 32B）は、PSV の packed sfen を SFEN 文字列・`Position`
 //! 構築を経由せず `tools::packed_sfen::unpack_sfen_to_parts` → `pack_hcp_from_parts` で
-//! 直接展開する（ホットパスでのヒープ割り当てを避ける）。指し手 move16 と勝敗・eval の
-//! 視点変換は本ファイル内で行う（いずれも hcpe / hcpe3 形式の参照実装 cshogi の
-//! `to_hcp` / `move16_from_psv` と一致）。
+//! 直接展開する（ホットパスでのヒープ割り当てを避ける）。指し手 move16 と勝敗の視点変換は
+//! `tools::packed_sfen` の共有関数 (`psv_move16_to_hcpe` / `stm_result_to_hcpe`) を使う
+//! （いずれも hcpe / hcpe3 形式の参照実装 cshogi の `to_hcp` / `move16_from_psv` と一致）。
 //! load-all を避けてチャンクストリーミングし、ピークメモリを入力件数に非依存にする。
 //!
 //! # 使用例

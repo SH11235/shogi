@@ -1552,6 +1552,10 @@ pub fn hcpe_move16_to_psv(hcpe_move16: u16) -> u16 {
         return 0;
     }
     let to = hcpe_move16 & 0x7f;
+    // 移動先がマス番号 0..80 の範囲外なら破損レコード (旧 Position 経路の Square::from_u8 相当の検証)
+    if to > 80 {
+        return 0;
+    }
     let from_field = (hcpe_move16 >> 7) & 0x7f;
     if from_field >= 81 {
         // 駒打ち: hcpe の駒種(0 始まり) → YO の駒種(1 始まり) を from へ、bit14 を立てる
@@ -2163,6 +2167,9 @@ mod tests {
         // 不正な駒打ち駒種 (from > 87) は 0
         assert_eq!(hcpe_move16_to_psv(40 | (88 << 7)), 0);
         assert_eq!(hcpe_move16_to_psv(0), 0);
+        // 移動先マスが範囲外 (to > 80) の破損レコードは 0 (盤上の手・駒打ちとも)
+        assert_eq!(hcpe_move16_to_psv(85 | (60 << 7)), 0);
+        assert_eq!(hcpe_move16_to_psv(127 | (81 << 7)), 0);
     }
 
     #[test]
