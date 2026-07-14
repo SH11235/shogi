@@ -9,7 +9,7 @@
 | ツール | 説明 |
 |--------|------|
 | `tournament` | 複数エンジンの round-robin 並列トーナメント、SPRT 検定 |
-| `analyze_selfplay` | tournament 出力の集計・Elo/nElo 算出・SPRT post-hoc 判定 |
+| `analyze_selfplay` | tournament 出力の集計・Elo/nElo 算出・SPRT post-hoc 判定（[詳細](docs/analyze_selfplay.md)） |
 | `floodgate_record` | csa_client の per-game JSONL から 1 エンジンの戦績を集計（先後別勝率・相手別・後手勝ち/負け/引分・実戦 NPS、`--config` で csa_client 設定から入力導出、`--fetch-ratings` で wdoor 現在レート併記・履歴記録。floodgate 連続対局向け、[詳細](docs/floodgate_record.md)） |
 | `gensfen` | NNUE 学習用 PSV/pack/hcpe3 教師局面の生成（PSV move16 は実 YaneuraOu 形式、USI engine vs engine／NativeBackend、native LS progress 係数、千日手裁定、異常終局の全局破棄、宣言勝ち PSV 終端局面、乱択来歴 JSONL 記録） |
 | `floodgate_pipeline` | Floodgate棋譜のダウンロード・変換・`live-mirror --push` MONITOR2 着手通知付きリアルタイムミラー（[詳細](docs/floodgate_pipeline.md)） |

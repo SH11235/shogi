@@ -1247,6 +1247,28 @@ fn elo_ci95(wins: u32, losses: u32, draws: u32) -> Option<f64> {
     Some(1.96 * se_elo)
 }
 
+/// Pentanomial 集計を相手視点に反転する。
+fn reverse_penta(penta: Penta) -> Penta {
+    Penta {
+        ll: penta.ww,
+        dl: penta.wd,
+        dd: penta.dd,
+        wl: penta.wl,
+        wd: penta.dl,
+        ww: penta.ll,
+    }
+}
+
+/// SPRT の test/base と一致する直接対決を test 視点で表示するか判定する。
+fn should_show_right_first(
+    left: &str,
+    right: &str,
+    sprt_test: Option<&str>,
+    sprt_base: Option<&str>,
+) -> bool {
+    sprt_test == Some(right) && sprt_base == Some(left)
+}
+
 // ---------------------------------------------------------------------------
 // メイン処理
 // ---------------------------------------------------------------------------
@@ -1394,28 +1416,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // 直接対決ペアごとの pentanomial 集計（nElo 表示用、テキスト出力時のみ）
-    let h2h_penta: BTreeMap<(String, String), Penta> = if !cli.json {
-        let mut map = BTreeMap::new();
-        for (left, right) in head_to_head.keys() {
-            let mut penta = Penta::ZERO;
-            for path in &files {
-                if path.contains(".summary.") {
-                    continue;
-                }
-                // left=base, right=test で集計 → normalized_elo() は right 視点
-                match collect_sprt_penta(path, left, right) {
-                    Ok(p) => penta += p,
-                    Err(e) => eprintln!("警告: h2h penta 集計失敗 {path}: {e}"),
-                }
-            }
-            map.insert((left.clone(), right.clone()), penta);
-        }
-        map
-    } else {
-        BTreeMap::new()
-    };
-
     // SPRT post-hoc 集計（JSON モードでは最終 JSON にフィールドとして埋め込むため事前に計算する）
     let sprt_payload: Option<(Penta, SprtJsonOutput)> = if cli.sprt {
         // CLI が全項目（ラベル+パラメータ）を明示している場合は meta 参照を完全スキップ。
@@ -1507,6 +1507,44 @@ fn main() -> Result<()> {
         None
     };
 
+    // 直接対決ペアごとの pentanomial 集計（nElo 表示用、テキスト出力時のみ）。
+    // SPRT 対象ペアは集計済みの値を視点変換して再利用し、未完了ペアの通知と
+    // JSONL の走査が重複するのを避ける。
+    let h2h_penta: BTreeMap<(String, String), Penta> = if !cli.json {
+        let mut map = BTreeMap::new();
+        for (left, right) in head_to_head.keys() {
+            let reused = sprt_payload.as_ref().and_then(|(penta, output)| {
+                if output.base == *left && output.test == *right {
+                    Some(*penta)
+                } else if output.base == *right && output.test == *left {
+                    Some(reverse_penta(*penta))
+                } else {
+                    None
+                }
+            });
+            let penta = if let Some(penta) = reused {
+                penta
+            } else {
+                let mut penta = Penta::ZERO;
+                for path in &files {
+                    if path.contains(".summary.") {
+                        continue;
+                    }
+                    // left=base, right=test で集計 → normalized_elo() は right 視点
+                    match collect_sprt_penta(path, left, right) {
+                        Ok(p) => penta += p,
+                        Err(e) => eprintln!("警告: h2h penta 集計失敗 {path}: {e}"),
+                    }
+                }
+                penta
+            };
+            map.insert((left.clone(), right.clone()), penta);
+        }
+        map
+    } else {
+        BTreeMap::new()
+    };
+
     if cli.json {
         print_json(
             valid_files,
@@ -1529,6 +1567,7 @@ fn main() -> Result<()> {
             &h2h_penta,
             &labels,
             &extra,
+            sprt_payload.as_ref().map(|(_, output)| output),
         );
         if let Some((penta, json)) = sprt_payload.as_ref() {
             print_sprt_text_report(*penta, json);
@@ -1551,6 +1590,7 @@ fn print_text(
     h2h_penta: &BTreeMap<(String, String), Penta>,
     labels: &BTreeMap<String, String>,
     extra: &AggregatedExtraStats,
+    sprt: Option<&SprtJsonOutput>,
 ) {
     let pct = if total_all > 0 {
         total_done as f64 / total_all as f64 * 100.0
@@ -1607,42 +1647,102 @@ fn print_text(
     println!("直接対決");
     println!("{}", "=".repeat(75));
     for ((a, b), v) in head_to_head {
-        let an = labels.get(a).map_or(a.as_str(), |s| s.as_str());
-        let bn = labels.get(b).map_or(b.as_str(), |s| s.as_str());
+        // SPRT 対象ペアは test を左に表示し、直後の SPRT レポートと視点を揃える。
+        // それ以外は従来どおり辞書順の left 視点を保つ。
+        let show_right_first = should_show_right_first(
+            a,
+            b,
+            sprt.map(|output| output.test.as_str()),
+            sprt.map(|output| output.base.as_str()),
+        );
         let total = v.left_wins + v.right_wins + v.draws;
-        let wr_a = if total > 0 {
-            v.left_wins as f64 / total as f64 * 100.0
+        let half = v.done / 2;
+        let half_up = half + v.done % 2;
+        let (
+            primary,
+            secondary,
+            primary_wins,
+            secondary_wins,
+            primary_sente_games,
+            primary_sente_wins,
+            primary_gote_games,
+            primary_gote_wins,
+            primary_sente_total,
+            primary_gote_total,
+            nelo_sign,
+        ) = if show_right_first {
+            (
+                b,
+                a,
+                v.right_wins,
+                v.left_wins,
+                v.left_gote_games,
+                v.left_gote_games - v.left_gote_wins,
+                v.left_sente_games,
+                v.left_sente_games - v.left_sente_wins,
+                half,
+                half_up,
+                1.0,
+            )
+        } else {
+            (
+                a,
+                b,
+                v.left_wins,
+                v.right_wins,
+                v.left_sente_games,
+                v.left_sente_wins,
+                v.left_gote_games,
+                v.left_gote_wins,
+                half_up,
+                half,
+                -1.0,
+            )
+        };
+        let primary_name = labels.get(primary).map_or(primary.as_str(), |s| s.as_str());
+        let secondary_name = labels.get(secondary).map_or(secondary.as_str(), |s| s.as_str());
+        let primary_wr = if total > 0 {
+            primary_wins as f64 / total as f64 * 100.0
         } else {
             0.0
         };
 
-        let elo = elo_diff(v.left_wins, v.right_wins, v.draws);
-        let ci = elo_ci95(v.left_wins, v.right_wins, v.draws);
+        let elo = elo_diff(primary_wins, secondary_wins, v.draws);
+        let ci = elo_ci95(primary_wins, secondary_wins, v.draws);
 
-        // pentanomial nElo（right=test 視点で集計されているため、left 視点に変換）
+        // pentanomial nElo は正規化キーの right 視点で集計されている。
         let nelo_str = h2h_penta
             .get(&(a.clone(), b.clone()))
             .and_then(|p| p.normalized_elo())
-            .map(|(e, c)| format!(" | nElo:{:+.0} ±{:.0}", -e, c))
+            .map(|(e, c)| format!(" | nElo:{:+.0} ±{:.0}", nelo_sign * e, c))
             .unwrap_or_default();
 
-        // 行内の並びは辞書順で先後の意味を持たないため、符号の視点を明示する
+        // 符号の視点を明示する。
         let elo_str = match (elo, ci) {
-            (Some(e), Some(c)) => format!(" | Elo差:{:+.0} ±{:.0}{} ({an}視点)", e, c, nelo_str),
-            _ if !nelo_str.is_empty() => format!("{nelo_str} ({an}視点)"),
+            (Some(e), Some(c)) => {
+                format!(" | Elo差:{:+.0} ±{:.0}{} ({primary_name}視点)", e, c, nelo_str)
+            }
+            _ if !nelo_str.is_empty() => format!("{nelo_str} ({primary_name}視点)"),
             _ => nelo_str,
         };
 
         println!(
             "  {:16} vs {:16} | {:3}局 | {}:{:3}勝 {}:{:3}勝 引分:{} | {}勝率:{:.1}%{}",
-            an, bn, v.done, an, v.left_wins, bn, v.right_wins, v.draws, an, wr_a, elo_str
+            primary_name,
+            secondary_name,
+            v.done,
+            primary_name,
+            primary_wins,
+            secondary_name,
+            secondary_wins,
+            v.draws,
+            primary_name,
+            primary_wr,
+            elo_str
         );
 
         // 先手/後手別勝率
-        if v.left_sente_games > 0 || v.left_gote_games > 0 {
-            let half = v.done / 2;
-            let half_up = half + v.done % 2;
-
+        if primary_sente_games > 0 || primary_gote_games > 0 {
             let fmt_wr = |label: &str, wins: u32, decisive: u32, total_games: u32| -> String {
                 if decisive > 0 {
                     format!(
@@ -1657,17 +1757,19 @@ fn print_text(
                 }
             };
 
-            let a_sente = fmt_wr("先手", v.left_sente_wins, v.left_sente_games, half_up);
-            let a_gote = fmt_wr("後手", v.left_gote_wins, v.left_gote_games, half);
-            // right の先手 = left の後手局、right の後手 = left の先手局
-            let r_sente_decisive = v.left_gote_games;
-            let r_sente_wins = r_sente_decisive - v.left_gote_wins;
-            let r_gote_decisive = v.left_sente_games;
-            let r_gote_wins = r_gote_decisive - v.left_sente_wins;
-            let b_sente = fmt_wr("先手", r_sente_wins, r_sente_decisive, half);
-            let b_gote = fmt_wr("後手", r_gote_wins, r_gote_decisive, half_up);
-            println!("    {} {} {}", an, a_sente, a_gote);
-            println!("    {} {} {}", bn, b_sente, b_gote);
+            let primary_sente =
+                fmt_wr("先手", primary_sente_wins, primary_sente_games, primary_sente_total);
+            let primary_gote =
+                fmt_wr("後手", primary_gote_wins, primary_gote_games, primary_gote_total);
+            // secondary の先手 = primary の後手局、secondary の後手 = primary の先手局
+            let secondary_sente_wins = primary_gote_games - primary_gote_wins;
+            let secondary_gote_wins = primary_sente_games - primary_sente_wins;
+            let secondary_sente =
+                fmt_wr("先手", secondary_sente_wins, primary_gote_games, primary_gote_total);
+            let secondary_gote =
+                fmt_wr("後手", secondary_gote_wins, primary_sente_games, primary_sente_total);
+            println!("    {primary_name} {primary_sente} {primary_gote}");
+            println!("    {secondary_name} {secondary_sente} {secondary_gote}");
         }
     }
 
@@ -1948,6 +2050,39 @@ fn print_json(
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn h2h_places_sprt_test_on_the_left() {
+        assert!(should_show_right_first("base", "test", Some("test"), Some("base")));
+        assert!(!should_show_right_first("test", "base", Some("test"), Some("base")));
+        assert!(!should_show_right_first("a", "b", Some("test"), Some("base")));
+        assert!(!should_show_right_first("base", "test", None, None));
+    }
+
+    #[test]
+    fn reverse_penta_swaps_win_and_loss_categories() {
+        let penta = Penta {
+            ll: 1,
+            dl: 2,
+            dd: 3,
+            wl: 4,
+            wd: 5,
+            ww: 6,
+        };
+        let reversed = reverse_penta(penta);
+        assert_eq!(
+            reversed,
+            Penta {
+                ll: 6,
+                dl: 5,
+                dd: 3,
+                wl: 4,
+                wd: 2,
+                ww: 1
+            }
+        );
+        assert_eq!(reverse_penta(reversed), penta);
+    }
 
     fn write_meta_jsonl(dir: &std::path::Path, name: &str, sprt_json: Option<&str>) -> String {
         let path = dir.join(name);
