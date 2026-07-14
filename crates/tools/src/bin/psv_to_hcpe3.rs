@@ -182,6 +182,11 @@ fn convert(
 
     let hcp = pack_hcp_from_parts(&parts);
     let move16 = psv_move16_to_hcpe(psv.move16);
+    // 非 0 の move16 が変換で 0 になった = 範囲外の破損値。黙って bestMove16=0 の
+    // 「一見有効な」レコードを書くと教師 policy が静かに壊れるため、エラーとして skip する。
+    if psv.move16 != 0 && move16 == 0 {
+        return ConvResult::Error(format!("不正な move16: 0x{:04x}", psv.move16));
+    }
     let result = stm_result_to_hcpe(psv.game_result, parts.side_to_move);
     let eval = baked_eval(psv.score, eval_scale);
 

@@ -31,8 +31,8 @@ struct Cli {
     #[arg(long)]
     output: PathBuf,
 
-    /// 各局面でデコードした指し手の合法性を検証
-    #[arg(long, default_value_t = true)]
+    /// 各局面でデコードした指し手の合法性を検証（`--verify-legal=false` で形式確認のみの高速移行）
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     verify_legal: bool,
 }
 
