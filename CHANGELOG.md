@@ -97,6 +97,10 @@ Release ノートおよび release commit の「rshogi-core は v1.1.0 (0.4.0) �
   native + LayerStacks (num_buckets>1) で `--progress-file` 未指定なら起動エラーにし、
   progress 重みゼロフォールバックのサイレント品質バグを修正。--resume 時はパスと
   内容 SHA-256 の両方を照合。
+- **gensfen の教師ラベル裁定**: timeout・illegal_move・no_bestmove の対局を教師データから
+  全局破棄し、result JSONL の `adopted` と終局理由別サマリで可視化。通常千日手と連続王手
+  千日手を対局ループで裁定し、宣言勝ち局面を `move16=0` の PSV 終端局面として収録。
+  MultiPV 乱択は評価値差の明示指定を必須化。
 - **nyugyoku_gensfen** (#906): 入玉譜 manifest から玉の敵陣初侵入 ply にアンカーした
   開始局面集を抽出 (entry-40/-20/0/+20)。direct-mapped 固定サイズ dedup・partition 分割で
   数億局面規模でもピークメモリ入力非依存、checkpoint resume 対応。

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -17,8 +18,8 @@ use rshogi_core::nnue::{
     get_network, load_progress_coeff_kpabs_from_bytes, set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::{EnteringKingPointInfo, Position};
-use rshogi_core::types::{Color, Move};
-use serde::{Deserialize, Serialize};
+use rshogi_core::types::{Color, EnteringKingRule, Move};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::sync::atomic::AtomicU64;
 use tools::packed_sfen::{
@@ -302,8 +303,9 @@ struct Cli {
 
     /// MultiPV ランダム選択の評価値差閾値（centipawns）。
     /// PV1 のスコアとの差がこの値以内の候補からランダム選択する。
-    #[arg(long, default_value_t = 32000)]
-    random_multi_pv_diff: i32,
+    /// --random-multi-pv が 2 以上のときは必須。
+    #[arg(long)]
+    random_multi_pv_diff: Option<i32>,
 
     /// ランダムムーブの回数。0 で無効。
     /// 序盤の指定範囲内で N 回、合法手からランダムに選択する。
@@ -441,7 +443,8 @@ struct ResultLog<'a> {
     start_pos_index: usize,
     start_sfen: &'a str,
     outcome: &'a str,
-    reason: &'a str,
+    reason: OutcomeReason,
+    adopted: bool,
     plies: u32,
     final_points_black: u32,
     final_points_white: u32,
@@ -450,6 +453,117 @@ struct ResultLog<'a> {
     enemy_zone_pieces_black: u32,
     enemy_zone_pieces_white: u32,
     diversions: &'a [DiversionLog],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbnormalEndReason {
+    Timeout,
+    IllegalMove,
+    NoBestmove,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutcomeReason {
+    Mate,
+    Resign,
+    Win,
+    Sennichite,
+    PerpetualCheck,
+    MaxMoves,
+    Timeout,
+    IllegalMove,
+    NoBestmove,
+}
+
+impl Serialize for OutcomeReason {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl OutcomeReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mate => "mate",
+            Self::Resign => "resign",
+            Self::Win => "win",
+            Self::Sennichite => "sennichite",
+            Self::PerpetualCheck => "perpetual_check",
+            Self::MaxMoves => "max_moves",
+            Self::Timeout => "timeout",
+            Self::IllegalMove => "illegal_move",
+            Self::NoBestmove => "no_bestmove",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrainingDisposition {
+    Adopt,
+    Discard(AbnormalEndReason),
+}
+
+impl TrainingDisposition {
+    fn from_outcome_reason(reason: OutcomeReason) -> Self {
+        match reason {
+            OutcomeReason::Mate
+            | OutcomeReason::Resign
+            | OutcomeReason::Win
+            | OutcomeReason::Sennichite
+            | OutcomeReason::PerpetualCheck
+            | OutcomeReason::MaxMoves => Self::Adopt,
+            OutcomeReason::Timeout => Self::Discard(AbnormalEndReason::Timeout),
+            OutcomeReason::IllegalMove => Self::Discard(AbnormalEndReason::IllegalMove),
+            OutcomeReason::NoBestmove => Self::Discard(AbnormalEndReason::NoBestmove),
+        }
+    }
+
+    fn is_adopted(self) -> bool {
+        self == Self::Adopt
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TrainingStats {
+    total_written: u64,
+    skipped_initial: u64,
+    skipped_in_check: u64,
+    discarded_positions: u64,
+    discarded_timeout_games: u64,
+    discarded_illegal_move_games: u64,
+    discarded_no_bestmove_games: u64,
+    declaration_win_dedup_skipped_games: u64,
+}
+
+impl TrainingStats {
+    fn merge(&mut self, other: Self) {
+        self.total_written += other.total_written;
+        self.skipped_initial += other.skipped_initial;
+        self.skipped_in_check += other.skipped_in_check;
+        self.discarded_positions += other.discarded_positions;
+        self.discarded_timeout_games += other.discarded_timeout_games;
+        self.discarded_illegal_move_games += other.discarded_illegal_move_games;
+        self.discarded_no_bestmove_games += other.discarded_no_bestmove_games;
+        self.declaration_win_dedup_skipped_games += other.declaration_win_dedup_skipped_games;
+    }
+}
+
+fn game_result_for_side(outcome: GameOutcome, side_to_move: Color) -> i8 {
+    match outcome {
+        GameOutcome::BlackWin => match side_to_move {
+            Color::Black => 1,
+            Color::White => -1,
+        },
+        GameOutcome::WhiteWin => match side_to_move {
+            Color::Black => -1,
+            Color::White => 1,
+        },
+        GameOutcome::Draw => 0,
+        GameOutcome::InProgress => unreachable!(),
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -492,7 +606,7 @@ struct MetricsLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_mate_white: Option<i32>,
     outcome: String,
-    reason: String,
+    reason: OutcomeReason,
 }
 
 #[derive(Default)]
@@ -593,8 +707,11 @@ struct TrainingDataCollector {
     total_written: u64,
     skipped_initial: u64,
     skipped_in_check: u64,
-    /// InProgress（手数制限/タイムアウト）で終了した対局のスキップ数
-    skipped_in_progress: u64,
+    discarded_positions: u64,
+    discarded_timeout_games: u64,
+    discarded_illegal_move_games: u64,
+    discarded_no_bestmove_games: u64,
+    declaration_win_dedup_skipped_games: u64,
     /// .pack 形式用: 対局開始局面の HCP バイト列、手数、平手フラグ
     start_hcp: Option<([u8; 32], u16, bool)>,
     /// .pack 形式用: 平手局面の PackedSfen（平手判定の基準）
@@ -645,7 +762,11 @@ impl TrainingDataCollector {
             total_written: 0,
             skipped_initial: 0,
             skipped_in_check: 0,
-            skipped_in_progress: 0,
+            discarded_positions: 0,
+            discarded_timeout_games: 0,
+            discarded_illegal_move_games: 0,
+            discarded_no_bestmove_games: 0,
+            declaration_win_dedup_skipped_games: 0,
             start_hcp: None,
             hirate_packed_sfen,
         })
@@ -660,6 +781,10 @@ impl TrainingDataCollector {
     /// 現在蓄積中のエントリ数
     fn entries_len(&self) -> usize {
         self.entries.len()
+    }
+
+    fn record_declaration_win_dedup_skip(&mut self) {
+        self.declaration_win_dedup_skipped_games += 1;
     }
 
     /// 記録局面が 1 手飛んだとき、replay が必要な hcpe3 形式では蓄積中のセグメントを
@@ -759,14 +884,49 @@ impl TrainingDataCollector {
         });
     }
 
+    /// 宣言勝ちが成立した現在局面を PSV の終端局面として記録する。
+    fn record_declaration_win_position(&mut self, pos: &Position) {
+        if self.format != TrainingFormat::Psv {
+            return;
+        }
+
+        let current_ply = pos.game_ply();
+        if current_ply <= self.skip_initial_ply as i32 {
+            self.skipped_initial += 1;
+            return;
+        }
+
+        // 宣言成立は探索値より強い勝ち確定情報なので、評価の符号や有無に依存させない。
+        self.entries.push(TrainingEntry {
+            sfen: pack_position(pos),
+            score: 10000,
+            move16: 0,
+            game_ply: current_ply.clamp(0, u16::MAX as i32) as u16,
+            side_to_move: pos.side_to_move(),
+            hcpe3: None,
+        });
+    }
+
     /// 対局終了時に勝敗を設定して書き出す
-    /// InProgress（手数制限/タイムアウト終了）の対局は学習データに含めない
-    fn finish_game(&mut self, outcome: GameOutcome, game_id: u32) -> Result<()> {
-        // InProgressの対局は学習データとして不適切なので破棄
-        if outcome == GameOutcome::InProgress {
-            self.skipped_in_progress += self.entries.len() as u64;
+    fn finish_game(
+        &mut self,
+        outcome: GameOutcome,
+        disposition: TrainingDisposition,
+        game_id: u32,
+    ) -> Result<()> {
+        if let TrainingDisposition::Discard(reason) = disposition {
+            self.discarded_positions += self.entries.len() as u64;
+            match reason {
+                AbnormalEndReason::Timeout => self.discarded_timeout_games += 1,
+                AbnormalEndReason::IllegalMove => self.discarded_illegal_move_games += 1,
+                AbnormalEndReason::NoBestmove => self.discarded_no_bestmove_games += 1,
+            }
             self.entries.clear();
             return Ok(());
+        }
+
+        if outcome == GameOutcome::InProgress {
+            return Err(anyhow!("cannot adopt an in-progress game as training data"));
         }
 
         if self.entries.is_empty() {
@@ -788,24 +948,7 @@ impl TrainingDataCollector {
         for (idx, entry) in self.entries.iter().enumerate() {
             // game_result: 手番側から見た勝敗
             // 1 = 勝ち, 0 = 引き分け, -1 = 負け
-            let game_result = match outcome {
-                GameOutcome::BlackWin => {
-                    if entry.side_to_move == Color::Black {
-                        1i8
-                    } else {
-                        -1i8
-                    }
-                }
-                GameOutcome::WhiteWin => {
-                    if entry.side_to_move == Color::White {
-                        1i8
-                    } else {
-                        -1i8
-                    }
-                }
-                GameOutcome::Draw => 0i8,
-                GameOutcome::InProgress => unreachable!(),
-            };
+            let game_result = game_result_for_side(outcome, entry.side_to_move);
 
             let psv = PackedSfenValue {
                 sfen: entry.sfen,
@@ -932,13 +1075,17 @@ impl TrainingDataCollector {
         Ok(())
     }
 
-    fn stats(&self) -> (u64, u64, u64, u64) {
-        (
-            self.total_written,
-            self.skipped_initial,
-            self.skipped_in_check,
-            self.skipped_in_progress,
-        )
+    fn stats(&self) -> TrainingStats {
+        TrainingStats {
+            total_written: self.total_written,
+            skipped_initial: self.skipped_initial,
+            skipped_in_check: self.skipped_in_check,
+            discarded_positions: self.discarded_positions,
+            discarded_timeout_games: self.discarded_timeout_games,
+            discarded_illegal_move_games: self.discarded_illegal_move_games,
+            discarded_no_bestmove_games: self.discarded_no_bestmove_games,
+            declaration_win_dedup_skipped_games: self.declaration_win_dedup_skipped_games,
+        }
     }
 }
 
@@ -969,18 +1116,111 @@ impl SharedDedupHash {
         }
     }
 
+    fn effective_key(key: u64) -> u64 {
+        // key=0 は未使用エントリと区別できないので特殊扱い
+        if key == 0 { 1 } else { key }
+    }
+
+    fn contains(&self, key: u64) -> bool {
+        let effective_key = Self::effective_key(key);
+        let idx = (effective_key & self.mask) as usize;
+        self.table[idx].load(Ordering::Relaxed) == effective_key
+    }
+
     /// 重複なら true を返し、新規なら挿入して false を返す
     fn check_and_insert(&self, key: u64) -> bool {
-        // key=0 は未使用エントリと区別できないので特殊扱い
-        let effective_key = if key == 0 { 1 } else { key };
+        let effective_key = Self::effective_key(key);
         let idx = (effective_key & self.mask) as usize;
-        let old = self.table[idx].load(Ordering::Relaxed);
-        if old == effective_key {
+        if self.table[idx].load(Ordering::Relaxed) == effective_key {
             return true;
         }
         self.table[idx].store(effective_key, Ordering::Relaxed);
         false
     }
+}
+
+#[derive(Default)]
+struct PendingDedupKeys {
+    ordered: Vec<u64>,
+    unique: HashSet<u64>,
+}
+
+impl PendingDedupKeys {
+    fn check_and_stage(&mut self, dedup_hash: &SharedDedupHash, key: u64) -> bool {
+        let effective_key = SharedDedupHash::effective_key(key);
+        let shared_hit = dedup_hash.contains(effective_key);
+        let first_encounter = self.unique.insert(effective_key);
+        if first_encounter {
+            self.ordered.push(effective_key);
+        }
+        shared_hit || !first_encounter
+    }
+
+    fn publish(&self, dedup_hash: &SharedDedupHash) {
+        // 同じ対局からの反映順を初回遭遇順に固定するため、ordered をそのまま走査する。
+        for &key in &self.ordered {
+            dedup_hash.check_and_insert(key);
+        }
+    }
+}
+
+fn check_training_position_dedup(
+    dedup_hash: Option<&SharedDedupHash>,
+    pending_keys: &mut PendingDedupKeys,
+    key: u64,
+    collector: Option<&mut TrainingDataCollector>,
+    dedup_hits: &mut u64,
+    dedup_discarded: &mut u64,
+    interval_dedup_hits: &mut u64,
+    interval_positions_checked: &mut u64,
+) -> bool {
+    let Some(dedup_hash) = dedup_hash else {
+        return false;
+    };
+
+    *interval_positions_checked += 1;
+    if !pending_keys.check_and_stage(dedup_hash, key) {
+        return false;
+    }
+
+    *dedup_hits += 1;
+    *interval_dedup_hits += 1;
+    if let Some(collector) = collector {
+        *dedup_discarded += collector.entries_len() as u64;
+        collector.start_game();
+    }
+    true
+}
+
+fn check_declaration_win_position_dedup(
+    format: TrainingFormat,
+    dedup_hash: Option<&SharedDedupHash>,
+    pending_keys: &mut PendingDedupKeys,
+    key: u64,
+    collector: Option<&mut TrainingDataCollector>,
+    dedup_hits: &mut u64,
+    interval_dedup_hits: &mut u64,
+    interval_positions_checked: &mut u64,
+) -> bool {
+    if format != TrainingFormat::Psv {
+        return false;
+    }
+    let Some(dedup_hash) = dedup_hash else {
+        return false;
+    };
+
+    *interval_positions_checked += 1;
+    if !pending_keys.check_and_stage(dedup_hash, key) {
+        return false;
+    }
+
+    *dedup_hits += 1;
+    *interval_dedup_hits += 1;
+    if let Some(collector) = collector {
+        // 終端後には再収集できないため、重複した終端だけを除外して収集済み局面は残す。
+        collector.record_declaration_win_dedup_skip();
+    }
+    true
 }
 
 /// 開始局面を重複なしで消費するためのシャッフル済みインデックス列
@@ -1044,6 +1284,139 @@ fn validate_hcpe3_opts(
         bail!("--hcpe3-policy-temp must be a finite value > 0");
     }
     Ok(())
+}
+
+fn validate_cli(cli: &Cli) -> Result<()> {
+    if cli.concurrency == 0 {
+        bail!("--concurrency must be >= 1");
+    }
+    if cli.random_multi_pv.unwrap_or(0) > 1 && cli.random_multi_pv_diff.is_none() {
+        bail!("--random-multi-pv-diff is required when --random-multi-pv is greater than 1");
+    }
+    if cli.random_multi_pv_diff.is_some_and(|diff| diff < 0) {
+        bail!("--random-multi-pv-diff must be >= 0");
+    }
+    Ok(())
+}
+
+fn entering_king_rule_from_options(options: &[String]) -> Result<EnteringKingRule> {
+    let mut rule = EnteringKingRule::default();
+    for option in options {
+        let Some((name, value)) = option.split_once('=') else {
+            continue;
+        };
+        if name.trim() != "EnteringKingRule" {
+            continue;
+        }
+        rule = EnteringKingRule::from_usi(value.trim())
+            .ok_or_else(|| anyhow!("unknown EnteringKingRule value: {}", value.trim()))?;
+    }
+    Ok(rule)
+}
+
+fn has_entering_king_rule_option(options: &[String]) -> bool {
+    options.iter().any(|option| {
+        option
+            .split_once('=')
+            .is_some_and(|(name, _)| name.trim() == "EnteringKingRule")
+    })
+}
+
+fn winner_for_side(side: Color) -> GameOutcome {
+    match side {
+        Color::Black => GameOutcome::BlackWin,
+        Color::White => GameOutcome::WhiteWin,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlayedMoveHistory {
+    mover: Color,
+    gives_check: bool,
+}
+
+struct GameRepetitionHistory {
+    position_keys: Vec<u64>,
+    played_moves: Vec<PlayedMoveHistory>,
+}
+
+impl GameRepetitionHistory {
+    fn new(pos: &Position) -> Self {
+        Self {
+            position_keys: vec![pos.key()],
+            played_moves: Vec::new(),
+        }
+    }
+
+    fn record_move(
+        &mut self,
+        pos: &Position,
+        mover: Color,
+        gives_check: bool,
+    ) -> Option<(GameOutcome, OutcomeReason)> {
+        self.played_moves.push(PlayedMoveHistory { mover, gives_check });
+        self.position_keys.push(pos.key());
+
+        let current_index = self.position_keys.len() - 1;
+        let current_key = self.position_keys[current_index];
+        let first_of_four = self.position_keys[..current_index]
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, key)| **key == current_key)
+            .nth(2)
+            .map(|(index, _)| index)?;
+
+        let continuously_checks = |side| {
+            let mut moves =
+                self.played_moves[first_of_four..].iter().filter(|played| played.mover == side);
+            moves
+                .next()
+                .is_some_and(|played| played.gives_check && moves.all(|played| played.gives_check))
+        };
+        let side_to_move = pos.side_to_move();
+
+        // 両者が連続王手となる局面でも core と同じく現在手番側の負けを優先する。
+        if continuously_checks(side_to_move) {
+            Some((winner_for_side(side_to_move.opponent()), OutcomeReason::PerpetualCheck))
+        } else if continuously_checks(side_to_move.opponent()) {
+            Some((winner_for_side(side_to_move), OutcomeReason::PerpetualCheck))
+        } else {
+            Some((GameOutcome::Draw, OutcomeReason::Sennichite))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclarationWinAction {
+    Unavailable,
+    PseudoWin,
+    PlayMove(Move),
+}
+
+fn declaration_win_action(pos: &Position, rule: EnteringKingRule) -> DeclarationWinAction {
+    let action = pos.declaration_win(rule);
+    if action == Move::NONE {
+        DeclarationWinAction::Unavailable
+    } else if action == Move::WIN {
+        DeclarationWinAction::PseudoWin
+    } else {
+        DeclarationWinAction::PlayMove(action)
+    }
+}
+
+fn is_valid_bestmove_win(pos: &Position, rule: EnteringKingRule) -> bool {
+    declaration_win_action(pos, rule) == DeclarationWinAction::PseudoWin
+}
+
+fn is_try_rule_win_move(pos: &Position, rule: EnteringKingRule, played_move: Move) -> bool {
+    if rule != EnteringKingRule::TryRule {
+        return false;
+    }
+    matches!(
+        declaration_win_action(pos, rule),
+        DeclarationWinAction::PlayMove(expected) if expected.raw() == played_move.raw()
+    )
 }
 
 /// 詰みスコア（手番側視点・手数）を hcpe3 eval の 32000-ply 符号化へ。
@@ -1241,11 +1614,11 @@ fn make_game_ticket<R: Rng + ?Sized>(
 
 struct WorkerGameResult {
     outcome: GameOutcome,
-    outcome_reason: String,
+    outcome_reason: OutcomeReason,
 }
 
 struct WorkerOutput {
-    training_stats: (u64, u64, u64, u64),
+    training_stats: TrainingStats,
 }
 
 struct WorkerConfig {
@@ -1265,6 +1638,8 @@ struct WorkerConfig {
     ponder: bool,
     black_usi_opts: Vec<String>,
     white_usi_opts: Vec<String>,
+    entering_king_rule_black: EnteringKingRule,
+    entering_king_rule_white: EnteringKingRule,
     // Game
     max_moves: u32,
     timeout_margin_ms: u64,
@@ -1438,16 +1813,18 @@ fn worker_main(
 
             let parsed = &cfg.start_defs[ticket.startpos_idx];
             let mut pos = build_position(parsed, None, None)?;
+            let mut repetition_history = GameRepetitionHistory::new(&pos);
             let start_sfen = pos.to_sfen();
             let start_pos_index = parsed.source_line.unwrap_or(ticket.startpos_idx + 1);
             let mut tc = TimeControl::new(cfg.btime, cfg.wtime, cfg.binc, cfg.winc, cfg.byoyomi);
             let mut outcome = GameOutcome::InProgress;
-            let mut outcome_reason = "max_moves";
+            let mut outcome_reason = OutcomeReason::MaxMoves;
             let mut plies_played = 0u32;
             let mut move_list: Vec<String> = Vec::new();
             let mut eval_list: Vec<String> = Vec::new();
             let mut diversions: Vec<DiversionLog> = Vec::new();
             let mut metrics = MetricsCollector::default();
+            let mut pending_dedup_keys = PendingDedupKeys::default();
 
             if let Some(ref mut collector) = training_data_collector {
                 collector.start_game();
@@ -1468,6 +1845,11 @@ fn worker_main(
             for ply_idx in 0..cfg.max_moves {
                 plies_played = ply_idx + 1;
                 let side = pos.side_to_move();
+                let entering_king_rule = if side == Color::Black {
+                    cfg.entering_king_rule_black
+                } else {
+                    cfg.entering_king_rule_white
+                };
                 let engine_label = if side == Color::Black {
                     "black"
                 } else {
@@ -1496,7 +1878,7 @@ fn worker_main(
                         } else {
                             GameOutcome::BlackWin
                         };
-                        outcome_reason = "mate";
+                        outcome_reason = OutcomeReason::Mate;
                         break;
                     }
                     let mv = legal_moves[rng.random_range(0..legal_moves.len())];
@@ -1518,10 +1900,23 @@ fn worker_main(
                     } else {
                         pos.gives_check(mv)
                     };
+                    let try_rule_win = is_try_rule_win_move(&pos, entering_king_rule, mv);
                     pos.do_move(mv, gives_check);
+                    if try_rule_win {
+                        outcome = winner_for_side(side);
+                        outcome_reason = OutcomeReason::Win;
+                    } else if let Some((repetition_result, reason)) =
+                        repetition_history.record_move(&pos, side, gives_check)
+                    {
+                        outcome = repetition_result;
+                        outcome_reason = reason;
+                    }
                     if eval_writer.is_some() {
                         eval_list.push("R".to_string());
                         move_list.push(rm_usi.clone());
+                    }
+                    if outcome != GameOutcome::InProgress {
+                        break;
                     }
                     continue;
                 }
@@ -1570,12 +1965,14 @@ fn worker_main(
                     } else {
                         GameOutcome::BlackWin
                     };
-                    outcome_reason = "timeout";
+                    outcome_reason = OutcomeReason::Timeout;
                     terminal = true;
                     if search.best_move_usi.is_none() {
                         move_usi = "timeout".to_string();
                     }
-                } else if let Some(ref mv_str) = search.best_move_usi {
+                } else if let Some(ref mv_str) = search.best_move_usi
+                    && mv_str != "none"
+                {
                     match mv_str.as_str() {
                         "resign" => {
                             move_usi = mv_str.clone();
@@ -1584,17 +1981,42 @@ fn worker_main(
                             } else {
                                 GameOutcome::BlackWin
                             };
-                            outcome_reason = "resign";
+                            outcome_reason = OutcomeReason::Resign;
                             terminal = true;
                         }
                         "win" => {
                             move_usi = mv_str.clone();
-                            outcome = if side == Color::Black {
-                                GameOutcome::BlackWin
+                            if is_valid_bestmove_win(&pos, entering_king_rule) {
+                                let skip_record = check_declaration_win_position_dedup(
+                                    cfg.training_format,
+                                    dedup_hash.as_deref(),
+                                    &mut pending_dedup_keys,
+                                    pos.key(),
+                                    training_data_collector.as_mut(),
+                                    &mut dedup_hits,
+                                    &mut interval_dedup_hits,
+                                    &mut interval_positions_checked,
+                                );
+                                if !skip_record
+                                    && let Some(ref mut collector) = training_data_collector
+                                {
+                                    collector.record_declaration_win_position(&pos);
+                                }
+                                outcome = if side == Color::Black {
+                                    GameOutcome::BlackWin
+                                } else {
+                                    GameOutcome::WhiteWin
+                                };
+                                outcome_reason = OutcomeReason::Win;
                             } else {
-                                GameOutcome::WhiteWin
-                            };
-                            outcome_reason = "win";
+                                outcome = if side == Color::Black {
+                                    GameOutcome::WhiteWin
+                                } else {
+                                    GameOutcome::BlackWin
+                                };
+                                outcome_reason = OutcomeReason::IllegalMove;
+                                move_usi = "illegal".to_string();
+                            }
                             terminal = true;
                         }
                         _ => {
@@ -1610,26 +2032,16 @@ fn worker_main(
                                 Some(mv) => {
                                     // --- gensfen: ハッシュ重複検出 ---
                                     // 全ワーカーで共有するテーブルで重複チェック（tanuki-と同じ構成）
-                                    let skip_record = if let Some(ref dh) = dedup_hash {
-                                        interval_positions_checked += 1;
-                                        if dh.check_and_insert(pos.key()) {
-                                            dedup_hits += 1;
-                                            interval_dedup_hits += 1;
-                                            let discarded = training_data_collector
-                                                .as_ref()
-                                                .map_or(0, |c| c.entries_len() as u64);
-                                            dedup_discarded += discarded;
-                                            if let Some(ref mut collector) = training_data_collector
-                                            {
-                                                collector.start_game();
-                                            }
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    };
+                                    let skip_record = check_training_position_dedup(
+                                        dedup_hash.as_deref(),
+                                        &mut pending_dedup_keys,
+                                        pos.key(),
+                                        training_data_collector.as_mut(),
+                                        &mut dedup_hits,
+                                        &mut dedup_discarded,
+                                        &mut interval_dedup_hits,
+                                        &mut interval_positions_checked,
+                                    );
 
                                     // --- gensfen: MultiPV ランダム選択 ---
                                     let played_mv = if cfg.random_multi_pv > 1 {
@@ -1676,9 +2088,22 @@ fn worker_main(
                                     } else {
                                         pos.gives_check(played_mv)
                                     };
+                                    let try_rule_win =
+                                        is_try_rule_win_move(&pos, entering_king_rule, played_mv);
                                     pos.do_move(played_mv, gives_check);
                                     tc.update_after_move(side, search.elapsed_ms);
                                     move_usi = played_mv.to_usi();
+                                    if try_rule_win {
+                                        outcome = winner_for_side(side);
+                                        outcome_reason = OutcomeReason::Win;
+                                        terminal = true;
+                                    } else if let Some((repetition_result, reason)) =
+                                        repetition_history.record_move(&pos, side, gives_check)
+                                    {
+                                        outcome = repetition_result;
+                                        outcome_reason = reason;
+                                        terminal = true;
+                                    }
                                 }
                                 None => {
                                     outcome = if side == Color::Black {
@@ -1686,7 +2111,7 @@ fn worker_main(
                                     } else {
                                         GameOutcome::BlackWin
                                     };
-                                    outcome_reason = "illegal_move";
+                                    outcome_reason = OutcomeReason::IllegalMove;
                                     terminal = true;
                                     move_usi = "illegal".to_string();
                                 }
@@ -1703,9 +2128,9 @@ fn worker_main(
                     let mut legal_moves = MoveList::new();
                     generate_legal(&pos, &mut legal_moves);
                     outcome_reason = if legal_moves.is_empty() {
-                        "mate"
+                        OutcomeReason::Mate
                     } else {
-                        "no_bestmove"
+                        OutcomeReason::NoBestmove
                     };
                     terminal = true;
                 }
@@ -1730,8 +2155,9 @@ fn worker_main(
 
             if outcome == GameOutcome::InProgress {
                 outcome = GameOutcome::Draw;
-                outcome_reason = "max_moves";
+                outcome_reason = OutcomeReason::MaxMoves;
             }
+            let training_disposition = TrainingDisposition::from_outcome_reason(outcome_reason);
             let final_meta = final_entering_king_meta(&pos);
             let result = ResultLog {
                 kind: "result",
@@ -1740,6 +2166,7 @@ fn worker_main(
                 start_sfen: &start_sfen,
                 outcome: outcome.label(),
                 reason: outcome_reason,
+                adopted: training_disposition.is_adopted(),
                 plies: plies_played,
                 final_points_black: final_meta.black.points,
                 final_points_white: final_meta.white.points,
@@ -1781,20 +2208,25 @@ fn worker_main(
                     last_mate_black: metrics.last_mate_black,
                     last_mate_white: metrics.last_mate_white,
                     outcome: outcome.label().to_string(),
-                    reason: outcome_reason.to_string(),
+                    reason: outcome_reason,
                 };
                 serde_json::to_writer(&mut *w, &metrics_log)?;
                 w.write_all(b"\n")?;
             }
 
             if let Some(ref mut collector) = training_data_collector {
-                collector.finish_game(outcome, game_idx + 1)?;
+                collector.finish_game(outcome, training_disposition, game_idx + 1)?;
+            }
+            if training_disposition.is_adopted()
+                && let Some(dedup_hash) = dedup_hash.as_deref()
+            {
+                pending_dedup_keys.publish(dedup_hash);
             }
             writer.flush()?;
 
             let _ = tx.send(WorkerGameResult {
                 outcome,
-                outcome_reason: outcome_reason.to_string(),
+                outcome_reason,
             });
 
             // dedup rate 監視（dedup 有効時のみカウント・チェック）
@@ -1866,7 +2298,7 @@ fn worker_main(
             collector.flush()?;
             collector.stats()
         } else {
-            (0, 0, 0, 0)
+            TrainingStats::default()
         };
 
         Ok(WorkerOutput { training_stats })
@@ -1878,7 +2310,7 @@ fn worker_main(
             eprintln!("worker {}: error: {e}", cfg.worker_id);
             shutdown.store(true, Ordering::Relaxed);
             WorkerOutput {
-                training_stats: (0, 0, 0, 0),
+                training_stats: TrainingStats::default(),
             }
         }
     }
@@ -2054,6 +2486,7 @@ fn concatenate_temp_files(final_path: &Path, temp_paths: &[PathBuf], append: boo
 
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
+    validate_cli(&cli)?;
 
     // 既存 run には sidecar が無い可能性があり、PSV だけへの追記は 1:1 対応を壊す。
     // 既存 PSV/sidecar の全件検証を暗黙に行わず、安全側で併用を禁止する。
@@ -2242,13 +2675,30 @@ fn main() -> Result<()> {
     let white_usi_opts = cli.usi_options_white.clone().unwrap_or_else(|| common_usi_opts.clone());
 
     let native_mode = cli.native.unwrap_or(true);
+    if native_mode
+        && (has_entering_king_rule_option(&black_usi_opts)
+            || has_entering_king_rule_option(&white_usi_opts))
+    {
+        eprintln!(
+            "warning: NativeBackend ignores the EnteringKingRule USI option and uses CSARule27"
+        );
+    }
     if !native_mode && cli.progress_file.is_some() {
         bail!(
             "--progress-file is only supported with --native=true. \
              In USI mode, pass the engine option directly with --usi-option LS_PROGRESS_COEFF=<path>."
         );
     }
-
+    let entering_king_rule_black = if native_mode {
+        EnteringKingRule::default()
+    } else {
+        entering_king_rule_from_options(&black_usi_opts)?
+    };
+    let entering_king_rule_white = if native_mode {
+        EnteringKingRule::default()
+    } else {
+        entering_king_rule_from_options(&white_usi_opts)?
+    };
     // USI モードかつ先後同一エンジンなら 1 プロセスで兼用する最適化。
     // TT/履歴が先後で共有されるため棋力評価対局（tournament）では不可だが、
     // gensfen は教師局面生成専用のため常に有効化して問題ない。
@@ -2428,6 +2878,7 @@ fn main() -> Result<()> {
     let keep_tt_resolved = cli.keep_tt.unwrap_or(false);
     let dedup_hash_size_resolved = cli.dedup_hash_size.unwrap_or(64 * 1024 * 1024);
     let random_multi_pv_resolved = cli.random_multi_pv.unwrap_or(0);
+    let random_multi_pv_diff_resolved = cli.random_multi_pv_diff.unwrap_or(0);
 
     // gensfen: 共有ハッシュ重複検出テーブル（全ワーカーで1つ共有、tanuki-と同じ構成）
     let shared_dedup_hash = if dedup_hash_size_resolved > 0 {
@@ -2545,6 +2996,8 @@ fn main() -> Result<()> {
             ponder: cli.ponder,
             black_usi_opts: black_usi_opts.clone(),
             white_usi_opts: white_usi_opts.clone(),
+            entering_king_rule_black,
+            entering_king_rule_white,
             max_moves: cli.max_moves,
             timeout_margin_ms: cli.timeout_margin_ms,
             btime: cli.btime,
@@ -2575,7 +3028,7 @@ fn main() -> Result<()> {
             keep_tt: keep_tt_resolved,
             dedup_hash: shared_dedup_hash.clone(),
             random_multi_pv: random_multi_pv_resolved,
-            random_multi_pv_diff: cli.random_multi_pv_diff,
+            random_multi_pv_diff: random_multi_pv_diff_resolved,
             random_move_count: cli.random_move_count,
             random_move_min_ply: cli.random_move_min_ply,
             random_move_max_ply: cli.random_move_max_ply,
@@ -2670,7 +3123,7 @@ fn main() -> Result<()> {
             completed,
             cli.games,
             result.outcome.label(),
-            result.outcome_reason,
+            result.outcome_reason.as_str(),
             black_wins,
             white_wins,
             draws
@@ -2730,17 +3183,10 @@ fn main() -> Result<()> {
     }
 
     // Join workers and collect training stats
-    let mut total_written = 0u64;
-    let mut total_skipped_initial = 0u64;
-    let mut total_skipped_in_check = 0u64;
-    let mut total_skipped_in_progress = 0u64;
+    let mut training_stats = TrainingStats::default();
     for h in handles {
         if let Ok(output) = h.join() {
-            let (tw, si, sic, sip) = output.training_stats;
-            total_written += tw;
-            total_skipped_initial += si;
-            total_skipped_in_check += sic;
-            total_skipped_in_progress += sip;
+            training_stats.merge(output.training_stats);
         }
     }
 
@@ -2799,13 +3245,31 @@ fn main() -> Result<()> {
     if training_data_enabled {
         println!();
         println!("--- Training Data ---");
-        println!("Total positions written: {total_written}");
-        println!("Skipped (initial ply 1-{}): {total_skipped_initial}", cli.skip_initial_ply);
+        println!("Total positions written: {}", training_stats.total_written);
+        println!(
+            "Skipped (initial ply 1-{}): {}",
+            cli.skip_initial_ply, training_stats.skipped_initial
+        );
         if cli.skip_in_check {
-            println!("Skipped (in check): {total_skipped_in_check}");
+            println!("Skipped (in check): {}", training_stats.skipped_in_check);
         }
-        if total_skipped_in_progress > 0 {
-            println!("Skipped (in progress games): {total_skipped_in_progress}");
+        if training_stats.discarded_timeout_games > 0
+            || training_stats.discarded_illegal_move_games > 0
+            || training_stats.discarded_no_bestmove_games > 0
+        {
+            println!(
+                "Discarded abnormal games: timeout={} illegal_move={} no_bestmove={} ({} collected positions discarded at game end)",
+                training_stats.discarded_timeout_games,
+                training_stats.discarded_illegal_move_games,
+                training_stats.discarded_no_bestmove_games,
+                training_stats.discarded_positions
+            );
+        }
+        if training_stats.declaration_win_dedup_skipped_games > 0 {
+            println!(
+                "Declaration-win terminals skipped by dedup: {} games",
+                training_stats.declaration_win_dedup_skipped_games
+            );
         }
         println!(
             "Output: {}",
@@ -3064,6 +3528,7 @@ mod tests {
 
     use clap::Parser;
     use rand::{SeedableRng, rngs::StdRng};
+    use rshogi_core::types::RepetitionState;
     use std::path::PathBuf;
 
     #[test]
@@ -3139,6 +3604,203 @@ mod tests {
         assert_eq!(meta.white.enemy_zone_pieces, 14);
     }
 
+    fn play_moves(
+        pos: &mut Position,
+        history: &mut GameRepetitionHistory,
+        moves: &[&str],
+    ) -> Option<(GameOutcome, OutcomeReason)> {
+        let mut repetition = None;
+        for usi in moves {
+            let mv = Move::from_usi(usi).expect("USI move");
+            assert!(is_legal_with_pass(pos, mv), "illegal fixture move: {usi}");
+            let mover = pos.side_to_move();
+            let gives_check = pos.gives_check(mv);
+            pos.do_move(mv, gives_check);
+            repetition = history.record_move(pos, mover, gives_check);
+        }
+        repetition
+    }
+
+    #[test]
+    fn repetition_draw_is_adjudicated_only_on_fourth_occurrence() {
+        let mut pos = Position::new();
+        pos.set_sfen("4k4/9/9/9/9/9/9/9/4K4 b - 1").unwrap();
+        let mut history = GameRepetitionHistory::new(&pos);
+        let cycle = ["5i4i", "5a4a", "4i5i", "4a5a"];
+        assert!(play_moves(&mut pos, &mut history, &cycle).is_none());
+        assert!(play_moves(&mut pos, &mut history, &cycle).is_none());
+        let repetition = play_moves(&mut pos, &mut history, &cycle);
+        assert_eq!(pos.repetition_state(0), RepetitionState::Draw);
+        let (outcome, reason) = repetition.unwrap();
+        assert!(outcome == GameOutcome::Draw);
+        assert_eq!(reason, OutcomeReason::Sennichite);
+    }
+
+    #[test]
+    fn repetition_history_adjudicates_a_cycle_longer_than_core_window() {
+        let mut pos = Position::new();
+        pos.set_sfen("4k4/9/9/9/9/9/9/9/4K4 b - 1").unwrap();
+        let mut history = GameRepetitionHistory::new(&pos);
+        let cycle = [
+            "5i4i", "5a4a", "4i3i", "4a3a", "3i3h", "3a3b", "3h3g", "3b3c", "3g4g", "3c4c", "4g5g",
+            "4c5c", "5g6g", "5c6c", "6g6h", "6c6b", "6h6i", "6b6a", "6i5i", "6a5a",
+        ];
+
+        assert!(play_moves(&mut pos, &mut history, &cycle).is_none());
+        assert!(play_moves(&mut pos, &mut history, &cycle).is_none());
+        let repetition = play_moves(&mut pos, &mut history, &cycle);
+
+        assert_eq!(pos.repetition_state(0), RepetitionState::None);
+        let (outcome, reason) = repetition.unwrap();
+        assert!(outcome == GameOutcome::Draw);
+        assert_eq!(reason, OutcomeReason::Sennichite);
+    }
+
+    #[test]
+    fn perpetual_check_win_is_current_side_perspective() {
+        let mut pos = Position::new();
+        pos.set_sfen("4k4/4R4/9/9/9/9/9/9/K8 w - 1").unwrap();
+        let mut history = GameRepetitionHistory::new(&pos);
+        let cycle = ["5a4a", "5b4b", "4a5a", "4b5b"];
+        let mut repetition = None;
+        for _ in 0..3 {
+            repetition = play_moves(&mut pos, &mut history, &cycle);
+        }
+        assert_eq!(pos.side_to_move(), Color::White);
+        assert_eq!(pos.repetition_state(0), RepetitionState::Win);
+        let (outcome, reason) = repetition.unwrap();
+        assert!(outcome == GameOutcome::WhiteWin);
+        assert_eq!(reason, OutcomeReason::PerpetualCheck);
+        assert_eq!(game_result_for_side(outcome, Color::White), 1);
+        assert_eq!(game_result_for_side(outcome, Color::Black), -1);
+    }
+
+    #[test]
+    fn perpetual_check_lose_is_current_side_perspective() {
+        let mut pos = Position::new();
+        pos.set_sfen("5k3/4R4/9/9/9/9/9/9/K8 b - 1").unwrap();
+        let mut history = GameRepetitionHistory::new(&pos);
+        let cycle = ["5b4b", "4a5a", "4b5b", "5a4a"];
+        let mut repetition = None;
+        for _ in 0..3 {
+            repetition = play_moves(&mut pos, &mut history, &cycle);
+        }
+        assert_eq!(pos.side_to_move(), Color::Black);
+        assert_eq!(pos.repetition_state(0), RepetitionState::Lose);
+        let (outcome, reason) = repetition.unwrap();
+        assert!(outcome == GameOutcome::WhiteWin);
+        assert_eq!(reason, OutcomeReason::PerpetualCheck);
+        assert_eq!(game_result_for_side(outcome, Color::White), 1);
+        assert_eq!(game_result_for_side(outcome, Color::Black), -1);
+    }
+
+    #[test]
+    fn invalid_external_bestmove_win_is_rejected() {
+        let mut pos = Position::new();
+        pos.set_hirate();
+        assert!(!is_valid_bestmove_win(&pos, EnteringKingRule::Point27));
+
+        pos.set_sfen("KGG6/SS7/PPPPPP3/9/9/9/2pppppp1/1ss1gg1nl/4k2nl b 2R2B3p 1")
+            .unwrap();
+        assert!(is_valid_bestmove_win(&pos, EnteringKingRule::Point27));
+    }
+
+    #[test]
+    fn try_rule_requires_the_returned_king_move_instead_of_bestmove_win() {
+        let mut pos = Position::new();
+        pos.set_sfen("3K5/9/9/9/9/9/9/9/4k4 b 2r2b4g4s4n4l18p 1").unwrap();
+        let action = declaration_win_action(&pos, EnteringKingRule::TryRule);
+        let DeclarationWinAction::PlayMove(mv) = action else {
+            panic!("TryRule must return the king move");
+        };
+        assert_eq!(mv.to_usi(), "6a5a");
+        assert!(!is_valid_bestmove_win(&pos, EnteringKingRule::TryRule));
+        assert!(!is_valid_bestmove_win(&pos, EnteringKingRule::None));
+    }
+
+    #[test]
+    fn entering_king_rule_follows_usi_option() {
+        assert_eq!(entering_king_rule_from_options(&[]).unwrap(), EnteringKingRule::Point27);
+        assert_eq!(
+            entering_king_rule_from_options(&["EnteringKingRule=CSARule24".to_string()]).unwrap(),
+            EnteringKingRule::Point24
+        );
+        assert!(
+            entering_king_rule_from_options(&["EnteringKingRule=invalid".to_string()]).is_err()
+        );
+        assert_eq!(
+            entering_king_rule_from_options(&["EnteringKingRule=NoEnteringKing".to_string()])
+                .unwrap(),
+            EnteringKingRule::None
+        );
+        assert_eq!(
+            entering_king_rule_from_options(&["EnteringKingRule=TryRule".to_string()]).unwrap(),
+            EnteringKingRule::TryRule
+        );
+        assert!(has_entering_king_rule_option(&["EnteringKingRule = TryRule".to_string()]));
+        assert!(!has_entering_king_rule_option(&["Threads=2".to_string()]));
+    }
+
+    #[test]
+    fn cli_rejects_zero_concurrency() {
+        let cli = Cli::parse_from(["gensfen", "--concurrency", "0"]);
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn cli_requires_multipv_diff_when_random_multipv_is_enabled() {
+        let missing = Cli::parse_from(["gensfen", "--random-multi-pv", "4"]);
+        assert!(validate_cli(&missing).is_err());
+        let explicit = Cli::parse_from([
+            "gensfen",
+            "--random-multi-pv",
+            "4",
+            "--random-multi-pv-diff",
+            "100",
+        ]);
+        assert!(validate_cli(&explicit).is_ok());
+        let disabled = Cli::parse_from(["gensfen"]);
+        assert!(validate_cli(&disabled).is_ok());
+    }
+
+    #[test]
+    fn training_disposition_discards_only_abnormal_reasons() {
+        for reason in [
+            OutcomeReason::Timeout,
+            OutcomeReason::IllegalMove,
+            OutcomeReason::NoBestmove,
+        ] {
+            assert!(!TrainingDisposition::from_outcome_reason(reason).is_adopted());
+        }
+        for reason in [
+            OutcomeReason::Mate,
+            OutcomeReason::Resign,
+            OutcomeReason::Win,
+            OutcomeReason::MaxMoves,
+            OutcomeReason::Sennichite,
+            OutcomeReason::PerpetualCheck,
+        ] {
+            assert!(TrainingDisposition::from_outcome_reason(reason).is_adopted());
+        }
+    }
+
+    #[test]
+    fn outcome_reason_serialization_uses_as_str() {
+        for reason in [
+            OutcomeReason::Mate,
+            OutcomeReason::Resign,
+            OutcomeReason::Win,
+            OutcomeReason::Sennichite,
+            OutcomeReason::PerpetualCheck,
+            OutcomeReason::MaxMoves,
+            OutcomeReason::Timeout,
+            OutcomeReason::IllegalMove,
+            OutcomeReason::NoBestmove,
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), reason.as_str());
+        }
+    }
+
     #[test]
     fn shared_dedup_hash_detects_duplicates() {
         let dh = SharedDedupHash::new(1024);
@@ -3163,6 +3825,176 @@ mod tests {
         assert!(!dh.check_and_insert(4));
         // key=2 は上書きされているので false（新規扱い）
         assert!(!dh.check_and_insert(2));
+    }
+
+    #[test]
+    fn abnormal_games_do_not_publish_pending_dedup_keys() {
+        for reason in [
+            AbnormalEndReason::Timeout,
+            AbnormalEndReason::IllegalMove,
+            AbnormalEndReason::NoBestmove,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("abnormal.psv");
+            let mut collector =
+                TrainingDataCollector::new(&path, 0, false, TrainingFormat::Psv, 1000, 600.0, None)
+                    .unwrap();
+            let dedup = SharedDedupHash::new(1024);
+            let mut pending = PendingDedupKeys::default();
+            let mut hits = 0;
+            let mut discarded = 0;
+            let mut interval_hits = 0;
+            let mut interval_checked = 0;
+            let mut pos = Position::new();
+            pos.set_hirate();
+            let mv = Move::from_usi("7g7f").unwrap();
+
+            assert!(!check_training_position_dedup(
+                Some(&dedup),
+                &mut pending,
+                pos.key(),
+                Some(&mut collector),
+                &mut hits,
+                &mut discarded,
+                &mut interval_hits,
+                &mut interval_checked,
+            ));
+            collector.record_position(&pos, Some(10), None, Some(mv), mv, &[]);
+            collector
+                .finish_game(GameOutcome::WhiteWin, TrainingDisposition::Discard(reason), 1)
+                .unwrap();
+
+            let mut next_game_pending = PendingDedupKeys::default();
+            assert!(!check_training_position_dedup(
+                Some(&dedup),
+                &mut next_game_pending,
+                pos.key(),
+                Some(&mut collector),
+                &mut hits,
+                &mut discarded,
+                &mut interval_hits,
+                &mut interval_checked,
+            ));
+        }
+    }
+
+    #[test]
+    fn pending_dedup_keys_detect_duplicates_within_game() {
+        let dedup = SharedDedupHash::new(1024);
+        let mut pending = PendingDedupKeys::default();
+        let mut hits = 0;
+        let mut discarded = 0;
+        let mut interval_hits = 0;
+        let mut interval_checked = 0;
+
+        assert!(!check_training_position_dedup(
+            Some(&dedup),
+            &mut pending,
+            12345,
+            None,
+            &mut hits,
+            &mut discarded,
+            &mut interval_hits,
+            &mut interval_checked,
+        ));
+        assert!(check_training_position_dedup(
+            Some(&dedup),
+            &mut pending,
+            12345,
+            None,
+            &mut hits,
+            &mut discarded,
+            &mut interval_hits,
+            &mut interval_checked,
+        ));
+        assert_eq!((hits, discarded, interval_hits, interval_checked), (1, 0, 1, 2));
+        assert!(!dedup.contains(12345));
+    }
+
+    #[test]
+    fn pending_dedup_collision_keeps_exact_set_semantics_through_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collision.psv");
+        let mut collector =
+            TrainingDataCollector::new(&path, 0, false, TrainingFormat::Psv, 1000, 600.0, None)
+                .unwrap();
+        let dedup = SharedDedupHash::new(2);
+        let mut pending = PendingDedupKeys::default();
+        let mut hits = 0;
+        let mut discarded = 0;
+        let mut interval_hits = 0;
+        let mut interval_checked = 0;
+        let mut pos = Position::new();
+        pos.set_hirate();
+        let mv = Move::from_usi("7g7f").unwrap();
+
+        assert!(!check_training_position_dedup(
+            Some(&dedup),
+            &mut pending,
+            2,
+            Some(&mut collector),
+            &mut hits,
+            &mut discarded,
+            &mut interval_hits,
+            &mut interval_checked,
+        ));
+        collector.record_position(&pos, Some(10), None, Some(mv), mv, &[]);
+        assert!(!check_training_position_dedup(
+            Some(&dedup),
+            &mut pending,
+            4,
+            Some(&mut collector),
+            &mut hits,
+            &mut discarded,
+            &mut interval_hits,
+            &mut interval_checked,
+        ));
+        collector.record_position(&pos, Some(20), None, Some(mv), mv, &[]);
+        assert!(check_training_position_dedup(
+            Some(&dedup),
+            &mut pending,
+            2,
+            Some(&mut collector),
+            &mut hits,
+            &mut discarded,
+            &mut interval_hits,
+            &mut interval_checked,
+        ));
+        assert_eq!((hits, discarded, interval_hits, interval_checked), (1, 2, 1, 3));
+
+        pending.publish(&dedup);
+        assert!(!dedup.contains(2));
+        assert!(dedup.contains(4));
+    }
+
+    #[test]
+    fn shared_hit_remains_pending_after_colliding_publish() {
+        let dedup = SharedDedupHash::new(2);
+        assert!(!dedup.check_and_insert(2));
+
+        let mut game_pending = PendingDedupKeys::default();
+        assert!(game_pending.check_and_stage(&dedup, 2));
+        assert_eq!(game_pending.ordered, vec![2]);
+
+        let mut colliding_pending = PendingDedupKeys::default();
+        assert!(!colliding_pending.check_and_stage(&dedup, 4));
+        colliding_pending.publish(&dedup);
+        assert!(!dedup.contains(2));
+        assert!(dedup.contains(4));
+
+        assert!(game_pending.check_and_stage(&dedup, 2));
+        assert_eq!(game_pending.ordered, vec![2]);
+    }
+
+    #[test]
+    fn adopted_game_publishes_pending_dedup_keys() {
+        let dedup = SharedDedupHash::new(1024);
+        let mut first_game_pending = PendingDedupKeys::default();
+        assert!(!first_game_pending.check_and_stage(&dedup, 12345));
+        first_game_pending.publish(&dedup);
+
+        let mut next_game_pending = PendingDedupKeys::default();
+        assert!(next_game_pending.check_and_stage(&dedup, 12345));
     }
 
     #[test]
@@ -3353,7 +4185,8 @@ mod tests {
             start_pos_index: 1,
             start_sfen: "lnsgkgsnl/1r5b1/p1ppppppp/9/1p7/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL b - 1",
             outcome: "draw",
-            reason: "max_moves",
+            reason: OutcomeReason::MaxMoves,
+            adopted: true,
             plies: 1,
             final_points_black: 0,
             final_points_white: 0,
@@ -3365,6 +4198,8 @@ mod tests {
         };
         let value = serde_json::to_value(result).unwrap();
         assert_eq!(value["diversions"], serde_json::json!([]));
+        assert_eq!(value["adopted"], true);
+        assert_eq!(value["reason"], "max_moves");
     }
 
     #[test]
@@ -3539,6 +4374,238 @@ mod tests {
     }
 
     #[test]
+    fn abnormal_endings_discard_every_collected_position() {
+        for (name, reason) in [
+            ("timeout", AbnormalEndReason::Timeout),
+            ("illegal", AbnormalEndReason::IllegalMove),
+            ("no_bestmove", AbnormalEndReason::NoBestmove),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{name}.psv"));
+            let mut pos = Position::new();
+            pos.set_hirate();
+            let mv = Move::from_usi("7g7f").unwrap();
+            let stats;
+            {
+                let mut collector = TrainingDataCollector::new(
+                    &path,
+                    0,
+                    false,
+                    TrainingFormat::Psv,
+                    1000,
+                    600.0,
+                    None,
+                )
+                .unwrap();
+                collector.record_position(&pos, Some(20), None, Some(mv), mv, &[]);
+                collector
+                    .finish_game(GameOutcome::WhiteWin, TrainingDisposition::Discard(reason), 1)
+                    .unwrap();
+                collector.flush().unwrap();
+                stats = collector.stats();
+            }
+            assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+            assert_eq!(stats.total_written, 0);
+            assert_eq!(stats.discarded_positions, 1);
+            assert_eq!(stats.discarded_timeout_games, u64::from(name == "timeout"));
+            assert_eq!(stats.discarded_illegal_move_games, u64::from(name == "illegal"));
+            assert_eq!(stats.discarded_no_bestmove_games, u64::from(name == "no_bestmove"));
+        }
+    }
+
+    #[test]
+    fn max_moves_draw_adopts_all_collected_positions_with_draw_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("max_moves.psv");
+        let mut pos = Position::new();
+        pos.set_hirate();
+        let first = Move::from_usi("7g7f").unwrap();
+        let second = Move::from_usi("3c3d").unwrap();
+        {
+            let mut collector =
+                TrainingDataCollector::new(&path, 0, false, TrainingFormat::Psv, 1000, 600.0, None)
+                    .unwrap();
+            collector.record_position(&pos, Some(20), None, Some(first), first, &[]);
+            let gives_check = pos.gives_check(first);
+            pos.do_move(first, gives_check);
+            collector.record_position(&pos, Some(-10), None, Some(second), second, &[]);
+            collector.finish_game(GameOutcome::Draw, TrainingDisposition::Adopt, 1).unwrap();
+            collector.flush().unwrap();
+        }
+        let bytes = std::fs::read(path).unwrap();
+        let records: Vec<_> = bytes
+            .chunks_exact(PackedSfenValue::SIZE)
+            .map(|record| PackedSfenValue::from_bytes(record).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.game_result == 0));
+    }
+
+    #[test]
+    fn declaration_win_position_is_recorded_as_psv_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("declaration.psv");
+        let mut pos = Position::new();
+        pos.set_sfen("KGG6/SS7/PPPPPP3/9/9/9/2pppppp1/1ss1gg1nl/4k2nl b 2R2B3p 1")
+            .unwrap();
+        assert!(is_valid_bestmove_win(&pos, EnteringKingRule::Point27));
+        {
+            let mut collector =
+                TrainingDataCollector::new(&path, 0, false, TrainingFormat::Psv, 1000, 600.0, None)
+                    .unwrap();
+            collector.record_declaration_win_position(&pos);
+            collector
+                .finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 1)
+                .unwrap();
+            collector.flush().unwrap();
+        }
+        let bytes = std::fs::read(path).unwrap();
+        let record = PackedSfenValue::from_bytes(&bytes).unwrap();
+        assert_eq!(record.score, 10000);
+        assert_eq!(record.move16, 0);
+        assert_eq!(record.game_result, 1);
+    }
+
+    #[test]
+    fn declaration_win_position_score_is_fixed_to_saturated_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("declaration_score.psv");
+        let mut pos = Position::new();
+        pos.set_sfen("KGG6/SS7/PPPPPP3/9/9/9/2pppppp1/1ss1gg1nl/4k2nl b 2R2B3p 1")
+            .unwrap();
+        let mut collector =
+            TrainingDataCollector::new(&path, 0, false, TrainingFormat::Psv, 1000, 600.0, None)
+                .unwrap();
+
+        collector.record_declaration_win_position(&pos);
+        assert_eq!(collector.entries[0].score, 10000);
+    }
+
+    #[test]
+    fn declaration_win_dedup_keeps_second_games_non_terminal_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("declaration_dedup.psv");
+        let mut declaration_pos = Position::new();
+        declaration_pos
+            .set_sfen("KGG6/SS7/PPPPPP3/9/9/9/2pppppp1/1ss1gg1nl/4k2nl b 2R2B3p 1")
+            .unwrap();
+        let mut collector =
+            TrainingDataCollector::new(&path, 0, false, TrainingFormat::Psv, 1000, 600.0, None)
+                .unwrap();
+        let dedup = SharedDedupHash::new(8);
+        let mut hits = 0;
+        let mut interval_hits = 0;
+        let mut interval_checked = 0;
+        let mut first_game_pending = PendingDedupKeys::default();
+
+        let first_is_duplicate = check_declaration_win_position_dedup(
+            TrainingFormat::Psv,
+            Some(&dedup),
+            &mut first_game_pending,
+            declaration_pos.key(),
+            Some(&mut collector),
+            &mut hits,
+            &mut interval_hits,
+            &mut interval_checked,
+        );
+        assert!(!first_is_duplicate);
+        collector.record_declaration_win_position(&declaration_pos);
+        collector
+            .finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 1)
+            .unwrap();
+        first_game_pending.publish(&dedup);
+
+        collector.start_game();
+        let mut second_game_pending = PendingDedupKeys::default();
+        let mut normal_pos = Position::new();
+        normal_pos.set_hirate();
+        let normal_move = Move::from_usi("7g7f").unwrap();
+        collector.record_position(
+            &normal_pos,
+            Some(100),
+            None,
+            Some(normal_move),
+            normal_move,
+            &[],
+        );
+        let second_is_duplicate = check_declaration_win_position_dedup(
+            TrainingFormat::Psv,
+            Some(&dedup),
+            &mut second_game_pending,
+            declaration_pos.key(),
+            Some(&mut collector),
+            &mut hits,
+            &mut interval_hits,
+            &mut interval_checked,
+        );
+        assert!(second_is_duplicate);
+        assert_eq!(collector.entries_len(), 1);
+        assert_eq!(hits, 1);
+        assert_eq!(interval_hits, 1);
+        assert_eq!(interval_checked, 2);
+        collector
+            .finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 2)
+            .unwrap();
+        collector.flush().unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().len(), (PackedSfenValue::SIZE * 2) as u64);
+        assert_eq!(collector.stats().declaration_win_dedup_skipped_games, 1);
+    }
+
+    #[test]
+    fn declaration_win_does_not_append_fake_replay_move() {
+        for format in [TrainingFormat::Pack, TrainingFormat::Hcpe3] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("declaration.bin");
+            let mut pos = Position::new();
+            pos.set_sfen("KGG6/SS7/PPPPPP3/9/9/9/2pppppp1/1ss1gg1nl/4k2nl b 2R2B3p 1")
+                .unwrap();
+            let collector =
+                TrainingDataCollector::new(&path, 0, false, format, 1000, 600.0, None).unwrap();
+            let mut collector = collector;
+            collector.record_declaration_win_position(&pos);
+            assert_eq!(collector.entries_len(), 0);
+        }
+    }
+
+    #[test]
+    fn unrecorded_declaration_win_does_not_dedup_or_discard_pack_and_hcpe3_games() {
+        for format in [TrainingFormat::Pack, TrainingFormat::Hcpe3] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("declaration.bin");
+            let mut recorded_pos = Position::new();
+            recorded_pos.set_hirate();
+            let mv = Move::from_usi("7g7f").unwrap();
+            let mut collector =
+                TrainingDataCollector::new(&path, 0, false, format, 1000, 600.0, None).unwrap();
+            collector.record_position(&recorded_pos, Some(10), None, Some(mv), mv, &[]);
+
+            let mut declaration_pos = Position::new();
+            declaration_pos
+                .set_sfen("KGG6/SS7/PPPPPP3/9/9/9/2pppppp1/1ss1gg1nl/4k2nl b 2R2B3p 1")
+                .unwrap();
+            let dedup = SharedDedupHash::new(8);
+            let mut hits = 0;
+            let mut interval_hits = 0;
+            let mut interval_checked = 0;
+            let mut pending = PendingDedupKeys::default();
+
+            assert!(!check_declaration_win_position_dedup(
+                format,
+                Some(&dedup),
+                &mut pending,
+                declaration_pos.key(),
+                Some(&mut collector),
+                &mut hits,
+                &mut interval_hits,
+                &mut interval_checked,
+            ));
+            assert_eq!(collector.entries_len(), 1);
+            assert_eq!((hits, interval_hits, interval_checked), (0, 0, 0));
+            assert!(!dedup.check_and_insert(declaration_pos.key()));
+        }
+    }
+
+    #[test]
     fn psv_game_id_sidecar_matches_result_game_ids() {
         let dir = tempfile::tempdir().unwrap();
         let psv_path = dir.path().join("short.psv");
@@ -3570,9 +4637,11 @@ mod tests {
             .unwrap();
             collector.entries.push(entry(Color::Black));
             collector.entries.push(entry(Color::White));
-            collector.finish_game(GameOutcome::BlackWin, 7).unwrap();
+            collector
+                .finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 7)
+                .unwrap();
             collector.entries.push(entry(Color::Black));
-            collector.finish_game(GameOutcome::Draw, 9).unwrap();
+            collector.finish_game(GameOutcome::Draw, TrainingDisposition::Adopt, 9).unwrap();
             collector.flush().unwrap();
         }
 
@@ -3641,7 +4710,7 @@ mod tests {
             .unwrap();
             col.start_game();
             col.record_position(&pos, Some(123), None, Some(mv), mv, &candidates);
-            col.finish_game(GameOutcome::BlackWin, 1).unwrap();
+            col.finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 1).unwrap();
             col.flush().unwrap();
         }
 
@@ -3709,7 +4778,7 @@ mod tests {
             .unwrap();
             col.start_game();
             col.record_position(&pos, Some(100), None, Some(m1), m1, &candidates);
-            col.finish_game(GameOutcome::WhiteWin, 1).unwrap();
+            col.finish_game(GameOutcome::WhiteWin, TrainingDisposition::Adopt, 1).unwrap();
             col.flush().unwrap();
         }
 
@@ -3830,7 +4899,7 @@ mod tests {
             col.start_game();
             // 実着手 played != 最善手 best。selectedMove16 は replay 用に played を記録する
             col.record_position(&pos, Some(100), None, Some(best), played, &candidates);
-            col.finish_game(GameOutcome::BlackWin, 1).unwrap();
+            col.finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 1).unwrap();
             col.flush().unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();
@@ -3866,7 +4935,7 @@ mod tests {
             col.start_game();
             // --random-multi-pv 未指定相当: 候補なし → 実着手の one-hot (visit=1)
             col.record_position(&pos, Some(50), None, Some(mv), mv, &[]);
-            col.finish_game(GameOutcome::BlackWin, 1).unwrap();
+            col.finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 1).unwrap();
             col.flush().unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();
@@ -3920,7 +4989,7 @@ mod tests {
                 m2,
                 &[legal_candidate(1, -15, "3c3d")],
             );
-            col.finish_game(GameOutcome::Draw, 1).unwrap();
+            col.finish_game(GameOutcome::Draw, TrainingDisposition::Adopt, 1).unwrap();
             col.flush().unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();
@@ -3980,7 +5049,7 @@ mod tests {
                 m2,
                 &[legal_candidate(1, 40, "3c3d")],
             );
-            col.finish_game(GameOutcome::BlackWin, 1).unwrap();
+            col.finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 1).unwrap();
             col.flush().unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();

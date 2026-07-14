@@ -7,7 +7,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | ツール | 説明 |
 |--------|------|
 | `tournament` | 複数エンジンの round-robin 並列トーナメント。JSONL 出力 |
-| `gensfen` | NNUE 学習用 PSV/pack/hcpe3 教師局面の生成（PSV move16 は実 YaneuraOu 形式、engine vs engine／NativeBackend、native LS progress 係数、乱択来歴 JSONL 記録） |
+| `gensfen` | NNUE 学習用 PSV/pack/hcpe3 教師局面の生成（PSV move16 は実 YaneuraOu 形式、engine vs engine／NativeBackend、native LS progress 係数、千日手裁定、異常終局の全局破棄、宣言勝ち PSV 終端局面、乱択来歴 JSONL 記録） |
 | `nyugyoku_gensfen` | CSA manifest から入玉アンカー局面を disk-partition exact dedup で抽出し、checkpoint/resume 付きで gensfen 用 `startpos.txt` と provenance を生成（[詳細](nyugyoku_gensfen.md)） |
 | `csa_client` | USI エンジンを floodgate 等の CSA サーバーに接続して連続対局 |
 | `analyze_selfplay` | 自己対局の JSONL ログを集計。勝率・Elo 差・NPS 等を表示 |
@@ -61,7 +61,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `filter_teacher_data` | 王手除外・スコアフィルタ・クリップなどの前処理を適用 |
 | `fix_scores` | preprocess で上書きされたスコアを元ファイルから復元 |
 | `psv_to_jsonl` | PSV 形式を JSONL 形式に変換 |
-| `psv_to_hcpe3` | PSV を dlshogi 学習用 hcpe3 / hcpe に変換（cshogi と byte 一致、streaming、`--evalfix-a` で eval 焼き込み） |
+| `psv_to_hcpe3` | PSV を dlshogi 学習用 hcpe3 / hcpe に変換（通常手は cshogi と byte 一致、streaming、`move16=0` の有効な着手なしレコードを件数付きスキップ、`--evalfix-a` 対応） |
 | `migrate_psv_move16` | 旧リポジトリ形式 (B) の PSV move16 を実 YaneuraOu 形式 (A) へストリーミング移行（[詳細](migrate_psv_move16.md)） |
 | `pack_to_psv` | GenSfen .pack を PackedSfenValue (PSV) 形式に展開し、move16 を実 YaneuraOu 形式へ変換 |
 | `hcpe_to_psv` | hcpe (cshogi HuffmanCodedPosAndEval) を PSV に変換（外部公開 hcpe プールの `--data`/`--test-data` 用、[詳細](hcpe_to_psv.md)） |

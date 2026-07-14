@@ -4,6 +4,8 @@
 //! 食う形式へストリーミング変換する。PSV は局面単位（棋譜構造を持たない）ため、
 //! `--format hcpe3` では各局面を「1 局面 = 1 game」の退化した hcpe3 として書く
 //! （moveNum=1 / candidateNum=1 / visitNum=1、policy target は best move の one-hot）。
+//! 有効な着手を持たない `move16=0` のレコードは、この表現では policy target を構成できないため
+//! 両出力形式でスキップし、件数をサマリへ出す。
 //! `--format hcpe` は dlshogi 同梱 psv_to_hcpe.py と同じ 38 バイト hcpe を出力する。
 //!
 //! 盤面の hcp（HuffmanCodedPos, 32B）は、PSV の packed sfen を SFEN 文字列・`Position`
@@ -110,6 +112,7 @@ struct Cli {
 /// 1 レコードの変換結果。出力は `data[..len]`。
 enum ConvResult {
     Record { data: [u8; RECORD_BUF], len: usize },
+    NoMove,
     Error(String),
 }
 
@@ -179,6 +182,9 @@ fn convert(
         Ok(p) => p,
         Err(e) => return ConvResult::Error(format!("SFEN の展開に失敗: {e}")),
     };
+    if psv.move16 == 0 {
+        return ConvResult::NoMove;
+    }
 
     let hcp = pack_hcp_from_parts(&parts);
     let move16 = psv_move16_to_hcpe(psv.move16);
@@ -196,13 +202,14 @@ fn convert(
     }
 }
 
-/// 並列処理結果を入力順のまま書き出す。戻り値: (書き出し件数, エラー件数)。
+/// 並列処理結果を入力順のまま書き出す。戻り値: (書き出し件数, 着手なし件数, エラー件数)。
 fn write_results(
     results: &[ConvResult],
     writer: &mut BufWriter<File>,
     verbose: bool,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, u64)> {
     let mut written = 0u64;
+    let mut no_moves = 0u64;
     let mut errors = 0u64;
     for result in results {
         match result {
@@ -210,6 +217,7 @@ fn write_results(
                 writer.write_all(&data[..*len])?;
                 written += 1;
             }
+            ConvResult::NoMove => no_moves += 1,
             ConvResult::Error(e) => {
                 errors += 1;
                 if verbose {
@@ -218,7 +226,7 @@ fn write_results(
             }
         }
     }
-    Ok((written, errors))
+    Ok((written, no_moves, errors))
 }
 
 fn validate_psv_move16_format(path: &PathBuf, records: u64) -> Result<()> {
@@ -358,6 +366,7 @@ fn main() -> Result<()> {
     let mut chunk: Vec<[u8; PackedSfenValue::SIZE]> = Vec::with_capacity(cli.chunk);
     let mut buffer = [0u8; PackedSfenValue::SIZE];
     let mut total_written = 0u64;
+    let mut total_no_moves = 0u64;
     let mut total_errors = 0u64;
     let mut interrupted = false;
     let mut reached_eof = false;
@@ -390,8 +399,9 @@ fn main() -> Result<()> {
         let results: Vec<ConvResult> =
             chunk.par_iter().map(|record| convert(record, format, eval_scale)).collect();
 
-        let (written, errors) = write_results(&results, &mut writer, verbose)?;
+        let (written, no_moves, errors) = write_results(&results, &mut writer, verbose)?;
         total_written += written;
+        total_no_moves += no_moves;
         total_errors += errors;
         progress.inc(results.len() as u64);
 
@@ -400,7 +410,7 @@ fn main() -> Result<()> {
             let now = Instant::now();
             if now.duration_since(last_report).as_secs() >= PROGRESS_LOG_SECS {
                 last_report = now;
-                let done = total_written + total_errors;
+                let done = total_written + total_no_moves + total_errors;
                 let secs = start.elapsed().as_secs_f64();
                 let rate = done as f64 / secs.max(1e-9);
                 let eta = if total > done && rate > 0.0 {
@@ -440,7 +450,7 @@ fn main() -> Result<()> {
         format!("{} -> {} のリネームに失敗", tmp_output.display(), cli.output.display())
     })?;
     // エラーレコードがあると推定 total と実 pos がずれるため、実処理件数で長さを確定して完了させる。
-    progress.set_length(total_written + total_errors);
+    progress.set_length(total_written + total_no_moves + total_errors);
     progress.finish_with_message("完了");
 
     eprintln!(
@@ -449,6 +459,9 @@ fn main() -> Result<()> {
         format,
         cli.output.display()
     );
+    if total_no_moves > 0 {
+        eprintln!("有効な着手を持たないレコードをスキップ: {total_no_moves} レコード (move16=0)");
+    }
     if total_errors > 0 {
         eprintln!("注意: {total_errors} レコードを変換できずスキップしました");
     }
@@ -483,6 +496,24 @@ mod tests {
         assert_eq!(psv_move16_to_hcpe(0x40a5), 0x28a5); // 歩打ち P*5b（bit14, from=1）
         assert_eq!(psv_move16_to_hcpe(0x4380), 0x2b80); // 金打ち G*1a（bit14, from=7）
         assert_eq!(psv_move16_to_hcpe(0x9f46), 0x5f46); // 成り 7i8h+（bit15 → hcpe bit14）
+    }
+
+    #[test]
+    fn record_without_move_is_not_converted_to_policy_record() {
+        let mut pos = rshogi_core::position::Position::new();
+        pos.set_hirate();
+        let record = PackedSfenValue {
+            sfen: tools::packed_sfen::pack_position(&pos),
+            score: 10000,
+            move16: 0,
+            game_ply: 1,
+            game_result: 1,
+            padding: 0,
+        }
+        .to_bytes();
+
+        assert!(matches!(convert(&record, Format::Hcpe3, None), ConvResult::NoMove));
+        assert!(matches!(convert(&record, Format::Hcpe, None), ConvResult::NoMove));
     }
 
     #[test]

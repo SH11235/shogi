@@ -11,7 +11,7 @@
 | `tournament` | 複数エンジンの round-robin 並列トーナメント、SPRT 検定 |
 | `analyze_selfplay` | tournament 出力の集計・Elo/nElo 算出・SPRT post-hoc 判定 |
 | `floodgate_record` | csa_client の per-game JSONL から 1 エンジンの戦績を集計（先後別勝率・相手別・後手勝ち/負け/引分・実戦 NPS、`--config` で csa_client 設定から入力導出、`--fetch-ratings` で wdoor 現在レート併記・履歴記録。floodgate 連続対局向け、[詳細](docs/floodgate_record.md)） |
-| `gensfen` | NNUE 学習用 PSV/pack/hcpe3 教師局面の生成（PSV move16 は実 YaneuraOu 形式、USI engine vs engine／NativeBackend、native LS progress 係数、乱択来歴 JSONL 記録） |
+| `gensfen` | NNUE 学習用 PSV/pack/hcpe3 教師局面の生成（PSV move16 は実 YaneuraOu 形式、USI engine vs engine／NativeBackend、native LS progress 係数、千日手裁定、異常終局の全局破棄、宣言勝ち PSV 終端局面、乱択来歴 JSONL 記録） |
 | `floodgate_pipeline` | Floodgate棋譜のダウンロード・変換・`live-mirror --push` MONITOR2 着手通知付きリアルタイムミラー（[詳細](docs/floodgate_pipeline.md)） |
 | `nyugyoku_gensfen` | CSA manifest から入玉アンカー局面を disk-partition exact dedup で抽出し、checkpoint/resume 付きで gensfen 用 `startpos.txt` と出典 TSV を生成（[詳細](docs/nyugyoku_gensfen.md)） |
 | `book_from_csa` | CSA 棋譜群から YANEURAOU-DB2016 テキスト定跡 `.db` を生成（消費時間による定跡手判定・レート/勝敗フィルタ、[詳細](docs/book_from_csa.md)） |
@@ -39,7 +39,7 @@
 | `preprocess_psv` | PSV ファイルの前処理（qsearch leaf置換等） |
 | `validate_psv` | PSV ファイルの不正局面検出・除去 |
 | `psv_to_jsonl` | PSV 形式 → JSONL 変換（デバッグ・確認用） |
-| `psv_to_hcpe3` | PSV → dlshogi 学習用 hcpe3 / hcpe 変換（cshogi 互換、streaming、`--evalfix-a` で eval 焼き込み） |
+| `psv_to_hcpe3` | PSV → dlshogi 学習用 hcpe3 / hcpe 変換（cshogi 互換、streaming、`move16=0` の有効な着手なしレコードを件数付きスキップ、`--evalfix-a` 対応） |
 | `migrate_psv_move16` | 旧リポジトリ形式 (B) の PSV move16 を実 YaneuraOu 形式 (A) へ移行（[詳細](docs/migrate_psv_move16.md)） |
 | `pack_to_psv` | GenSfen .pack → PSV 変換（move16 は実 YaneuraOu 形式） |
 | `fix_scores` | スコアの補正 |
@@ -110,7 +110,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 - [rescore_psv](docs/rescore_psv.md) - PSV 評価値の再スコアリング（推奨: dlshogi ONNX + TensorRT FP16。qsearch-leaf ラベル / policy 展開 / レジューム対応）
 - [relabel_psv](docs/relabel_psv.md) - PSV score の勝敗ラベル置換と任意の宣言勝ち override / diversions deblunder
 - [rescore_hcpe](docs/rescore_hcpe.md) - hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（共有コアで yardstick とラベル bit 一致、分散ラベリング・チャンク単位 + 途中 resume 対応）
-- [psv_to_hcpe3](docs/psv_to_hcpe3.md) - PSV → dlshogi 学習用 hcpe3 / hcpe 変換（cshogi 互換、streaming、`--evalfix-a` で eval 焼き込み）
+- [psv_to_hcpe3](docs/psv_to_hcpe3.md) - PSV → dlshogi 学習用 hcpe3 / hcpe 変換（cshogi 互換、streaming、`move16=0` の有効な着手なしレコードを件数付きスキップ、`--evalfix-a` 対応）
 - [migrate_psv_move16](docs/migrate_psv_move16.md) - 旧 PSV move16 の実 YaneuraOu 形式への移行
 - [book_rescore](docs/book_rescore.md) - YANEURAOU-DB2016 テキスト定跡の候補手に USI 探索または ONNX 静的評価値を付与（実行中は進捗/ETA を stderr 表示）
 - [book_kachi_label](docs/book_kachi_label.md) - YANEURAOU-DB2016 テキスト定跡の候補手に `%KACHI` 決着率を付与する sidecar JSONL を生成
