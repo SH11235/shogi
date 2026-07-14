@@ -54,7 +54,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `shuffle_psv` | PSV ファイル内のレコード（40バイト単位）をシャッフル |
 | `split_psv` | PSV ファイルを局面数または容量で複数ファイルへ分割 |
 | `merge_psv` | 複数の PSV ファイルを順序どおりストリーミング結合 |
-| `relabel_psv` | PSV の score を手番側視点の game_result 由来値へ streaming 置換し、任意で宣言勝ち override / diversions deblunder（[詳細](relabel_psv.md)） |
+| `relabel_psv` | PSV の score を game_result 由来値へ置換し、宣言勝ち override / diversion 整合性 deblunder / dry-run / verdict sidecar に対応（[詳細](relabel_psv.md)） |
 | `rescore_psv` | PSV 評価値を NNUE / 外部エンジン / ONNX (dlshogi・AobaZero, GPU/TensorRT) で再計算。qsearch-leaf ラベル・policy 展開・レジューム対応（[詳細](rescore_psv.md)） |
 | `rescore_hcpe` | hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（局面/結果は保持）。共有コア `teacher_labeler` 経由で `yardstick_label` とラベル bit 一致。fresh-per-position で分散ラベリング可、チャンク単位 + 途中（intra-chunk）resume 対応 |
 | `preprocess_psv` | PSV ファイルに qsearch leaf 置換を適用。チャンクストリーミング処理対応 |

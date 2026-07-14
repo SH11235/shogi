@@ -33,7 +33,7 @@
 | `shuffle_psv` | PSV ファイルのシャッフル |
 | `split_psv` | PSV ファイルを局面数または容量で分割 |
 | `merge_psv` | 複数の PSV ファイルを順序どおり結合 |
-| `relabel_psv` | PSV の score を手番側視点の game_result 由来値へ streaming 置換し、任意で宣言勝ち override / diversions deblunder（[詳細](docs/relabel_psv.md)） |
+| `relabel_psv` | PSV の score を game_result 由来値へ置換し、宣言勝ち override / diversion 整合性 deblunder / dry-run / verdict sidecar に対応（[詳細](docs/relabel_psv.md)） |
 | `rescore_psv` | 局面の再評価（探索スコア付与） |
 | `rescore_hcpe` | hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（分散ラベリング・チャンク単位 + 途中 resume 対応） |
 | `preprocess_psv` | PSV ファイルの前処理（qsearch leaf置換等） |
@@ -108,7 +108,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 - [ek_testset](docs/ek_testset.md) - held-out CSA から入玉評価テストセットを構築し、native NNUE 評価で DT/OC 指標を採点
 - [nnue_saturation](docs/nnue_saturation.md) - LayerStacks NNUE の活性飽和率（u8 127 張り付き）を実局面で計測
 - [rescore_psv](docs/rescore_psv.md) - PSV 評価値の再スコアリング（推奨: dlshogi ONNX + TensorRT FP16。qsearch-leaf ラベル / policy 展開 / レジューム対応）
-- [relabel_psv](docs/relabel_psv.md) - PSV score の勝敗ラベル置換と任意の宣言勝ち override / diversions deblunder
+- [relabel_psv](docs/relabel_psv.md) - PSV score の勝敗ラベル置換、宣言勝ち override、diversion 整合性 deblunder
 - [rescore_hcpe](docs/rescore_hcpe.md) - hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（共有コアで yardstick とラベル bit 一致、分散ラベリング・チャンク単位 + 途中 resume 対応）
 - [psv_to_hcpe3](docs/psv_to_hcpe3.md) - PSV → dlshogi 学習用 hcpe3 / hcpe 変換（cshogi 互換、streaming、`move16=0` の有効な着手なしレコードを件数付きスキップ、`--evalfix-a` 対応）
 - [migrate_psv_move16](docs/migrate_psv_move16.md) - 旧 PSV move16 の実 YaneuraOu 形式への移行
