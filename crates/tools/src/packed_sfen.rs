@@ -528,13 +528,18 @@ pub fn unpack_sfen_to_parts(packed: &[u8; 32]) -> Result<UnpackedSfen, String> {
     })
 }
 
-/// HuffmanCodedPos (Apery/cshogi 形式) をSFEN文字列に変換
+/// HuffmanCodedPos (Apery/cshogi 形式) を String/Position を経由せず素の局面要素へ展開する。
 ///
 /// cshogi の `to_hcp()` が出力する形式。YaneuraOu の PackedSfen とは
 /// 盤上駒・手駒の色ビットと成りビットの順序が逆:
 ///   - PSfen (YaneuraOu): huffman → promotion → color
 ///   - HCP   (Apery):     huffman → color → promotion
-pub fn unpack_hcp(packed: &[u8; 32]) -> Result<String, String> {
+///
+/// `unpack_sfen_to_parts` の HCP 版。大量変換のホットパスはこれと
+/// `pack_sfen_from_parts` を直接使い、文字列・Position 経由の往復を排除する。
+/// `unpack_sfen_to_parts` と同じく玉重複・駒種在庫上限の検証を行う
+/// (後段に `Position::set_sfen` の検証が無い前提で破損レコードをここで弾く)。
+pub fn unpack_hcp_to_parts(packed: &[u8; 32]) -> Result<UnpackedSfen, String> {
     let mut stream = BitStream::new(packed);
 
     // 手番 (1bit)
@@ -557,6 +562,11 @@ pub fn unpack_hcp(packed: &[u8; 32]) -> Result<String, String> {
     let white_king_sq = stream.read_n_bit(7) as u8;
     if white_king_sq >= 81 {
         return Err(format!("Invalid white king position: {white_king_sq}"));
+    }
+    // 先後の玉が同一マスだと後手玉の代入が先手玉を上書きし、玉欠けの不正局面を
+    // 検証なしで下流へ渡してしまう。破損レコードとして弾く。
+    if black_king_sq == white_king_sq {
+        return Err(format!("先手玉と後手玉が同一マス: {black_king_sq}"));
     }
     board[white_king_sq as usize] = Piece::W_KING;
 
@@ -615,10 +625,50 @@ pub fn unpack_hcp(packed: &[u8; 32]) -> Result<String, String> {
 
         let pt = piece_type_from_index(entry.piece_idx).ok_or("Invalid hand piece type")?;
         let color = entry.color.ok_or("Hand piece without color")?;
+        // 破損 hcpe で手駒が過剰だと `Hand::add`（飽和なし）が隣接駒種のビットへ桁あふれする。
+        // 追加前に駒種上限で弾き、ビットフィールドの破壊と count() の誤読を防ぐ。
+        if hands[color.index()].count(pt) >= INVENTORY_MAX[piece_type_to_index(pt)] {
+            return Err(format!("手駒が上限を超過: {pt:?}"));
+        }
         hands[color.index()] = hands[color.index()].add(pt);
     }
 
-    Ok(generate_sfen(&board, &hands, side_to_move))
+    // 駒種ごとの総数（盤上 + 手駒、成りは基底駒種に合算）が上限を超える破損レコードを弾く。
+    let mut totals = [0u32; 8];
+    for &piece in &board {
+        if piece.is_some() {
+            totals[piece_type_to_index(piece.piece_type())] += 1;
+        }
+    }
+    for pt in [
+        PieceType::Pawn,
+        PieceType::Lance,
+        PieceType::Knight,
+        PieceType::Silver,
+        PieceType::Bishop,
+        PieceType::Rook,
+        PieceType::Gold,
+    ] {
+        let idx = piece_type_to_index(pt);
+        let total = totals[idx] + hands[0].count(pt) + hands[1].count(pt);
+        if total > INVENTORY_MAX[idx] {
+            return Err(format!("{pt:?} の総数が上限超過: {total} > {}", INVENTORY_MAX[idx]));
+        }
+    }
+
+    Ok(UnpackedSfen {
+        board,
+        hands,
+        side_to_move,
+        black_king_sq,
+        white_king_sq,
+    })
+}
+
+/// HuffmanCodedPos (Apery/cshogi 形式) をSFEN文字列に変換
+pub fn unpack_hcp(packed: &[u8; 32]) -> Result<String, String> {
+    let parts = unpack_hcp_to_parts(packed)?;
+    Ok(generate_sfen(&parts.board, &parts.hands, parts.side_to_move))
 }
 
 /// HCP 手駒/駒箱の符号エントリ
@@ -1353,6 +1403,56 @@ pub fn pack_position(pos: &Position) -> [u8; 32] {
     stream.finish()
 }
 
+/// 素の局面要素から YaneuraOu PackedSfen(32B) を生成する。`pack_position` の parts 版。
+///
+/// `pack_hcp_from_parts` と対になる関数で、`unpack_hcp_to_parts` の結果を
+/// String/Position を経由せず直接 PSfen 化する。同一局面では `pack_position` と
+/// bit 一致する (回帰テストで保証)。
+pub fn pack_sfen_from_parts(parts: &UnpackedSfen) -> [u8; 32] {
+    let mut stream = BitStreamWriter::new();
+
+    // 1. 手番 (1bit): 0=先手, 1=後手
+    stream.write_one_bit(parts.side_to_move == Color::White);
+
+    // 2. 先手玉位置 (7bit) / 3. 後手玉位置 (7bit)
+    stream.write_n_bit(parts.black_king_sq as u32, 7);
+    stream.write_n_bit(parts.white_king_sq as u32, 7);
+
+    // 4. 盤上の駒 (81マス、玉はスキップ)
+    for &piece in &parts.board {
+        if piece.is_some() && piece.piece_type() == PieceType::King {
+            continue;
+        }
+        write_board_piece(&mut stream, piece);
+    }
+
+    // 5. 手駒 (先手→後手、pack_position と同じ駒種順)
+    let piece_order = [
+        PieceType::Rook,
+        PieceType::Bishop,
+        PieceType::Gold,
+        PieceType::Silver,
+        PieceType::Knight,
+        PieceType::Lance,
+        PieceType::Pawn,
+    ];
+    for &color in &[Color::Black, Color::White] {
+        let hand = parts.hands[color.index()];
+        for &pt in &piece_order {
+            for _ in 0..hand.count(pt) {
+                write_hand_piece(&mut stream, pt, color);
+            }
+        }
+    }
+
+    // 6. 駒箱パディング (pack_position と同一規約)
+    while stream.bit_position() + 3 <= 256 {
+        write_piecebox_padding(&mut stream);
+    }
+
+    stream.finish()
+}
+
 /// Move を Move16形式に変換
 ///
 /// ## Move16形式
@@ -1419,6 +1519,78 @@ pub fn move_to_hcpe_move16(mv: Move) -> u16 {
         let from = mv.from().index() as u16;
         let promote = if mv.is_promotion() { 0x4000 } else { 0 };
         to | (from << 7) | promote
+    }
+}
+
+/// 実 YaneuraOu PSV の move16 を hcpe / hcpe3 形式の move16 へ変換する。
+///
+/// 実 YaneuraOu の Move16 は bit14=駒打ちフラグ（from フィールド=駒種, 歩=1..金=7）、
+/// bit15=成りフラグ。hcpe 形式は駒打ちを `from = 81 + (駒種 - 1)` で表し、成りを
+/// bit14 で表す。形式の参照実装 cshogi `move16_from_psv` と一致する。
+/// リポジトリ内部表現 (`move_to_move16` / `move16_to_move`) とは**別形式**である点に注意。
+#[inline]
+pub fn psv_move16_to_hcpe(yo_move16: u16) -> u16 {
+    let to = yo_move16 & 0x7f;
+    let from_field = (yo_move16 >> 7) & 0x7f;
+    if yo_move16 & 0x4000 != 0 {
+        // 駒打ち: from フィールドは駒種(1 始まり) → from = 81 + (駒種 - 1) = 80 + from_field
+        to | ((80 + from_field) << 7)
+    } else {
+        // 盤上の手: 成りは YaneuraOu の bit15 → hcpe の bit14 へ移す
+        let promote = if yo_move16 & 0x8000 != 0 { 0x4000 } else { 0 };
+        to | (from_field << 7) | promote
+    }
+}
+
+/// hcpe / hcpe3 形式の move16 を実 YaneuraOu PSV の move16 へ変換する
+/// (`psv_move16_to_hcpe` の逆変換)。
+///
+/// 駒打ちの from フィールドが 81+6 (金) を超える不正値は 0 を返す。
+#[inline]
+pub fn hcpe_move16_to_psv(hcpe_move16: u16) -> u16 {
+    if hcpe_move16 == 0 {
+        return 0;
+    }
+    let to = hcpe_move16 & 0x7f;
+    let from_field = (hcpe_move16 >> 7) & 0x7f;
+    if from_field >= 81 {
+        // 駒打ち: hcpe の駒種(0 始まり) → YO の駒種(1 始まり) を from へ、bit14 を立てる
+        if from_field > 81 + 6 {
+            return 0;
+        }
+        to | ((from_field - 80) << 7) | 0x4000
+    } else {
+        // 盤上の手: 成りは hcpe の bit14 → YO の bit15 へ移す
+        let promote = if hcpe_move16 & 0x4000 != 0 { 0x8000 } else { 0 };
+        to | (from_field << 7) | promote
+    }
+}
+
+/// hcpe の gameResult（絶対視点 0=DRAW / 1=BLACK_WIN / 2=WHITE_WIN）を
+/// PSV の game_result（手番側視点 1=win / -1=loss / 0=draw）へ変換する。
+/// 0/1/2 以外は破損レコードとして `None`。`stm_result_to_hcpe` の逆写像。
+#[inline]
+pub fn hcpe_result_to_stm(game_result: u8, stm: Color) -> Option<i8> {
+    match game_result {
+        0 => Some(0),
+        1 => Some(if stm == Color::Black { 1 } else { -1 }),
+        2 => Some(if stm == Color::White { 1 } else { -1 }),
+        _ => None,
+    }
+}
+
+/// PSV の game_result（手番側視点の ±1/0）を hcpe の gameResult
+/// （0=DRAW / 1=BLACK_WIN / 2=WHITE_WIN）へ変換する。
+///
+/// 手番側勝ち(`1`)なら勝者 = 手番側、手番側負け(`-1`)なら勝者 = 相手側になる。
+/// cshogi の `to_hcp` 系と同じく BLACK=0 / WHITE=1 を `+1` した値が勝者の色を表す。
+#[inline]
+pub fn stm_result_to_hcpe(game_result: i8, side_to_move: Color) -> u8 {
+    let stm = side_to_move.index() as u8;
+    match game_result {
+        1 => stm + 1,
+        -1 => 2 - stm,
+        _ => 0,
     }
 }
 
@@ -1932,5 +2104,79 @@ mod tests {
         assert_eq!(psv.move16, psv2.move16);
         assert_eq!(psv.game_ply, psv2.game_ply);
         assert_eq!(psv.game_result, psv2.game_result);
+    }
+
+    #[test]
+    fn hcp_direct_path_matches_position_path() {
+        // hcpe → PSV 方向のホットパス「hcp → unpack_hcp_to_parts → pack_sfen_from_parts」直接経路が、
+        // 従来の「hcp → unpack_hcp(String) → set_sfen → pack_position」と bit 一致することを
+        // 保証する回帰テスト。test_direct_path_matches_position_path の HCP→PSfen 版。
+        let sfens = [
+            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1", // 平手
+            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPP1P/1B5R1/LNSGKGSNL b P 1", // 手駒あり
+            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1+B5R1/LNSGKGSNL b - 1", // 成り駒
+            "lnsgkgsn1/1r5b1/ppppppppp/9/9/9/1PPPPPPPP/1B5R1/LNSGKGSN1 b - 1", // 駒落ち(駒箱)
+            "9/9/9/9/4k4/9/9/9/4K4 w 2G2g 1",                                  // 手駒多数・偏り
+        ];
+        for sfen in sfens {
+            let mut pos = Position::new();
+            pos.set_sfen(sfen).expect("set_sfen should succeed");
+            let hcp = pack_position_hcp(&pos);
+            let reference = pack_position(&pos);
+
+            // 直接経路（String も Position も経由しない）
+            let parts = unpack_hcp_to_parts(&hcp).expect("unpack_hcp_to_parts should succeed");
+            let direct = pack_sfen_from_parts(&parts);
+
+            assert_eq!(direct, reference, "direct path psfen mismatch for {sfen}");
+            assert_eq!(parts.side_to_move, pos.side_to_move(), "side_to_move mismatch for {sfen}");
+        }
+    }
+
+    #[test]
+    fn unpack_hcp_to_parts_rejects_duplicate_king_square() {
+        // 破損 hcp: 先手玉と後手玉が同一マス (unpack_sfen_to_parts と同じ検証を持つこと)
+        let mut w = BitStreamWriter::new();
+        w.write_one_bit(false); // 手番=先手
+        w.write_n_bit(40, 7); // 先手玉 = マス40
+        w.write_n_bit(40, 7); // 後手玉 = マス40（同一 → 不正）
+        let packed = w.finish();
+        assert!(unpack_hcp_to_parts(&packed).is_err(), "同一マスの両玉は破損として弾くべき");
+    }
+
+    #[test]
+    fn psv_hcpe_move16_oracle_fixtures() {
+        // 実 YaneuraOu Move16 (bit14=打ち, from=駒種 1..7 / bit15=成り) と
+        // hcpe Move16 (打ち from=81+idx / bit14=成り) の固定オラクル。
+        // 参照実装 cshogi move16_from_psv の変換規則から作成。
+        let cases: [(u16, u16, &str); 4] = [
+            // (yo_psv, hcpe, label)
+            (59 | (60 << 7), 59 | (60 << 7), "通常手 77→76"),
+            (10 | (11 << 7) | 0x8000, 10 | (11 << 7) | 0x4000, "成り 23→22"),
+            (40 | (1 << 7) | 0x4000, 40 | (81 << 7), "歩打ち 55"),
+            (40 | (7 << 7) | 0x4000, 40 | (87 << 7), "金打ち 55"),
+        ];
+        for (yo, hcpe, label) in cases {
+            assert_eq!(psv_move16_to_hcpe(yo), hcpe, "psv→hcpe: {label}");
+            assert_eq!(hcpe_move16_to_psv(hcpe), yo, "hcpe→psv: {label}");
+        }
+        // 不正な駒打ち駒種 (from > 87) は 0
+        assert_eq!(hcpe_move16_to_psv(40 | (88 << 7)), 0);
+        assert_eq!(hcpe_move16_to_psv(0), 0);
+    }
+
+    #[test]
+    fn hcpe_result_stm_roundtrip_oracle() {
+        // 全 (gameResult, 手番) で hcpe→stm→hcpe が恒等写像であること
+        for game_result in [0u8, 1, 2] {
+            for stm in [Color::Black, Color::White] {
+                let s = hcpe_result_to_stm(game_result, stm).expect("0/1/2 は正当");
+                assert_eq!(stm_result_to_hcpe(s, stm), game_result, "r={game_result} stm={stm:?}");
+            }
+        }
+        // 絶対視点の意味の固定オラクル: BLACK_WIN(1) は先手番で +1、後手番で -1
+        assert_eq!(hcpe_result_to_stm(1, Color::Black), Some(1));
+        assert_eq!(hcpe_result_to_stm(1, Color::White), Some(-1));
+        assert_eq!(hcpe_result_to_stm(3, Color::Black), None);
     }
 }

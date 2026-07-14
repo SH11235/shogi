@@ -39,14 +39,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use rshogi_core::types::Color;
-use tools::packed_sfen::{PackedSfenValue, pack_hcp_from_parts, unpack_sfen_to_parts};
+use tools::packed_sfen::{
+    PackedSfenValue, pack_hcp_from_parts, psv_move16_to_hcpe, stm_result_to_hcpe,
+    unpack_sfen_to_parts,
+};
+use tools::teacher_labeler::HCPE_RECORD_SIZE;
 
 /// hcpe3 レコード長（hcp[32] + moveNum:u16 + result:u8 + opponent:u8
 /// + selectedMove16:u16 + eval:i16 + candidateNum:u16 + move16:u16 + visitNum:u16）
 const HCPE3_SIZE: usize = 46;
-/// hcpe レコード長（hcp[32] + eval:i16 + bestMove16:u16 + gameResult:u8 + dummy:u8）
-const HCPE_SIZE: usize = 38;
 /// 出力レコードバッファ。両形式の最大長を確保し `len` で実長を持つ。
 const RECORD_BUF: usize = HCPE3_SIZE;
 
@@ -113,40 +114,6 @@ enum ConvResult {
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-/// game_result（手番側視点の ±1/0）を cshogi gameResult（0:DRAW / 1:BLACK_WIN / 2:WHITE_WIN）へ。
-///
-/// 手番側勝ち(`1`)なら勝者 = 手番側、手番側負け(`-1`)なら勝者 = 相手側になる。
-/// cshogi の `to_hcp` 系と同じく BLACK=0 / WHITE=1 を `+1` した値が勝者の色を表す。
-#[inline]
-fn game_result_byte(game_result: i8, side_to_move: Color) -> u8 {
-    let stm = side_to_move.index() as u8;
-    match game_result {
-        1 => stm + 1,
-        -1 => 2 - stm,
-        _ => 0,
-    }
-}
-
-/// YaneuraOu PSV の move16 を hcpe / hcpe3 が要求する move16 へ意味的に復号する。
-///
-/// YaneuraOu PSV の move16 は bit14=駒打ちフラグ（from フィールド=駒種, 歩=1..飛=7）、
-/// bit15=成りフラグ。hcpe 形式は駒打ちを `from = 81 + (駒種 - 1)` で表し、成りを bit14 で
-/// 表すため、両フラグを見て変換する。実 YaneuraOu の手で形式の参照実装 cshogi
-/// `move16_from_psv` と一致することを確認済み。
-#[inline]
-fn move16_psv_to_hcpe(yo_move16: u16) -> u16 {
-    let to = yo_move16 & 0x7f;
-    let from_field = (yo_move16 >> 7) & 0x7f;
-    if yo_move16 & 0x4000 != 0 {
-        // 駒打ち: from フィールドは駒種(1 始まり) → from = 81 + (駒種 - 1) = 80 + from_field
-        to | ((80 + from_field) << 7)
-    } else {
-        // 盤上の手: 成りは YaneuraOu の bit15 → hcpe の bit14 へ移す
-        let promote = if yo_move16 & 0x8000 != 0 { 0x4000 } else { 0 };
-        to | (from_field << 7) | promote
-    }
-}
-
 /// dlshogi 固定 decode 定数 = 1/0.0013226。evalfix bake のスケール分子。
 const EVAL_DECODE_CONST: f64 = 756.0864962951762;
 
@@ -187,7 +154,7 @@ fn build_hcpe(eval: i16, hcp: &[u8; 32], move16: u16, result: u8) -> ConvResult 
     data[37] = 0; // dummy
     ConvResult::Record {
         data,
-        len: HCPE_SIZE,
+        len: HCPE_RECORD_SIZE,
     }
 }
 
@@ -213,8 +180,8 @@ fn convert(
     };
 
     let hcp = pack_hcp_from_parts(&parts);
-    let move16 = move16_psv_to_hcpe(psv.move16);
-    let result = game_result_byte(psv.game_result, parts.side_to_move);
+    let move16 = psv_move16_to_hcpe(psv.move16);
+    let result = stm_result_to_hcpe(psv.game_result, parts.side_to_move);
     let eval = baked_eval(psv.score, eval_scale);
 
     match format {
@@ -468,29 +435,30 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rshogi_core::types::Color;
 
     #[test]
     fn game_result_mapping_matches_oracle() {
         // 手番側勝ち(1): 勝者 = 手番側
-        assert_eq!(game_result_byte(1, Color::Black), 1); // BLACK_WIN
-        assert_eq!(game_result_byte(1, Color::White), 2); // WHITE_WIN
+        assert_eq!(stm_result_to_hcpe(1, Color::Black), 1); // BLACK_WIN
+        assert_eq!(stm_result_to_hcpe(1, Color::White), 2); // WHITE_WIN
         // 手番側負け(-1): 勝者 = 相手側
-        assert_eq!(game_result_byte(-1, Color::Black), 2); // WHITE_WIN
-        assert_eq!(game_result_byte(-1, Color::White), 1); // BLACK_WIN
+        assert_eq!(stm_result_to_hcpe(-1, Color::Black), 2); // WHITE_WIN
+        assert_eq!(stm_result_to_hcpe(-1, Color::White), 1); // BLACK_WIN
         // 引き分け(0): DRAW
-        assert_eq!(game_result_byte(0, Color::Black), 0);
-        assert_eq!(game_result_byte(0, Color::White), 0);
+        assert_eq!(stm_result_to_hcpe(0, Color::Black), 0);
+        assert_eq!(stm_result_to_hcpe(0, Color::White), 0);
     }
 
     #[test]
-    fn move16_psv_to_hcpe_matches_oracle() {
+    fn psv_move16_to_hcpe_matches_oracle() {
         // 実 YaneuraOu PSV move16（bit14=駒打ち, bit15=成り）を hcpe 形式へ。
         // 期待値は cshogi `move16_from_psv` で生成（参照実装）。
-        assert_eq!(move16_psv_to_hcpe(0x0000), 0x0000); // none
-        assert_eq!(move16_psv_to_hcpe(0x078e), 0x078e); // 通常手 2g2f
-        assert_eq!(move16_psv_to_hcpe(0x40a5), 0x28a5); // 歩打ち P*5b（bit14, from=1）
-        assert_eq!(move16_psv_to_hcpe(0x4380), 0x2b80); // 金打ち G*1a（bit14, from=7）
-        assert_eq!(move16_psv_to_hcpe(0x9f46), 0x5f46); // 成り 7i8h+（bit15 → hcpe bit14）
+        assert_eq!(psv_move16_to_hcpe(0x0000), 0x0000); // none
+        assert_eq!(psv_move16_to_hcpe(0x078e), 0x078e); // 通常手 2g2f
+        assert_eq!(psv_move16_to_hcpe(0x40a5), 0x28a5); // 歩打ち P*5b（bit14, from=1）
+        assert_eq!(psv_move16_to_hcpe(0x4380), 0x2b80); // 金打ち G*1a（bit14, from=7）
+        assert_eq!(psv_move16_to_hcpe(0x9f46), 0x5f46); // 成り 7i8h+（bit15 → hcpe bit14）
     }
 
     #[test]
