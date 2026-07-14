@@ -12,6 +12,10 @@ crates.io への `rshogi-core` publish は (v1.3.0 リリース以降) `vX.Y.Z` 
 バージョンを bump する (publish される tarball とタグの内容を常に一致させ、「バージョン
 番号が動いていない = core 変更なし」という誤推定を防ぐため)。
 
+## Unreleased
+
+- **relabel_psv**: 処理完了時の stderr 統計を human-readable な1行から JSON 1行へ変更。
+
 ## v1.3.0 — 2026-07-11
 
 v1.2.0 後の機能追加リリース。定跡 (opening book) 機構一式 — 新規クレート `rshogi-book`
