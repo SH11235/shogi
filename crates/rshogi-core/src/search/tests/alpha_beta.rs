@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use crate::eval::EvalHash;
 use crate::search::SearchTuneParams;
-use crate::search::alpha_beta::{SearchWorker, build_reductions, reduction};
+use crate::search::alpha_beta::{
+    SearchWorker, build_reductions, enforce_decreasing_depth, reduction,
+    should_activate_depth_liveness,
+};
 use crate::tt::TranspositionTable;
 
 #[test]
@@ -85,6 +88,45 @@ fn test_reduction_zero_root_delta_clamped() {
     // root_delta=0 を渡しても内部で1にクランプされることを確認
     let r = reduction(&reductions, &tune, false, 10, 10, 0, 0) / 1024;
     assert!(r >= 0, "reduction should clamp root_delta to >=1 even when 0 is passed");
+}
+
+#[test]
+fn test_depth_liveness_activation_requires_node_and_run_thresholds() {
+    assert!(!should_activate_depth_liveness(99_999, 0, 8, 100_000, 8));
+    assert!(!should_activate_depth_liveness(100_000, 0, 7, 100_000, 8));
+    assert!(should_activate_depth_liveness(100_000, 0, 8, 100_000, 8));
+
+    // root search が go の途中から始まっても、試行内の消費 node だけを数える。
+    assert!(!should_activate_depth_liveness(149_999, 50_000, 8, 100_000, 8));
+    assert!(should_activate_depth_liveness(150_000, 50_000, 8, 100_000, 8));
+
+    // どちらかの閾値が0なら同一バイナリの無効化条件になる。
+    assert!(!should_activate_depth_liveness(u64::MAX, 0, 256, 0, 8));
+    assert!(!should_activate_depth_liveness(u64::MAX, 0, 256, 100_000, 0));
+}
+
+#[test]
+fn test_depth_liveness_enforces_strict_progress_only_after_activation() {
+    assert_eq!(enforce_decreasing_depth(5, 4, false), 5);
+    assert_eq!(enforce_decreasing_depth(4, 4, false), 4);
+    assert_eq!(enforce_decreasing_depth(5, 4, true), 3);
+    assert_eq!(enforce_decreasing_depth(4, 4, true), 3);
+    assert_eq!(enforce_decreasing_depth(2, 4, true), 2);
+    assert_eq!(enforce_decreasing_depth(1, 1, true), 0);
+}
+
+#[test]
+fn test_depth_liveness_state_is_reset_for_each_go() {
+    let tt = Arc::new(TranspositionTable::new(16));
+    let eval_hash = Arc::new(EvalHash::new(1));
+    let mut worker = SearchWorker::new(tt, eval_hash, 0, 0, SearchTuneParams::default());
+
+    worker.state.root_search_start_nodes = 42;
+    worker.state.depth_liveness_active = true;
+    worker.prepare_search();
+
+    assert_eq!(worker.state.root_search_start_nodes, 0);
+    assert!(!worker.state.depth_liveness_active);
 }
 
 #[test]

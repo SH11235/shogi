@@ -66,6 +66,36 @@ pub(super) fn draw_jitter(nodes: u64, tune_params: &SearchTuneParams) -> i32 {
     ((nodes & mask) as i32) + tune_params.draw_jitter_offset
 }
 
+/// 1回の root search 内で remaining depth が減らない edge が連鎖したとき、
+/// 探索の進行性を回復する guard を発火させるか判定する。
+#[inline]
+pub(crate) fn should_activate_depth_liveness(
+    nodes: u64,
+    root_search_start_nodes: u64,
+    nondecreasing_depth_run: i32,
+    node_threshold: i32,
+    run_threshold: i32,
+) -> bool {
+    node_threshold > 0
+        && run_threshold > 0
+        && nodes.saturating_sub(root_search_start_nodes) >= node_threshold as u64
+        && nondecreasing_depth_run >= run_threshold
+}
+
+/// guard 発火後は、実際に指し手を進めた子探索の remaining depth を必ず1以上減らす。
+#[inline]
+pub(crate) fn enforce_decreasing_depth(
+    depth: Depth,
+    parent_depth: Depth,
+    depth_liveness_active: bool,
+) -> Depth {
+    if depth_liveness_active {
+        depth.min(parent_depth - 1)
+    } else {
+        depth
+    }
+}
+
 #[inline]
 /// 補正履歴を適用した静的評価に変換（詰みスコア領域に入り込まないようにクリップ）
 pub(super) fn to_corrected_static_eval(unadjusted: Value, correction_value: i32) -> Value {
@@ -354,6 +384,10 @@ pub struct SearchState {
     pub sel_depth: i32,
     /// ルート深さ
     pub root_depth: Depth,
+    /// 現在の root search（aspiration retry ごと）の開始ノード数
+    pub root_search_start_nodes: u64,
+    /// この go で depth liveness guard が発火済みか
+    pub depth_liveness_active: bool,
     /// 完了済み深さ
     pub completed_depth: Depth,
     /// 最善手
@@ -397,6 +431,8 @@ impl SearchState {
             abort: false,
             sel_depth: 0,
             root_depth: 0,
+            root_search_start_nodes: 0,
+            depth_liveness_active: false,
             completed_depth: 0,
             best_move: Move::NONE,
             best_move_changes: 0.0,
@@ -724,6 +760,8 @@ impl SearchWorker {
         self.state.nodes = 0;
         self.state.sel_depth = 0;
         self.state.root_depth = 0;
+        self.state.root_search_start_nodes = 0;
+        self.state.depth_liveness_active = false;
         self.state.root_delta = 1;
         self.state.completed_depth = 0;
         self.state.best_move = Move::NONE;
@@ -936,6 +974,9 @@ impl SearchWorker {
         limits: &LimitsType,
         time_manager: &mut TimeManagement,
     ) -> Value {
+        self.state.stack[0].search_entry_depth = depth;
+        self.state.stack[0].nondecreasing_depth_run = 0;
+
         // 千日手評価値テーブルの初期化
         self.init_draw_value_table(pos.side_to_move());
 
@@ -1653,6 +1694,8 @@ impl SearchWorker {
         // rootNode && pvIdx の経路のみこの関数が担当する。
         // pv_idx == 0 は search_root() を使い、root TT save はそちらでのみ実行する。
         debug_assert!(pv_idx > 0);
+        self.state.stack[0].search_entry_depth = depth;
+        self.state.stack[0].nondecreasing_depth_run = 0;
 
         // 千日手評価値テーブルの初期化
         self.init_draw_value_table(pos.side_to_move());
@@ -2109,6 +2152,54 @@ impl SearchWorker {
                 nnue_evaluate(st, pos)
             };
         }
+
+        // A legal move normally consumes one ply and therefore remaining depth must eventually
+        // decrease. Multi-extension, negative LMR and full-depth re-search can all produce a
+        // child depth >= its parent's depth. A long consecutive run of such edges is the common
+        // liveness failure observed in both rshogi and YaneuraOu fixed-depth searches.
+        //
+        // Singular verification recurses at the same ply without making a move. It is a separate
+        // search root for this purpose and must not be linked to the outer move path.
+        let raw_depth = depth;
+        let excluded_search = st.stack[ply as usize].excluded_move.is_some();
+        let real_child = ply > 0 && !excluded_search;
+        let parent_depth = if real_child {
+            st.stack[(ply - 1) as usize].search_entry_depth
+        } else {
+            raw_depth
+        };
+        let raw_nondecreasing_depth_run = if real_child && raw_depth >= parent_depth {
+            st.stack[(ply - 1) as usize].nondecreasing_depth_run + 1
+        } else {
+            0
+        };
+
+        if !st.depth_liveness_active
+            && should_activate_depth_liveness(
+                st.nodes,
+                st.root_search_start_nodes,
+                raw_nondecreasing_depth_run,
+                ctx.tune_params.depth_liveness_node_threshold,
+                ctx.tune_params.depth_liveness_run_threshold,
+            )
+        {
+            st.depth_liveness_active = true;
+        }
+
+        if real_child {
+            depth = enforce_decreasing_depth(depth, parent_depth, st.depth_liveness_active);
+        }
+        if depth <= DEPTH_QS {
+            return qsearch::<NT>(st, ctx, pos, alpha, beta, ply, limits, time_manager);
+        }
+
+        let nondecreasing_depth_run = if real_child && depth >= parent_depth {
+            st.stack[(ply - 1) as usize].nondecreasing_depth_run + 1
+        } else {
+            0
+        };
+        st.stack[ply as usize].search_entry_depth = depth;
+        st.stack[ply as usize].nondecreasing_depth_run = nondecreasing_depth_run;
 
         // 選択的深さを更新
         if pv_node && st.sel_depth < ply + 1 {
@@ -2652,6 +2743,10 @@ impl SearchWorker {
                 // - move_count: ローカル変数で管理しているため影響なし
                 // - その他: ヒューリスティック用途のため多少の誤差は許容される
 
+                // verification search は同一 ply の追跡フィールドを上書きするため、
+                // 外側の move path に戻る際に復元する。
+                let outer_search_entry_depth = st.stack[ply as usize].search_entry_depth;
+                let outer_nondecreasing_depth_run = st.stack[ply as usize].nondecreasing_depth_run;
                 st.stack[ply as usize].excluded_move = mv;
                 let singular_value = Self::search_node::<{ NodeType::NonPV as u8 }>(
                     st,
@@ -2666,6 +2761,8 @@ impl SearchWorker {
                     time_manager,
                 );
                 st.stack[ply as usize].excluded_move = Move::NONE;
+                st.stack[ply as usize].search_entry_depth = outer_search_entry_depth;
+                st.stack[ply as usize].nondecreasing_depth_run = outer_nondecreasing_depth_run;
 
                 // SE再帰呼び出し内の上方伝播により
                 // st.stack[ply].tt_pvが変更される可能性がある。
@@ -2701,14 +2798,6 @@ impl SearchWorker {
                     extension = 1
                         + (singular_value < singular_beta - Value::new(double_margin)) as i32
                         + (singular_value < singular_beta - Value::new(triple_margin)) as i32;
-
-                    // engine 自身に打ち切り予算（時間・ノード・infinite）が無い深さ固定探索では、
-                    // double/triple 延長が child の探索深さを親より深くし続け、置換表飽和下で
-                    // 延長が連鎖して探索木が爆発し `go depth N` が事実上終了しなくなる。止める
-                    // 手段が無いため、この場合のみ単延長に制限して net の深さ成長を抑え終了を保証する。
-                    if !limits.has_interrupt_budget() {
-                        extension = extension.min(1);
-                    }
 
                     // singular確定時にdepthを+1
                     depth += 1;

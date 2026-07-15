@@ -1562,6 +1562,9 @@ where
                 let adjusted_depth =
                     (search_depth - failed_high_cnt - (3 * (search_again_counter + 1) / 4)).max(1);
 
+                // Aspiration retry ごとに node budget を測る。guard 自体は一度発火したら
+                // go の残り全体で有効にし、別 retry で同じ病的連鎖が再発するのを防ぐ。
+                worker.state.root_search_start_nodes = worker.state.nodes;
                 let score = if pv_idx == 0 {
                     worker.search_root(pos, adjusted_depth, alpha, beta, limits, time_manager)
                 } else {
