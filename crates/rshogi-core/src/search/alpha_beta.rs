@@ -389,6 +389,65 @@ impl DepthLivenessState {
             nondecreasing_depth_run: [0; STACK_SIZE],
         }
     }
+
+    /// Keep the tracking implementation out of the normal search hot path. Searches with an
+    /// interrupt budget never allocate this state, so their per-node cost remains a single
+    /// predictable `Option::None` branch in `search_node`.
+    #[inline(never)]
+    fn update_depth(
+        &mut self,
+        nodes: u64,
+        mut depth: Depth,
+        ply: i32,
+        excluded_search: bool,
+        node_threshold: i32,
+        run_threshold: i32,
+    ) -> Depth {
+        // A legal move normally consumes one ply and therefore remaining depth must eventually
+        // decrease. Multi-extension, negative LMR and full-depth re-search can all produce a
+        // child depth >= its parent's depth. A long consecutive run of such edges is the common
+        // liveness failure observed in both rshogi and YaneuraOu.
+        //
+        // Singular verification recurses at the same ply without making a move. It is a separate
+        // search root for this purpose and must not be linked to the outer move path.
+        let raw_depth = depth;
+        let real_child = ply > 0 && !excluded_search;
+        let parent_depth = if real_child {
+            self.search_entry_depth[(ply - 1) as usize]
+        } else {
+            raw_depth
+        };
+        let raw_nondecreasing_depth_run = if real_child && raw_depth >= parent_depth {
+            self.nondecreasing_depth_run[(ply - 1) as usize] + 1
+        } else {
+            0
+        };
+
+        if !self.active
+            && should_activate_depth_liveness(
+                nodes,
+                self.root_search_start_nodes,
+                raw_nondecreasing_depth_run,
+                node_threshold,
+                run_threshold,
+            )
+        {
+            self.active = true;
+        }
+
+        if real_child {
+            depth = enforce_decreasing_depth(depth, parent_depth, self.active);
+        }
+
+        let nondecreasing_depth_run = if real_child && depth >= parent_depth {
+            self.nondecreasing_depth_run[(ply - 1) as usize] + 1
+        } else {
+            0
+        };
+        self.search_entry_depth[ply as usize] = depth;
+        self.nondecreasing_depth_run[ply as usize] = nondecreasing_depth_run;
+        depth
+    }
 }
 
 /// 探索中に変化する状態
@@ -2202,53 +2261,18 @@ impl SearchWorker {
 
         let liveness_nodes = st.nodes;
         if let Some(liveness) = st.depth_liveness.as_mut() {
-            // A legal move normally consumes one ply and therefore remaining depth must
-            // eventually decrease. Multi-extension, negative LMR and full-depth re-search can
-            // all produce a child depth >= its parent's depth. A long consecutive run of such
-            // edges is the common liveness failure observed in both rshogi and YaneuraOu.
-            //
-            // Singular verification recurses at the same ply without making a move. It is a
-            // separate search root for this purpose and must not be linked to the outer move path.
-            let raw_depth = depth;
             let excluded_search = st.stack[ply as usize].excluded_move.is_some();
-            let real_child = ply > 0 && !excluded_search;
-            let parent_depth = if real_child {
-                liveness.search_entry_depth[(ply - 1) as usize]
-            } else {
-                raw_depth
-            };
-            let raw_nondecreasing_depth_run = if real_child && raw_depth >= parent_depth {
-                liveness.nondecreasing_depth_run[(ply - 1) as usize] + 1
-            } else {
-                0
-            };
-
-            if !liveness.active
-                && should_activate_depth_liveness(
-                    liveness_nodes,
-                    liveness.root_search_start_nodes,
-                    raw_nondecreasing_depth_run,
-                    ctx.tune_params.depth_liveness_node_threshold,
-                    ctx.tune_params.depth_liveness_run_threshold,
-                )
-            {
-                liveness.active = true;
-            }
-
-            if real_child {
-                depth = enforce_decreasing_depth(depth, parent_depth, liveness.active);
-            }
+            depth = liveness.update_depth(
+                liveness_nodes,
+                depth,
+                ply,
+                excluded_search,
+                ctx.tune_params.depth_liveness_node_threshold,
+                ctx.tune_params.depth_liveness_run_threshold,
+            );
             if depth <= DEPTH_QS {
                 return qsearch::<NT>(st, ctx, pos, alpha, beta, ply, limits, time_manager);
             }
-
-            let nondecreasing_depth_run = if real_child && depth >= parent_depth {
-                liveness.nondecreasing_depth_run[(ply - 1) as usize] + 1
-            } else {
-                0
-            };
-            liveness.search_entry_depth[ply as usize] = depth;
-            liveness.nondecreasing_depth_run[ply as usize] = nondecreasing_depth_run;
         }
 
         // 選択的深さを更新
