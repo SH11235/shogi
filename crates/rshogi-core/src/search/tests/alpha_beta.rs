@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use crate::eval::EvalHash;
-use crate::search::SearchTuneParams;
 use crate::search::alpha_beta::{
     SearchWorker, build_reductions, enforce_decreasing_depth, reduction,
     should_activate_depth_liveness,
 };
+use crate::search::{LimitsType, SearchTuneParams};
 use crate::tt::TranspositionTable;
 
 #[test]
@@ -120,13 +120,24 @@ fn test_depth_liveness_state_is_reset_for_each_go() {
     let tt = Arc::new(TranspositionTable::new(16));
     let eval_hash = Arc::new(EvalHash::new(1));
     let mut worker = SearchWorker::new(tt, eval_hash, 0, 0, SearchTuneParams::default());
+    let mut fixed_depth = LimitsType::new();
+    fixed_depth.depth = 15;
 
-    worker.state.root_search_start_nodes = 42;
-    worker.state.depth_liveness_active = true;
-    worker.prepare_search();
+    assert!(!worker.state.depth_liveness_is_enabled());
+    worker.prepare_search(&fixed_depth);
 
-    assert_eq!(worker.state.root_search_start_nodes, 0);
-    assert!(!worker.state.depth_liveness_active);
+    assert!(worker.state.depth_liveness_is_enabled());
+    worker.state.set_depth_liveness_active_for_test(true);
+    assert!(worker.state.depth_liveness_is_active_for_test());
+    worker.prepare_search(&fixed_depth);
+
+    assert!(worker.state.depth_liveness_is_enabled());
+    assert!(!worker.state.depth_liveness_is_active_for_test());
+
+    let mut node_limited = fixed_depth;
+    node_limited.nodes = 100_000;
+    worker.prepare_search(&node_limited);
+    assert!(!worker.state.depth_liveness_is_enabled());
 }
 
 #[test]

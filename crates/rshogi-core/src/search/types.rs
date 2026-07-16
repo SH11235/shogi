@@ -10,7 +10,7 @@ use std::mem::MaybeUninit;
 
 use crate::movegen::{MoveList, generate_legal_with_pass};
 use crate::position::Position;
-use crate::types::{Depth, MAX_PLY, Move, Piece, RepetitionState, Square, Value};
+use crate::types::{MAX_PLY, Move, Piece, RepetitionState, Square, Value};
 
 use super::history::PieceToHistory;
 use std::ptr::NonNull;
@@ -189,12 +189,6 @@ pub struct Stack {
     /// ルートからの手数
     pub ply: i32,
 
-    /// このノードのsearch入口で実際に用いたremaining depth
-    pub search_entry_depth: Depth,
-
-    /// 親からremaining depthが減らなかった連続edge数
-    pub nondecreasing_depth_run: i32,
-
     /// このノードで選択されている手
     pub current_move: Move,
 
@@ -234,8 +228,6 @@ impl Default for Stack {
             cont_history_ptr: NonNull::dangling(),
             cont_hist_key: None,
             ply: 0,
-            search_entry_depth: 0,
-            nondecreasing_depth_run: 0,
             current_move: Move::NONE,
             excluded_move: Move::NONE,
             static_eval: Value::NONE,

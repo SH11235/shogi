@@ -339,7 +339,7 @@ mod imp {
                     worker.draw_value_black = task.draw_value_black;
                     worker.draw_value_white = task.draw_value_white;
                     worker.entering_king_rule = task.entering_king_rule;
-                    worker.prepare_search();
+                    worker.prepare_search(&task.limits);
 
                     let mut pos = task.pos;
                     let mut time_manager =
@@ -805,7 +805,7 @@ mod imp {
                         worker.draw_value_white = draw_value_white;
                         worker.entering_king_rule = entering_king_rule;
                         worker.search_tune_params = search_tune_params;
-                        worker.prepare_search();
+                        worker.prepare_search(&limits_clone);
 
                         let mut search_pos = pos_clone;
                         let mut time_manager =
