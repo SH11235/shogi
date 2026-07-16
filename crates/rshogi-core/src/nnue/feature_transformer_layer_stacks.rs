@@ -758,23 +758,27 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
                 // 差分更新
                 let mut removed = IndexList::new();
                 let mut added = IndexList::new();
-                append_changed_indices::<FT>(
-                    dirty_piece,
-                    perspective,
-                    pos.king_square(perspective),
-                    &mut removed,
-                    &mut added,
-                );
-
                 let prev = prev_acc.get(p);
                 let curr = acc.get_mut(p);
                 curr.copy_from_slice(prev);
-                if !self.try_apply_dirty_piece_fast(
+                let fast_applied = self.try_apply_dirty_piece_fast(
                     curr,
                     dirty_piece,
                     perspective,
                     pos.king_square(perspective),
-                ) {
+                );
+                // PSQT は main accumulator の fast path 成功時も changed indices を使う。
+                // PSQT なしでは slow path に落ちた場合だけ生成すればよい。
+                if !fast_applied || cfg!(feature = "nnue-psqt") {
+                    append_changed_indices::<FT>(
+                        dirty_piece,
+                        perspective,
+                        pos.king_square(perspective),
+                        &mut removed,
+                        &mut added,
+                    );
+                }
+                if !fast_applied {
                     for index in removed.iter() {
                         self.sub_weights(curr, index);
                     }
@@ -913,23 +917,27 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
                 // 差分更新（キャッシュ不使用）
                 let mut removed = IndexList::new();
                 let mut added = IndexList::new();
-                append_changed_indices::<FT>(
-                    dirty_piece,
-                    perspective,
-                    pos.king_square(perspective),
-                    &mut removed,
-                    &mut added,
-                );
-
                 let prev = prev_acc.get(p);
                 let curr = acc.get_mut(p);
                 curr.copy_from_slice(prev);
-                if !self.try_apply_dirty_piece_fast(
+                let fast_applied = self.try_apply_dirty_piece_fast(
                     curr,
                     dirty_piece,
                     perspective,
                     pos.king_square(perspective),
-                ) {
+                );
+                // PSQT は main accumulator の fast path 成功時も changed indices を使う。
+                // PSQT なしでは slow path に落ちた場合だけ生成すればよい。
+                if !fast_applied || cfg!(feature = "nnue-psqt") {
+                    append_changed_indices::<FT>(
+                        dirty_piece,
+                        perspective,
+                        pos.king_square(perspective),
+                        &mut removed,
+                        &mut added,
+                    );
+                }
+                if !fast_applied {
                     for index in removed.iter() {
                         self.sub_weights(curr, index);
                     }
