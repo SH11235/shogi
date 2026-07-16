@@ -177,6 +177,37 @@ fn test_depth_liveness_verification_snapshot_restores_outer_path() {
 }
 
 #[test]
+fn test_depth_liveness_verification_root_mark_skips_run_and_enforcement() {
+    let mut liveness = DepthLivenessState::new();
+    let (node_thr, run_thr) = (100, 1);
+
+    // 発火前 (node 閾値未達) に multi-extension 相当の非減少 edge で entry 16 > parent 15 を作る。
+    liveness.update_depth(50, 15, 0, false, node_thr, run_thr);
+    assert_eq!(liveness.update_depth(50, 16, 1, false, node_thr, run_thr), 16);
+    assert_eq!(liveness.snapshot_ply(1), (16, 1));
+
+    // node 閾値超過後の same-ply verification entry (depth 15 >= parent entry 15)。
+    // mark が無いと非減少 edge と誤認され、ここが最初の発火点になって 14 へ clamp される。
+    liveness.mark_same_ply_verification_root();
+    assert_eq!(
+        liveness.update_depth(200, 15, 1, false, node_thr, run_thr),
+        15,
+        "mark 付き verification root は run 判定・enforcement の対象外"
+    );
+    assert_eq!(liveness.snapshot_ply(1), (15, 0));
+
+    // verification entry で guard が発火していないことを、node 閾値未達の非減少 edge が
+    // clamp されない (発火済みなら閾値によらず enforcement される) ことで確認する。
+    assert_eq!(
+        liveness.update_depth(50, 15, 2, false, node_thr, run_thr),
+        15,
+        "verification root では guard は発火しない"
+    );
+    // mark は一回性: 上の ply=2 entry は通常の実手 child として run が数えられている。
+    assert_eq!(liveness.snapshot_ply(2), (15, 1));
+}
+
+#[test]
 fn test_nmp_verification_restores_depth_liveness_in_production_path() {
     use std::cell::Cell;
     use std::sync::atomic::AtomicBool;
@@ -190,6 +221,16 @@ fn test_nmp_verification_restores_depth_liveness_in_production_path() {
     let tt = Arc::new(TranspositionTable::new(16));
     let eval_hash = Arc::new(EvalHash::new(1));
     let mut worker = SearchWorker::new(tt, eval_hash, 0, 0, SearchTuneParams::default());
+    // r = 1 + 16/32 = 1 にして verification depth 15 >= parent entry 15 の
+    // 非減少 same-ply entry を作る (verification root 除外が無いと clamp される設定)。
+    worker
+        .search_tune_params
+        .set_from_usi_name("SPSA_NMP_REDUCTION_BASE", 1)
+        .unwrap();
+    worker
+        .search_tune_params
+        .set_from_usi_name("SPSA_NMP_REDUCTION_DEPTH_DIV", 32)
+        .unwrap();
     let mut fixed_depth = LimitsType::new();
     fixed_depth.depth = 20;
     worker.prepare_search(&fixed_depth);
@@ -197,11 +238,16 @@ fn test_nmp_verification_restores_depth_liveness_in_production_path() {
     let mut pos = Position::new();
     pos.set_hirate();
 
-    // 外側 move path: root (ply=0) と NMP を試みるノード自身 (ply=1) の entry を記録。
-    let (node_thr, run_thr) = (100, 8);
-    worker.state.depth_liveness_update_for_test(16, 0, node_thr, run_thr);
+    // 外側 move path: root (ply=0) entry 15 と、multi-extension 相当で entry 16 になった
+    // NMP ノード自身 (ply=1) を、node 閾値未達 (guard 未発火) の時点で記録する。
+    let (node_thr, run_thr) = (100, 1);
+    worker.state.nodes = 50;
+    worker.state.depth_liveness_update_for_test(15, 0, node_thr, run_thr);
     worker.state.depth_liveness_update_for_test(16, 1, node_thr, run_thr);
     let outer = worker.state.depth_liveness_snapshot(1).unwrap();
+    assert_eq!(outer, (16, 1));
+    // null search 中に node 閾値を跨いだ状況を再現する。
+    worker.state.nodes = 200;
 
     let ctx = SearchContext {
         tt: &worker.tt,
@@ -244,8 +290,14 @@ fn test_nmp_verification_restores_depth_liveness_in_production_path() {
         |st, _ctx, _pos, child_depth, _alpha, _beta, ply, _cut_node, _limits, _tm| {
             calls.set(calls.get() + 1);
             if ply == 1 {
-                // verification search: 実際の search_node と同様に同一 ply の追跡を上書きする。
-                st.depth_liveness_update_for_test(child_depth, ply, node_thr, run_thr);
+                // verification search: 実際の search_node と同様に同一 ply の追跡を更新する。
+                assert_eq!(child_depth, 15, "r=1 で verification depth は 15 のはず");
+                let entered =
+                    st.depth_liveness_update_for_test(child_depth, ply, node_thr, run_thr);
+                assert_eq!(
+                    entered, child_depth,
+                    "verification root は非減少 same-ply entry でも clamp されないこと"
+                );
                 verification_snapshot.set(st.depth_liveness_snapshot(1));
                 beta
             } else {
@@ -262,6 +314,10 @@ fn test_nmp_verification_restores_depth_liveness_in_production_path() {
         worker.state.depth_liveness_snapshot(1).unwrap(),
         outer,
         "try_null_move_pruning は verification 後に外側 ply の追跡を復元すること"
+    );
+    assert!(
+        !worker.state.depth_liveness_is_active_for_test(),
+        "verification entry を発火点にしないこと"
     );
 }
 

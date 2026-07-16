@@ -384,7 +384,10 @@ where
 
             // NMP verification search は同一 ply の depth-liveness 追跡フィールドを
             // 浅い depth で上書きするため、外側の move path に戻る際に復元する。
+            // また verification 自体を実手 child と誤認させない (偽の非減少 edge
+            // カウントや verification depth への clamp を防ぐ)。
             let outer_depth_liveness = st.depth_liveness_snapshot(ply);
+            st.depth_liveness_mark_verification_root();
             let v = search_node(
                 st,
                 ctx,

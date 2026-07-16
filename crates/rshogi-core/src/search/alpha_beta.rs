@@ -376,6 +376,11 @@ pub struct SearchContext<'a> {
 pub(crate) struct DepthLivenessState {
     root_search_start_nodes: u64,
     active: bool,
+    /// 次に entry する node を same-ply verification root として扱い、run 判定と
+    /// enforcement から外す一回性マーク。NMP verification は excluded_move を
+    /// 立てずに同一 ply を再探索するため、このマークが無いと実手 child と誤認され、
+    /// 偽の非減少 edge カウントや verification depth への clamp が起きる。
+    same_ply_verification_root: bool,
     search_entry_depth: [Depth; STACK_SIZE],
     nondecreasing_depth_run: [i32; STACK_SIZE],
 }
@@ -385,6 +390,7 @@ impl DepthLivenessState {
         Self {
             root_search_start_nodes: 0,
             active: false,
+            same_ply_verification_root: false,
             search_entry_depth: [0; STACK_SIZE],
             nondecreasing_depth_run: [0; STACK_SIZE],
         }
@@ -409,9 +415,12 @@ impl DepthLivenessState {
         // liveness failure observed in both rshogi and YaneuraOu.
         //
         // Singular verification recurses at the same ply without making a move. It is a separate
-        // search root for this purpose and must not be linked to the outer move path.
+        // search root for this purpose and must not be linked to the outer move path. NMP
+        // verification does the same without setting excluded_move, so it is marked via
+        // `same_ply_verification_root` instead (consumed exactly by this entry).
+        let verification_root = std::mem::take(&mut self.same_ply_verification_root);
         let raw_depth = depth;
-        let real_child = ply > 0 && !excluded_search;
+        let real_child = ply > 0 && !excluded_search && !verification_root;
         let parent_depth = if real_child {
             self.search_entry_depth[(ply - 1) as usize]
         } else {
@@ -447,6 +456,11 @@ impl DepthLivenessState {
         self.search_entry_depth[ply as usize] = depth;
         self.nondecreasing_depth_run[ply as usize] = nondecreasing_depth_run;
         depth
+    }
+
+    /// 直後の update_depth 1回だけを same-ply verification root として扱わせる。
+    pub(crate) fn mark_same_ply_verification_root(&mut self) {
+        self.same_ply_verification_root = true;
     }
 
     /// 同一 ply で再帰する verification search (SE / NMP) は当該 ply の追跡フィールドを
@@ -561,6 +575,14 @@ impl SearchState {
 
     pub(crate) fn depth_liveness_snapshot(&self, ply: i32) -> Option<(Depth, i32)> {
         self.depth_liveness.as_ref().map(|liveness| liveness.snapshot_ply(ply))
+    }
+
+    /// 直後に entry する same-ply verification search (NMP) を depth-liveness の
+    /// run 判定・enforcement から外す。
+    pub(crate) fn depth_liveness_mark_verification_root(&mut self) {
+        if let Some(liveness) = self.depth_liveness.as_mut() {
+            liveness.mark_same_ply_verification_root();
+        }
     }
 
     pub(crate) fn depth_liveness_restore(&mut self, ply: i32, snapshot: Option<(Depth, i32)>) {
