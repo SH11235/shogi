@@ -1292,7 +1292,7 @@ const SPSA_OPTION_SPECS: &[SearchTuneOptionSpec] = &[
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_DEPTH_LIVENESS_NODES",
-        default: 100000,
+        default: 500000,
         min: 0,
         max: 100000000,
     },
@@ -1617,7 +1617,7 @@ impl Default for SearchTuneParams {
             // Group C
             aspiration_delta_base: 5,
             aspiration_mean_sq_div: 9000,
-            depth_liveness_node_threshold: 100_000,
+            depth_liveness_node_threshold: 500_000,
             depth_liveness_run_threshold: 8,
             // Group D
             lmr_table_coeff: 2809,
@@ -2104,7 +2104,7 @@ mod tests {
     #[test]
     fn depth_liveness_params_default_and_disable_round_trip() {
         let mut params = SearchTuneParams::default();
-        assert_eq!(params.depth_liveness_node_threshold, 100_000);
+        assert_eq!(params.depth_liveness_node_threshold, 500_000);
         assert_eq!(params.depth_liveness_run_threshold, 8);
 
         params.set_from_usi_name("SPSA_DEPTH_LIVENESS_NODES", 0).unwrap();
