@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::eval::EvalHash;
 use crate::search::alpha_beta::{
-    SearchWorker, build_reductions, enforce_decreasing_depth, reduction,
+    DepthLivenessState, SearchWorker, build_reductions, enforce_decreasing_depth, reduction,
     should_activate_depth_liveness,
 };
 use crate::search::{LimitsType, SearchTuneParams};
@@ -113,6 +113,67 @@ fn test_depth_liveness_enforces_strict_progress_only_after_activation() {
     assert_eq!(enforce_decreasing_depth(4, 4, true), 3);
     assert_eq!(enforce_decreasing_depth(2, 4, true), 2);
     assert_eq!(enforce_decreasing_depth(1, 1, true), 0);
+}
+
+#[test]
+fn test_depth_liveness_update_depth_counts_runs_and_enforces_after_activation() {
+    let mut liveness = DepthLivenessState::new();
+    let (node_thr, run_thr) = (100, 3);
+
+    // root (ply=0) は real child ではないので run は増えない。
+    assert_eq!(liveness.update_depth(0, 5, 0, false, node_thr, run_thr), 5);
+    assert_eq!(liveness.snapshot_ply(0), (5, 0));
+
+    // 非減少 edge (child depth >= parent entry depth) が連続すると run が積み上がる。
+    assert_eq!(liveness.update_depth(200, 5, 1, false, node_thr, run_thr), 5);
+    assert_eq!(liveness.snapshot_ply(1), (5, 1));
+    assert_eq!(liveness.update_depth(200, 5, 2, false, node_thr, run_thr), 5);
+    assert_eq!(liveness.snapshot_ply(2), (5, 2));
+
+    // run が閾値に達すると発火し、以降の実手 child は parent entry depth - 1 に切り詰められる。
+    assert_eq!(liveness.update_depth(200, 5, 3, false, node_thr, run_thr), 4);
+    assert_eq!(liveness.snapshot_ply(3), (4, 0));
+    assert_eq!(liveness.update_depth(200, 5, 4, false, node_thr, run_thr), 3);
+
+    // depth が減る edge では run がリセットされる (発火前の状態で確認)。
+    let mut liveness = DepthLivenessState::new();
+    liveness.update_depth(0, 5, 0, false, node_thr, run_thr);
+    liveness.update_depth(200, 5, 1, false, node_thr, run_thr);
+    assert_eq!(liveness.update_depth(200, 4, 2, false, node_thr, run_thr), 4);
+    assert_eq!(liveness.snapshot_ply(2), (4, 0));
+
+    // excluded (SE verification) は別 root 扱いで、run にも enforcement にも関与しない。
+    let run_before = liveness.snapshot_ply(1);
+    assert_eq!(liveness.update_depth(200, 3, 1, true, node_thr, run_thr), 3);
+    assert_eq!(liveness.snapshot_ply(1), (3, 0));
+    liveness.restore_ply(1, run_before);
+    assert_eq!(liveness.snapshot_ply(1), run_before);
+}
+
+#[test]
+fn test_depth_liveness_verification_snapshot_restores_outer_path() {
+    let mut liveness = DepthLivenessState::new();
+    let (node_thr, run_thr) = (100, 8);
+
+    liveness.update_depth(0, 16, 0, false, node_thr, run_thr);
+    liveness.update_depth(200, 15, 1, false, node_thr, run_thr);
+    let outer = liveness.snapshot_ply(1);
+    assert_eq!(outer, (15, 0));
+
+    // NMP verification は excluded_move を立てずに同一 ply で浅い depth を再探索し、
+    // 追跡フィールドを上書きする。
+    liveness.update_depth(200, 4, 1, false, node_thr, run_thr);
+    assert_eq!(liveness.snapshot_ply(1), (4, 0));
+
+    // 復元しないと、外側の子 (ply=2, depth=14) が entry depth 4 と比較され
+    // 偽の非減少 edge として run を進めてしまう。
+    liveness.update_depth(200, 14, 2, false, node_thr, run_thr);
+    assert_eq!(liveness.snapshot_ply(2), (14, 1));
+
+    liveness.restore_ply(1, outer);
+    assert_eq!(liveness.snapshot_ply(1), (15, 0));
+    liveness.update_depth(200, 14, 2, false, node_thr, run_thr);
+    assert_eq!(liveness.snapshot_ply(2), (14, 0));
 }
 
 #[test]

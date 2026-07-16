@@ -2,6 +2,13 @@
 //!
 //! USI `setoption` で更新できる探索係数を集約する。
 
+use crate::types::MAX_PLY;
+
+/// depth-liveness の非減少 edge 連続数は ply が `MAX_PLY` で打ち切られるため
+/// `MAX_PLY - 1` を超えられない。これより大きい閾値を許すと「0のみ無効」の
+/// 契約に反して guard が黙って無効化されるので、上限をここで縛る。
+const DEPTH_LIVENESS_RUN_MAX: i32 = MAX_PLY - 1;
+
 /// 1つのチューニング項目のUSI定義。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchTuneOptionSpec {
@@ -1300,7 +1307,7 @@ const SPSA_OPTION_SPECS: &[SearchTuneOptionSpec] = &[
         usi_name: "SPSA_DEPTH_LIVENESS_RUN",
         default: 8,
         min: 0,
-        max: 256,
+        max: DEPTH_LIVENESS_RUN_MAX,
     },
     // Group D: Reductions テーブル
     SearchTuneOptionSpec {
@@ -2013,7 +2020,12 @@ impl SearchTuneParams {
         try_apply!("SPSA_ASP_DELTA_BASE", aspiration_delta_base, 1, 64);
         try_apply!("SPSA_ASP_MEAN_SQ_DIV", aspiration_mean_sq_div, 1, 100000);
         try_apply!("SPSA_DEPTH_LIVENESS_NODES", depth_liveness_node_threshold, 0, 100000000);
-        try_apply!("SPSA_DEPTH_LIVENESS_RUN", depth_liveness_run_threshold, 0, 256);
+        try_apply!(
+            "SPSA_DEPTH_LIVENESS_RUN",
+            depth_liveness_run_threshold,
+            0,
+            DEPTH_LIVENESS_RUN_MAX
+        );
         // Group D
         try_apply!("SPSA_LMR_TABLE_COEFF", lmr_table_coeff, 1024, 8192);
         // Group E

@@ -373,7 +373,7 @@ pub struct SearchContext<'a> {
 /// Keep this out of [`Stack`] so the existing hot stack layout is unchanged when the guard is
 /// disabled. The state is allocated once per `go` only for a search without an interrupt budget
 /// and with both thresholds non-zero.
-struct DepthLivenessState {
+pub(crate) struct DepthLivenessState {
     root_search_start_nodes: u64,
     active: bool,
     search_entry_depth: [Depth; STACK_SIZE],
@@ -381,7 +381,7 @@ struct DepthLivenessState {
 }
 
 impl DepthLivenessState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             root_search_start_nodes: 0,
             active: false,
@@ -394,7 +394,7 @@ impl DepthLivenessState {
     /// interrupt budget never allocate this state, so their per-node cost remains a single
     /// predictable `Option::None` branch in `search_node`.
     #[inline(never)]
-    fn update_depth(
+    pub(crate) fn update_depth(
         &mut self,
         nodes: u64,
         mut depth: Depth,
@@ -447,6 +447,21 @@ impl DepthLivenessState {
         self.search_entry_depth[ply as usize] = depth;
         self.nondecreasing_depth_run[ply as usize] = nondecreasing_depth_run;
         depth
+    }
+
+    /// 同一 ply で再帰する verification search (SE / NMP) は当該 ply の追跡フィールドを
+    /// 上書きするため、外側の move path に戻る前に snapshot を取り復元する。
+    pub(crate) fn snapshot_ply(&self, ply: i32) -> (Depth, i32) {
+        (
+            self.search_entry_depth[ply as usize],
+            self.nondecreasing_depth_run[ply as usize],
+        )
+    }
+
+    pub(crate) fn restore_ply(&mut self, ply: i32, snapshot: (Depth, i32)) {
+        let (search_entry_depth, nondecreasing_depth_run) = snapshot;
+        self.search_entry_depth[ply as usize] = search_entry_depth;
+        self.nondecreasing_depth_run[ply as usize] = nondecreasing_depth_run;
     }
 }
 
@@ -541,6 +556,16 @@ impl SearchState {
     pub(crate) fn begin_depth_liveness_attempt(&mut self) {
         if let Some(liveness) = self.depth_liveness.as_mut() {
             liveness.root_search_start_nodes = self.nodes;
+        }
+    }
+
+    pub(crate) fn depth_liveness_snapshot(&self, ply: i32) -> Option<(Depth, i32)> {
+        self.depth_liveness.as_ref().map(|liveness| liveness.snapshot_ply(ply))
+    }
+
+    pub(crate) fn depth_liveness_restore(&mut self, ply: i32, snapshot: Option<(Depth, i32)>) {
+        if let (Some(liveness), Some(snapshot)) = (self.depth_liveness.as_mut(), snapshot) {
+            liveness.restore_ply(ply, snapshot);
         }
     }
 
@@ -2817,14 +2842,7 @@ impl SearchWorker {
                 // - move_count: ローカル変数で管理しているため影響なし
                 // - その他: ヒューリスティック用途のため多少の誤差は許容される
 
-                // verification search は同一 ply の追跡フィールドを上書きするため、
-                // 外側の move path に戻る際に復元する。
-                let outer_depth_liveness = st.depth_liveness.as_ref().map(|liveness| {
-                    (
-                        liveness.search_entry_depth[ply as usize],
-                        liveness.nondecreasing_depth_run[ply as usize],
-                    )
-                });
+                let outer_depth_liveness = st.depth_liveness_snapshot(ply);
                 st.stack[ply as usize].excluded_move = mv;
                 let singular_value = Self::search_node::<{ NodeType::NonPV as u8 }>(
                     st,
@@ -2839,12 +2857,7 @@ impl SearchWorker {
                     time_manager,
                 );
                 st.stack[ply as usize].excluded_move = Move::NONE;
-                if let (Some(liveness), Some((search_entry_depth, nondecreasing_depth_run))) =
-                    (st.depth_liveness.as_mut(), outer_depth_liveness)
-                {
-                    liveness.search_entry_depth[ply as usize] = search_entry_depth;
-                    liveness.nondecreasing_depth_run[ply as usize] = nondecreasing_depth_run;
-                }
+                st.depth_liveness_restore(ply, outer_depth_liveness);
 
                 // SE再帰呼び出し内の上方伝播により
                 // st.stack[ply].tt_pvが変更される可能性がある。

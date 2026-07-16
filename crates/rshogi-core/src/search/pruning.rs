@@ -382,6 +382,9 @@ where
                 + ctx.tune_params.nmp_min_ply_update_num * (depth - r)
                     / ctx.tune_params.nmp_min_ply_update_den.max(1);
 
+            // NMP verification search は同一 ply の depth-liveness 追跡フィールドを
+            // 浅い depth で上書きするため、外側の move path に戻る際に復元する。
+            let outer_depth_liveness = st.depth_liveness_snapshot(ply);
             let v = search_node(
                 st,
                 ctx,
@@ -394,6 +397,7 @@ where
                 limits,
                 time_manager,
             );
+            st.depth_liveness_restore(ply, outer_depth_liveness);
 
             st.nmp_min_ply = 0;
 
