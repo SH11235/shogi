@@ -291,6 +291,8 @@ struct PositionResult {
     sfen: String,
     a_depths: Vec<DepthInfo>,
     b_depths: Vec<DepthInfo>,
+    a_truncated: bool,
+    b_truncated: bool,
     a_bestmove: String,
     b_bestmove: String,
     bestmove_match: bool,
@@ -648,6 +650,15 @@ struct EngineParams {
     nodes_budget: Option<u64>,
 }
 
+fn search_was_truncated(
+    depths: &[DepthInfo],
+    requested_depth: u32,
+    nodes_budget: Option<u64>,
+) -> bool {
+    nodes_budget.is_some()
+        && depths.iter().map(|info| info.depth).max().unwrap_or(0) < requested_depth
+}
+
 impl EngineParams {
     fn spawn(&self) -> Result<UsiEngine> {
         let eval_option = self.eval_path.as_deref().map(|p| (self.eval_opt_name, p));
@@ -686,6 +697,8 @@ fn process_position(
 
     let final_nodes_a = result_a.depths.last().map(|d| d.nodes).unwrap_or(0);
     let final_nodes_b = result_b.depths.last().map(|d| d.nodes).unwrap_or(0);
+    let a_truncated = search_was_truncated(&result_a.depths, depth, params_a.nodes_budget);
+    let b_truncated = search_was_truncated(&result_b.depths, depth, params_b.nodes_budget);
     let final_nodes_diff = final_nodes_a as i64 - final_nodes_b as i64;
     let final_nodes_ratio = if final_nodes_b > 0 {
         Some(final_nodes_a as f64 / final_nodes_b as f64)
@@ -699,6 +712,8 @@ fn process_position(
         sfen: sfen.to_string(),
         a_depths: result_a.depths,
         b_depths: result_b.depths,
+        a_truncated,
+        b_truncated,
         a_bestmove: result_a.bestmove,
         b_bestmove: result_b.bestmove,
         bestmove_match,
@@ -767,6 +782,8 @@ fn process_positions_reuse(
         let elapsed_secs = start.elapsed().as_secs_f64();
         let final_nodes_a = result_a.depths.last().map(|d| d.nodes).unwrap_or(0);
         let final_nodes_b = result_b.depths.last().map(|d| d.nodes).unwrap_or(0);
+        let a_truncated = search_was_truncated(&result_a.depths, depth, params_a.nodes_budget);
+        let b_truncated = search_was_truncated(&result_b.depths, depth, params_b.nodes_budget);
         let final_nodes_diff = final_nodes_a as i64 - final_nodes_b as i64;
         let final_nodes_ratio = if final_nodes_b > 0 {
             Some(final_nodes_a as f64 / final_nodes_b as f64)
@@ -780,6 +797,8 @@ fn process_positions_reuse(
             sfen: sfen.clone(),
             a_depths: result_a.depths,
             b_depths: result_b.depths,
+            a_truncated,
+            b_truncated,
             a_bestmove: result_a.bestmove,
             b_bestmove: result_b.bestmove,
             bestmove_match,
@@ -850,6 +869,14 @@ fn write_summary(
     }
     if let Some(nodes) = rc.nodes_b {
         writeln!(writer, "追加ノード上限(B): {nodes}")?;
+    }
+    let a_truncated_count = results.iter().filter(|r| r.a_truncated).count();
+    let b_truncated_count = results.iter().filter(|r| r.b_truncated).count();
+    if a_truncated_count > 0 || b_truncated_count > 0 {
+        writeln!(
+            writer,
+            "未完了 (途中打ち切り): A側 {a_truncated_count}局面 / B側 {b_truncated_count}局面"
+        )?;
     }
     writeln!(
         writer,
@@ -959,22 +986,35 @@ fn write_summary(
     writeln!(writer)?;
 
     // 全depth完全一致と乖離開始深度の分布
-    let mut all_depths_perfect = 0usize;
+    let incomplete_count = results.iter().filter(|r| r.a_truncated || r.b_truncated).count();
+    let complete_count = results.len() - incomplete_count;
+    let all_depths_perfect = results
+        .iter()
+        .filter(|r| !r.a_truncated && !r.b_truncated)
+        .filter(|r| first_divergence_depth(r).is_none())
+        .count();
     let mut first_diverge_depth: BTreeMap<u32, usize> = BTreeMap::new();
     for r in results {
         if let Some(depth) = first_divergence_depth(r) {
             *first_diverge_depth.entry(depth).or_insert(0) += 1;
-        } else {
-            all_depths_perfect += 1;
         }
     }
-    writeln!(
-        writer,
-        "--- 全depth完全一致: {}/{} ({:.1}%) ---",
-        all_depths_perfect,
-        results.len(),
-        all_depths_perfect as f64 / results.len() as f64 * 100.0
-    )?;
+    let perfect_rate = if complete_count > 0 {
+        all_depths_perfect as f64 / complete_count as f64 * 100.0
+    } else {
+        0.0
+    };
+    if incomplete_count > 0 {
+        writeln!(
+            writer,
+            "--- 全depth完全一致: {all_depths_perfect}/{complete_count} ({perfect_rate:.1}%) (未完了 {incomplete_count}局面を除外) ---"
+        )?;
+    } else {
+        writeln!(
+            writer,
+            "--- 全depth完全一致: {all_depths_perfect}/{complete_count} ({perfect_rate:.1}%) ---"
+        )?;
+    }
     if !first_diverge_depth.is_empty() {
         writeln!(writer)?;
         writeln!(writer, "--- 乖離開始深度の分布 ---")?;
@@ -1302,6 +1342,8 @@ mod tests {
             sfen: format!("position-{index}"),
             a_depths,
             b_depths,
+            a_truncated: false,
+            b_truncated: false,
             a_bestmove: "7g7f".to_string(),
             b_bestmove: "7g7f".to_string(),
             bestmove_match: true,
@@ -1410,6 +1452,68 @@ mod tests {
                 "coverage(A/B)=2/1"
             ]
         );
+    }
+
+    #[test]
+    fn truncated_detection_handles_empty_partial_and_complete_depths() {
+        assert!(search_was_truncated(&[], 3, Some(100)));
+        assert!(search_was_truncated(&[depth_info(1, 10), depth_info(2, 20)], 3, Some(100)));
+        assert!(!search_was_truncated(&[depth_info(1, 10), depth_info(3, 30)], 3, Some(100)));
+        assert!(!search_was_truncated(&[], 3, None));
+    }
+
+    #[test]
+    fn empty_truncated_results_are_excluded_from_perfect_matches() {
+        let mut result = position_result(1, &[], &[]);
+        result.a_truncated = search_was_truncated(&result.a_depths, 3, Some(100));
+        result.b_truncated = search_was_truncated(&result.b_depths, 3, Some(100));
+
+        let mut output = Vec::new();
+        write_summary(&mut output, &[result], &resolved_config(3), None, 1).unwrap();
+        let summary = String::from_utf8(output).unwrap();
+
+        assert!(summary.contains("未完了 (途中打ち切り): A側 1局面 / B側 1局面"));
+        assert!(summary.contains("--- 全depth完全一致: 0/0 (0.0%) (未完了 1局面を除外) ---"));
+    }
+
+    #[test]
+    fn summary_reports_truncation_and_uses_complete_denominator() {
+        let complete_match = position_result(1, &[10, 20], &[10, 20]);
+        let complete_divergence = position_result(2, &[10, 30], &[10, 20]);
+        let mut a_truncated = position_result(3, &[10], &[10, 20]);
+        a_truncated.a_truncated = true;
+        let mut both_truncated = position_result(4, &[], &[]);
+        both_truncated.a_truncated = true;
+        both_truncated.b_truncated = true;
+
+        let mut output = Vec::new();
+        write_summary(
+            &mut output,
+            &[
+                complete_match,
+                complete_divergence,
+                a_truncated,
+                both_truncated,
+            ],
+            &resolved_config(2),
+            None,
+            1,
+        )
+        .unwrap();
+        let summary = String::from_utf8(output).unwrap();
+
+        assert!(summary.contains("未完了 (途中打ち切り): A側 2局面 / B側 1局面"));
+        assert!(summary.contains("--- 全depth完全一致: 1/2 (50.0%) (未完了 2局面を除外) ---"));
+    }
+
+    #[test]
+    fn position_result_serializes_truncated_flags() {
+        let mut result = position_result(1, &[10], &[10]);
+        result.a_truncated = true;
+
+        let json = serde_json::to_value(result).unwrap();
+        assert_eq!(json["a_truncated"], true);
+        assert_eq!(json["b_truncated"], false);
     }
 
     #[test]
