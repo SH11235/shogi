@@ -177,6 +177,95 @@ fn test_depth_liveness_verification_snapshot_restores_outer_path() {
 }
 
 #[test]
+fn test_nmp_verification_restores_depth_liveness_in_production_path() {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicBool;
+
+    use crate::position::Position;
+    use crate::search::alpha_beta::SearchContext;
+    use crate::search::pruning::try_null_move_pruning;
+    use crate::search::{NodeType, TimeManagement};
+    use crate::types::{Move, Value};
+
+    let tt = Arc::new(TranspositionTable::new(16));
+    let eval_hash = Arc::new(EvalHash::new(1));
+    let mut worker = SearchWorker::new(tt, eval_hash, 0, 0, SearchTuneParams::default());
+    let mut fixed_depth = LimitsType::new();
+    fixed_depth.depth = 20;
+    worker.prepare_search(&fixed_depth);
+
+    let mut pos = Position::new();
+    pos.set_hirate();
+
+    // 外側 move path: root (ply=0) と NMP を試みるノード自身 (ply=1) の entry を記録。
+    let (node_thr, run_thr) = (100, 8);
+    worker.state.depth_liveness_update_for_test(16, 0, node_thr, run_thr);
+    worker.state.depth_liveness_update_for_test(16, 1, node_thr, run_thr);
+    let outer = worker.state.depth_liveness_snapshot(1).unwrap();
+
+    let ctx = SearchContext {
+        tt: &worker.tt,
+        eval_hash: &worker.eval_hash,
+        history: &worker.history,
+        cont_history_sentinel: worker.cont_history_sentinel,
+        generate_all_legal_moves: worker.generate_all_legal_moves,
+        max_moves_to_draw: worker.max_moves_to_draw,
+        thread_id: worker.thread_id,
+        allow_tt_write: worker.allow_tt_write,
+        tune_params: &worker.search_tune_params,
+        reductions: &worker.reductions,
+        draw_value_table: worker.draw_value_table,
+    };
+    let mut time_manager =
+        TimeManagement::new(Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+
+    // depth >= nmp_verification_depth_threshold かつ null search が beta を上回る状況を作り、
+    // verification search (同一 ply の再帰) まで到達させる。margin は depth 16 の既定
+    // パラメータで負になるため、static_eval は beta より十分高くしておく。
+    let beta = Value::new(100);
+    let static_eval = Value::new(1000);
+    let depth = 16;
+    let calls = Cell::new(0);
+    let verification_snapshot = Cell::new(None);
+    let (value, _improving) = try_null_move_pruning::<{ NodeType::NonPV as u8 }, _>(
+        &mut worker.state,
+        &ctx,
+        &mut pos,
+        depth,
+        beta,
+        1,
+        true,
+        false,
+        static_eval,
+        false,
+        Move::NONE,
+        &fixed_depth,
+        &mut time_manager,
+        |st, _ctx, _pos, child_depth, _alpha, _beta, ply, _cut_node, _limits, _tm| {
+            calls.set(calls.get() + 1);
+            if ply == 1 {
+                // verification search: 実際の search_node と同様に同一 ply の追跡を上書きする。
+                st.depth_liveness_update_for_test(child_depth, ply, node_thr, run_thr);
+                verification_snapshot.set(st.depth_liveness_snapshot(1));
+                beta
+            } else {
+                -beta
+            }
+        },
+    );
+
+    assert_eq!(calls.get(), 2, "null search と verification search の両方を通ること");
+    assert!(value.is_some(), "verification が beta を上回れば NMP cutoff が成立すること");
+    let corrupted = verification_snapshot.get().unwrap();
+    assert_ne!(corrupted, outer, "verification search は同一 ply の追跡を実際に上書きすること");
+    assert_eq!(
+        worker.state.depth_liveness_snapshot(1).unwrap(),
+        outer,
+        "try_null_move_pruning は verification 後に外側 ply の追跡を復元すること"
+    );
+}
+
+#[test]
 fn test_depth_liveness_state_is_reset_for_each_go() {
     let tt = Arc::new(TranspositionTable::new(16));
     let eval_hash = Arc::new(EvalHash::new(1));

@@ -574,6 +574,23 @@ impl SearchState {
         self.depth_liveness.is_some()
     }
 
+    /// search_node が node 入口で行う depth-liveness 追跡更新を、実手 child として
+    /// テストから再現する (verification search の production 配線を検証する用途)。
+    #[cfg(test)]
+    pub(crate) fn depth_liveness_update_for_test(
+        &mut self,
+        depth: Depth,
+        ply: i32,
+        node_threshold: i32,
+        run_threshold: i32,
+    ) -> Depth {
+        let nodes = self.nodes;
+        self.depth_liveness
+            .as_mut()
+            .expect("depth liveness must be enabled")
+            .update_depth(nodes, depth, ply, false, node_threshold, run_threshold)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_depth_liveness_active_for_test(&mut self, active: bool) {
         self.depth_liveness.as_mut().expect("depth liveness must be enabled").active = active;
