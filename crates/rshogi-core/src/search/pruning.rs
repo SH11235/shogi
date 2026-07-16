@@ -8,7 +8,7 @@
 
 use crate::nnue::DirtyPiece;
 use crate::position::Position;
-use crate::types::{Bound, Depth, Move, Value};
+use crate::types::{Bound, DEPTH_QS, Depth, Move, Value};
 
 use super::alpha_beta::{
     FutilityParams, SearchContext, SearchState, Step14Context, Step14Outcome, TTContext,
@@ -385,9 +385,13 @@ where
             // NMP verification search は同一 ply の depth-liveness 追跡フィールドを
             // 浅い depth で上書きするため、外側の move path に戻る際に復元する。
             // また verification 自体を実手 child と誤認させない (偽の非減少 edge
-            // カウントや verification depth への clamp を防ぐ)。
+            // カウントや verification depth への clamp を防ぐ)。マークは一回性なので、
+            // verification が qsearch へ直行して liveness 更新に到達しない depth では
+            // 立てない (残留すると次の実手 child が誤って追跡から外れる)。
             let outer_depth_liveness = st.depth_liveness_snapshot(ply);
-            st.depth_liveness_mark_verification_root();
+            if depth - r > DEPTH_QS {
+                st.depth_liveness_mark_verification_root();
+            }
             let v = search_node(
                 st,
                 ctx,

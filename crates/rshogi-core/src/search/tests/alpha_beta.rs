@@ -322,6 +322,97 @@ fn test_nmp_verification_restores_depth_liveness_in_production_path() {
 }
 
 #[test]
+fn test_nmp_qsearch_verification_leaves_no_stale_mark() {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicBool;
+
+    use crate::position::Position;
+    use crate::search::alpha_beta::SearchContext;
+    use crate::search::pruning::try_null_move_pruning;
+    use crate::search::{NodeType, TimeManagement};
+    use crate::types::{Move, Value};
+
+    let tt = Arc::new(TranspositionTable::new(16));
+    let eval_hash = Arc::new(EvalHash::new(1));
+    let mut worker = SearchWorker::new(tt, eval_hash, 0, 0, SearchTuneParams::default());
+    // r = 32 で verification depth を負にし、search_node が liveness 更新前に
+    // qsearch へ早期 return する経路を作る (マークが消費されない状況)。
+    worker
+        .search_tune_params
+        .set_from_usi_name("SPSA_NMP_REDUCTION_BASE", 32)
+        .unwrap();
+    worker
+        .search_tune_params
+        .set_from_usi_name("SPSA_NMP_REDUCTION_DEPTH_DIV", 32)
+        .unwrap();
+    let mut fixed_depth = LimitsType::new();
+    fixed_depth.depth = 20;
+    worker.prepare_search(&fixed_depth);
+
+    let mut pos = Position::new();
+    pos.set_hirate();
+
+    let (node_thr, run_thr) = (100, 1);
+    worker.state.nodes = 50;
+    worker.state.depth_liveness_update_for_test(15, 0, node_thr, run_thr);
+    worker.state.depth_liveness_update_for_test(16, 1, node_thr, run_thr);
+    worker.state.nodes = 200;
+
+    let ctx = SearchContext {
+        tt: &worker.tt,
+        eval_hash: &worker.eval_hash,
+        history: &worker.history,
+        cont_history_sentinel: worker.cont_history_sentinel,
+        generate_all_legal_moves: worker.generate_all_legal_moves,
+        max_moves_to_draw: worker.max_moves_to_draw,
+        thread_id: worker.thread_id,
+        allow_tt_write: worker.allow_tt_write,
+        tune_params: &worker.search_tune_params,
+        reductions: &worker.reductions,
+        draw_value_table: worker.draw_value_table,
+    };
+    let mut time_manager =
+        TimeManagement::new(Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+
+    let beta = Value::new(100);
+    let static_eval = Value::new(1000);
+    let calls = Cell::new(0);
+    let (value, _improving) = try_null_move_pruning::<{ NodeType::NonPV as u8 }, _>(
+        &mut worker.state,
+        &ctx,
+        &mut pos,
+        16,
+        beta,
+        1,
+        true,
+        false,
+        static_eval,
+        false,
+        Move::NONE,
+        &fixed_depth,
+        &mut time_manager,
+        |_st, _ctx, _pos, child_depth, _alpha, _beta, ply, _cut_node, _limits, _tm| {
+            calls.set(calls.get() + 1);
+            // depth <= 0 の呼び出しは search_node なら liveness 更新前に qsearch へ
+            // 早期 return するため、ここでは追跡を触らない。
+            assert!(child_depth <= 0, "r=32 で null/verification とも depth は負のはず");
+            if ply == 1 { beta } else { -beta }
+        },
+    );
+
+    assert_eq!(calls.get(), 2);
+    assert!(value.is_some());
+
+    // マークが残留していると、次の実手 child が verification root と誤認され
+    // run 判定・enforcement から外れてしまう (発火せず 16 が素通しになる)。
+    assert_eq!(
+        worker.state.depth_liveness_update_for_test(16, 2, node_thr, run_thr),
+        15,
+        "verification 後の実手 child は通常どおり追跡され、発火・enforcement されること"
+    );
+}
+
+#[test]
 fn test_depth_liveness_state_is_reset_for_each_go() {
     let tt = Arc::new(TranspositionTable::new(16));
     let eval_hash = Arc::new(EvalHash::new(1));
