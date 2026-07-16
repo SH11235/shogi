@@ -163,13 +163,13 @@ impl LimitsType {
     /// 暴走探索を engine 自身が打ち切れる予算（時間・ノード・infinite）を持つか。
     ///
     /// `false`（深さ／詰み目標の完了のみで停止し、時間もノードも `stop` も効かない探索）の場合、
-    /// Singular Extension の double/triple 延長が置換表飽和下で連鎖して探索木が
+    /// remaining depth が減らない探索pathが置換表飽和下で連鎖して探索木が
     /// 深さ方向に成長し続けても止める手段が無く、`go depth N` が事実上終了しなくなる。
-    /// この判定が `false` のときだけ SE 延長を単延長に制限して終了を保証する。
+    /// この判定が `false` の探索だけ動的depth-liveness guardの追跡対象にする。
     ///
     /// 「実際に enforce される停止条件」のみを予算とみなす:
     /// - `use_time_management()`: 純粋な時間管理が有効で時間で停止する（`go depth N btime T` の
-    ///   ように depth 併用だと時間管理は無効化されるため `true` にならず、この場合は cap 対象）。
+    ///   ように depth 併用だと時間管理は無効化されるため `true` にならず、この場合は guard 対象）。
     ///   `rtime` は `time_manager.init` でこの判定が真のときだけ反映されるため（depth 併用時は
     ///   `!use_time_management()` の早期 return より後で処理され enforce されない）、ここでは
     ///   独立項を持たず `use_time_management()` に内包する。
@@ -178,7 +178,7 @@ impl LimitsType {
     /// - infinite: `stop` で打ち切り可能。
     ///
     /// なお `go perft N` は `use_time_management()` が `false` になり「予算なし」扱いだが、
-    /// perft は alpha-beta を通らず SE に到達しないため cap は発火しない（実害なし）。
+    /// perft は alpha-beta を通らず guard 追跡を行わない（実害なし）。
     #[inline]
     pub fn has_interrupt_budget(&self) -> bool {
         self.use_time_management() || self.movetime != 0 || self.nodes != 0 || self.infinite
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_has_interrupt_budget() {
-        // 純粋な depth 固定（go depth N）・詰み探索は engine 自身の打ち切り予算なし → cap 対象
+        // 純粋な depth 固定（go depth N）・詰み探索は engine 自身の打ち切り予算なし → guard 対象
         let mut l = LimitsType::new();
         l.depth = 15;
         assert!(!l.has_interrupt_budget());
@@ -298,14 +298,14 @@ mod tests {
         }
 
         // depth + rtime は time_manager.init で rtime 処理前に !use_time_management() で早期 return
-        // され rtime が enforce されない → 予算なし扱い（cap 対象）
+        // され rtime が enforce されない → 予算なし扱い（guard 対象）
         let mut l = LimitsType::new();
         l.depth = 15;
         l.rtime = 1000;
         assert!(!l.has_interrupt_budget());
 
         // depth と残り時間/秒読みの併用は時間管理が無効化される（time MAX/2 で実 enforce されない）
-        // ため予算なし扱い → cap 対象とし、この組合せでもハングしないようにする
+        // ため予算なし扱い → guard 対象とし、この組合せでもハングしないようにする
         let mut l = LimitsType::new();
         l.depth = 15;
         l.time[Color::Black.index()] = 60000;

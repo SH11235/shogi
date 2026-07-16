@@ -2,6 +2,13 @@
 //!
 //! USI `setoption` で更新できる探索係数を集約する。
 
+use crate::types::MAX_PLY;
+
+/// depth-liveness の非減少 edge 連続数は ply が `MAX_PLY` で打ち切られるため
+/// `MAX_PLY - 1` を超えられない。これより大きい閾値を許すと「0のみ無効」の
+/// 契約に反して guard が黙って無効化されるので、上限をここで縛る。
+const DEPTH_LIVENESS_RUN_MAX: i32 = MAX_PLY - 1;
+
 /// 1つのチューニング項目のUSI定義。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchTuneOptionSpec {
@@ -340,6 +347,10 @@ pub struct SearchTuneParams {
     pub aspiration_delta_base: i32,
     /// aspiration window: mean squared score 除算値
     pub aspiration_mean_sq_div: i32,
+    /// 1回のroot searchでこのnode数を超えたらdepth livenessを監視（0=無効）
+    pub depth_liveness_node_threshold: i32,
+    /// remaining depthが減らない連続edge数の発火閾値（0=無効）
+    pub depth_liveness_run_threshold: i32,
 
     // =========================================================================
     // Group D: Reductions テーブル
@@ -1286,6 +1297,18 @@ const SPSA_OPTION_SPECS: &[SearchTuneOptionSpec] = &[
         min: 1,
         max: 100000,
     },
+    SearchTuneOptionSpec {
+        usi_name: "SPSA_DEPTH_LIVENESS_NODES",
+        default: 500000,
+        min: 0,
+        max: 100000000,
+    },
+    SearchTuneOptionSpec {
+        usi_name: "SPSA_DEPTH_LIVENESS_RUN",
+        default: 8,
+        min: 0,
+        max: DEPTH_LIVENESS_RUN_MAX,
+    },
     // Group D: Reductions テーブル
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_TABLE_COEFF",
@@ -1601,6 +1624,8 @@ impl Default for SearchTuneParams {
             // Group C
             aspiration_delta_base: 5,
             aspiration_mean_sq_div: 9000,
+            depth_liveness_node_threshold: 500_000,
+            depth_liveness_run_threshold: 8,
             // Group D
             lmr_table_coeff: 2809,
             // Group E
@@ -1994,6 +2019,13 @@ impl SearchTuneParams {
         // Group C
         try_apply!("SPSA_ASP_DELTA_BASE", aspiration_delta_base, 1, 64);
         try_apply!("SPSA_ASP_MEAN_SQ_DIV", aspiration_mean_sq_div, 1, 100000);
+        try_apply!("SPSA_DEPTH_LIVENESS_NODES", depth_liveness_node_threshold, 0, 100000000);
+        try_apply!(
+            "SPSA_DEPTH_LIVENESS_RUN",
+            depth_liveness_run_threshold,
+            0,
+            DEPTH_LIVENESS_RUN_MAX
+        );
         // Group D
         try_apply!("SPSA_LMR_TABLE_COEFF", lmr_table_coeff, 1024, 8192);
         // Group E
@@ -2079,6 +2111,18 @@ mod tests {
         assert_eq!(params.update_all_stats_quiet_malus_decay_num, 955);
         assert_eq!(params.lmr_all_node_scale_num, 273);
         assert_eq!(params.lmr_all_node_scale_offset, 286);
+    }
+
+    #[test]
+    fn depth_liveness_params_default_and_disable_round_trip() {
+        let mut params = SearchTuneParams::default();
+        assert_eq!(params.depth_liveness_node_threshold, 500_000);
+        assert_eq!(params.depth_liveness_run_threshold, 8);
+
+        params.set_from_usi_name("SPSA_DEPTH_LIVENESS_NODES", 0).unwrap();
+        params.set_from_usi_name("SPSA_DEPTH_LIVENESS_RUN", 0).unwrap();
+        assert_eq!(params.depth_liveness_node_threshold, 0);
+        assert_eq!(params.depth_liveness_run_threshold, 0);
     }
 
     #[test]

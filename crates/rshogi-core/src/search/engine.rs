@@ -1033,7 +1033,7 @@ impl Search {
         worker.entering_king_rule = self.entering_king_rule;
 
         // 探索状態のリセット（履歴はクリアしない）
-        worker.prepare_search();
+        worker.prepare_search(&limits);
         worker.allow_tt_write = true;
 
         // 探索深さを決定
@@ -1562,6 +1562,9 @@ where
                 let adjusted_depth =
                     (search_depth - failed_high_cnt - (3 * (search_again_counter + 1) / 4)).max(1);
 
+                // Aspiration retry ごとに node budget を測る。guard 自体は一度発火したら
+                // go の残り全体で有効にし、別 retry で同じ病的連鎖が再発するのを防ぐ。
+                worker.state.begin_depth_liveness_attempt();
                 let score = if pv_idx == 0 {
                     worker.search_root(pos, adjusted_depth, alpha, beta, limits, time_manager)
                 } else {
