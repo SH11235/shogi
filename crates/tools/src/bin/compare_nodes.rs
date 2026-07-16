@@ -2,6 +2,9 @@
 //!
 //! YaneuraOu との alignment 調査や、同一エンジンの A/B テストに使用する。
 //! 複数局面を並列処理し、結果をタイムスタンプ付きディレクトリに保存する。
+//! `--nodes-a` / `--nodes-b` を指定すると、対象エンジンの探索コマンドを
+//! `go depth N nodes M` にして、depth 固定探索にエンジン別のノード上限を追加できる。
+//! 省略した側にはノード上限を追加しない。
 //!
 //! # 使用方法
 //!
@@ -33,6 +36,16 @@
 //!   --eval-b $SHOGI_DATA/nnue/halfkp_256x2-32-32_crelu \
 //!   --sfen "l6nl/1r1sgkgs1/p3pp1p1/2pp2p1p/1p1n3P1/P1P2PP1P/1PSPP1N2/2GK2SR1/LN3G2L b Bb 29" \
 //!   --depth 18 \
+//!   --workers 1
+//! ```
+//!
+//! エンジンBだけにノード上限を追加する例（設定ファイルにエンジン等を指定済みの場合）:
+//! ```bash
+//! cargo run --release -p tools --bin compare_nodes -- \
+//!   --config compare_nodes.toml \
+//!   --sfen startpos \
+//!   --depth 20 \
+//!   --nodes-b 100000000 \
 //!   --workers 1
 //! ```
 
@@ -103,6 +116,14 @@ struct Cli {
     #[arg(long)]
     depth: Option<u32>,
 
+    /// エンジンAに追加するノード上限（1以上）。`go depth N nodes M` で探索する
+    #[arg(long)]
+    nodes_a: Option<u64>,
+
+    /// エンジンBに追加するノード上限（1以上）。`go depth N nodes M` で探索する
+    #[arg(long)]
+    nodes_b: Option<u64>,
+
     /// ランダムサンプル数（0=全件）
     #[arg(long, default_value_t = 0)]
     sample: usize,
@@ -127,7 +148,7 @@ struct Cli {
 
 /// コンフィグファイルの構造体。全フィールド Optional で CLI 引数が優先される。
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct Config {
     engine_a: Option<PathBuf>,
     engine_b: Option<PathBuf>,
@@ -137,6 +158,8 @@ struct Config {
     eval_a: Option<PathBuf>,
     eval_b: Option<PathBuf>,
     depth: Option<u32>,
+    nodes_a: Option<u64>,
+    nodes_b: Option<u64>,
     seed: Option<u64>,
     output_base: Option<PathBuf>,
 }
@@ -151,6 +174,8 @@ struct ResolvedConfig {
     eval_a: Option<PathBuf>,
     eval_b: Option<PathBuf>,
     depth: u32,
+    nodes_a: Option<u64>,
+    nodes_b: Option<u64>,
     sample: usize,
     workers: Option<usize>,
     seed: u64,
@@ -158,30 +183,23 @@ struct ResolvedConfig {
     reuse_engine: bool,
 }
 
-fn load_config(path: &Path) -> Option<Config> {
-    if !path.exists() {
-        return None;
-    }
-    match fs::read_to_string(path) {
-        Ok(content) => match toml::from_str::<Config>(&content) {
-            Ok(config) => {
-                eprintln!("コンフィグ読み込み: {}", path.display());
-                Some(config)
-            }
-            Err(e) => {
-                eprintln!("コンフィグ解析エラー ({}): {e}", path.display());
-                None
-            }
-        },
+fn load_config(path: &Path) -> Result<Option<Config>> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
-            eprintln!("コンフィグ読み込みエラー ({}): {e}", path.display());
-            None
+            return Err(e)
+                .with_context(|| format!("コンフィグを読み込めません: {}", path.display()));
         }
-    }
+    };
+    let config = toml::from_str::<Config>(&content)
+        .with_context(|| format!("コンフィグを解析できません: {}", path.display()))?;
+    eprintln!("コンフィグ読み込み: {}", path.display());
+    Ok(Some(config))
 }
 
 fn resolve_config(cli: Cli) -> Result<ResolvedConfig> {
-    let config = load_config(&cli.config).unwrap_or_default();
+    let config = load_config(&cli.config)?.unwrap_or_default();
 
     let engine_a = cli.engine_a.or(config.engine_a).ok_or_else(|| {
         anyhow::anyhow!(
@@ -209,6 +227,14 @@ fn resolve_config(cli: Cli) -> Result<ResolvedConfig> {
 
     let hash = cli.hash.or(config.hash).unwrap_or(64);
     let depth = cli.depth.or(config.depth).unwrap_or(10);
+    let nodes_a = cli.nodes_a.or(config.nodes_a);
+    let nodes_b = cli.nodes_b.or(config.nodes_b);
+    if nodes_a == Some(0) {
+        anyhow::bail!("--nodes-a / nodes_a は1以上を指定してください");
+    }
+    if nodes_b == Some(0) {
+        anyhow::bail!("--nodes-b / nodes_b は1以上を指定してください");
+    }
     let seed = cli.seed.or(config.seed).unwrap_or(42);
     let output_base = cli
         .output_base
@@ -227,6 +253,8 @@ fn resolve_config(cli: Cli) -> Result<ResolvedConfig> {
         eval_a,
         eval_b,
         depth,
+        nodes_a,
+        nodes_b,
         sample: cli.sample,
         workers: cli.workers,
         seed,
@@ -352,6 +380,8 @@ struct Meta {
     eval_b: Option<String>,
     sfens_file: String,
     depth: u32,
+    nodes_a: Option<u64>,
+    nodes_b: Option<u64>,
     workers: usize,
     sample: usize,
     seed: u64,
@@ -453,8 +483,13 @@ impl UsiEngine {
         Ok(())
     }
 
-    /// go depth N で探索し、深度別の情報を収集
-    fn search_depth(&mut self, sfen: &str, depth: u32) -> Result<SearchResult> {
+    /// go depth N（必要なら nodes M も併用）で探索し、深度別の情報を収集
+    fn search_depth(
+        &mut self,
+        sfen: &str,
+        depth: u32,
+        nodes_budget: Option<u64>,
+    ) -> Result<SearchResult> {
         // USIプロトコルの position コマンドを構築
         // "sfen ..." で始まる行はそのまま、それ以外は "sfen " を付加
         let pos_cmd = if sfen.starts_with("sfen ") || sfen == "startpos" {
@@ -463,7 +498,11 @@ impl UsiEngine {
             format!("position sfen {sfen}")
         };
         self.send(&pos_cmd)?;
-        self.send(&format!("go depth {depth}"))?;
+        let go = match nodes_budget {
+            Some(nodes) => format!("go depth {depth} nodes {nodes}"),
+            None => format!("go depth {depth}"),
+        };
+        self.send(&go)?;
 
         let mut depth_map: BTreeMap<u32, DepthInfo> = BTreeMap::new();
         let mut line = String::new();
@@ -606,6 +645,7 @@ struct EngineParams {
     eval_opt_name: &'static str,
     eval_path: Option<PathBuf>,
     options: Vec<String>,
+    nodes_budget: Option<u64>,
 }
 
 impl EngineParams {
@@ -636,10 +676,10 @@ fn process_position(
     engine_b.send("usinewgame")?;
 
     let result_a = engine_a
-        .search_depth(sfen, depth)
+        .search_depth(sfen, depth, params_a.nodes_budget)
         .with_context(|| format!("エンジンA探索失敗: position {index}"))?;
     let result_b = engine_b
-        .search_depth(sfen, depth)
+        .search_depth(sfen, depth, params_b.nodes_budget)
         .with_context(|| format!("エンジンB探索失敗: position {index}"))?;
 
     let elapsed_secs = start.elapsed().as_secs_f64();
@@ -707,7 +747,7 @@ fn process_positions_reuse(
     for (index, sfen) in sfens {
         let start = std::time::Instant::now();
 
-        let result_a = match engine_a.search_depth(sfen, depth) {
+        let result_a = match engine_a.search_depth(sfen, depth, params_a.nodes_budget) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("position {index} エンジンA探索失敗: {e}");
@@ -715,7 +755,7 @@ fn process_positions_reuse(
                 continue;
             }
         };
-        let result_b = match engine_b.search_depth(sfen, depth) {
+        let result_b = match engine_b.search_depth(sfen, depth, params_b.nodes_budget) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("position {index} エンジンB探索失敗: {e}");
@@ -758,6 +798,36 @@ fn process_positions_reuse(
 // サマリ出力
 // ---------------------------------------------------------------------------
 
+fn first_divergence_depth(result: &PositionResult) -> Option<u32> {
+    let mut a_index = 0;
+    let mut b_index = 0;
+
+    while a_index < result.a_depths.len() && b_index < result.b_depths.len() {
+        let a = &result.a_depths[a_index];
+        let b = &result.b_depths[b_index];
+
+        match a.depth.cmp(&b.depth) {
+            std::cmp::Ordering::Less => return Some(a.depth),
+            std::cmp::Ordering::Greater => return Some(b.depth),
+            std::cmp::Ordering::Equal if a.nodes != b.nodes => return Some(a.depth),
+            std::cmp::Ordering::Equal => {
+                a_index += 1;
+                b_index += 1;
+            }
+        }
+    }
+
+    result
+        .a_depths
+        .get(a_index)
+        .or_else(|| result.b_depths.get(b_index))
+        .map(|depth| depth.depth)
+}
+
+fn depths_diverged(result: &PositionResult) -> bool {
+    first_divergence_depth(result).is_some()
+}
+
 fn write_summary(
     writer: &mut dyn Write,
     results: &[PositionResult],
@@ -765,12 +835,6 @@ fn write_summary(
     wall_clock_secs: Option<f64>,
     workers: usize,
 ) -> Result<()> {
-    if results.is_empty() {
-        writeln!(writer, "=== ノード数比較サマリ ===")?;
-        writeln!(writer, "--- 結果がありません ---")?;
-        return Ok(());
-    }
-
     writeln!(writer, "=== ノード数比較サマリ ===")?;
     writeln!(writer, "エンジンA: {}", rc.engine_a.display())?;
     if !rc.options_a.is_empty() {
@@ -781,6 +845,12 @@ fn write_summary(
         writeln!(writer, "  オプション: {}", rc.options_b.join(", "))?;
     }
     writeln!(writer, "深度: {}, 局面数: {}", rc.depth, results.len())?;
+    if let Some(nodes) = rc.nodes_a {
+        writeln!(writer, "追加ノード上限(A): {nodes}")?;
+    }
+    if let Some(nodes) = rc.nodes_b {
+        writeln!(writer, "追加ノード上限(B): {nodes}")?;
+    }
     writeln!(
         writer,
         "モード: {}",
@@ -800,6 +870,12 @@ fn write_summary(
     if let Some(wc) = wall_clock_secs {
         writeln!(writer, "経過時間: {:.1}s", wc)?;
     }
+
+    if results.is_empty() {
+        writeln!(writer, "--- 結果がありません ---")?;
+        return Ok(());
+    }
+
     let mut per_position: Vec<f64> = results.iter().map(|r| r.elapsed_secs).collect();
     per_position.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let total_secs: f64 = per_position.iter().sum();
@@ -830,34 +906,43 @@ fn write_summary(
     for d in 1..=rc.depth {
         let mut a_total: u64 = 0;
         let mut b_total: u64 = 0;
-        let mut count: u64 = 0;
+        let mut a_count: u64 = 0;
+        let mut b_count: u64 = 0;
 
         for r in results {
-            let a_nodes =
-                r.a_depths.iter().find(|di| di.depth == d).map(|di| di.nodes).unwrap_or(0);
-            let b_nodes =
-                r.b_depths.iter().find(|di| di.depth == d).map(|di| di.nodes).unwrap_or(0);
-            a_total += a_nodes;
-            b_total += b_nodes;
-            count += 1;
+            if let Some(depth) = r.a_depths.iter().find(|di| di.depth == d) {
+                a_total += depth.nodes;
+                a_count += 1;
+            }
+            if let Some(depth) = r.b_depths.iter().find(|di| di.depth == d) {
+                b_total += depth.nodes;
+                b_count += 1;
+            }
         }
 
-        if count == 0 {
-            continue;
-        }
-
-        let a_avg = a_total / count;
-        let b_avg = b_total / count;
+        let a_avg = a_total
+            .checked_div(a_count)
+            .map(|avg| avg.to_string())
+            .unwrap_or_else(|| "-".into());
+        let b_avg = b_total
+            .checked_div(b_count)
+            .map(|avg| avg.to_string())
+            .unwrap_or_else(|| "-".into());
         let ratio = if b_total > 0 {
             a_total as f64 / b_total as f64
         } else {
             f64::NAN
         };
+        let coverage = if a_count == b_count {
+            String::new()
+        } else {
+            format!(" coverage(A/B)={a_count}/{b_count}")
+        };
 
         writeln!(
             writer,
-            "{:>5} {:>12} {:>12} {:>12} {:>12} {:>7.3}x",
-            d, a_avg, b_avg, a_total, b_total, ratio
+            "{:>5} {:>12} {:>12} {:>12} {:>12} {:>7.3}x{}",
+            d, a_avg, b_avg, a_total, b_total, ratio, coverage
         )?;
     }
     writeln!(writer)?;
@@ -876,18 +961,10 @@ fn write_summary(
     // 全depth完全一致と乖離開始深度の分布
     let mut all_depths_perfect = 0usize;
     let mut first_diverge_depth: BTreeMap<u32, usize> = BTreeMap::new();
-    for r in results.iter() {
-        let min_len = r.a_depths.len().min(r.b_depths.len());
-        let mut diverged = false;
-        for i in 0..min_len {
-            if r.a_depths[i].nodes != r.b_depths[i].nodes {
-                let d = r.a_depths[i].depth;
-                *first_diverge_depth.entry(d).or_insert(0) += 1;
-                diverged = true;
-                break;
-            }
-        }
-        if !diverged {
+    for r in results {
+        if let Some(depth) = first_divergence_depth(r) {
+            *first_diverge_depth.entry(depth).or_insert(0) += 1;
+        } else {
             all_depths_perfect += 1;
         }
     }
@@ -1043,6 +1120,12 @@ fn main() -> Result<()> {
         println!("局面数: {} {sfens_source}", sfens.len());
     }
     println!("深度: {}, Hash: {} MB, ワーカー: {}", rc.depth, rc.hash, workers);
+    if let Some(nodes) = rc.nodes_a {
+        println!("追加ノード上限(A): {nodes}");
+    }
+    if let Some(nodes) = rc.nodes_b {
+        println!("追加ノード上限(B): {nodes}");
+    }
     if let Some(eval) = &rc.eval_a {
         println!("EvalFile(A): {}", eval.display());
     }
@@ -1072,6 +1155,8 @@ fn main() -> Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(直接指定)".to_string()),
         depth: rc.depth,
+        nodes_a: rc.nodes_a,
+        nodes_b: rc.nodes_b,
         workers,
         sample: rc.sample,
         seed: rc.seed,
@@ -1101,6 +1186,7 @@ fn main() -> Result<()> {
         eval_opt_name: "EvalFile",
         eval_path: rc.eval_a.clone(),
         options: rc.options_a.clone(),
+        nodes_budget: rc.nodes_a,
     });
     let params_b = Arc::new(EngineParams {
         path: rc.engine_b.clone(),
@@ -1108,6 +1194,7 @@ fn main() -> Result<()> {
         eval_opt_name: "EvalDir",
         eval_path: rc.eval_b.clone(),
         options: rc.options_b.clone(),
+        nodes_budget: rc.nodes_b,
     });
     let depth = rc.depth;
 
@@ -1163,14 +1250,8 @@ fn main() -> Result<()> {
     write_summary(&mut std::io::stdout().lock(), &pw.results, &rc, Some(wall_clock_secs), workers)?;
 
     // 乖離があった局面の SFEN を書き出し（--sfens に再入力可能な形式）
-    let divergent: Vec<&PositionResult> = pw
-        .results
-        .iter()
-        .filter(|r| {
-            let min_len = r.a_depths.len().min(r.b_depths.len());
-            (0..min_len).any(|i| r.a_depths[i].nodes != r.b_depths[i].nodes)
-        })
-        .collect();
+    let divergent: Vec<&PositionResult> =
+        pw.results.iter().filter(|r| depths_diverged(r)).collect();
     if !divergent.is_empty() {
         let div_path = output_dir.join("divergent_sfens.txt");
         let mut w = BufWriter::new(File::create(&div_path)?);
@@ -1185,4 +1266,159 @@ fn main() -> Result<()> {
     println!("結果保存先: {}", output_dir.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn depth_info(depth: u32, nodes: u64) -> DepthInfo {
+        DepthInfo {
+            depth,
+            nodes,
+            score_cp: None,
+            score_mate: None,
+            nps: None,
+            pv: String::new(),
+        }
+    }
+
+    fn position_result(index: usize, a_nodes: &[u64], b_nodes: &[u64]) -> PositionResult {
+        let a_depths = a_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &nodes)| depth_info(i as u32 + 1, nodes))
+            .collect::<Vec<_>>();
+        let b_depths = b_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &nodes)| depth_info(i as u32 + 1, nodes))
+            .collect::<Vec<_>>();
+        let final_a = a_nodes.last().copied().unwrap_or(0);
+        let final_b = b_nodes.last().copied().unwrap_or(0);
+
+        PositionResult {
+            index,
+            sfen: format!("position-{index}"),
+            a_depths,
+            b_depths,
+            a_bestmove: "7g7f".to_string(),
+            b_bestmove: "7g7f".to_string(),
+            bestmove_match: true,
+            final_nodes_diff: final_a as i64 - final_b as i64,
+            final_nodes_ratio: (final_b > 0).then(|| final_a as f64 / final_b as f64),
+            elapsed_secs: 1.0,
+        }
+    }
+
+    fn resolved_config(depth: u32) -> ResolvedConfig {
+        ResolvedConfig {
+            engine_a: PathBuf::from("engine-a"),
+            engine_b: PathBuf::from("engine-b"),
+            options_a: vec!["Threads=1".to_string()],
+            options_b: Vec::new(),
+            hash: 64,
+            eval_a: Some(PathBuf::from("eval-a.bin")),
+            eval_b: None,
+            depth,
+            nodes_a: Some(1_000),
+            nodes_b: Some(2_000),
+            sample: 0,
+            workers: Some(1),
+            seed: 42,
+            output_base: PathBuf::from("results"),
+            reuse_engine: false,
+        }
+    }
+
+    #[test]
+    fn load_config_allows_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.toml");
+
+        assert!(load_config(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_config_rejects_invalid_toml_with_path_and_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.toml");
+        fs::write(&path, "nodes_a = \"many\"\n").unwrap();
+
+        let error = load_config(&path).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(&path.display().to_string()));
+        assert!(message.contains("nodes_a"));
+    }
+
+    #[test]
+    fn load_config_rejects_unknown_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typo.toml");
+        fs::write(&path, "node_a = 1000\n").unwrap();
+
+        let error = load_config(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field `node_a`"));
+    }
+
+    #[test]
+    fn empty_summary_keeps_configuration_header() {
+        let rc = resolved_config(20);
+        let mut output = Vec::new();
+
+        write_summary(&mut output, &[], &rc, Some(1.5), 1).unwrap();
+
+        let summary = String::from_utf8(output).unwrap();
+        assert!(summary.contains("エンジンA: engine-a"));
+        assert!(summary.contains("深度: 20, 局面数: 0"));
+        assert!(summary.contains("追加ノード上限(A): 1000"));
+        assert!(summary.contains("追加ノード上限(B): 2000"));
+        assert!(summary.contains("モード: 局面ごと新規起動（TTリセット・並列）"));
+        assert!(summary.contains("Hash: 64 MB"));
+        assert!(summary.ends_with("--- 結果がありません ---\n"));
+    }
+
+    #[test]
+    fn shorter_depth_series_is_divergent_and_does_not_dilute_averages() {
+        let results = vec![
+            position_result(1, &[100, 200], &[100, 200]),
+            position_result(2, &[100, 600], &[100]),
+        ];
+        assert!(!depths_diverged(&results[0]));
+        assert!(depths_diverged(&results[1]));
+        assert_eq!(first_divergence_depth(&results[1]), Some(2));
+
+        let mut output = Vec::new();
+        write_summary(&mut output, &results, &resolved_config(2), None, 1).unwrap();
+        let summary = String::from_utf8(output).unwrap();
+
+        assert!(summary.contains("--- 全depth完全一致: 1/2 (50.0%) ---"));
+        assert!(summary.contains("  d2  :    1 局面"));
+        let depth_two = summary
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some("2"))
+            .unwrap();
+        assert_eq!(
+            depth_two.split_whitespace().collect::<Vec<_>>(),
+            [
+                "2",
+                "400",
+                "200",
+                "800",
+                "200",
+                "4.000x",
+                "coverage(A/B)=2/1"
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_intermediate_depth_is_first_divergence() {
+        let mut result = position_result(1, &[], &[]);
+        result.a_depths = vec![depth_info(1, 100), depth_info(3, 300)];
+        result.b_depths = vec![depth_info(1, 100), depth_info(2, 300)];
+
+        assert!(depths_diverged(&result));
+        assert_eq!(first_divergence_depth(&result), Some(2));
+    }
 }
