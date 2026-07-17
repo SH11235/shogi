@@ -31,6 +31,11 @@ fn row_requires_rebuild(
         || (cursor_ended_at_ms == row_ended_at_ms as i64 && cursor_game_id >= row_game_id)
 }
 
+#[cfg(test)]
+fn revision_allows_page_persist(expected_revision: i64, current_revision: i64) -> bool {
+    expected_revision == current_revision
+}
+
 #[cfg(any(target_arch = "wasm32", test))]
 fn snapshot_is_ready(
     active_generation: Option<i64>,
@@ -79,6 +84,7 @@ mod imp {
         cursor_ended_at_ms: i64,
         cursor_game_id: String,
         rebuild_required: i64,
+        data_revision: i64,
     }
 
     #[derive(Debug, Deserialize)]
@@ -204,7 +210,28 @@ mod imp {
                 load_existing_players(db, state.building_generation, &player_ids).await?;
             let updated = apply_player_games(existing, &games);
             let last = rows.last().expect("non-empty page").to_player_game();
-            persist_page(db, state.building_generation, &updated, &games, &last).await?;
+            let persisted = persist_page(
+                db,
+                state.building_generation,
+                state.data_revision,
+                &updated,
+                &games,
+                &last,
+            )
+            .await?;
+            if !persisted {
+                // The page was derived from a stale read. Every page mutation
+                // was revision-guarded and therefore discarded; the same D1
+                // batch marked the generation for a clean rebuild.
+                state.rebuild_required = 1;
+                return Ok(MaterializationOutcome {
+                    processed_games,
+                    active_generation: state.active_generation,
+                    rebuild_in_progress: true,
+                    lease_acquired: true,
+                    deadline_reached: false,
+                });
+            }
             processed_games = processed_games.saturating_add(rows.len() as u32);
             state.cursor_ended_at_ms = last.ended_at_ms as i64;
             state.cursor_game_id = last.game_id;
@@ -263,7 +290,7 @@ mod imp {
     }
 
     async fn load_state(db: &worker::D1Database) -> Result<StateRow> {
-        db.prepare("SELECT active_generation, building_generation, cursor_ended_at_ms, cursor_game_id, rebuild_required FROM player_rating_state WHERE singleton = 1")
+        db.prepare("SELECT active_generation, building_generation, cursor_ended_at_ms, cursor_game_id, rebuild_required, data_revision FROM player_rating_state WHERE singleton = 1")
             .first::<StateRow>(None)
             .await?
             .ok_or_else(|| worker::Error::RustError("player_rating_state missing".into()))
@@ -360,11 +387,12 @@ mod imp {
     async fn persist_page(
         db: &worker::D1Database,
         generation: i64,
+        expected_revision: i64,
         players: &[PlayerSummary],
         games: &[PlayerGame],
         last: &PlayerGame,
-    ) -> Result<()> {
-        let mut statements = Vec::with_capacity(players.len() + 1);
+    ) -> Result<bool> {
+        let mut statements = Vec::with_capacity(players.len() + games.len() + 2);
         for player in players {
             let values = [
                 JsValue::from_f64(generation as f64),
@@ -377,9 +405,10 @@ mod imp {
                 JsValue::from_f64(player.games as f64),
                 JsValue::from_f64(player.last_played_at_ms as f64),
                 JsValue::from_f64(if player.legacy { 1.0 } else { 0.0 }),
+                JsValue::from_f64(expected_revision as f64),
             ];
             statements.push(
-                db.prepare("INSERT INTO player_rating_generations (generation, player_id, display_name, rating, wins, losses, draws, games, last_played_at_ms, legacy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(generation, player_id) DO UPDATE SET display_name=excluded.display_name, rating=excluded.rating, wins=excluded.wins, losses=excluded.losses, draws=excluded.draws, games=excluded.games, last_played_at_ms=excluded.last_played_at_ms, legacy=excluded.legacy")
+                db.prepare("INSERT INTO player_rating_generations (generation, player_id, display_name, rating, wins, losses, draws, games, last_played_at_ms, legacy) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE (SELECT data_revision FROM player_rating_state WHERE singleton = 1) = ? ON CONFLICT(generation, player_id) DO UPDATE SET display_name=excluded.display_name, rating=excluded.rating, wins=excluded.wins, losses=excluded.losses, draws=excluded.draws, games=excluded.games, last_played_at_ms=excluded.last_played_at_ms, legacy=excluded.legacy")
                     .bind(&values)?,
             );
         }
@@ -394,22 +423,32 @@ mod imp {
                     game.white_player_id.as_deref().expect("canonicalized before persist"),
                 ),
                 JsValue::from_str(&game.game_id),
+                JsValue::from_f64(expected_revision as f64),
             ];
             statements.push(
-                db.prepare("UPDATE games_search_index SET black_player_id = ?, white_player_id = ? WHERE game_id = ?")
+                db.prepare("UPDATE games_search_index SET black_player_id = ?, white_player_id = ? WHERE game_id = ? AND (SELECT data_revision FROM player_rating_state WHERE singleton = 1) = ?")
                     .bind(&values)?,
             );
         }
         let cursor_values = [
             JsValue::from_f64(last.ended_at_ms as f64),
             JsValue::from_str(&last.game_id),
+            JsValue::from_f64(expected_revision as f64),
         ];
         statements.push(
-            db.prepare("UPDATE player_rating_state SET cursor_ended_at_ms = ?, cursor_game_id = ? WHERE singleton = 1")
+            db.prepare("UPDATE player_rating_state SET cursor_ended_at_ms = ?, cursor_game_id = ? WHERE singleton = 1 AND data_revision = ?")
                 .bind(&cursor_values)?,
         );
-        db.batch(statements).await?;
-        Ok(())
+        let mismatch_values = [JsValue::from_f64(expected_revision as f64)];
+        statements.push(
+            db.prepare("UPDATE player_rating_state SET rebuild_required = 1 WHERE singleton = 1 AND data_revision <> ?")
+                .bind(&mismatch_values)?,
+        );
+        let results = db.batch(statements).await?;
+        let cursor_result = results.get(results.len().saturating_sub(2)).ok_or_else(|| {
+            worker::Error::RustError("player rating cursor result missing".into())
+        })?;
+        Ok(cursor_result.meta()?.and_then(|meta| meta.changes).unwrap_or(0) == 1)
     }
 }
 
@@ -474,5 +513,14 @@ mod tests {
         assert!(super::deadline_reached(Some(25_000), 25_000));
         assert!(super::deadline_reached(Some(25_000), 25_001));
         assert!(!super::deadline_reached(None, u64::MAX));
+    }
+
+    #[test]
+    fn page_loaded_before_concurrent_upsert_is_discarded() {
+        let revision_at_page_load = 7;
+        assert!(super::revision_allows_page_persist(revision_at_page_load, 7));
+        // A real game UPSERT increments data_revision atomically before the
+        // materializer's guarded batch can run.
+        assert!(!super::revision_allows_page_persist(revision_at_page_load, 8));
     }
 }

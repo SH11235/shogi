@@ -21,7 +21,8 @@
 //!   `kifu-by-id/<encoded_game_id>.csa` を直接 get する。本文 (CSA V2) と
 //!   `kifu-by-id/<encoded_game_id>.meta.json` から取得した正準メタ (https://github.com/SH11235/rshogi/issues/551
 //!   設計 v3 §12) を合わせて返す。
-//! - `GET /api/v1/players` D1 の active Elo snapshot から返す選手一覧。
+//! - `GET /api/v1/players?page=<N>&pageSize=<N>` D1 の active Elo snapshot から
+//!   paginationして返す選手一覧（全体件数・対局数・global leader付き）。
 //! - `GET /api/v1/players/<player_id>` 選手 summary と最近の対局一覧。
 //!
 //! いずれも GameRoom DO を経由せず、Worker 直 fetch のみで完結する (R2 read
@@ -159,7 +160,7 @@ pub async fn try_handle(req: &Request, env: &Env) -> Result<Option<Response>> {
     let path = url.path().to_owned();
 
     if path == "/api/v1/players" {
-        return Ok(Some(handle_players(req, env).await?));
+        return Ok(Some(handle_players(req, env, &url).await?));
     }
     if let Some(player_id) = path.strip_prefix("/api/v1/players/") {
         if player_id.is_empty() || player_id.contains('/') {
@@ -285,6 +286,11 @@ struct SearchResponse {
 #[derive(Debug, Serialize)]
 struct PlayersResponse {
     players: Vec<PlayerSummary>,
+    page: u32,
+    page_size: u32,
+    total_count: u64,
+    total_games: u64,
+    leader: Option<PlayerSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -357,10 +363,14 @@ async fn active_generation(db: &worker::D1Database) -> std::result::Result<Optio
         .map_err(|e| e.to_string())
 }
 
-async fn handle_players(req: &Request, env: &Env) -> Result<Response> {
+async fn handle_players(req: &Request, env: &Env, url: &Url) -> Result<Response> {
     if let Some(blocked) = check_origin(req, env)? {
         return Ok(blocked);
     }
+    let (page, page_size) = match parse_page_params(url) {
+        Ok(values) => values,
+        Err(message) => return with_cors(no_store_error(message, 400)?, req, env),
+    };
     let db = match env.d1(ConfigKeys::GAMES_SEARCH_DB_BINDING) {
         Ok(db) => db,
         Err(e) => {
@@ -376,9 +386,48 @@ async fn handle_players(req: &Request, env: &Env) -> Result<Response> {
             return with_cors(no_store_error("Storage error", 502)?, req, env);
         }
     };
-    let values = [worker::wasm_bindgen::JsValue::from_f64(generation as f64)];
+    #[derive(serde::Deserialize)]
+    struct PlayerTotalsRow {
+        total_count: u64,
+        total_games: u64,
+    }
+    let generation_values = [worker::wasm_bindgen::JsValue::from_f64(generation as f64)];
+    let totals = match db
+        .prepare("SELECT COUNT(*) AS total_count, CAST(COALESCE(SUM(games), 0) / 2 AS INTEGER) AS total_games FROM player_rating_generations WHERE generation = ?")
+        .bind(&generation_values)?
+        .first::<PlayerTotalsRow>(None)
+        .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => PlayerTotalsRow {
+            total_count: 0,
+            total_games: 0,
+        },
+        Err(e) => {
+            log_viewer_api_failed("players_totals", &extract_client_kind(req), &e.to_string());
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let leader = match db
+        .prepare("SELECT player_id, display_name, rating, wins, losses, draws, games, last_played_at_ms, legacy FROM player_rating_generations WHERE generation = ? ORDER BY rating DESC, player_id ASC LIMIT 1")
+        .bind(&generation_values)?
+        .first::<MaterializedPlayerRow>(None)
+        .await
+    {
+        Ok(row) => row.map(PlayerSummary::from),
+        Err(e) => {
+            log_viewer_api_failed("players_leader", &extract_client_kind(req), &e.to_string());
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let offset = u64::from(page - 1) * u64::from(page_size);
+    let values = [
+        worker::wasm_bindgen::JsValue::from_f64(generation as f64),
+        worker::wasm_bindgen::JsValue::from_f64(f64::from(page_size)),
+        worker::wasm_bindgen::JsValue::from_f64(offset as f64),
+    ];
     let rows = match db
-        .prepare("SELECT player_id, display_name, rating, wins, losses, draws, games, last_played_at_ms, legacy FROM player_rating_generations WHERE generation = ? ORDER BY rating DESC, player_id ASC")
+        .prepare("SELECT player_id, display_name, rating, wins, losses, draws, games, last_played_at_ms, legacy FROM player_rating_generations WHERE generation = ? ORDER BY rating DESC, player_id ASC LIMIT ? OFFSET ?")
         .bind(&values)?
         .all()
         .await
@@ -392,6 +441,11 @@ async fn handle_players(req: &Request, env: &Env) -> Result<Response> {
     };
     let mut response = Response::from_json(&PlayersResponse {
         players: rows.into_iter().map(PlayerSummary::from).collect(),
+        page,
+        page_size,
+        total_count: totals.total_count,
+        total_games: totals.total_games,
+        leader,
     })?;
     set_cache_control(&mut response, CacheableKind::List.cache_control_header())?;
     with_cors(response, req, env)

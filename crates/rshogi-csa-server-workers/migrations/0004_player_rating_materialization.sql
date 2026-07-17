@@ -22,7 +22,8 @@ CREATE TABLE player_rating_state (
     cursor_ended_at_ms INTEGER NOT NULL DEFAULT -1,
     cursor_game_id TEXT NOT NULL DEFAULT '',
     rebuild_required INTEGER NOT NULL DEFAULT 1 CHECK (rebuild_required IN (0, 1)),
-    lease_until_ms INTEGER NOT NULL DEFAULT 0
+    lease_until_ms INTEGER NOT NULL DEFAULT 0,
+    data_revision INTEGER NOT NULL DEFAULT 0
 );
 
 INSERT INTO player_rating_state (singleton) VALUES (1);

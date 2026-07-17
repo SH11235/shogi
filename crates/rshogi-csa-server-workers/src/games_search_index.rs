@@ -378,11 +378,12 @@ async fn upsert_fields(env: &worker::Env, fields: UpsertFields<'_>) -> worker::R
         JsValue::from_f64(f64::from(fields.moves_count)),
         JsValue::from_str(fields.clock_json),
     ];
-    // cursor 以前への late insert/update は Elo の後続順序を変える。変更判定を
-    // UPSERT 前に行い、dirty marker と UPSERT を同じ D1 transaction に入れる。
-    // これにより marker だけ失敗して同一 backfill retry が no-op になる穴を防ぐ。
+    // Every real change advances data_revision in the same transaction as the
+    // UPSERT. A materializer page loaded from an older revision can therefore
+    // discard all derived writes before advancing its cursor. Cursor以前の
+    // late insert/updateは同時に全履歴rebuildも要求する。
     let dirty = db
-        .prepare("UPDATE player_rating_state SET rebuild_required = 1 WHERE singleton = 1 AND (cursor_ended_at_ms > ? OR (cursor_ended_at_ms = ? AND cursor_game_id >= ?)) AND (NOT EXISTS (SELECT 1 FROM games_search_index WHERE game_id = ?) OR EXISTS (SELECT 1 FROM games_search_index WHERE game_id = ? AND (sente_name IS NOT ? OR gote_name IS NOT ? OR black_player_id IS NOT ? OR white_player_id IS NOT ? OR started_at_ms IS NOT ? OR ended_at_ms IS NOT ? OR wire_result_kind IS NOT ? OR end_reason IS NOT ? OR source IS NOT ? OR moves_count IS NOT ? OR clock_json IS NOT ?)))")
+        .prepare("UPDATE player_rating_state SET data_revision = data_revision + 1, rebuild_required = CASE WHEN cursor_ended_at_ms > ? OR (cursor_ended_at_ms = ? AND cursor_game_id >= ?) THEN 1 ELSE rebuild_required END WHERE singleton = 1 AND (NOT EXISTS (SELECT 1 FROM games_search_index WHERE game_id = ?) OR EXISTS (SELECT 1 FROM games_search_index WHERE game_id = ? AND (sente_name IS NOT ? OR gote_name IS NOT ? OR black_player_id IS NOT ? OR white_player_id IS NOT ? OR started_at_ms IS NOT ? OR ended_at_ms IS NOT ? OR wire_result_kind IS NOT ? OR end_reason IS NOT ? OR source IS NOT ? OR moves_count IS NOT ? OR clock_json IS NOT ?)))")
         .bind(&dirty_values)?;
     let upsert = db.prepare("INSERT INTO games_search_index (game_id, sente_name, gote_name, black_player_id, white_player_id, started_at_ms, ended_at_ms, result_kind, source, moves_count, wire_result_kind, end_reason, clock_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(game_id) DO UPDATE SET sente_name=excluded.sente_name, gote_name=excluded.gote_name, black_player_id=excluded.black_player_id, white_player_id=excluded.white_player_id, started_at_ms=excluded.started_at_ms, ended_at_ms=excluded.ended_at_ms, result_kind=excluded.result_kind, source=excluded.source, moves_count=excluded.moves_count, wire_result_kind=excluded.wire_result_kind, end_reason=excluded.end_reason, clock_json=excluded.clock_json WHERE sente_name IS NOT excluded.sente_name OR gote_name IS NOT excluded.gote_name OR black_player_id IS NOT excluded.black_player_id OR white_player_id IS NOT excluded.white_player_id OR ended_at_ms IS NOT excluded.ended_at_ms OR wire_result_kind IS NOT excluded.wire_result_kind OR end_reason IS NOT excluded.end_reason OR started_at_ms IS NOT excluded.started_at_ms OR source IS NOT excluded.source OR moves_count IS NOT excluded.moves_count OR clock_json IS NOT excluded.clock_json")
         .bind(&values)?;
@@ -466,7 +467,7 @@ pub async fn register_player_aliases(
     // Reparenting, cycle removal, fresh aliases and rebuild marker commit
     // atomically. A transient failure cannot leave a half-rotated alias graph.
     statements.push(
-        db.prepare("UPDATE player_rating_state SET rebuild_required = 1 WHERE singleton = 1"),
+        db.prepare("UPDATE player_rating_state SET rebuild_required = 1, data_revision = data_revision + 1 WHERE singleton = 1"),
     );
     db.batch(statements).await?;
     Ok(())

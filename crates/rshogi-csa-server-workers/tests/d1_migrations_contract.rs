@@ -28,6 +28,7 @@ fn rating_materialization_uses_generation_swap_and_alias_index() {
         "CREATE TABLE player_rating_state",
         "active_generation INTEGER",
         "rebuild_required INTEGER NOT NULL DEFAULT 1",
+        "data_revision INTEGER NOT NULL DEFAULT 0",
         "CREATE TABLE player_id_aliases",
         "ON player_id_aliases (canonical_id, alias_id)",
     ] {
@@ -37,15 +38,21 @@ fn rating_materialization_uses_generation_swap_and_alias_index() {
     let source = repo_file("src/player_rating_materialization.rs");
     assert!(source.contains("WHERE singleton = 1 AND rebuild_required = 0"));
     assert!(source.contains("lease_until_ms <= ?"));
+    assert!(source.contains("data_revision = ?"));
+    assert!(source.contains("data_revision <> ?"));
 
     let search_index = repo_file("src/games_search_index.rs");
     assert!(search_index.contains("NOT EXISTS (SELECT 1 FROM games_search_index"));
     assert!(search_index.contains("db.batch(vec![dirty, upsert])"));
+    assert!(search_index.contains("data_revision = data_revision + 1"));
 
     let api = repo_file("src/viewer_api.rs");
     assert!(api.contains("WHERE generation = ?"));
     assert!(api.contains("COUNT(*) AS total_count FROM games_search_index"));
     assert!(api.contains("ORDER BY ended_at_ms DESC, game_id ASC LIMIT ? OFFSET ?"));
+    assert!(api.contains("COALESCE(SUM(games), 0) / 2"));
+    assert!(api.contains("players_leader"));
+    assert!(api.contains("ORDER BY rating DESC, player_id ASC LIMIT ? OFFSET ?"));
     assert!(api.contains("PLAYER_GAMES_PREDICATE"));
     assert!(api.contains("IN (SELECT alias_id FROM player_id_aliases WHERE canonical_id = ?)"));
 
