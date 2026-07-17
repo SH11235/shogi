@@ -39,7 +39,7 @@ use crate::protocol::{
     CsaConnection, GameResult, GameSummary, ReconnectState as ProtocolReconnectState,
     parse_game_result, parse_server_move,
 };
-use crate::record::{GameRecord, JsonlMoveExtra};
+use crate::record::{GameRecord, JsonlMoveExtra, ResumeRecordDecision};
 
 // ────────────────────────────────────────────
 // 公開エントリポイント
@@ -64,7 +64,7 @@ where
     E: UsiEngineDriver + ?Sized,
     S: SessionEventSink + ?Sized,
 {
-    drive_session(config, conn, engine, shutdown.as_ref(), sink, SessionMode::Fresh)
+    drive_session(config, conn, engine, shutdown.as_ref(), sink, SessionMode::Fresh, None)
 }
 
 /// `LOGIN ... reconnect:<game_id>+<token>` 後の resume セッションを進捗通知付きで
@@ -84,7 +84,7 @@ where
     E: UsiEngineDriver + ?Sized,
     S: SessionEventSink + ?Sized,
 {
-    drive_session(config, conn, engine, shutdown.as_ref(), sink, SessionMode::Resumed)
+    drive_session(config, conn, engine, shutdown.as_ref(), sink, SessionMode::Resumed, None)
 }
 
 /// 進捗通知不要な consumer 向けの薄いラッパー。内部で [`NoopSessionEventSink`] を渡す。
@@ -97,7 +97,7 @@ pub fn run_game_session(
     shutdown: &AtomicBool,
 ) -> Result<SessionOutcome, SessionError> {
     let mut sink = NoopSessionEventSink;
-    drive_session(config, conn, engine, shutdown, &mut sink, SessionMode::Fresh)
+    drive_session(config, conn, engine, shutdown, &mut sink, SessionMode::Fresh, None)
 }
 
 /// 進捗通知不要な consumer 向けの薄いラッパー (resume 経路)。
@@ -108,7 +108,30 @@ pub fn run_resumed_session(
     shutdown: &AtomicBool,
 ) -> Result<SessionOutcome, SessionError> {
     let mut sink = NoopSessionEventSink;
-    drive_session(config, conn, engine, shutdown, &mut sink, SessionMode::Resumed)
+    drive_session(config, conn, engine, shutdown, &mut sink, SessionMode::Resumed, None)
+}
+
+/// 進捗通知不要な CLI 等に向けた、切断前 record 引き継ぎ付き resume entry point。
+/// 再送 `Game_Summary` の現在局面と保持局面を照合し、一致すれば対局開始からの
+/// 通し record を返す。不一致なら警告を出し、resume 局面から
+/// [`crate::record::RecordStatus::ReconnectFragment`] として記録する。
+pub fn run_resumed_session_with_record(
+    conn: &mut CsaConnection,
+    engine: &mut UsiEngine,
+    config: &CsaClientConfig,
+    shutdown: &AtomicBool,
+    retained_record: GameRecord,
+) -> Result<SessionOutcome, SessionError> {
+    let mut sink = NoopSessionEventSink;
+    drive_session(
+        config,
+        conn,
+        engine,
+        shutdown,
+        &mut sink,
+        SessionMode::Resumed,
+        Some(retained_record),
+    )
 }
 
 // ────────────────────────────────────────────
@@ -128,6 +151,7 @@ fn drive_session<E, S>(
     shutdown: &AtomicBool,
     sink: &mut S,
     mode: SessionMode,
+    retained_record: Option<GameRecord>,
 ) -> Result<SessionOutcome, SessionError>
 where
     E: UsiEngineDriver + ?Sized,
@@ -207,6 +231,7 @@ where
         summary.clone(),
         reconnect_state_protocol,
         sink,
+        retained_record,
     );
 
     match loop_result {
@@ -321,6 +346,7 @@ fn run_session_loop<E, S>(
     summary: GameSummary,
     resume_state: Option<ProtocolReconnectState>,
     sink: &mut S,
+    retained_record: Option<GameRecord>,
 ) -> LoopOutcome
 where
     E: UsiEngineDriver + ?Sized,
@@ -336,12 +362,43 @@ where
         clock.apply_resume_remaining(state.black_remaining_ms, state.white_remaining_ms);
     }
 
+    let reconnect_turn = resume_state.as_ref().and_then(|state| state.current_turn);
+    let (record, pos, initial_sfen, usi_moves, apply_summary_initial_moves) = match retained_record
+        .map(|record| record.continue_for_resume(&summary, reconnect_turn))
+    {
+        Some(ResumeRecordDecision::Continued {
+            record,
+            position,
+            usi_moves,
+        }) => {
+            log::info!(
+                "[REC] resume 局面一致。切断前の棋譜を継続: game_id={} retained_moves={}",
+                record.game_id,
+                record.moves.len()
+            );
+            let initial_sfen = record.initial_position.to_sfen();
+            (*record, *position, initial_sfen, usi_moves, false)
+        }
+        Some(ResumeRecordDecision::Fragment { record, reason }) => {
+            log::warn!("[REC] resume 局面不一致。再接続以降を断片棋譜として保存します: {reason}");
+            let pos = summary.position.clone();
+            let initial_sfen = pos.to_sfen();
+            (*record, pos, initial_sfen, Vec::new(), true)
+        }
+        None => {
+            let record = GameRecord::new(&summary);
+            let pos = summary.position.clone();
+            let initial_sfen = pos.to_sfen();
+            (record, pos, initial_sfen, Vec::new(), true)
+        }
+    };
+
     let mut s = SessionState {
-        pos: summary.position.clone(),
-        initial_sfen: summary.position.to_sfen(),
-        usi_moves: Vec::new(),
+        pos,
+        initial_sfen,
+        usi_moves,
         clock,
-        record: GameRecord::new(&summary),
+        record,
         ponder_state: None,
         my_color: summary.my_color,
         conn,
@@ -360,7 +417,12 @@ where
     // 一部であり、この時点では既に局面に焼き込まれている扱いとして MoveConfirmed は
     // emit しない。ただし record / clock / usi_moves には反映する必要がある)。
     let mut move_color = summary.position.side_to_move;
-    for cm in &summary.initial_moves {
+    let summary_initial_moves = if apply_summary_initial_moves {
+        summary.initial_moves.as_slice()
+    } else {
+        &[]
+    };
+    for cm in summary_initial_moves {
         let usi = match csa_move_to_usi(&cm.mv, &s.pos) {
             Ok(u) => u,
             Err(err) => return LoopOutcome::Error(map_anyhow_to_session_error(err)),

@@ -139,7 +139,7 @@ fn jsonl_filename(record: &GameRecord) -> String {
     let datetime = record.start_time.format("%Y%m%d_%H%M%S").to_string();
     let sente = sanitize_for_filename(&record.sente_name);
     let gote = sanitize_for_filename(&record.gote_name);
-    format!("{datetime}_{sente}_vs_{gote}.jsonl")
+    format!("{datetime}_{sente}_vs_{gote}{}.jsonl", record.filename_suffix())
 }
 
 /// ファイル名・JSONL `engine` ラベルの名前正規化。英数字と `-` `_` 以外を `_` に置換する
@@ -499,6 +499,7 @@ fn winner_label(record: &GameRecord, result: &GameResult) -> Option<String> {
 mod tests {
     use super::*;
     use crate::protocol::{GameResult, GameSummary, TimeConfig};
+    use crate::record::RecordStatus;
     use rshogi_csa::{Color, initial_position};
 
     fn summary() -> GameSummary {
@@ -608,5 +609,18 @@ mod tests {
         let path = dir.join(jsonl_filename(&record));
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconnect_fragment_filename_is_explicit() {
+        let mut record = GameRecord::new(&summary());
+        record.status = RecordStatus::ReconnectFragment {
+            reason: "test mismatch".to_owned(),
+        };
+        assert!(
+            jsonl_filename(&record).ends_with("_reconnect_fragment.jsonl"),
+            "filename={}",
+            jsonl_filename(&record)
+        );
     }
 }

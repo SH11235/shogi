@@ -27,7 +27,7 @@ use rshogi_csa_client::events::SessionOutcome;
 use rshogi_csa_client::jsonl::write_game_jsonl;
 use rshogi_csa_client::protocol::{CsaConnection, GameResult, compute_effective_retry_delay};
 use rshogi_csa_client::record::save_record;
-use rshogi_csa_client::session::{run_game_session, run_resumed_session};
+use rshogi_csa_client::session::{run_game_session, run_resumed_session_with_record};
 use rshogi_csa_client::transport::{ConnectOpts, TransportTarget};
 
 /// `--target` プリセット。本リポ単一 Cloudflare アカウントの staging / production
@@ -467,11 +467,12 @@ fn run_one_game(
     // 場合は reconnect 試行自体を skip するため、https://github.com/SH11235/rshogi/issues/591 の
     // `LOGIN:incorrect reconnect_rejected` 経路に到達しない。
     let reconnect_request = match session_result.as_ref() {
-        Ok(outcome) => should_attempt_reconnect(outcome, shutdown.load(Ordering::SeqCst)),
+        Ok(outcome) => should_attempt_reconnect(outcome, shutdown.load(Ordering::SeqCst))
+            .map(|(game_id, token)| (game_id, token, outcome.record.clone())),
         Err(_) => None,
     };
 
-    if let Some((game_id, token)) = reconnect_request {
+    if let Some((game_id, token, retained_record)) = reconnect_request {
         log::warn!(
             "[CSA] サーバ切断を検出。Reconnect_Token を持つので grace 内に再接続を試みます: game_id={}",
             game_id
@@ -484,7 +485,15 @@ fn run_one_game(
             game_id: &game_id,
             token: &token,
         };
-        match attempt_reconnect(&target, &opts, &credentials, engine, config, shutdown) {
+        match attempt_reconnect(
+            &target,
+            &opts,
+            &credentials,
+            engine,
+            config,
+            shutdown,
+            retained_record,
+        ) {
             Ok((reconnect_result, reconnect_record)) => {
                 log::info!("[CSA] 再接続成功: 対局を継続して終局: {:?}", reconnect_result);
                 return Ok((reconnect_result, reconnect_record));
@@ -557,11 +566,13 @@ fn attempt_reconnect(
     engine: &mut UsiEngine,
     config: &CsaClientConfig,
     shutdown: &AtomicBool,
+    retained_record: rshogi_csa_client::record::GameRecord,
 ) -> Result<(GameResult, rshogi_csa_client::record::GameRecord)> {
     let mut conn = CsaConnection::connect_with_target(target, opts)?;
     conn.login_reconnect(creds.id, creds.password, creds.game_id, creds.token)?;
-    let outcome = run_resumed_session(&mut conn, engine, config, shutdown)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let outcome =
+        run_resumed_session_with_record(&mut conn, engine, config, shutdown, retained_record)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
     let _ = conn.logout();
     Ok((outcome.result, outcome.record))
 }
@@ -1109,6 +1120,7 @@ mod tests {
                 start_time: chrono::Local::now(),
                 my_color: CsaColor::Black,
                 jsonl_moves: vec![],
+                status: rshogi_csa_client::record::RecordStatus::Complete,
             },
             summary: Some(summary),
         }

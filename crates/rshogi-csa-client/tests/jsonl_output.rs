@@ -10,7 +10,7 @@ use rshogi_csa::{Color, initial_position};
 use rshogi_csa_client::config::{CsaClientConfig, EngineConfig, RecordConfig, TimeConfig};
 use rshogi_csa_client::jsonl::write_game_jsonl;
 use rshogi_csa_client::protocol::{GameResult, TimeConfig as ProtoTimeConfig};
-use rshogi_csa_client::record::{GameRecord, JsonlMoveExtra};
+use rshogi_csa_client::record::{GameRecord, JsonlMoveExtra, RecordStatus};
 use serde_json::Value;
 
 /// テスト用の minimal な `GameRecord` を作る。
@@ -36,6 +36,7 @@ fn build_record(my_color: Color) -> GameRecord {
         start_time: chrono::Local::now(),
         my_color,
         jsonl_moves: Vec::new(),
+        status: RecordStatus::Complete,
     }
 }
 
