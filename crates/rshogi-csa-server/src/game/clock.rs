@@ -123,6 +123,21 @@ impl ClockSpec {
         self.build_clock().format_summary()
     }
 
+    /// 再接続時に同一手番へ付与できる時計補償の上限（ミリ秒）。
+    ///
+    /// 秒読み方式では 1 回分の秒読み時間を返す。Workers frontend はこの値を
+    /// 「再接続後に最低限保証する残時間」と「同一手番で累積付与できる上限」の
+    /// 両方に使い、切断を繰り返して思考時間を無制限に増やす悪用を防ぐ。
+    /// Fischer 方式には秒読みがないため補償しない。
+    pub fn reconnect_compensation_limit_ms(&self) -> u64 {
+        match self {
+            Self::Countdown { byoyomi_sec, .. } => u64::from(*byoyomi_sec) * 1_000,
+            Self::CountdownMsec { byoyomi_ms, .. } => u64::from(*byoyomi_ms),
+            Self::Fischer { .. } => 0,
+            Self::StopWatch { byoyomi_min, .. } => u64::from(*byoyomi_min) * 60_000,
+        }
+    }
+
     /// `total_time_*` が 0 の構成を弾く。`byoyomi_*` / `increment_sec` の 0 は
     /// sudden death として許容する。`Err` には違反フィールド名 (`"total_time_sec"`
     /// / `"total_time_ms"` / `"total_time_min"`) を返し、メッセージ組み立ては
@@ -904,6 +919,42 @@ mod tests {
             byoyomi_min: 1,
         };
         assert_eq!(spec.format_time_section(), StopWatchClock::new(15, 1).format_summary());
+    }
+
+    #[test]
+    fn reconnect_compensation_limit_is_one_byoyomi_and_zero_for_fischer() {
+        assert_eq!(
+            ClockSpec::Countdown {
+                total_time_sec: 600,
+                byoyomi_sec: 10,
+            }
+            .reconnect_compensation_limit_ms(),
+            10_000
+        );
+        assert_eq!(
+            ClockSpec::CountdownMsec {
+                total_time_ms: 10_000,
+                byoyomi_ms: 250,
+            }
+            .reconnect_compensation_limit_ms(),
+            250
+        );
+        assert_eq!(
+            ClockSpec::StopWatch {
+                total_time_min: 15,
+                byoyomi_min: 2,
+            }
+            .reconnect_compensation_limit_ms(),
+            120_000
+        );
+        assert_eq!(
+            ClockSpec::Fischer {
+                total_time_sec: 600,
+                increment_sec: 10,
+            }
+            .reconnect_compensation_limit_ms(),
+            0
+        );
     }
 
     /// 4 variant 全てで `total_time_*` 0 が該当フィールド名 `Err` を返す。

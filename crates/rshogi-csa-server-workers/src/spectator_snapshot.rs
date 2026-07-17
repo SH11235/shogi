@@ -9,7 +9,8 @@
 //! 1. 観戦者向け `BEGIN Game_Summary` ブロック（`Black/White_Time_Remaining_Ms:`
 //!    末尾拡張行を含む、player 経路の `Your_Turn:` / `Reconnect_Token:` は含まない）
 //! 2. これまでの move 行 (1 手あたり 1〜2 行): まず `<token>,T<elapsed_sec>`
-//!    （broadcast の通常形式と一致。`elapsed_sec` は `at_ms` 差分から再計算する）、
+//!    （broadcast の通常形式と一致。`elapsed_sec` は `at_ms` 差分から再接続時計補償を
+//!    差し引いて再計算する）、
 //!    続いてコメントが付いていれば `'<comment>` 行（Floodgate 評価値 PV。ライブ
 //!    broadcast の観戦者専用コメント行と同一形式）
 //! 3. （終局済 DO の場合のみ）終局結果コード行 (`#RESIGN` / `#TIME_UP` 等)
@@ -123,8 +124,9 @@ pub fn build_spectator_snapshot(input: SpectatorSnapshotInput<'_>) -> Vec<String
     // 既存の指し手を broadcast と同一 wire 形式に正規化して push する。
     // `MoveRow::line` は client が送ってきた raw 行 (`+7776FU,T3` や Floodgate
     // 形式 `+7776FU,'* 123 +7776FU...`) をそのまま保持しているため、
-    // - token 部を取り出し、消費時間は broadcast 同様 `at_ms` 差分から再計算した
-    //   `<token>,T<sec>` を出す (raw 行の `T` 値や `,T` 欠落に依存しない)
+    // - token 部を取り出し、消費時間は broadcast 同様 `at_ms` 差分から再接続時計
+    //   補償を差し引いて再計算した `<token>,T<sec>` を出す
+    //   (raw 行の `T` 値や `,T` 欠落に依存しない)
     // - コメントが付いていれば直後に `'<comment>` 行を 1 行足す (Floodgate
     //   評価値 PV。ライブ broadcast の観戦者専用コメント行と同じ形式で、観戦
     //   client は `'` 始まり行を無視する互換性がある)
@@ -175,17 +177,20 @@ pub(crate) fn parse_move_row_line(line: &str) -> (&str, Option<&str>) {
 /// 算出する共有ヘルパ。
 ///
 /// `first_prev_ms` は初手の計時起点 (= `play_started_at_ms`、無ければ
-/// `matched_at_ms`)。以降は 1 手前の `at_ms` を起点にする。負値 `at_ms` は
-/// `0` に丸め、起点より小さい `at_ms` は `saturating_sub` で `0` 秒にする。
-/// snapshot と export で同一の経過秒を出すためのロジック集約。
+/// `matched_at_ms`)。以降は 1 手前の raw `at_ms` を起点にし、各行の差分から
+/// `reconnect_credit_ms` を差し引く。これにより次手番の起点は実際の着手時刻の
+/// まま、補償対象手の `T` だけを core 課金と同じ実効経過時間へ揃える。負値
+/// `at_ms` / credit は 0 に丸める。snapshot と export で同じ値を使う。
 pub(crate) fn move_elapsed_secs(moves: &[MoveRow], first_prev_ms: u64) -> Vec<u32> {
     let mut prev_ts = first_prev_ms;
     moves
         .iter()
         .map(|m| {
             let at_ms = m.at_ms.max(0) as u64;
-            let elapsed_ms = at_ms.saturating_sub(prev_ts);
+            let raw_elapsed_ms = at_ms.saturating_sub(prev_ts);
             prev_ts = at_ms;
+            let credit_ms = m.reconnect_credit_ms.max(0) as u64;
+            let elapsed_ms = raw_elapsed_ms.saturating_sub(credit_ms);
             (elapsed_ms / 1000) as u32
         })
         .collect()
@@ -223,6 +228,7 @@ pub(crate) fn move_rows_from_exported_csa(csa_text: &str, first_prev_ms: u64) ->
                 .to_owned(),
                 line: line.to_owned(),
                 at_ms,
+                reconnect_credit_ms: 0,
             });
         } else if let Some(comment) = line.strip_prefix('\'')
             && let Some(last) = rows.last_mut()
@@ -281,6 +287,7 @@ mod tests {
             color: color.to_owned(),
             line: line.to_owned(),
             at_ms,
+            reconnect_credit_ms: 0,
         }
     }
 
@@ -533,6 +540,21 @@ PI
         assert_eq!(move_elapsed_secs(&moves, 1_000_000), vec![3, 2, 0]);
         // 空入力は空 Vec。
         assert_eq!(move_elapsed_secs(&[], 1_000_000), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn move_elapsed_secs_subtracts_credit_without_shifting_the_next_turn_origin() {
+        let mut moves = vec![
+            move_row_at(1, "black", "+7776FU", 1_005_000),
+            move_row_at(2, "white", "-3334FU", 1_007_000),
+            move_row_at(3, "black", "+2726FU", 1_010_000),
+        ];
+        moves[0].reconnect_credit_ms = 3_000;
+        moves[2].reconnect_credit_ms = 1_000;
+
+        // 1 手目は raw 5s - credit 3s = T2。2 手目の起点は補償後の仮想時刻でなく
+        // 1 手目の raw at_ms のままなので T2、3 手目は raw 3s - credit 1s = T2。
+        assert_eq!(move_elapsed_secs(&moves, 1_000_000), vec![2, 2, 2]);
     }
 
     #[test]
