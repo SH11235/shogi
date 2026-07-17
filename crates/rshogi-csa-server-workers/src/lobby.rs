@@ -56,7 +56,6 @@ use crate::rate_limit::{
     RateLimitDecision, RateLimitKind, build_challenge_lobby_rate_limited_line,
     build_login_lobby_rate_limited_line, check_and_consume_via_do, resolve_thresholds_from_env,
 };
-use rshogi_csa_server::ClockSpec;
 use rshogi_csa_server::matching::challenge::{
     ChallengeEntry, ChallengeRegistry, ChallengeToken, IssueError,
 };
