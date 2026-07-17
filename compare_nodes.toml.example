@@ -16,3 +16,8 @@ eval_a = "/path/to/eval/halfkp_256x2-32-32_crelu/suisho5.bin"
 eval_b = "/path/to/eval/halfkp_256x2-32-32_crelu"
 
 depth = 25
+
+# エンジン別の任意ノード上限。指定した側は `go depth N nodes M` で探索する。
+# 停止しない depth 固定探索の安全弁や、nodes 併用経路の A/B 比較に使用できる。
+# nodes_a = 100000000
+# nodes_b = 100000000
