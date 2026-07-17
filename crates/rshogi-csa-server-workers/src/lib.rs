@@ -44,6 +44,9 @@ pub mod export_retry;
 pub mod floodgate_history;
 pub mod games_index;
 pub mod games_search_index;
+pub mod player_identity;
+pub mod player_rating_materialization;
+pub mod player_ratings;
 // `handle_auth` は `WORKERS_HANDLE_AUTH` whitelist の parse + password SHA256
 // 比較を担う。`HandleAuthRegistry` + `verify` は I/O 非依存の
 // pure helper でホスト target からテストできるよう `pub mod` で公開する。
@@ -162,9 +165,11 @@ fn minute_of_hour(epoch_ms: f64) -> i64 {
 /// ミリ秒なので、起動が数秒遅延しても分判定は予定どおり安定する:
 ///
 /// - 分が [`BACKFILL_MINUTE`] (0 分) のとき: `run_games_index_backfill` →
-///   `run_games_search_backfill` → `run_live_orphan_sweep` を順次実行する。3 者は
-///   cron 発火直後の時刻を共有し、3 ジョブ合わせて 25 秒以内に打ち切る。
-/// - それ以外 (15 / 30 / 45 分) のとき: `run_live_orphan_sweep` のみ。
+///   `run_games_search_backfill` → player rating materializer →
+///   `run_live_orphan_sweep` を順次実行する。全ジョブは cron 発火直後の時刻を
+///   共有し、合計25秒で新規page処理を打ち切る。
+/// - それ以外 (15 / 30 / 45 分) のとき: player rating materializer →
+///   `run_live_orphan_sweep` の順に同じ共有deadline内で実行する。
 ///   delete best-effort 失敗時の復旧遅延を 15 分以内に詰めるための高頻度経路
 ///   (https://github.com/SH11235/rshogi/issues/629)。
 ///
@@ -202,6 +207,27 @@ pub async fn scheduled(
                 err: format!("{e:?}"),
             );
         }
+    }
+    match player_rating_materialization::run_player_rating_materialization(
+        &env,
+        player_rating_materialization::MAX_PAGES_PER_RUN,
+        Some(started_at_ms.saturating_add(backfill::SCHEDULED_WORK_DEADLINE_MS)),
+    )
+    .await
+    {
+        Ok(outcome) if outcome.deadline_reached => crate::structured_log!(
+            event: "player_rating_materialization_deadline_reached",
+            component: "scheduled",
+            cron: cron,
+            processed_games: outcome.processed_games,
+        ),
+        Ok(_) => {}
+        Err(e) => crate::structured_log!(
+            event: "player_rating_materialization_failed",
+            component: "scheduled",
+            cron: cron,
+            err: format!("{e:?}"),
+        ),
     }
     if let Err(e) = backfill::run_live_orphan_sweep(&env, started_at_ms).await {
         crate::structured_log!(

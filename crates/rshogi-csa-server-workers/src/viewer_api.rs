@@ -1,6 +1,7 @@
 //! viewer 配信 HTTP API (`/api/v1/games`) のルーティングと R2 アクセス。
 //!
-//! v3 設計 (https://github.com/SH11235/rshogi/issues/542 issuecomment-4338088406) に準拠する 4 エンドポイント:
+//! v3 設計 (https://github.com/SH11235/rshogi/issues/542 issuecomment-4338088406) に準拠する games API に加え、
+//! player ID 単位の集計 API を提供する:
 //!
 //! - `GET /api/v1/games?cursor=<opaque>&limit=<N>` 一覧 (終局済)
 //!   `KIFU_BUCKET.list({prefix: "games-index/", cursor, limit})` を 1 回呼び、
@@ -20,6 +21,9 @@
 //!   `kifu-by-id/<encoded_game_id>.csa` を直接 get する。本文 (CSA V2) と
 //!   `kifu-by-id/<encoded_game_id>.meta.json` から取得した正準メタ (https://github.com/SH11235/rshogi/issues/551
 //!   設計 v3 §12) を合わせて返す。
+//! - `GET /api/v1/players?page=<N>&pageSize=<N>` D1 の active Elo snapshot から
+//!   paginationして返す選手一覧（全体件数・対局数・global leader付き）。
+//! - `GET /api/v1/players/<player_id>` 選手 summary と最近の対局一覧。
 //!
 //! いずれも GameRoom DO を経由せず、Worker 直 fetch のみで完結する (R2 read
 //! 1 ホップ)。CORS は staging では `WS_ALLOWED_ORIGINS` をそのまま流用して
@@ -104,13 +108,16 @@ use crate::games_search_index::{
 };
 use crate::live_games_index::LIVE_KEY_PREFIX;
 use crate::origin::{OriginDecision, evaluate};
+use crate::player_rating_materialization::{MAX_PAGES_PER_RUN, run_player_rating_materialization};
+use crate::player_ratings::PlayerSummary;
 use crate::x1_paths::{kifu_by_id_meta_key, kifu_by_id_object_key};
 
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 100;
 const MIN_LIMIT: u32 = 1;
+const PLAYER_GAMES_PREDICATE: &str = "((black_player_id = ? OR black_player_id IN (SELECT alias_id FROM player_id_aliases WHERE canonical_id = ?)) OR (white_player_id = ? OR white_player_id IN (SELECT alias_id FROM player_id_aliases WHERE canonical_id = ?)))";
 
-/// `/api/v1/games[/...]` 配下のリクエストを判定して該当ハンドラに振り分ける。
+/// `/api/v1/games[/...]` / `/api/v1/players[/...]` を判定してハンドラに振り分ける。
 ///
 /// 戻り値 `Some(_)` はマッチしたことを示す。`None` の場合は既存ルーティングに
 /// 引き継ぐ (404 までの fallthrough)。
@@ -132,6 +139,14 @@ pub async fn try_handle(req: &Request, env: &Env) -> Result<Option<Response>> {
         return Ok(Some(handle_options(req, env)?));
     }
 
+    if method == Method::Post {
+        let url = req.url()?;
+        if url.path() == "/api/v1/admin/player-ratings/warmup" {
+            return Ok(Some(handle_player_ratings_warmup(req, env).await?));
+        }
+        return Ok(None);
+    }
+
     if method != Method::Get {
         return Ok(None);
     }
@@ -144,6 +159,16 @@ pub async fn try_handle(req: &Request, env: &Env) -> Result<Option<Response>> {
     let url = req.url()?;
     let path = url.path().to_owned();
 
+    if path == "/api/v1/players" {
+        return Ok(Some(handle_players(req, env, &url).await?));
+    }
+    if let Some(player_id) = path.strip_prefix("/api/v1/players/") {
+        if player_id.is_empty() || player_id.contains('/') {
+            let resp = no_store_error("Not Found", 404)?;
+            return Ok(Some(with_cors(resp, req, env)?));
+        }
+        return Ok(Some(handle_player_detail(req, env, &url, player_id).await?));
+    }
     if path == "/api/v1/games" {
         return Ok(Some(handle_list(req, env, &url).await?));
     }
@@ -174,11 +199,16 @@ pub async fn try_handle(req: &Request, env: &Env) -> Result<Option<Response>> {
 /// viewer 配信 API 配下のパスかどうかを判定する純粋ロジック。
 ///
 /// `OPTIONS` preflight 経路で対象パスをゲートするためにも使用する。
-/// `/api/v1/games` (一覧)、`/api/v1/games/live` (live 一覧)、検索、
-/// `/api/v1/games/<id>` (単局) のみを true とする。
+/// games 一覧 / live / 検索 / 単局、および players 一覧 / 詳細のみ true とする。
 fn is_viewer_api_path(path: &str) -> bool {
-    if matches!(path, "/api/v1/games" | "/api/v1/games/live" | "/api/v1/games/search") {
+    if matches!(
+        path,
+        "/api/v1/games" | "/api/v1/games/live" | "/api/v1/games/search" | "/api/v1/players"
+    ) {
         return true;
+    }
+    if let Some(rest) = path.strip_prefix("/api/v1/players/") {
+        return !rest.is_empty() && !rest.contains('/');
     }
     if let Some(rest) = path.strip_prefix("/api/v1/games/") {
         return !rest.is_empty() && !rest.contains('/');
@@ -251,6 +281,325 @@ struct SearchResponse {
     page: u32,
     page_size: u32,
     total_count: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PlayersResponse {
+    players: Vec<PlayerSummary>,
+    page: u32,
+    page_size: u32,
+    total_count: u64,
+    total_games: u64,
+    leader: Option<PlayerSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct PlayerDetailResponse {
+    player: PlayerSummary,
+    games: Vec<SearchGameSummary>,
+    page: u32,
+    page_size: u32,
+    total_count: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ActiveGenerationRow {
+    active_generation: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MaterializedPlayerRow {
+    player_id: String,
+    display_name: String,
+    rating: f64,
+    wins: u64,
+    losses: u64,
+    draws: u64,
+    games: u64,
+    last_played_at_ms: u64,
+    legacy: i64,
+}
+
+impl From<MaterializedPlayerRow> for PlayerSummary {
+    fn from(row: MaterializedPlayerRow) -> Self {
+        Self {
+            player_id: row.player_id,
+            display_name: row.display_name,
+            rating: row.rating,
+            wins: row.wins,
+            losses: row.losses,
+            draws: row.draws,
+            games: row.games,
+            last_played_at_ms: row.last_played_at_ms,
+            legacy: row.legacy != 0,
+        }
+    }
+}
+
+fn parse_page_params(url: &Url) -> std::result::Result<(u32, u32), String> {
+    let mut page = 1;
+    let mut page_size = DEFAULT_PAGE_SIZE;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "page" => {
+                page = value.parse().map_err(|_| "page must be a positive integer")?;
+            }
+            "pageSize" => {
+                page_size =
+                    value.parse().map_err(|_| format!("pageSize must be 1..={MAX_PAGE_SIZE}"))?;
+            }
+            _ => {}
+        }
+    }
+    validate_pagination(page, page_size)?;
+    Ok((page, page_size))
+}
+
+async fn active_generation(db: &worker::D1Database) -> std::result::Result<Option<i64>, String> {
+    db.prepare("SELECT active_generation FROM player_rating_state WHERE singleton = 1")
+        .first::<ActiveGenerationRow>(None)
+        .await
+        .map(|row| row.and_then(|row| row.active_generation))
+        .map_err(|e| e.to_string())
+}
+
+async fn handle_players(req: &Request, env: &Env, url: &Url) -> Result<Response> {
+    if let Some(blocked) = check_origin(req, env)? {
+        return Ok(blocked);
+    }
+    let (page, page_size) = match parse_page_params(url) {
+        Ok(values) => values,
+        Err(message) => return with_cors(no_store_error(message, 400)?, req, env),
+    };
+    let db = match env.d1(ConfigKeys::GAMES_SEARCH_DB_BINDING) {
+        Ok(db) => db,
+        Err(e) => {
+            log_viewer_api_failed("players_binding", &extract_client_kind(req), &e.to_string());
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let generation = match active_generation(&db).await {
+        Ok(Some(generation)) => generation,
+        Ok(None) => return with_cors(no_store_error("Ratings warming up", 503)?, req, env),
+        Err(e) => {
+            log_viewer_api_failed("players_state", &extract_client_kind(req), &e);
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    #[derive(serde::Deserialize)]
+    struct PlayerTotalsRow {
+        total_count: u64,
+        total_games: u64,
+    }
+    let generation_values = [worker::wasm_bindgen::JsValue::from_f64(generation as f64)];
+    let totals = match db
+        .prepare("SELECT COUNT(*) AS total_count, CAST(COALESCE(SUM(games), 0) / 2 AS INTEGER) AS total_games FROM player_rating_generations WHERE generation = ?")
+        .bind(&generation_values)?
+        .first::<PlayerTotalsRow>(None)
+        .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => PlayerTotalsRow {
+            total_count: 0,
+            total_games: 0,
+        },
+        Err(e) => {
+            log_viewer_api_failed("players_totals", &extract_client_kind(req), &e.to_string());
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let leader = match db
+        .prepare("SELECT player_id, display_name, rating, wins, losses, draws, games, last_played_at_ms, legacy FROM player_rating_generations WHERE generation = ? ORDER BY rating DESC, player_id ASC LIMIT 1")
+        .bind(&generation_values)?
+        .first::<MaterializedPlayerRow>(None)
+        .await
+    {
+        Ok(row) => row.map(PlayerSummary::from),
+        Err(e) => {
+            log_viewer_api_failed("players_leader", &extract_client_kind(req), &e.to_string());
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let offset = u64::from(page - 1) * u64::from(page_size);
+    let values = [
+        worker::wasm_bindgen::JsValue::from_f64(generation as f64),
+        worker::wasm_bindgen::JsValue::from_f64(f64::from(page_size)),
+        worker::wasm_bindgen::JsValue::from_f64(offset as f64),
+    ];
+    let rows = match db
+        .prepare("SELECT player_id, display_name, rating, wins, losses, draws, games, last_played_at_ms, legacy FROM player_rating_generations WHERE generation = ? ORDER BY rating DESC, player_id ASC LIMIT ? OFFSET ?")
+        .bind(&values)?
+        .all()
+        .await
+        .and_then(|result| result.results::<MaterializedPlayerRow>())
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            log_viewer_api_failed("players_query", &extract_client_kind(req), &e.to_string());
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let mut response = Response::from_json(&PlayersResponse {
+        players: rows.into_iter().map(PlayerSummary::from).collect(),
+        page,
+        page_size,
+        total_count: totals.total_count,
+        total_games: totals.total_games,
+        leader,
+    })?;
+    set_cache_control(&mut response, CacheableKind::List.cache_control_header())?;
+    with_cors(response, req, env)
+}
+
+async fn handle_player_detail(
+    req: &Request,
+    env: &Env,
+    url: &Url,
+    player_id: &str,
+) -> Result<Response> {
+    if let Some(blocked) = check_origin(req, env)? {
+        return Ok(blocked);
+    }
+    let (page, page_size) = match parse_page_params(url) {
+        Ok(values) => values,
+        Err(message) => return with_cors(no_store_error(message, 400)?, req, env),
+    };
+    let db = match env.d1(ConfigKeys::GAMES_SEARCH_DB_BINDING) {
+        Ok(db) => db,
+        Err(e) => {
+            log_viewer_api_failed(
+                "player_detail_binding",
+                &extract_client_kind(req),
+                &e.to_string(),
+            );
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let generation = match active_generation(&db).await {
+        Ok(Some(generation)) => generation,
+        Ok(None) => return with_cors(no_store_error("Ratings warming up", 503)?, req, env),
+        Err(e) => {
+            log_viewer_api_failed("player_detail_state", &extract_client_kind(req), &e);
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let canonical = resolve_canonical_player_id(&db, player_id).await?;
+    let player = match load_materialized_player(&db, generation, &canonical).await? {
+        Some(player) => player,
+        None => return with_cors(no_store_error("Not Found", 404)?, req, env),
+    };
+
+    // Keep bind count constant even after many rotations. The canonical alias
+    // index resolves the family inside D1 instead of loading every alias into
+    // Worker memory and binding it twice.
+    let predicate = PLAYER_GAMES_PREDICATE;
+    let family_values = [
+        worker::wasm_bindgen::JsValue::from_str(&canonical),
+        worker::wasm_bindgen::JsValue::from_str(&canonical),
+        worker::wasm_bindgen::JsValue::from_str(&canonical),
+        worker::wasm_bindgen::JsValue::from_str(&canonical),
+    ];
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        total_count: u64,
+    }
+    let count_sql =
+        format!("SELECT COUNT(*) AS total_count FROM games_search_index WHERE {predicate}");
+    let total_count = db
+        .prepare(&count_sql)
+        .bind(&family_values)?
+        .first::<CountRow>(None)
+        .await?
+        .map(|row| row.total_count)
+        .unwrap_or(0);
+    let offset = u64::from(page - 1) * u64::from(page_size);
+    let rows_sql = format!(
+        "SELECT game_id, started_at_ms, ended_at_ms, sente_name, gote_name, black_player_id, white_player_id, wire_result_kind, end_reason, moves_count, clock_json, source FROM games_search_index WHERE {predicate} ORDER BY ended_at_ms DESC, game_id ASC LIMIT ? OFFSET ?"
+    );
+    let mut row_values = family_values.to_vec();
+    row_values.push(worker::wasm_bindgen::JsValue::from_f64(f64::from(page_size)));
+    row_values.push(worker::wasm_bindgen::JsValue::from_f64(offset as f64));
+    let rows = db.prepare(&rows_sql).bind(&row_values)?.all().await?.results::<SearchRow>()?;
+    let games: std::result::Result<Vec<_>, _> =
+        rows.into_iter().map(SearchRow::into_summary).collect();
+    let games = match games {
+        Ok(games) => games,
+        Err(e) => {
+            log_viewer_api_failed(
+                "player_detail_clock_parse",
+                &extract_client_kind(req),
+                &e.to_string(),
+            );
+            return with_cors(no_store_error("Storage error", 502)?, req, env);
+        }
+    };
+    let mut response = Response::from_json(&PlayerDetailResponse {
+        player,
+        games,
+        page,
+        page_size,
+        total_count,
+    })?;
+    set_cache_control(&mut response, CacheableKind::List.cache_control_header())?;
+    with_cors(response, req, env)
+}
+
+async fn resolve_canonical_player_id(db: &worker::D1Database, player_id: &str) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct AliasRow {
+        canonical_id: String,
+    }
+    let values = [worker::wasm_bindgen::JsValue::from_str(player_id)];
+    Ok(db
+        .prepare("SELECT canonical_id FROM player_id_aliases WHERE alias_id = ?")
+        .bind(&values)?
+        .first::<AliasRow>(None)
+        .await?
+        .map(|row| row.canonical_id)
+        .unwrap_or_else(|| player_id.to_owned()))
+}
+
+async fn load_materialized_player(
+    db: &worker::D1Database,
+    generation: i64,
+    canonical_id: &str,
+) -> Result<Option<PlayerSummary>> {
+    // rebuild 中は active snapshot が旧 canonical を持つ場合があるため、canonical
+    // または任意の旧 alias を固定 bind の subquery で選ぶ。partial building
+    // generation は読まない。
+    let values = [
+        worker::wasm_bindgen::JsValue::from_f64(generation as f64),
+        worker::wasm_bindgen::JsValue::from_str(canonical_id),
+        worker::wasm_bindgen::JsValue::from_str(canonical_id),
+        worker::wasm_bindgen::JsValue::from_str(canonical_id),
+    ];
+    Ok(db
+        .prepare("SELECT player_id, display_name, rating, wins, losses, draws, games, last_played_at_ms, legacy FROM player_rating_generations WHERE generation = ? AND (player_id = ? OR player_id IN (SELECT alias_id FROM player_id_aliases WHERE canonical_id = ?)) ORDER BY CASE WHEN player_id = ? THEN 0 ELSE 1 END LIMIT 1")
+        .bind(&values)?
+        .first::<MaterializedPlayerRow>(None)
+        .await?
+        .map(PlayerSummary::from))
+}
+
+async fn handle_player_ratings_warmup(req: &Request, env: &Env) -> Result<Response> {
+    let authorization = req.headers().get("Authorization")?.unwrap_or_default();
+    let token = authorization.strip_prefix("Bearer ").unwrap_or("");
+    if crate::admin_auth::verify_admin_token_str(token, env).is_err() {
+        return no_store_error("Forbidden", 403);
+    }
+    // Admin warmup is an independent HTTP invocation and does not share the
+    // scheduled handler's 25-second budget.
+    let outcome = run_player_rating_materialization(env, MAX_PAGES_PER_RUN, None).await?;
+    let mut response = Response::from_json(&serde_json::json!({
+        "processed_games": outcome.processed_games,
+        "ready": outcome.active_generation.is_some() && !outcome.rebuild_in_progress,
+        "active_generation": outcome.active_generation,
+        "rebuild_in_progress": outcome.rebuild_in_progress,
+        "lease_acquired": outcome.lease_acquired,
+        "deadline_reached": outcome.deadline_reached,
+    }))?;
+    set_cache_control(&mut response, "no-store")?;
+    Ok(response)
 }
 
 fn parse_search_params(url: &Url) -> std::result::Result<SearchParams, String> {
@@ -1022,6 +1371,8 @@ mod tests {
         assert!(is_viewer_api_path("/api/v1/games/live"));
         assert!(is_viewer_api_path("/api/v1/games/search"));
         assert!(is_viewer_api_path("/api/v1/games/abc-123"));
+        assert!(is_viewer_api_path("/api/v1/players"));
+        assert!(is_viewer_api_path("/api/v1/players/p_v2_abc123"));
     }
 
     #[test]
@@ -1037,6 +1388,27 @@ mod tests {
     }
 
     #[test]
+    fn player_detail_pagination_uses_shared_bounds() {
+        for query in ["page=0", "pageSize=0", "pageSize=101"] {
+            let url =
+                Url::parse(&format!("https://example.com/api/v1/players/p_abc?{query}")).unwrap();
+            assert!(parse_page_params(&url).is_err(), "query={query}");
+        }
+        let url =
+            Url::parse("https://example.com/api/v1/players/p_abc?page=2&pageSize=100").unwrap();
+        assert_eq!(parse_page_params(&url), Ok((2, 100)));
+    }
+
+    #[test]
+    fn player_detail_alias_query_has_constant_bind_count() {
+        assert_eq!(PLAYER_GAMES_PREDICATE.matches('?').count(), 4);
+        assert!(
+            PLAYER_GAMES_PREDICATE
+                .contains("IN (SELECT alias_id FROM player_id_aliases WHERE canonical_id = ?)")
+        );
+    }
+
+    #[test]
     fn parse_search_params_rejects_invalid_time_bounds() {
         for query in ["from=invalid", "to=-1", "to=1.5"] {
             let url =
@@ -1049,6 +1421,8 @@ mod tests {
     fn is_viewer_api_path_rejects_extra_segments_and_trailing_slash() {
         assert!(!is_viewer_api_path("/api/v1/games/"));
         assert!(!is_viewer_api_path("/api/v1/games/x/y"));
+        assert!(!is_viewer_api_path("/api/v1/players/"));
+        assert!(!is_viewer_api_path("/api/v1/players/x/y"));
         assert!(!is_viewer_api_path("/api/v2/games"));
     }
 }

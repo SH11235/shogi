@@ -83,6 +83,12 @@ pub struct GamesIndexEntry<'a> {
     pub ended_at_ms: u64,
     pub black_handle: &'a str,
     pub white_handle: &'a str,
+    /// LOGIN credential から導出した公開用 opaque ID。旧 meta では省略される。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub black_player_id: Option<&'a str>,
+    /// LOGIN credential から導出した公開用 opaque ID。旧 meta では省略される。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub white_player_id: Option<&'a str>,
     pub result_kind: &'static str,
     pub end_reason: &'static str,
     pub moves_count: u32,
@@ -518,6 +524,8 @@ mod tests {
             ended_at_ms: 1_777_392_877_244,
             black_handle: "alice",
             white_handle: "bob",
+            black_player_id: Some("p_alice"),
+            white_player_id: Some("p_bob"),
             result_kind: "WIN_BLACK",
             end_reason: "RESIGN",
             moves_count: 142,
@@ -537,6 +545,7 @@ mod tests {
         // result_kind / end_reason が独立 field として直列化されることを固定。
         assert!(json.contains("\"result_kind\":\"WIN_BLACK\""), "json={json}");
         assert!(json.contains("\"end_reason\":\"RESIGN\""), "json={json}");
+        assert!(json.contains("\"black_player_id\":\"p_alice\""), "json={json}");
         assert!(json.contains("\"source\":\"kifu\""), "json={json}");
         // 未使用 clock field は省略される。
         assert!(!json.contains("byoyomi_sec"), "json={json}");

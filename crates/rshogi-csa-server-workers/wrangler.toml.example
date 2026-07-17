@@ -167,6 +167,12 @@ ADMIN_API_TOKEN = "local-dev-admin-token-placeholder"
 # (password hash を含むため公開 toml には書かない)。本テンプレートには placeholder
 # のみを残す。詳細は `docs/csa-server/admin_auth.md` §LOGIN handle whitelist 節参照。
 WORKERS_HANDLE_AUTH = "[]"
+
+# 公開用 player ID の HMAC 鍵。production / staging では32 bytes以上の単一
+# string、または versioned keyring JSON string を `wrangler secret put
+# PLAYER_ID_SECRET` で配置する。local dev 専用 placeholder（実運用値を commit
+# しないこと）。rotation 手順は docs/csa-server/deployment.md §2.5 を参照。
+PLAYER_ID_SECRET = "local-dev-player-id-secret-placeholder"
 # 切断時の再接続猶予秒数。`0` または未設定で再接続プロトコルを無効化（保守的既定）。
 # `> 0` を指定する構成は ALLOW_FLOODGATE_FEATURES=true との同時設定が必須。
 RECONNECT_GRACE_SECONDS = "0"

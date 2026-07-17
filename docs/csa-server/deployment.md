@@ -208,8 +208,8 @@ token 名は環境を識別できる文字列にする:
 > "Durable Objects" 行が無くても本構成の deploy は正常動作する。
 >
 > preset の権限内訳は Cloudflare 側仕様で更新されることがあるため、token 作成
-> 直前のサマリ画面で **`Workers スクリプト:編集`** と **`Workers R2 Storage:編集`**
-> の 2 つが含まれていることを確認してから "Create Token" を押す。preset から
+> 直前のサマリ画面で **`Workers スクリプト:編集`**、**`Workers R2 Storage:編集`**、
+> **`D1:編集`** が含まれていることを確認してから "Create Token" を押す。preset から
 > どちらかが脱落していた場合は "Custom token" に切り替えて下表を反映する。
 
 詳細を絞りたい場合は "Custom token" で以下を組み合わせる:
@@ -218,6 +218,7 @@ token 名は環境を識別できる文字列にする:
 |---|---|---|
 | Account | Workers Scripts | Edit （DO migration もここで covered）|
 | Account | Workers R2 Storage | Edit |
+| Account | D1 | Edit （deploy 前の `wrangler d1 migrations apply` で必要）|
 | Account | Workers Tail | Read （`vp run tail:*` で必要）|
 | Account | Account Settings | Read |
 | User | Memberships | Read |
@@ -315,10 +316,27 @@ Required reviewers の **作成時設定** 自体は §2.4.1 / §2.4.2 の通り
 | Secret | 用途 |
 |---|---|
 | `ADMIN_API_TOKEN` | WS 内 admin command (`%%ADMIN <token>`, [#621](https://github.com/SH11235/rshogi/issues/621)) や将来の HTTP admin endpoint の認可基盤として `crate::admin_auth` から参照する static API token (Floodgate audit [#560](https://github.com/SH11235/rshogi/issues/560))。生成 / rotation / admin client フロー / 旧 `ADMIN_HANDLE` 移行手順は [`docs/csa-server/admin_auth.md`](admin_auth.md) を参照。 |
+| `PLAYER_ID_SECRET` | LOGIN の handle + password から公開用 opaque player ID を HMAC-SHA256 で導出する鍵。32 bytes 以上かつ前後空白なしの旧単一 string、または下記 versioned keyring JSON string を設定する。値をログ・R2・D1・APIへ出さない。未設定・不正時は対局を継続し handle 由来 legacy ID にフォールバックするが、credential 単位の集約が失われるため release 前に secret-sync の validation を通す。 |
 
-設定 / rotation / admin client フローはすべて
+`ADMIN_API_TOKEN` の設定 / rotation / admin client フローは
 [`docs/csa-server/admin_auth.md`](admin_auth.md) に集約してある (token 生成、
 secret 登録、rotation、削除、確認、`%%ADMIN` 受信時の応答仕様までカバー)。
+
+`PLAYER_ID_SECRET` の新規環境では versioned keyring を推奨する（実値は例示しない）:
+
+```json
+{"active_version":"v1","keys":{"v1":"<32 bytes 以上のランダム値>"}}
+```
+
+`keys` は1〜8件に制限する。全keyは32 bytes以上で、versionは
+`[a-z0-9]{1,16}` とする。
+
+rotation は旧 key を残して `active_version` と新 key を追加する。例えば v1 から
+v2 へ移すときは `keys` に v1/v2 の両方を置く。接続した選手について Worker が
+旧 version ID（旧単一 string が作った `p_<digest>` を含む）を新 canonical ID の
+alias として登録し、rating rebuild を要求する。alias 登録前に旧 key を削除すると
+credential から旧 ID を導出できず、過去結果を統合できないため、対象選手の再接続と
+§3.2.1 の rebuild 完了を確認するまでは旧 key を削除しない。
 
 整合性 test (`tests/wrangler_environment_toml_consistency.rs`) が
 `wrangler.<env>.toml` の `[vars]` に `ADMIN_API_TOKEN` 等
@@ -382,7 +400,7 @@ CI 自動 deploy 前に、ローカルから 1 度手動で deploy して動作�
   （未確定なら空のままで OK。空のままでもネイティブ CSA クライアントは Origin 欠落で
   素通し。web client 化したときだけ Origin の追加が必要）
 - 時計設定（`CLOCK_KIND` / `TOTAL_TIME_*` / `BYOYOMI_*`）を運用方針に合わせる
-- `ADMIN_API_TOKEN` を staging Cloudflare secret に登録済みか確認（§2.5 / [`admin_auth.md`](admin_auth.md)）。
+- `ADMIN_API_TOKEN` と `PLAYER_ID_SECRET` を staging Cloudflare secret に登録済みか確認（§2.5 / [`admin_auth.md`](admin_auth.md)）。
   確認: `vp exec wrangler secret list --config wrangler.staging.toml`
 
 ```bash
@@ -433,7 +451,7 @@ websocat "wss://rshogi-csa-server-workers-staging.${SUBDOMAIN}.workers.dev/ws/te
 staging で動作確認できたら production も同様に立てる。
 
 `wrangler.production.toml` の値を §3.1 と同様に確認する（bucket 名は §2.1 の
-production bucket、`ADMIN_API_TOKEN` は production secret に登録済み）。
+production bucket、`ADMIN_API_TOKEN` / `PLAYER_ID_SECRET` は production secret に登録済み）。
 
 ```bash
 cd crates/rshogi-csa-server-workers
@@ -443,6 +461,29 @@ vp run deploy:prod    # Vite+ 非使用時は `pnpm run deploy:prod`（§1 末�
 `https://rshogi-csa-server-workers.<your-subdomain>.workers.dev/` にデプロイされる。
 同様に smoke check し、`/health` URL を `rshogi-csa-server-workers-production`
 Environment の variable に登録する。
+
+### 3.2.1 player rating snapshot を warmup する
+
+D1 migration 適用直後は `active_generation` が無いため、viewer の
+`GET /api/v1/players*` は partial result を返さず `503 Ratings warming up` を返す。
+deploy 後、環境ごとに既存の `ADMIN_API_TOKEN` を Authorization header にだけ載せ、
+bounded warmup を実行する（token を query string や log に載せない）:
+
+```bash
+WORKER_URL="https://rshogi-csa-server-workers-staging.<your-subdomain>.workers.dev"
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer ${ADMIN_API_TOKEN}" \
+  "${WORKER_URL}/api/v1/admin/player-ratings/warmup"
+```
+
+レスポンスの `ready` が `true` になるまで同じ操作を繰り返す。1 回は最大180局を
+処理し、現在の既存159局は最終の短い page を検出して同じ呼び出し内で公開できる。
+cron も15分ごとに同じ bounded job を実行するが、release gate は cron 待ちにせず
+この admin endpoint を使う。cron版は他のbackfill/sweepと発火時刻から25秒の
+共有deadlineを使い、到達時はcursorを保持して次回へ継続する。admin版は独立HTTP
+requestのため共有deadlineを持たず、レスポンスの `deadline_reached` は通常false。
+初回公開後の key rotation / late insert rebuild 中は
+旧 `active_generation` を返し続け、clean な次世代が完成した時点で切り替える。
 
 ### 3.3 DO migration 確認
 
@@ -596,6 +637,36 @@ contract を拡張する必要が出たら、test 側を更新するのと doc �
 blast radius は room 単位 (1 room = 1 GameRoom DO instance) だが、
 永続 storage / schema の消滅タイミングを rollback 手順の前提にしない
 こと。
+
+#### 3.4.6 D1 `games_search_index` migration
+
+viewer の検索・選手集計が使う `GAMES_SEARCH_DB` は DO 内 SQLite とは別の D1
+database である。`wrangler deploy` は `migrations/*.sql` を自動適用しないため、
+`.github/workflows/deploy-workers.yml` は各環境の Worker deploy 直前に次を実行する:
+
+```bash
+cd crates/rshogi-csa-server-workers
+pnpm exec wrangler d1 migrations apply GAMES_SEARCH_DB --remote \
+  --config wrangler.staging.toml
+pnpm exec wrangler d1 migrations apply GAMES_SEARCH_DB --remote \
+  --config wrangler.production.toml
+```
+
+migration は既存 row を保持する additive 変更 (`ADD COLUMN` / `CREATE INDEX`) のみ
+とし、旧 Worker が追加 column を無視できるため **migration → Worker deploy** の
+順に固定する。migration が失敗した場合 workflow はそこで停止し、新 schema を
+前提とする Worker を deploy しない。
+
+手動リリース時も同じ順序で実行する。適用状況は deploy 前に次で確認できる:
+
+```bash
+pnpm exec wrangler d1 migrations list GAMES_SEARCH_DB --remote \
+  --config wrangler.staging.toml
+```
+
+D1 migration 自体は rollback されない。Worker を rollback する場合も追加 column
+と index は残置し、修正が必要なら destructive rollback SQL ではなく次番号の
+forward migration を追加する。
 
 ### 3.5 web client 化時に `WS_ALLOWED_ORIGINS` を追加する
 

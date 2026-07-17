@@ -308,7 +308,9 @@ mod tests {
         PersistedConfig {
             game_id: "room-1-test".to_owned(),
             black_handle: "alice".to_owned(),
+            black_player_id: crate::player_identity::legacy_player_id("alice"),
             white_handle: "bob".to_owned(),
+            white_player_id: crate::player_identity::legacy_player_id("bob"),
             game_name: "g1".to_owned(),
             clock: ClockSpec::Countdown {
                 total_time_sec: 600,

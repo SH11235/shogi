@@ -313,10 +313,12 @@ historical 節として残す (旧手順を急遽踏みたい emergency rotation
 ┌─ Pulumi ESC (sh11235 org) ──────────────────────────────────┐
 │ env: sh11235/rshogi-csa-server-workers-staging              │
 │   values.workerSecrets.ADMIN_API_TOKEN  (encrypted)          │
+│   values.workerSecrets.PLAYER_ID_SECRET (encrypted)          │
 │ env: sh11235/rshogi-csa-server-workers-production           │
 │   values.workerSecrets.ADMIN_API_TOKEN  (encrypted)          │
+│   values.workerSecrets.PLAYER_ID_SECRET (encrypted)          │
 └──────────────────────────────────┬──────────────────────────┘
-                                   │ (1) esc env open --format json
+                                   │ (1) pulumi env open --format json
                                    ▼
                         ┌──────────────────────────┐
                         │ secret-sync.yml          │
@@ -353,22 +355,30 @@ values:
     ADMIN_API_TOKEN:
       fn::secret:
         ciphertext: <encrypted ciphertext>
+    PLAYER_ID_SECRET:
+      fn::secret:
+        ciphertext: <encrypted ciphertext>
     # 将来 Worker secret を追加するときは workerSecrets 配下にキーを足す
 ```
 
 `values.workerSecrets` 配下のキー名がそのまま `wrangler secret bulk` に渡され、
 Worker code 側 `env.var("KEY")` で参照される名前と一致する必要がある。
+`PLAYER_ID_SECRET` は32 bytes以上の単一 string、または
+`{"active_version":"v1","keys":{"v1":"<32 bytes以上>"}}` 形式の JSON を
+格納した secret string とする。`keys` は1〜8件。keyring 内の全 version/key を workflow が値を
+表示せず検証する。rotation 時は旧 key を残す（詳細は deployment.md §2.5）。
 `workerSecrets` キーが空 / 不在のまま `secret-sync.yml` を起動すると
 fail-closed で abort する (空 push で既存 secret を消去 / 上書きしない既定)。
 
-`esc env open --format json` は decrypt 済の **flat** JSON を吐く (top-level に
+`pulumi env open --format json` は decrypt 済の **flat** JSON を吐く (top-level に
 `workerSecrets` object が現れる、`values` 等のネストは出ない)。デバッグ時の参考:
 
 ```bash
-$ esc env open sh11235/rshogi-csa-server-workers-staging --format json
+$ pulumi env open sh11235/rshogi-csa-server-workers-staging --format json
 {
   "workerSecrets": {
-    "ADMIN_API_TOKEN": "<plaintext value>"
+    "ADMIN_API_TOKEN": "<plaintext value>",
+    "PLAYER_ID_SECRET": "<plaintext value>"
   }
 }
 ```
@@ -381,16 +391,14 @@ bulk` に渡す。`workerSecrets` が `values` ネスト下にある等の構造
 ### 9.3 通常の secret 追加 / rotation 手順
 
 ```bash
-# 1. ESC env を編集して新値を投入 (standalone esc CLI 経由)
-esc env edit sh11235/rshogi-csa-server-workers-staging
+# 1. ESC env を編集して新値を投入 (Pulumi CLI 経由)
+pulumi env edit sh11235/rshogi-csa-server-workers-staging
 #   → エディタが開くので values.workerSecrets.<KEY> を fn::secret で追加 / 更新
 #   (詳細は https://www.pulumi.com/docs/esc/cli/commands/esc_env_edit/ 参照)
-#   ※ Pulumi CLI を入れているなら `pulumi env edit ...` でも同等
 
 # 2. ESC 単体で値を確認 (workflow を流さずに dry-run したい場合)
-esc env open sh11235/rshogi-csa-server-workers-staging --format json | \
+pulumi env open sh11235/rshogi-csa-server-workers-staging --format json | \
     jq '.workerSecrets | keys'
-#   ※ workflow と同じ standalone `esc` CLI を使う。Pulumi CLI 経由なら `pulumi env open ...`
 
 # 3. workflow_dispatch で wrangler 同期を kick
 gh workflow run secret-sync.yml --repo SH11235/rshogi -f environment=staging
@@ -410,13 +418,13 @@ production も同手順で `staging` を `production` に置換するだけ。
 ### 9.4 secret-sync.yml の責務範囲
 
 - **やること**:
-  - 指定 `environment` の ESC env を `esc env open --format json` で読み出す
+  - 指定 `environment` の ESC env を `pulumi env open --format json` で読み出す
   - `.workerSecrets` を flat JSON object として書き出し、`wrangler secret bulk`
     で 1 回の API 呼び出しで投入
   - `Step Summary` に同期対象の ESC env 名 / wrangler config 名 / 反映確認コマンドを残す
 - **やらないこと**:
   - Worker script 本体の deploy (= `deploy-workers.yml` の責務)
-  - ESC 側の値変更 (= 運用者が `esc env edit` で行う)
+  - ESC 側の値変更 (= 運用者が `pulumi env edit` で行う)
   - 同期失敗時の自動 rollback (= ESC 値を戻して再 dispatch する手動 rollback 運用)
 
 ### 9.5 必要 GitHub secret / 権限
@@ -433,13 +441,13 @@ production も同手順で `staging` を `production` に置換するだけ。
 ### 9.6 トラブルシュート
 
 - **`ESC env '...' does not contain a non-empty 'workerSecrets' object`**: ESC env
-  の YAML 構造が §9.2 規約に合っていない。`esc env get <env>` で `values`
+  の YAML 構造が §9.2 規約に合っていない。`pulumi env get <env>` で `values`
   ツリーを確認し、`workerSecrets` 配下にキーがあるか見る。
 - **`wrangler secret bulk` が 401 / 403**: `CLOUDFLARE_API_TOKEN` の scope に
   `Workers Scripts: Edit` が含まれていない可能性。Cloudflare dashboard で token
   scope を確認 (deploy-workers.yml が動いていれば deploy 用 scope は満たすが、
   Cloudflare 側で scope を絞った別 token を使っている場合は要拡張)。
-- **`esc env open` が "no such environment"**: ESC env 名の typo か、
+- **`pulumi env open` が "no such environment"**: ESC env 名の typo か、
   `PULUMI_ACCESS_TOKEN` の発行 org が `sh11235` 以外。`pulumi whoami` で確認。
 
 ## 10. 参考

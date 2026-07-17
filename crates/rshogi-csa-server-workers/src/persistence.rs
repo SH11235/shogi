@@ -29,8 +29,14 @@ pub struct PersistedConfig {
     pub(crate) game_id: String,
     /// 先手プレイヤのハンドル。
     pub(crate) black_handle: String,
+    /// 先手の公開用 opaque player ID。旧 snapshot は空文字から legacy ID に解決する。
+    #[serde(default)]
+    pub(crate) black_player_id: String,
     /// 後手プレイヤのハンドル。
     pub(crate) white_handle: String,
+    /// 後手の公開用 opaque player ID。旧 snapshot は空文字から legacy ID に解決する。
+    #[serde(default)]
+    pub(crate) white_player_id: String,
     /// LOGIN ハンドル末尾の `<game_name>`。マッチ確認・棋譜メタに使う。
     pub(crate) game_name: String,
     /// 時計設定（Countdown / Fischer / StopWatch）。
@@ -303,7 +309,9 @@ mod tests {
         PersistedConfig {
             game_id: "room-1-test".to_owned(),
             black_handle: "alice".to_owned(),
+            black_player_id: crate::player_identity::legacy_player_id("alice"),
             white_handle: "bob".to_owned(),
+            white_player_id: crate::player_identity::legacy_player_id("bob"),
             game_name: "g1".to_owned(),
             clock: ClockSpec::Countdown {
                 total_time_sec: 60,
@@ -920,6 +928,8 @@ mod tests {
         assert_eq!(cfg.reconnect_grace_ms, None);
         assert_eq!(cfg.black_reconnect_token, None);
         assert_eq!(cfg.white_reconnect_token, None);
+        assert!(cfg.black_player_id.is_empty());
+        assert!(cfg.white_player_id.is_empty());
     }
 
     /// 明示 `null` 値は `None` として読まれる (`#[serde(default)]` と同等の振る舞い)。
