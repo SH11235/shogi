@@ -3369,6 +3369,14 @@ impl GameRoom {
         let Some(cfg) = self.config.borrow().as_ref().cloned() else {
             return Ok(None);
         };
+        // AGREE 未成立 (対局未開始) の部屋は対象外。この段階で合成すると成功時の
+        // `delete_grace_alarm_state` が `AgreeTimeout` の alarm kind を消し、
+        // `AgreeWaiting` の core では TimeUp 経路が no-op のため部屋が永久残留する。
+        // 未開始クライアントは通常 LOGIN でやり直せばよく、放置は AgreeTimeout が
+        // 掃除する。
+        if cfg.play_started_at_ms.is_none() {
+            return Ok(None);
+        }
         // grace 設定は対局開始時に `PersistedConfig.reconnect_grace_ms` へ固定
         // されている。現在の `Env` を読み直すと「対局開始後に設定変更 + deploy →
         // DO 再起動」で開始時に token を発行済みの対局を拒否してしまうため、
@@ -3391,13 +3399,16 @@ impl GameRoom {
         }
         // 再起動を跨いで storage に残った turn deadline alarm を上限として引き継ぎ、
         // 再接続によって相手手番の wall-clock deadline が延びないようにする。
+        // 取得エラー時は上限不明のまま受理せず reject に倒す (クライアントは
+        // LOGIN リトライで再試行する)。`Ok(None)` (alarm 消失) は受理するが、
+        // その場合の deadline は candidate B = 手番側の残時間 1 手分予算が上限で、
+        // replay 復元で経過思考時間が失われる既存 cold start 挙動と同等。
         let original_turn_alarm_epoch_ms = self
             .state
             .storage()
             .get_alarm()
             .await
-            .ok()
-            .flatten()
+            .map_err(|e| Error::RustError(format!("cold rejoin get_alarm: {e}")))?
             .and_then(|ms| u64::try_from(ms).ok());
         let core_borrow = self.core.borrow();
         let Some(core) = core_borrow.as_ref() else {
