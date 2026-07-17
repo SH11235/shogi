@@ -3397,22 +3397,38 @@ impl GameRoom {
                 return Ok(None);
             }
         }
+        let core_borrow = self.core.borrow();
+        let Some(core) = core_borrow.as_ref() else {
+            return Ok(None);
+        };
         // 再起動を跨いで storage に残った turn deadline alarm を上限として引き継ぎ、
         // 再接続によって相手手番の wall-clock deadline が延びないようにする。
         // 取得エラー時は上限不明のまま受理せず reject に倒す (クライアントは
-        // LOGIN リトライで再試行する)。`Ok(None)` (alarm 消失) は受理するが、
-        // その場合の deadline は candidate B = 手番側の残時間 1 手分予算が上限で、
-        // replay 復元で経過思考時間が失われる既存 cold start 挙動と同等。
-        let original_turn_alarm_epoch_ms = self
+        // LOGIN リトライで再試行する)。alarm 消失 (`Ok(None)`) 時は、cold start
+        // 復元後も保持される計時起点 (`turn_started_at_ms`、rshogi#852) から
+        // `now + 現手番の残時間 + margin + 安全ゲタ` を上限として再構成する —
+        // candidate B (経過思考時間を差し引かない 1 手分全予算) をそのまま使うと
+        // 無応答時の TimeUp 確定が実際の残時間より遅れるため。
+        let original_turn_alarm_epoch_ms = match self
             .state
             .storage()
             .get_alarm()
             .await
             .map_err(|e| Error::RustError(format!("cold rejoin get_alarm: {e}")))?
-            .and_then(|ms| u64::try_from(ms).ok());
-        let core_borrow = self.core.borrow();
-        let Some(core) = core_borrow.as_ref() else {
-            return Ok(None);
+        {
+            Some(ms) => u64::try_from(ms).ok(),
+            None => {
+                let now = self.now_ms();
+                let Some(remaining) = core.current_turn_remaining_ms(now) else {
+                    // Playing 以外 (Finished への遷移途中等の異常系)。合成しない。
+                    return Ok(None);
+                };
+                Some(
+                    now.saturating_add(remaining)
+                        .saturating_add(cfg.time_margin_ms)
+                        .saturating_add(ALARM_SAFETY_MS),
+                )
+            }
         };
         let pending =
             self.build_pending_reconnect(core, &cfg, role, grace, original_turn_alarm_epoch_ms)?;
