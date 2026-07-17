@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Miniflare, type WebSocket } from "miniflare";
@@ -83,6 +83,7 @@ export interface HarnessOptions {
   clockKind?: "countdown" | "countdown_msec" | "fischer" | "stopwatch";
   wsAllowedOrigins?: string;
   adminApiToken?: string;
+  playerIdSecret?: string;
   /// `WORKERS_HANDLE_AUTH` whitelist (issue #664) のオーバーライド。
   /// 既定は空配列 (`"[]"`) で「whitelist 未宣言」として self-claim 既定挙動を
   /// 維持する (一般 smoke は無影響)。検証時は
@@ -146,6 +147,7 @@ export async function createMiniflare(opts: HarnessOptions): Promise<Miniflare> 
       RATE_LIMITER: { className: "RateLimiter", useSQLite: true },
     },
     r2Buckets: ["KIFU_BUCKET", "FLOODGATE_HISTORY_BUCKET"],
+    d1Databases: ["GAMES_SEARCH_DB"],
     bindings: {
       CLOCK_KIND: opts.clockKind ?? "countdown",
       TOTAL_TIME_SEC: String(opts.totalTimeSec ?? 600),
@@ -162,6 +164,8 @@ export async function createMiniflare(opts: HarnessOptions): Promise<Miniflare> 
       // `adminApiToken: ""` を明示すること。`%%ADMIN <token>` 成功 E2E の場合は
       // 同 token を `adminApiToken` で揃えて binding する。
       ADMIN_API_TOKEN: opts.adminApiToken ?? "local-dev-admin-token-placeholder",
+      PLAYER_ID_SECRET:
+        opts.playerIdSecret ?? "local-dev-player-id-secret-placeholder",
       // `WORKERS_HANDLE_AUTH` 既定値は wrangler.toml.example と揃えた空配列で、
       // whitelist 未宣言モードとして self-claim 既定挙動を維持する。既存 smoke
       // が偶発的に handle_auth_failed に当たる経路を踏まないようにする。
@@ -212,7 +216,28 @@ export async function createMiniflare(opts: HarnessOptions): Promise<Miniflare> 
     defaultPersistRoot: opts.persistRoot,
   });
   await mf.ready;
+  await applyGamesSearchMigrations(mf);
   return mf;
+}
+
+async function applyGamesSearchMigrations(mf: Miniflare): Promise<void> {
+  const db = await mf.getD1Database("GAMES_SEARCH_DB");
+  const existing = await db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .bind("player_rating_state")
+    .first();
+  if (existing) return;
+  for (const name of [
+    "0001_games_search_index.sql",
+    "0002_games_index_backfill_state.sql",
+    "0003_games_search_index_player_ids.sql",
+    "0004_player_rating_materialization.sql",
+  ]) {
+    const sql = await readFile(resolve(WORKER_ROOT, "migrations", name), "utf8");
+    for (const statement of sql.split(";").map((part) => part.trim()).filter(Boolean)) {
+      await db.prepare(statement).run();
+    }
+  }
 }
 
 export async function makeTempPersistRoot(): Promise<{

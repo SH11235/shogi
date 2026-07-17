@@ -313,8 +313,10 @@ historical 節として残す (旧手順を急遽踏みたい emergency rotation
 ┌─ Pulumi ESC (sh11235 org) ──────────────────────────────────┐
 │ env: sh11235/rshogi-csa-server-workers-staging              │
 │   values.workerSecrets.ADMIN_API_TOKEN  (encrypted)          │
+│   values.workerSecrets.PLAYER_ID_SECRET (encrypted)          │
 │ env: sh11235/rshogi-csa-server-workers-production           │
 │   values.workerSecrets.ADMIN_API_TOKEN  (encrypted)          │
+│   values.workerSecrets.PLAYER_ID_SECRET (encrypted)          │
 └──────────────────────────────────┬──────────────────────────┘
                                    │ (1) esc env open --format json
                                    ▼
@@ -353,11 +355,18 @@ values:
     ADMIN_API_TOKEN:
       fn::secret:
         ciphertext: <encrypted ciphertext>
+    PLAYER_ID_SECRET:
+      fn::secret:
+        ciphertext: <encrypted ciphertext>
     # 将来 Worker secret を追加するときは workerSecrets 配下にキーを足す
 ```
 
 `values.workerSecrets` 配下のキー名がそのまま `wrangler secret bulk` に渡され、
 Worker code 側 `env.var("KEY")` で参照される名前と一致する必要がある。
+`PLAYER_ID_SECRET` は32 bytes以上の単一 string、または
+`{"active_version":"v1","keys":{"v1":"<32 bytes以上>"}}` 形式の JSON を
+格納した secret string とする。`keys` は1〜8件。keyring 内の全 version/key を workflow が値を
+表示せず検証する。rotation 時は旧 key を残す（詳細は deployment.md §2.5）。
 `workerSecrets` キーが空 / 不在のまま `secret-sync.yml` を起動すると
 fail-closed で abort する (空 push で既存 secret を消去 / 上書きしない既定)。
 
@@ -368,7 +377,8 @@ fail-closed で abort する (空 push で既存 secret を消去 / 上書きし
 $ esc env open sh11235/rshogi-csa-server-workers-staging --format json
 {
   "workerSecrets": {
-    "ADMIN_API_TOKEN": "<plaintext value>"
+    "ADMIN_API_TOKEN": "<plaintext value>",
+    "PLAYER_ID_SECRET": "<plaintext value>"
   }
 }
 ```

@@ -168,6 +168,13 @@ impl ConfigKeys {
     /// **local dev**: `wrangler.toml.example` の `[vars]` に空配列 placeholder
     /// (`"[]"`) を残し、friction なく `wrangler dev` を動かせるようにする。
     pub const WORKERS_HANDLE_AUTH: &'static str = "WORKERS_HANDLE_AUTH";
+    /// 公開用 player ID を LOGIN の handle + password から HMAC-SHA256 で導出する鍵。
+    /// 32 bytes 以上の単一 string、または `active_version` と version 別 `keys` を
+    /// 持つ JSON string を受ける。production / staging では
+    /// `wrangler secret put PLAYER_ID_SECRET` で配置し、API・R2・D1・ログへ値を
+    /// 出してはならない。未設定・不正時は対局を止めず、handle 由来の legacy
+    /// opaque ID にフォールバックして secret 値を含まない構造化警告を残す。
+    pub const PLAYER_ID_SECRET: &'static str = "PLAYER_ID_SECRET";
     /// 切断時の再接続猶予秒数。`0` または未設定なら再接続プロトコルを無効化し、
     /// WebSocket close を即時 `#ABNORMAL` に流す（保守的既定）。`> 0` を指定する
     /// 構成は `--allow-floodgate-features` (Workers では `ALLOW_FLOODGATE_FEATURES`)
@@ -182,7 +189,8 @@ impl ConfigKeys {
     /// Floodgate 機能群を opt-in 有効化するブール変数。`true` / `1` / `yes` / `on`
     /// で有効。`reconnect_protocol` 等の Floodgate 系を要求する構成で必須。
     pub const ALLOW_FLOODGATE_FEATURES: &'static str = "ALLOW_FLOODGATE_FEATURES";
-    /// viewer 配信 API (`/api/v1/games*` HTTP, `/ws/<id>/spectate` WS) を opt-in
+    /// viewer 配信 API (`/api/v1/games*` / `/api/v1/players*` HTTP,
+    /// `/ws/<id>/spectate` WS) を opt-in
     /// 有効化するブール変数。`true` / `1` / `yes` / `on` で有効、`false` / `0`
     /// / `no` / `off` または未設定で無効（= 該当 endpoint は 404 で既存ルーティング
     /// にフォールスルー）。production rollout 時の kill-switch を兼ね、本値を
@@ -305,8 +313,11 @@ impl ConfigKeys {
     /// `wrangler.toml.example` には `SHARED_PUBLIC_VARS_KEYS ∪ LOCAL_DEV_ONLY_VARS_KEYS`
     /// 全件を `[vars]` として記載することで、新規メンバーが `cp wrangler.toml.example
     /// wrangler.toml && wrangler dev` で即動作確認できる friction レス運用を維持する。
-    pub const LOCAL_DEV_ONLY_VARS_KEYS: &'static [&'static str] =
-        &[Self::ADMIN_API_TOKEN, Self::WORKERS_HANDLE_AUTH];
+    pub const LOCAL_DEV_ONLY_VARS_KEYS: &'static [&'static str] = &[
+        Self::ADMIN_API_TOKEN,
+        Self::WORKERS_HANDLE_AUTH,
+        Self::PLAYER_ID_SECRET,
+    ];
 
     /// **deploy 時に CI から runtime 注入される** `[vars]` キーの網羅列挙
     /// ([`Self::DEPLOYED_SHA`] 等)。`SHARED_PUBLIC_VARS_KEYS` / `LOCAL_DEV_ONLY_VARS_KEYS`

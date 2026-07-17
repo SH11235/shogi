@@ -226,6 +226,16 @@ jobs:
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "DEPLOY_TRIGGER_SHA=$sha"
+      # D1 migration は `wrangler deploy` では適用されない。additive migration を
+      # worker code より先に適用し、失敗時は deploy を止める。旧 worker は追加
+      # column を参照しないため、この順序でも staging の稼働を壊さない。
+      - name: Apply D1 migrations (staging)
+        if: steps.check.outputs.can_deploy == 'true'
+        working-directory: crates/rshogi-csa-server-workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm exec wrangler d1 migrations apply GAMES_SEARCH_DB --remote --config wrangler.staging.toml
       - name: Deploy via wrangler-action
         if: steps.check.outputs.can_deploy == 'true'
         uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
@@ -438,6 +448,15 @@ jobs:
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "DEPLOY_TRIGGER_SHA=$sha"
+      # staging と同じく D1 schema を code より先に additive 更新する。migration
+      # failure は deploy 前に fail-closed とし、schema 未適用の新 code を出さない。
+      - name: Apply D1 migrations (production)
+        if: steps.check.outputs.can_deploy == 'true'
+        working-directory: crates/rshogi-csa-server-workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm exec wrangler d1 migrations apply GAMES_SEARCH_DB --remote --config wrangler.production.toml
       - name: Deploy via wrangler-action
         if: steps.check.outputs.can_deploy == 'true'
         uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0

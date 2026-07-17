@@ -83,6 +83,7 @@ use crate::persistence::{
     ExportBodyKind, ExportPendingState, FailedExportObject, FinishedState, MoveRow,
     PersistedConfig, ReplaySummary, replay_core_room,
 };
+use crate::player_identity::{derive_player_identity, legacy_player_id};
 use crate::reconnect::{
     PendingAlarmKind, PendingReconnect, ReconnectMatchOutcome, ReconnectSnapshot, StartMatchGuard,
     build_resume_message, classify_alarm_after_enter_grace, classify_start_match_guard,
@@ -650,9 +651,28 @@ impl GameRoom {
         // 場合は永続化も attachment 差し替えも行わず、部屋を破壊しないよう拒否する
         // （game_name 不一致・重複 role・スロット超過の全てを一元的に弾く）。
         let mut next_slots = self.load_slots().await?;
+        let player_id_config =
+            self.env.var(ConfigKeys::PLAYER_ID_SECRET).ok().map(|value| value.to_string());
+        let identity =
+            match derive_player_identity(&handle, password.expose(), player_id_config.as_deref()) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    crate::structured_log!(
+                        event: "player_id_secret_invalid",
+                        component: "game_room",
+                        reason: error.reason(),
+                        fallback: "legacy_handle_id",
+                    );
+                    crate::player_identity::PlayerIdentity {
+                        player_id: legacy_player_id(&handle),
+                        aliases: Vec::new(),
+                    }
+                }
+            };
         next_slots.push(Slot {
             role,
             handle: handle.clone(),
+            player_id: identity.player_id.clone(),
             game_name: game_name.clone(),
         });
         if let MatchResult::Conflict { reason } = evaluate_match(&next_slots) {
@@ -665,6 +685,20 @@ impl GameRoom {
             );
             send_line(ws, &LoginReply::Incorrect.to_line())?;
             return Ok(());
+        }
+
+        if let Err(error) = crate::games_search_index::register_player_aliases(
+            &self.env,
+            &identity.player_id,
+            &identity.aliases,
+        )
+        .await
+        {
+            crate::structured_log!(
+                event: "player_id_alias_registration_failed",
+                component: "game_room",
+                err: format!("{error:?}"),
+            );
         }
 
         // 検証を通ったので slots を書き戻し、attachment を Player に差し替える。
@@ -680,11 +714,21 @@ impl GameRoom {
 
         if let MatchResult::Match {
             black_handle,
+            black_player_id,
             white_handle,
+            white_player_id,
             game_name,
         } = evaluate_match(&next_slots)
         {
-            let _ = self.start_match(&black_handle, &white_handle, &game_name).await?;
+            let _ = self
+                .start_match(
+                    &black_handle,
+                    &black_player_id,
+                    &white_handle,
+                    &white_player_id,
+                    &game_name,
+                )
+                .await?;
         }
 
         Ok(())
@@ -694,7 +738,9 @@ impl GameRoom {
     async fn start_match(
         &self,
         black_handle: &str,
+        black_player_id: &str,
         white_handle: &str,
+        white_player_id: &str,
         game_name: &str,
     ) -> Result<bool> {
         // https://github.com/SH11235/rshogi/issues/626: `start_match` の呼び出し前に存在する重複起動防止ガード
@@ -882,7 +928,9 @@ impl GameRoom {
         let cfg = PersistedConfig {
             game_id: game_id.clone(),
             black_handle: black_handle.to_owned(),
+            black_player_id: black_player_id.to_owned(),
             white_handle: white_handle.to_owned(),
+            white_player_id: white_player_id.to_owned(),
             game_name: game_name.to_owned(),
             clock: clock_spec.clone(),
             max_moves: preset.max_moves.unwrap_or(DEFAULT_MAX_MOVES),
@@ -1728,13 +1776,22 @@ impl GameRoom {
         let slots = self.load_slots().await?;
         let MatchResult::Match {
             black_handle,
+            black_player_id,
             white_handle,
+            white_player_id,
             game_name,
         } = evaluate_match(&slots)
         else {
             return Ok(false);
         };
-        self.start_match(&black_handle, &white_handle, &game_name).await
+        self.start_match(
+            &black_handle,
+            &black_player_id,
+            &white_handle,
+            &white_player_id,
+            &game_name,
+        )
+        .await
     }
 
     async fn load_kifu_by_game_id(&self, game_id: &GameId) -> Result<Option<String>> {
@@ -2439,12 +2496,24 @@ impl GameRoom {
         let source = resolve_index_source(&self.env);
 
         let (result_kind, end_reason) = classify_result(game_result);
+        let black_player_id = if cfg.black_player_id.is_empty() {
+            crate::player_identity::legacy_player_id(&cfg.black_handle)
+        } else {
+            cfg.black_player_id.clone()
+        };
+        let white_player_id = if cfg.white_player_id.is_empty() {
+            crate::player_identity::legacy_player_id(&cfg.white_handle)
+        } else {
+            cfg.white_player_id.clone()
+        };
         let entry = GamesIndexEntry {
             game_id: &cfg.game_id,
             started_at_ms: cfg.play_started_at_ms.unwrap_or(cfg.matched_at_ms),
             ended_at_ms,
             black_handle: &cfg.black_handle,
             white_handle: &cfg.white_handle,
+            black_player_id: Some(&black_player_id),
+            white_player_id: Some(&white_player_id),
             result_kind,
             end_reason,
             // CSA は理論上 0..=u32::MAX 手は到達しないが、API contract は

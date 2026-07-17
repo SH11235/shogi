@@ -16,6 +16,10 @@ pub struct Slot {
     pub role: Role,
     /// CSA LOGIN の `<handle>`。
     pub handle: String,
+    /// LOGIN credential から導出した公開用 opaque player ID。
+    /// 旧 snapshot では空文字となり、match 評価時に legacy ID へ解決する。
+    #[serde(default)]
+    pub player_id: String,
     /// CSA LOGIN の `<game_name>`。マッチ成立の同一性チェックに使う。
     pub game_name: String,
 }
@@ -29,8 +33,12 @@ pub enum MatchResult {
     Match {
         /// 先手プレイヤのハンドル。
         black_handle: String,
+        /// 先手プレイヤの公開 ID。
+        black_player_id: String,
         /// 後手プレイヤのハンドル。
         white_handle: String,
+        /// 後手プレイヤの公開 ID。
+        white_player_id: String,
         /// 共通の game_name。
         game_name: String,
     },
@@ -66,13 +74,23 @@ pub fn evaluate_match(slots: &[Slot]) -> MatchResult {
             }
             MatchResult::Match {
                 black_handle: black.handle.clone(),
+                black_player_id: resolved_player_id(black),
                 white_handle: white.handle.clone(),
+                white_player_id: resolved_player_id(white),
                 game_name: black.game_name.clone(),
             }
         }
         _ => MatchResult::Conflict {
             reason: "too many slots",
         },
+    }
+}
+
+fn resolved_player_id(slot: &Slot) -> String {
+    if slot.player_id.is_empty() {
+        crate::player_identity::legacy_player_id(&slot.handle)
+    } else {
+        slot.player_id.clone()
     }
 }
 
@@ -107,6 +125,7 @@ mod tests {
         Slot {
             role,
             handle: handle.to_owned(),
+            player_id: crate::player_identity::legacy_player_id(handle),
             game_name: game.to_owned(),
         }
     }
@@ -128,10 +147,22 @@ mod tests {
             evaluate_match(&slots),
             MatchResult::Match {
                 black_handle: "a".to_owned(),
+                black_player_id: crate::player_identity::legacy_player_id("a"),
                 white_handle: "b".to_owned(),
+                white_player_id: crate::player_identity::legacy_player_id("b"),
                 game_name: "g1".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn old_slot_without_player_id_resolves_to_legacy_id() {
+        let old: Slot = serde_json::from_value(serde_json::json!({
+            "role": "Black", "handle": "alice", "game_name": "g1"
+        }))
+        .unwrap();
+        assert!(old.player_id.is_empty());
+        assert_eq!(resolved_player_id(&old), crate::player_identity::legacy_player_id("alice"));
     }
 
     #[test]
