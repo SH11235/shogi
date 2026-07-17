@@ -74,11 +74,11 @@ pub struct PendingReconnect {
     /// `position_section` は切断時点の現在局面で再構築済み)。
     pub game_summary_for_disconnected: String,
     /// 切断時点で予約されていた turn alarm の発火時刻 (UNIX epoch ms)。
-    /// 再接続成功時に新しい turn alarm を貼り直す際、本値と「再接続時刻 + 残時間
-    /// budget」のうち**早い方**を採用することで、悪意あるクライアントが切断 →
-    /// grace 直前再接続を繰り返して相手手番の deadline を wall-clock 上で延長
-    /// する経路を防ぐ (元 deadline は壊さない)。`None` なら turn alarm 未予約
-    /// 時点での切断 (例: AGREE 直後の対局未開始) で、上書きせず素直に新規予約。
+    /// 再接続成功時に新しい turn alarm を貼り直す際、本値へ「今回付与した bounded
+    /// credit」だけを加えた時刻と、補償後の実残時間から再計算した時刻のうち
+    /// **早い方**を採用する。off-turn の credit は 0、on-turn も同一手番累積で
+    /// 秒読み 1 回分までなので、切断反復による無制限延長はできない。`None` なら
+    /// turn alarm 未予約時点での切断として、実残時間から新規予約する。
     /// `#[serde(default)]` で旧 schema からの cold-start 互換も維持する。
     #[serde(default)]
     pub original_turn_alarm_epoch_ms: Option<u64>,

@@ -10,6 +10,7 @@
 //! - `slots` (= [`crate::session_state::Slot`]): WebSocket 別の役割割当
 //! - [`PersistedConfig`]: マッチ成立時に確定する対局メタ + 開始局面 SFEN
 //! - `moves` テーブル ([`MoveRow`]): ply 順の指し手列（SQL）
+//! - `reconnect_clock_credits` テーブル: ply ごとの有界な再接続時計補償（SQL）
 //! - [`FinishedState`]: 終局確定後のフラグ（同 DO で再起動した場合の早期 return）
 //!
 //! cold start 復元の手順は [`replay_core_room`] のドキュメントを参照。
@@ -153,6 +154,11 @@ pub struct MoveRow {
     pub(crate) line: String,
     /// 手を受信した瞬間の wall-clock ミリ秒。replay の clock 復元に使う。
     pub(crate) at_ms: i64,
+    /// この手番で再接続により課金対象外とした累積時間（ミリ秒）。
+    /// `moves` と `reconnect_clock_credits` の LEFT JOIN で埋め、過去の補償手も
+    /// cold-start replay 時に同じ `T` / 時計消費へ復元する。
+    #[serde(default)]
+    pub(crate) reconnect_credit_ms: i64,
 }
 
 /// `replay_core_room` の戻り値。cold start 復元の各分岐をデータとして表現する。
@@ -206,9 +212,10 @@ pub enum ReplaySummary {
 ///    検証に失敗したら [`ReplaySummary::InvalidSfen`] を返す
 /// 3. `cfg.play_started_at_ms` が `Some(t)` のとき:
 ///    - 両側に AGREE を `t` のタイムスタンプで再送して `Playing` に遷移
-///    - `moves` を ply 順に逐次 `handle_line` で再生する。各手の wall-clock
-///      タイムスタンプは `at_ms.max(0).max(t)` に正規化（負値や AGREE より
-///      前の `at_ms` は clock を巻き戻すため）
+///    - `moves` を ply 順に逐次 `handle_line` で再生する。各手の直前にその ply の
+///      `reconnect_credit_ms` を戻し、wall-clock タイムスタンプは
+///      `at_ms.max(0).max(t)` に正規化（負値や AGREE より前の `at_ms` は clock を
+///      巻き戻すため）
 /// 4. `play_started_at_ms = None` の場合は `AgreeWaiting` のまま返す
 ///
 /// 設計上、本関数は I/O を持たないため、ホスト target で網羅的にテスト可能。
@@ -263,6 +270,10 @@ pub fn replay_core_room(cfg: &PersistedConfig, moves: &[MoveRow]) -> ReplaySumma
                 };
             }
         };
+        core.restore_current_turn_reconnect_credit_ms(
+            m.reconnect_credit_ms.max(0) as u64,
+            cfg.clock.reconnect_compensation_limit_ms(),
+        );
         let ts = (m.at_ms.max(0) as u64).max(play_started_at_ms);
         if let Err(e) = core.handle_line(color, &CsaLine::new(&m.line), ts) {
             return ReplaySummary::MoveReplayFailed {
@@ -315,6 +326,7 @@ mod tests {
             color: color.to_owned(),
             line: line.to_owned(),
             at_ms: (PLAY_STARTED_AT_MS + at_ms_offset_from_start) as i64,
+            reconnect_credit_ms: 0,
         }
     }
 
@@ -348,6 +360,10 @@ mod tests {
                 "white" => Color::White,
                 _ => unreachable!("test data must use black/white only"),
             };
+            core.restore_current_turn_reconnect_credit_ms(
+                m.reconnect_credit_ms.max(0) as u64,
+                cfg.clock.reconnect_compensation_limit_ms(),
+            );
             let ts = (m.at_ms.max(0) as u64).max(t0);
             core.handle_line(color, &CsaLine::new(&m.line), ts)
                 .expect("move in directly_played");
@@ -420,6 +436,37 @@ mod tests {
                 "turn_budget_ms mismatch for {color:?}"
             );
         }
+    }
+
+    #[test]
+    fn replay_reapplies_credit_for_past_reconnected_turns() {
+        let mut cfg = baseline_config();
+        cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
+        cfg.clock = ClockSpec::Countdown {
+            total_time_sec: 1,
+            byoyomi_sec: 1,
+        };
+        let mut first = move_row(1, "black", "+7776FU,T2", 3_500);
+        first.reconnect_credit_ms = 1_000;
+        let second = move_row(2, "white", "-3334FU,T0", 4_000);
+        let moves = vec![first.clone(), second.clone()];
+
+        let ReplaySummary::Restored { core } = replay_core_room(&cfg, &moves) else {
+            panic!("credit を含む過去手は replay できる必要がある");
+        };
+        assert_eq!(core.moves_played(), 2);
+        assert_eq!(core.current_turn(), Color::Black);
+        assert_eq!(core.clock_remaining_main_ms(Color::Black), 0);
+        assert_eq!(core.clock_remaining_main_ms(Color::White), 1_000);
+
+        // 同じ wall-clock 列で credit が無いと先手 1 手目が TimeUp になり、後手を
+        // replay できない。テストが credit 適用を実際に必要としていることを固定する。
+        let mut without_credit = moves;
+        without_credit[0].reconnect_credit_ms = 0;
+        assert!(matches!(
+            replay_core_room(&cfg, &without_credit),
+            ReplaySummary::MoveReplayFailed { ply: 2, .. }
+        ));
     }
 
     /// Fischer / StopWatch でも replay 後の `clock_turn_budget_ms` と本体残時間が
@@ -706,12 +753,14 @@ mod tests {
                 color: "black".to_owned(),
                 line: "+7776FU,T0".to_owned(),
                 at_ms: -42,
+                reconnect_credit_ms: 0,
             },
             MoveRow {
                 ply: 2,
                 color: "white".to_owned(),
                 line: "-3334FU,T0".to_owned(),
                 at_ms: (PLAY_STARTED_AT_MS - 10_000) as i64,
+                reconnect_credit_ms: 0,
             },
         ];
         let ReplaySummary::Restored {

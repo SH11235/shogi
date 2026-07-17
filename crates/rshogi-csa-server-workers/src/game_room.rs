@@ -138,7 +138,7 @@ const _: () = assert!(
 
 /// Durable Object 初期化 SQL。
 ///
-/// moves のみ SQL で持つ（append と ply 順 replay の効率を理由に）。
+/// moves と ply ごとの時計補償を SQL で持つ（append と ply 順 replay の効率を理由に）。
 /// 他の構造化状態 (slots / config / finished) は `state.storage().put/get` で
 /// JSON として置き、スキーママイグレーションを軽くする。
 const SCHEMA_SQL: &str = r#"
@@ -147,6 +147,10 @@ CREATE TABLE IF NOT EXISTS moves (
     color TEXT NOT NULL,
     line TEXT NOT NULL,
     at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reconnect_clock_credits (
+    ply INTEGER PRIMARY KEY CHECK (ply >= 1),
+    credited_ms INTEGER NOT NULL CHECK (credited_ms >= 0)
 );
 "#;
 
@@ -2287,8 +2291,9 @@ impl GameRoom {
         // MoveRow は client が送ってきた raw CSA 行 (`+7776FU,T3` や Floodgate
         // 形式 `+7776FU,'* 123 pv...`) を保持している。snapshot と同じ共有ヘルパ
         // (`parse_move_row_line` / `move_elapsed_secs`) で token / コメントを抽出し、
-        // 消費時間は at_ms 差分から秒に丸めて `KifuMove` に変換する。Floodgate の
-        // 評価値 PV コメントは `KifuMove::comment` に載せて棋譜 `'` 行として残す。
+        // 消費時間は at_ms 差分から再接続時計補償を引いて秒に丸め、`KifuMove` に
+        // 変換する。これでライブ `T` / snapshot / 終局棋譜が同じ実効経過時間に
+        // なる。Floodgate の評価値 PV コメントは `KifuMove::comment` に残す。
         let first_prev_ms = cfg.play_started_at_ms.unwrap_or(cfg.matched_at_ms);
         let elapsed = move_elapsed_secs(&moves_rows, first_prev_ms);
         let mut kifu_moves: Vec<KifuMove> = Vec::with_capacity(moves_rows.len());
@@ -2751,7 +2756,16 @@ impl GameRoom {
             Vec::new()
         };
         match replay_core_room(&cfg, &moves) {
-            ReplaySummary::Restored { core } => {
+            ReplaySummary::Restored { mut core } => {
+                // `replay_core_room` は確定済み各手の credit を適用済み。まだ着手
+                // されていない現手番にも先行保存済みの次 ply credit があれば戻す。
+                let next_ply = i64::from(core.moves_played()).saturating_add(1);
+                if let Some(credit) = self.load_reconnect_clock_credit(next_ply)? {
+                    core.restore_current_turn_reconnect_credit_ms(
+                        credit.max(0) as u64,
+                        cfg.clock.reconnect_compensation_limit_ms(),
+                    );
+                }
                 // `core` は `Box<CoreRoom>` で返るためここで unbox する
                 // (`ReplaySummary` の variant 間サイズ差対策、persistence.rs 参照)。
                 *self.core.borrow_mut() = Some(*core);
@@ -3094,16 +3108,37 @@ impl GameRoom {
         );
     }
 
-    /// `moves` テーブルを ply 昇順で読み出す。
+    /// `moves` テーブルを ply 昇順で読み出し、同じ ply の再接続時計補償を結合する。
     async fn load_moves(&self) -> Result<Vec<MoveRow>> {
         let sql = self.state.storage().sql();
-        let cursor =
-            sql.exec("SELECT ply, color, line, at_ms FROM moves ORDER BY ply ASC", None)?;
+        let cursor = sql.exec(
+            "SELECT m.ply, m.color, m.line, m.at_ms, \
+                    COALESCE(c.credited_ms, 0) AS reconnect_credit_ms \
+             FROM moves AS m \
+             LEFT JOIN reconnect_clock_credits AS c ON c.ply = m.ply \
+             ORDER BY m.ply ASC",
+            None,
+        )?;
         let rows: Vec<MoveRow> = cursor.to_array()?;
         Ok(rows)
     }
 
-    /// `moves` テーブルを空にする (https://github.com/SH11235/rshogi/issues/637)。
+    /// まだ `moves` に入っていない現手番を含め、指定 ply の再接続時計補償を読む。
+    fn load_reconnect_clock_credit(&self, ply: i64) -> Result<Option<i64>> {
+        #[derive(Deserialize)]
+        struct CreditRow {
+            credited_ms: i64,
+        }
+        let cursor = self.state.storage().sql().exec(
+            "SELECT credited_ms FROM reconnect_clock_credits WHERE ply = ?",
+            vec![ply.into()],
+        )?;
+        let rows: Vec<CreditRow> = cursor.to_array()?;
+        Ok(rows.into_iter().next().map(|row| row.credited_ms))
+    }
+
+    /// `moves` と `reconnect_clock_credits` テーブルを空にする
+    /// (https://github.com/SH11235/rshogi/issues/637)。
     ///
     /// 終局時に `finalize_if_ended` から呼び出され、同 room_id を再利用するリファクタ
     /// が将来入った場合でも `replay_core_room` が古い moves を再生して
@@ -3120,6 +3155,13 @@ impl GameRoom {
         if let Err(e) = sql.exec("DELETE FROM moves", None) {
             crate::structured_log!(
                 event: "clear_moves_failed",
+                component: "game_room",
+                err: format!("{e:?}"),
+            );
+        }
+        if let Err(e) = sql.exec("DELETE FROM reconnect_clock_credits", None) {
+            crate::structured_log!(
+                event: "clear_reconnect_clock_credits_failed",
                 component: "game_room",
                 err: format!("{e:?}"),
             );
@@ -3180,9 +3222,9 @@ impl GameRoom {
             .ok_or_else(|| Error::RustError("enter_grace_window: config missing".into()))?;
         // 既存 turn alarm の予定発火時刻を grace 経路前に取得しておき、
         // `PendingReconnect` に保存する。再接続成功後に新規 alarm を貼り直すとき、
-        // この値と「再接続時刻 + 残時間 budget」のうち早い方を採用することで、
-        // 悪意あるクライアントが切断 → grace 直前再接続を繰り返して相手手番の
-        // wall-clock 上の deadline を不当に延長する経路を防ぐ。
+        // この値に「今回実際に付与した bounded credit」だけを加えた時刻と、
+        // 補償後の実残時間から再計算した時刻のうち早い方を採用する。off-turn
+        // 再接続では credit=0 のため相手手番の deadline は一切延びない。
         // 同じ値を後段の `classify_alarm_after_enter_grace` でも使うため、
         // `get_alarm` は 1 回だけ呼んで使い回す。
         let existing_alarm = self.state.storage().get_alarm().await.ok().flatten();
@@ -3401,8 +3443,9 @@ impl GameRoom {
         let Some(core) = core_borrow.as_ref() else {
             return Ok(None);
         };
-        // 再起動を跨いで storage に残った turn deadline alarm を上限として引き継ぎ、
-        // 再接続によって相手手番の wall-clock deadline が延びないようにする。
+        // 再起動を跨いで storage に残った turn deadline alarm を上限として引き継ぐ。
+        // 成立後に延長できるのは「on-turn かつ同一手番累積で秒読み 1 回分まで」の
+        // bounded credit だけで、off-turn 再接続では元 deadline を保つ。
         // 取得エラー時は上限不明のまま受理せず reject に倒す (クライアントは
         // LOGIN リトライで再試行する)。alarm 消失 (`Ok(None)`) 時は、cold start
         // 復元後も保持される計時起点 (`turn_started_at_ms`、rshogi#852) から
@@ -3439,6 +3482,75 @@ impl GameRoom {
         let pending =
             self.build_pending_reconnect(core, &cfg, role, grace, original_turn_alarm_epoch_ms)?;
         Ok(Some(pending))
+    }
+
+    /// 再接続した側が現手番で、残時間が秒読み 1 回分を下回っている場合だけ不足分を
+    /// 補償する。同一手番の累積補償も秒読み 1 回分を上限とし、意図的な連続切断で
+    /// 思考時間を無制限に増やせないようにする。
+    ///
+    /// 次の ply に対応する SQL 行へ累積値を書いてから in-memory core に反映する。
+    /// 書き込み後に isolate が失われても `ensure_core_loaded` が同じ credit を replay
+    /// 後の core へ戻す。着手後も行を残し、将来の replay で過去の補償を再適用する。
+    async fn compensate_reconnect_clock_if_needed(&self, role: Role, now_ms: u64) -> Result<u64> {
+        let cfg = self.config.borrow().as_ref().cloned().ok_or_else(|| {
+            Error::RustError("reconnect clock compensation: config missing".into())
+        })?;
+        let limit_ms = cfg.clock.reconnect_compensation_limit_ms();
+        if limit_ms == 0 {
+            return Ok(0);
+        }
+
+        let color = role.to_core();
+        let plan = {
+            let core_borrow = self.core.borrow();
+            let Some(core) = core_borrow.as_ref() else {
+                return Ok(0);
+            };
+            if core.current_turn() != color {
+                return Ok(0);
+            }
+            let remaining_before_ms = core.current_turn_remaining_ms(now_ms).unwrap_or(0);
+            let granted_ms =
+                core.additional_reconnect_credit_ms(now_ms, limit_ms, limit_ms).unwrap_or(0);
+            let total_credited_ms =
+                core.current_turn_reconnect_credit_ms().saturating_add(granted_ms).min(limit_ms);
+            (core.moves_played(), remaining_before_ms, granted_ms, total_credited_ms)
+        };
+        let (moves_played, remaining_before_ms, granted_ms, total_credited_ms) = plan;
+        if granted_ms == 0 {
+            return Ok(0);
+        }
+
+        let target_ply = i64::from(moves_played).saturating_add(1);
+        let total_credited_i64 = i64::try_from(total_credited_ms).map_err(|_| {
+            Error::RustError("reconnect clock compensation exceeds SQLite INTEGER".into())
+        })?;
+        self.state.storage().sql().exec(
+            "INSERT INTO reconnect_clock_credits(ply, credited_ms) VALUES (?, ?) \
+             ON CONFLICT(ply) DO UPDATE SET credited_ms = excluded.credited_ms",
+            vec![target_ply.into(), total_credited_i64.into()],
+        )?;
+
+        let remaining_after_ms = {
+            let mut core_borrow = self.core.borrow_mut();
+            let Some(core) = core_borrow.as_mut() else {
+                return Ok(0);
+            };
+            core.restore_current_turn_reconnect_credit_ms(total_credited_ms, limit_ms);
+            core.current_turn_remaining_ms(now_ms).unwrap_or(0)
+        };
+        crate::structured_log!(
+            event: "reconnect_clock_compensated",
+            component: "game_room",
+            game_id: cfg.game_id.as_str(),
+            role: format!("{role:?}"),
+            moves_played: moves_played,
+            granted_ms: granted_ms,
+            total_credited_ms: total_credited_ms,
+            remaining_before_ms: remaining_before_ms,
+            remaining_after_ms: remaining_after_ms,
+        );
+        Ok(granted_ms)
     }
 
     /// LOGIN 行で `reconnect:<game_id>+<token>` が指定されたクライアントを受理し、
@@ -3533,6 +3645,10 @@ impl GameRoom {
             }
         }
 
+        // token / handle / color / grace の全照合が通った再接続だけを補償対象にする。
+        // LOGIN OK より先に永続化し、補償保存失敗時は成功応答を返さない。
+        let granted_credit_ms = self.compensate_reconnect_clock_if_needed(role, now_ms).await?;
+
         // 成功確定。LOGIN OK → resume 送出 → attachment を Player に差し替え →
         // grace registry / alarm tag を片付ける順で進める。
         let game_name = self.current_game_name_or_empty().await?;
@@ -3554,33 +3670,30 @@ impl GameRoom {
         self.delete_grace_alarm_state().await?;
         // 再接続クライアントが指し手を送らず放置しても確実に turn deadline が
         // 発火するよう、即時 alarm を貼り直す。決定方針:
-        // - 候補 A: 切断時に取り置いた元 turn alarm の発火時刻 (`pending.original
-        //   _turn_alarm_epoch_ms`)
-        // - 候補 B: 再接続時刻 + (現在手番の本体時間 + 秒読み + 通信マージン +
+        // - 候補 A: 切断時に取り置いた元 turn alarm の発火時刻 + 今回付与した補償
+        // - 候補 B: 再接続処理完了時刻 + (補償反映後の実残時間 + 通信マージン +
         //   安全側ゲタ)
-        // のうち**早い方**を採用する。常に B にすると悪意あるクライアントが
-        // 切断 → grace 直前再接続を繰り返して相手手番の wall-clock 上の deadline
-        // を延長する経路が成立するため、A を上限としても利く形にする。
+        // のうち**早い方**を採用する。A へ加えるのは今回の bounded credit だけで、
+        // off-turn は 0、on-turn も同一手番累積で秒読み 1 回分が上限となる。
         let now = self.now_ms();
         let candidate_b_total_ms = {
             let core_borrow = self.core.borrow();
             core_borrow.as_ref().map(|core| {
-                let next_turn = core.current_turn();
-                let budget = core.clock_turn_budget_ms(next_turn).max(0) as u64;
+                let remaining = core.current_turn_remaining_ms(now).unwrap_or(0);
                 let margin = self
                     .config
                     .borrow()
                     .as_ref()
                     .map(|c| c.time_margin_ms)
                     .unwrap_or(DEFAULT_TIME_MARGIN_MS);
-                budget.saturating_add(margin).saturating_add(ALARM_SAFETY_MS)
+                remaining.saturating_add(margin).saturating_add(ALARM_SAFETY_MS)
             })
         };
         if let Some(total_b) = candidate_b_total_ms {
             let candidate_b_epoch = now.saturating_add(total_b);
             let final_epoch = pending
                 .original_turn_alarm_epoch_ms
-                .map(|orig| orig.min(candidate_b_epoch))
+                .map(|orig| orig.saturating_add(granted_credit_ms).min(candidate_b_epoch))
                 .unwrap_or(candidate_b_epoch);
             // `set_alarm(Duration)` は「now から N ms 後」に発火する API なので
             // delay = final_epoch - now で渡す。`saturating_sub` は now が final_epoch

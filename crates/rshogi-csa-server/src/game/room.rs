@@ -161,6 +161,13 @@ pub struct GameRoom {
     moves_played: u32,
     /// 現在の手番が開始した瞬間の単調時刻（ミリ秒）。`Playing` 中のみ意味を持つ。
     turn_started_at_ms: Option<u64>,
+    /// 現手番で再接続により課金対象外とした時間（ミリ秒）。
+    ///
+    /// raw elapsed から本値を差し引いた実効経過時間を時計消費・`T` 行・alarm
+    /// 残時間で共通利用する。frontend が同一手番の累積上限を管理し、cold-start
+    /// replay 時は永続化済みの値を [`Self::restore_current_turn_reconnect_credit_ms`]
+    /// で戻す。
+    turn_reconnect_credit_ms: u64,
 }
 
 impl fmt::Debug for GameRoom {
@@ -170,6 +177,7 @@ impl fmt::Debug for GameRoom {
             .field("status", &self.status)
             .field("moves_played", &self.moves_played)
             .field("turn_started_at_ms", &self.turn_started_at_ms)
+            .field("turn_reconnect_credit_ms", &self.turn_reconnect_credit_ms)
             .finish()
     }
 }
@@ -210,6 +218,7 @@ impl GameRoom {
             status: GameStatus::AgreeWaiting,
             moves_played: 0,
             turn_started_at_ms: None,
+            turn_reconnect_credit_ms: 0,
         })
     }
 
@@ -336,10 +345,49 @@ impl GameRoom {
         if !matches!(self.status, GameStatus::Playing) {
             return None;
         }
-        let started = self.turn_started_at_ms.unwrap_or(now_ms);
-        let elapsed = now_ms.saturating_sub(started);
+        let elapsed = self.current_turn_elapsed_ms(now_ms);
         let budget = self.clock.turn_budget_ms(self.current_turn()).max(0) as u64;
         Some(budget.saturating_sub(elapsed))
+    }
+
+    /// 現手番に既に付与済みの再接続時計補償（ミリ秒）。
+    pub fn current_turn_reconnect_credit_ms(&self) -> u64 {
+        self.turn_reconnect_credit_ms
+    }
+
+    /// `now_ms` 時点の残時間を `minimum_remaining_ms` まで戻すために必要な追加補償を
+    /// 返す。同一手番の累積補償は `maximum_total_credit_ms` を超えない。
+    ///
+    /// 本メソッドは状態を変更しない。frontend は戻り値を永続化してから
+    /// [`Self::restore_current_turn_reconnect_credit_ms`] で反映することで、storage
+    /// 書き込みと DO isolate 消失の間でも補償を失わないようにできる。
+    pub fn additional_reconnect_credit_ms(
+        &self,
+        now_ms: u64,
+        minimum_remaining_ms: u64,
+        maximum_total_credit_ms: u64,
+    ) -> Option<u64> {
+        let remaining = self.current_turn_remaining_ms(now_ms)?;
+        let needed = minimum_remaining_ms.saturating_sub(remaining);
+        let available = maximum_total_credit_ms.saturating_sub(self.turn_reconnect_credit_ms);
+        Some(needed.min(available))
+    }
+
+    /// cold-start replay または再接続成立時に、現手番の累積時計補償を復元する。
+    /// 呼び出し側が時計方式に応じた上限を渡し、過大な永続値はここでも clamp する。
+    pub fn restore_current_turn_reconnect_credit_ms(
+        &mut self,
+        total_credit_ms: u64,
+        maximum_total_credit_ms: u64,
+    ) {
+        if matches!(self.status, GameStatus::Playing) {
+            self.turn_reconnect_credit_ms = total_credit_ms.min(maximum_total_credit_ms);
+        }
+    }
+
+    fn current_turn_elapsed_ms(&self, now_ms: u64) -> u64 {
+        let started = self.turn_started_at_ms.unwrap_or(now_ms);
+        now_ms.saturating_sub(started).saturating_sub(self.turn_reconnect_credit_ms)
     }
 
     /// 切断を検出したときに呼ぶ。再接続猶予 0 秒で即時 `#ABNORMAL` 確定。
@@ -392,6 +440,7 @@ impl GameRoom {
                 self.status = GameStatus::Playing;
                 self.moves_played = 0;
                 self.turn_started_at_ms = Some(now_ms);
+                self.turn_reconnect_credit_ms = 0;
                 let line = CsaLine::new(format!("START:{}", self.config.game_id));
                 Ok(HandleResult {
                     outcome: HandleOutcome::GameStarted,
@@ -423,6 +472,7 @@ impl GameRoom {
             let result = GameResult::Abnormal { winner: None };
             self.status = GameStatus::Finished(result.clone());
             self.turn_started_at_ms = None;
+            self.turn_reconnect_credit_ms = 0;
             Ok(HandleResult {
                 outcome: HandleOutcome::GameEnded(result),
                 broadcasts: vec![BroadcastEntry {
@@ -500,8 +550,7 @@ impl GameRoom {
         //    fischer では実効予算が「total + (inc + margin)×手数」に膨張し、ライブ台帳
         //    と終局棋譜の T が 1 秒/手ずれる (#857)。秒単位への切り捨ては clock 実装
         //    (`SecondsCountdownClock` / `FischerClock`) 側で行われる。
-        let started = self.turn_started_at_ms.unwrap_or(now_ms);
-        let elapsed_ms = now_ms.saturating_sub(started);
+        let elapsed_ms = self.current_turn_elapsed_ms(now_ms);
         let clock_result = self.clock.consume(from, elapsed_ms);
 
         // 2. 時間切れなら盤面を進めず終局（手は受理しない）。
@@ -591,6 +640,7 @@ impl GameRoom {
 
         // 7. 続行 → 次手番開始時刻を更新。
         self.turn_started_at_ms = Some(now_ms);
+        self.turn_reconnect_credit_ms = 0;
         let next_turn = from.opposite();
         let core_next: rshogi_core::types::Color = next_turn.into();
         let remaining_main_ms = self.clock.remaining_main_ms(core_next.into());
@@ -674,6 +724,7 @@ impl GameRoom {
         }
         self.status = GameStatus::Finished(result.clone());
         self.turn_started_at_ms = None;
+        self.turn_reconnect_credit_ms = 0;
         HandleResult {
             outcome: HandleOutcome::GameEnded(result),
             broadcasts,
@@ -789,6 +840,45 @@ mod tests {
         // budget 到達/超過 → 0（実時間が予算を超えた時間切れ。alarm は force_time_up する）
         assert_eq!(room.current_turn_remaining_ms(budget), Some(0));
         assert_eq!(room.current_turn_remaining_ms(budget + 5_000), Some(0));
+    }
+
+    #[test]
+    fn reconnect_credit_restores_byoyomi_and_keeps_t_line_consistent() {
+        let mut room = room_with(0, 0, 10);
+        agree_both(&mut room);
+
+        // 秒読み 10 秒 + 秒粒度の端数 999ms のうち 6 秒が経過済み。
+        assert_eq!(room.current_turn_remaining_ms(6_000), Some(4_999));
+        let granted = room.additional_reconnect_credit_ms(6_000, 10_000, 10_000).unwrap();
+        assert_eq!(granted, 5_001);
+        room.restore_current_turn_reconnect_credit_ms(granted, 10_000);
+        assert_eq!(room.current_turn_remaining_ms(6_000), Some(10_000));
+
+        // 再接続後さらに 8 秒で着手しても受理される。T 行は raw 14 秒ではなく、
+        // 補償 5,001ms を除いた実効経過 8,999ms と同じ T8 を出す。
+        let result = room.handle_line(Color::Black, &line("+7776FU"), 14_000).unwrap();
+        assert!(matches!(result.outcome, HandleOutcome::MoveAccepted { .. }));
+        assert_eq!(result.broadcasts[0].line.as_str(), "+7776FU,T8");
+        assert_eq!(room.current_turn_reconnect_credit_ms(), 0, "次手番では補償を reset");
+    }
+
+    #[test]
+    fn reconnect_credit_is_capped_across_repeated_disconnects_in_same_turn() {
+        let mut room = room_with(0, 0, 10);
+        agree_both(&mut room);
+
+        let first = room.additional_reconnect_credit_ms(6_000, 10_000, 10_000).unwrap();
+        room.restore_current_turn_reconnect_credit_ms(first, 10_000);
+        assert_eq!(first, 5_001);
+
+        // さらに時間を使って再切断しても、同一手番の残枠 4,999ms までしか付与しない。
+        let second = room.additional_reconnect_credit_ms(12_000, 10_000, 10_000).unwrap();
+        assert_eq!(second, 4_999);
+        room.restore_current_turn_reconnect_credit_ms(first + second, 10_000);
+        assert_eq!(room.current_turn_reconnect_credit_ms(), 10_000);
+
+        // 累積上限到達後の再切断では追加補償 0。切断ループで時間は増えない。
+        assert_eq!(room.additional_reconnect_credit_ms(13_000, 10_000, 10_000), Some(0));
     }
 
     #[test]
