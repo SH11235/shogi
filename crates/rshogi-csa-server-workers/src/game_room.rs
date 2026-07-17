@@ -3366,9 +3366,16 @@ impl GameRoom {
         if self.load_finished().await?.is_some() {
             return Ok(None);
         }
-        // reconnect 機能が無効な構成 (grace 0 / 設定不正) では合成しない。
-        let grace = match resolve_reconnect_grace(&self.env) {
-            Ok(g) if !g.is_zero() => g,
+        let Some(cfg) = self.config.borrow().as_ref().cloned() else {
+            return Ok(None);
+        };
+        // grace 設定は対局開始時に `PersistedConfig.reconnect_grace_ms` へ固定
+        // されている。現在の `Env` を読み直すと「対局開始後に設定変更 + deploy →
+        // DO 再起動」で開始時に token を発行済みの対局を拒否してしまうため、
+        // `websocket_close` 経路と同じく永続化済みの値を使う。0 / 未設定 =
+        // reconnect 無効な対局なので合成しない。
+        let grace = match cfg.reconnect_grace_ms {
+            Some(ms) if ms > 0 => Duration::from_millis(ms),
             _ => return Ok(None),
         };
         // 同 role の player socket が生きているなら切断ではない (二重接続要求)。
@@ -3382,9 +3389,6 @@ impl GameRoom {
                 return Ok(None);
             }
         }
-        let Some(cfg) = self.config.borrow().as_ref().cloned() else {
-            return Ok(None);
-        };
         // 再起動を跨いで storage に残った turn deadline alarm を上限として引き継ぎ、
         // 再接続によって相手手番の wall-clock deadline が延びないようにする。
         let original_turn_alarm_epoch_ms = self
