@@ -47,6 +47,28 @@ pub struct SpectatorClocks {
     pub side_to_move: Color,
 }
 
+/// 1 手受理後に観戦者へ送る権威時計の wire 行を組み立てる。
+///
+/// 指し手の `<token>,T<sec>` 行だけでは、観戦 client が秒単位へ丸められた消費時間と
+/// clock 種別から残時間を再計算する必要がある。サーバーが保持する ms 粒度の本体残時間を
+/// 指し手直後に送ることで、client は表示用 countdown の anchor を毎手再同期できる。
+///
+/// `ply` は直前の指し手と同じ値を入れ、client が現在盤面と結び付ける。snapshot 送信中の
+/// pending queue では clock 行を non-move として必ず flush する。これにより snapshot の
+/// moves 読み込みと clock 採取が競合しても、最後の毎手 clock が古い snapshot clock を
+/// 上書きできる。JSON payload は旧 client が未知の `##[CLOCK]` 行を安全に無視できる追加
+/// wire である。
+pub(crate) fn build_spectator_clock_update(clocks: &SpectatorClocks, ply: u32) -> String {
+    let side_to_move = match clocks.side_to_move {
+        Color::Black => "sente",
+        Color::White => "gote",
+    };
+    format!(
+        "##[CLOCK] {{\"black_remaining_ms\":{},\"white_remaining_ms\":{},\"side_to_move\":\"{side_to_move}\",\"ply\":{ply}}}",
+        clocks.black_remaining_ms, clocks.white_remaining_ms
+    )
+}
+
 /// core を復元できない終局済み DO でも Game_Summary を返すための時計 fallback。
 pub(crate) fn initial_spectator_clocks(config: &PersistedConfig) -> SpectatorClocks {
     let clock = config.clock.build_clock();
@@ -251,6 +273,29 @@ pub(crate) fn move_rows_from_exported_csa(csa_text: &str, first_prev_ms: u64) ->
 /// (https://github.com/SH11235/rshogi/issues/853 系: 終局手の棋譜欠落防止)。
 pub(crate) fn is_move_broadcast(entry: &rshogi_csa_server::BroadcastEntry) -> bool {
     entry.ply.is_some() && entry.line.as_str().starts_with(['+', '-'])
+}
+
+/// 毎手 clock を挿入する broadcast index と ply を返す。
+///
+/// Floodgate コメントは「直前の指し手に属する」wire 契約なので、move と同じ ply の
+/// 観戦者専用 `'` 行をすべて通過した位置を返す。終局手では、その後に続く結果行より
+/// 前へ clock を挿入する。1 回の HandleResult に盤面を進める move は高々 1 件。
+pub(crate) fn spectator_clock_insert_after(
+    entries: &[rshogi_csa_server::BroadcastEntry],
+) -> Option<(usize, u32)> {
+    let move_index = entries.iter().position(is_move_broadcast)?;
+    let ply = entries[move_index].ply?;
+    let mut insert_after = move_index;
+    while let Some(entry) = entries.get(insert_after + 1) {
+        let is_attached_comment = entry.ply == Some(ply)
+            && matches!(entry.target, rshogi_csa_server::BroadcastTarget::Spectators)
+            && entry.line.as_str().starts_with('\'');
+        if !is_attached_comment {
+            break;
+        }
+        insert_after += 1;
+    }
+    Some((insert_after, ply))
 }
 
 #[cfg(test)]
@@ -652,5 +697,45 @@ PI
             ply: None,
         };
         assert!(!is_move_broadcast(&no_ply));
+    }
+
+    #[test]
+    fn spectator_clock_update_is_structured_and_ply_bound() {
+        let clocks = SpectatorClocks {
+            black_remaining_ms: 445_123,
+            white_remaining_ms: 405_987,
+            side_to_move: Color::White,
+        };
+
+        assert_eq!(
+            build_spectator_clock_update(&clocks, 48),
+            "##[CLOCK] {\"black_remaining_ms\":445123,\"white_remaining_ms\":405987,\"side_to_move\":\"gote\",\"ply\":48}"
+        );
+    }
+
+    #[test]
+    fn spectator_clock_is_inserted_after_comment_and_before_terminal_lines() {
+        use rshogi_csa_server::{BroadcastEntry, BroadcastTarget, CsaLine};
+
+        let entries = vec![
+            BroadcastEntry {
+                target: BroadcastTarget::All,
+                line: CsaLine::new("+7776FU,T3"),
+                ply: Some(1),
+            },
+            BroadcastEntry {
+                target: BroadcastTarget::Spectators,
+                line: CsaLine::new("'* 123 -3334FU"),
+                ply: Some(1),
+            },
+            BroadcastEntry {
+                target: BroadcastTarget::Spectators,
+                line: CsaLine::new("#MAX_MOVES"),
+                ply: None,
+            },
+        ];
+
+        assert_eq!(spectator_clock_insert_after(&entries), Some((1, 1)));
+        assert_eq!(spectator_clock_insert_after(&entries[..1]), Some((0, 1)));
     }
 }

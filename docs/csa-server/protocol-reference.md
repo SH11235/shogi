@@ -80,6 +80,7 @@ CSA プロトコル一般仕様や本家 Floodgate 運用は §2 の外部参照
 | `START:<game_id>` | 両者 AGREE 後の対局開始通知 | `crates/rshogi-csa-server/src/game/room.rs::GameRoom::handle_agree` |
 | `REJECT:<game_id>` | どちらかが REJECT した | TCP `server.rs::drive_game_inner` の AGREE 結果が false の経路 (`server.rs::wait_both_agree` の戻り値で分岐) |
 | `<token>,T<sec>` | 1 手分の broadcast (各 client / 観戦者へ送出)。`T<sec>` 値はサーバー側 `room.rs` で計算した経過秒 | `room.rs::GameRoom::handle_move` (broadcast 行作成)、TCP `server.rs::parse_move_broadcast` (受信側ヘルパ) |
+| `##[CLOCK] {"black_remaining_ms":<ms>,"white_remaining_ms":<ms>,"side_to_move":"sente"\|"gote","ply":<n>}` `*` | **Workers 観戦者専用**。盤面を進めた各 `<token>,T<sec>` に付随する `'<comment>` 行があればその直後、無ければ指し手直後に、サーバー時計の本体残時間 (ms) と次手番を送る。`ply` はその指し手と同じ値。viewer はローカル countdown の anchor を毎手この値で再同期し、`T<sec>` の秒丸めや通信遅延による累積誤差を防ぐ。既存 client は未知の `##[...]` 行として無視できる。対局者および TCP frontend には送らない | Workers `game_room.rs::GameRoom::dispatch_broadcasts` / `spectator_snapshot.rs::build_spectator_clock_update` |
 | `'<comment>` | **観戦者専用**の付随行。直前の `<token>,T<sec>` に付いた Floodgate 評価値コメント (`* <eval> <pv...>` 等) を、対局者を除く観戦者だけへ 1 行配信する (`BroadcastTarget::Spectators`)。対局者へ送らないのはエンジン解析が相手に漏れないようにするため。指し手行と同一 ply で送られ、既存 viewer client は `'` 始まり行を無視する互換性がある。指し手にコメントが無ければ本行は出ない | `room.rs::GameRoom::apply_move` (comment 付き手のとき追加)、Workers `game_room.rs::dispatch_broadcasts`→`send_to_spectators` / TCP `server.rs::dispatch` (いずれも Spectators 経路) |
 
 ## 5. x1 拡張コマンド一覧
