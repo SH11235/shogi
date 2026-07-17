@@ -350,6 +350,20 @@ impl GameRoom {
         Some(budget.saturating_sub(elapsed))
     }
 
+    /// 現手番の時計 deadline（通信マージンを含まない単調時刻、ミリ秒）。
+    ///
+    /// 再接続後の alarm は「以前の alarm + 今回の差分」ではなく、この絶対値から
+    /// 再構成する。これにより credit 永続化直後に frontend が再起動しても、復元
+    /// 済みの累積 credit が deadline に必ず反映される。
+    pub fn current_turn_deadline_ms(&self) -> Option<u64> {
+        if !matches!(self.status, GameStatus::Playing) {
+            return None;
+        }
+        let started = self.turn_started_at_ms?;
+        let budget = self.clock.turn_budget_ms(self.current_turn()).max(0) as u64;
+        Some(started.saturating_add(budget).saturating_add(self.turn_reconnect_credit_ms))
+    }
+
     /// 現手番に既に付与済みの再接続時計補償（ミリ秒）。
     pub fn current_turn_reconnect_credit_ms(&self) -> u64 {
         self.turn_reconnect_credit_ms
@@ -849,10 +863,12 @@ mod tests {
 
         // 秒読み 10 秒 + 秒粒度の端数 999ms のうち 6 秒が経過済み。
         assert_eq!(room.current_turn_remaining_ms(6_000), Some(4_999));
+        assert_eq!(room.current_turn_deadline_ms(), Some(10_999));
         let granted = room.additional_reconnect_credit_ms(6_000, 10_000, 10_000).unwrap();
         assert_eq!(granted, 5_001);
         room.restore_current_turn_reconnect_credit_ms(granted, 10_000);
         assert_eq!(room.current_turn_remaining_ms(6_000), Some(10_000));
+        assert_eq!(room.current_turn_deadline_ms(), Some(16_000));
 
         // 再接続後さらに 8 秒で着手しても受理される。T 行は raw 14 秒ではなく、
         // 補償 5,001ms を除いた実効経過 8,999ms と同じ T8 を出す。

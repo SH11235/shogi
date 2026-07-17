@@ -3220,27 +3220,16 @@ impl GameRoom {
             .as_ref()
             .cloned()
             .ok_or_else(|| Error::RustError("enter_grace_window: config missing".into()))?;
-        // 既存 turn alarm の予定発火時刻を grace 経路前に取得しておき、
-        // `PendingReconnect` に保存する。再接続成功後に新規 alarm を貼り直すとき、
-        // この値に「今回実際に付与した bounded credit」だけを加えた時刻と、
-        // 補償後の実残時間から再計算した時刻のうち早い方を採用する。off-turn
-        // 再接続では credit=0 のため相手手番の deadline は一切延びない。
-        // 同じ値を後段の `classify_alarm_after_enter_grace` でも使うため、
-        // `get_alarm` は 1 回だけ呼んで使い回す。
+        // 既存 turn alarm の予定発火時刻を grace 経路前に取得する。grace deadline
+        // と比較して早い方を残すために使い、再接続成立後の turn alarm は core の
+        // 固定計時起点 + 現在予算 + 永続化済み累積 credit から再構成する。
         let existing_alarm = self.state.storage().get_alarm().await.ok().flatten();
-        let original_turn_alarm_epoch_ms = existing_alarm.map(|e| e as u64);
         let pending = {
             let borrow = self.core.borrow();
             let core = borrow.as_ref().ok_or_else(|| {
                 Error::RustError("enter_grace_window: core missing after ensure_core_loaded".into())
             })?;
-            self.build_pending_reconnect(
-                core,
-                &cfg,
-                role,
-                grace_duration,
-                original_turn_alarm_epoch_ms,
-            )?
+            self.build_pending_reconnect(core, &cfg, role, grace_duration)?
         };
         // 既存の turn alarm より grace deadline が早ければ上書き、遅ければ既存
         // alarm (時間切れ) を残す。`get_alarm` は次回発火時刻 (epoch ms) を返し、
@@ -3288,7 +3277,6 @@ impl GameRoom {
         cfg: &PersistedConfig,
         role: Role,
         grace_duration: Duration,
-        original_turn_alarm_epoch_ms: Option<u64>,
     ) -> Result<PendingReconnect> {
         let disconnected_color = role.to_core();
         let token = match disconnected_color {
@@ -3348,7 +3336,6 @@ impl GameRoom {
             deadline_ms,
             snapshot,
             game_summary_for_disconnected,
-            original_turn_alarm_epoch_ms,
         })
     }
 
@@ -3443,44 +3430,7 @@ impl GameRoom {
         let Some(core) = core_borrow.as_ref() else {
             return Ok(None);
         };
-        // 再起動を跨いで storage に残った turn deadline alarm を上限として引き継ぐ。
-        // 成立後に延長できるのは「on-turn かつ同一手番累積で秒読み 1 回分まで」の
-        // bounded credit だけで、off-turn 再接続では元 deadline を保つ。
-        // 取得エラー時は上限不明のまま受理せず reject に倒す (クライアントは
-        // LOGIN リトライで再試行する)。alarm 消失 (`Ok(None)`) 時は、cold start
-        // 復元後も保持される計時起点 (`turn_started_at_ms`、rshogi#852) から
-        // `now + 現手番の残時間 + margin + 安全ゲタ` を上限として再構成する —
-        // candidate B (経過思考時間を差し引かない 1 手分全予算) をそのまま使うと
-        // 無応答時の TimeUp 確定が実際の残時間より遅れるため。
-        let original_turn_alarm_epoch_ms = match self
-            .state
-            .storage()
-            .get_alarm()
-            .await
-            .map_err(|e| Error::RustError(format!("cold rejoin get_alarm: {e}")))?
-        {
-            Some(ms) => u64::try_from(ms).ok(),
-            None => {
-                let now = self.now_ms();
-                let Some(remaining) = core.current_turn_remaining_ms(now) else {
-                    // Playing 以外 (Finished への遷移途中等の異常系)。合成しない。
-                    return Ok(None);
-                };
-                if remaining == 0 {
-                    // 既に予算超過。margin/safety を再付与すると元 deadline より
-                    // 遅くなるため、即時発火の epoch を渡して time_up 判定に進める。
-                    Some(now)
-                } else {
-                    Some(
-                        now.saturating_add(remaining)
-                            .saturating_add(cfg.time_margin_ms)
-                            .saturating_add(ALARM_SAFETY_MS),
-                    )
-                }
-            }
-        };
-        let pending =
-            self.build_pending_reconnect(core, &cfg, role, grace, original_turn_alarm_epoch_ms)?;
+        let pending = self.build_pending_reconnect(core, &cfg, role, grace)?;
         Ok(Some(pending))
     }
 
@@ -3647,7 +3597,7 @@ impl GameRoom {
 
         // token / handle / color / grace の全照合が通った再接続だけを補償対象にする。
         // LOGIN OK より先に永続化し、補償保存失敗時は成功応答を返さない。
-        let granted_credit_ms = self.compensate_reconnect_clock_if_needed(role, now_ms).await?;
+        self.compensate_reconnect_clock_if_needed(role, now_ms).await?;
 
         // 成功確定。LOGIN OK → resume 送出 → attachment を Player に差し替え →
         // grace registry / alarm tag を片付ける順で進める。
@@ -3669,32 +3619,26 @@ impl GameRoom {
 
         self.delete_grace_alarm_state().await?;
         // 再接続クライアントが指し手を送らず放置しても確実に turn deadline が
-        // 発火するよう、即時 alarm を貼り直す。決定方針:
-        // - 候補 A: 切断時に取り置いた元 turn alarm の発火時刻 + 今回付与した補償
-        // - 候補 B: 再接続処理完了時刻 + (補償反映後の実残時間 + 通信マージン +
-        //   安全側ゲタ)
-        // のうち**早い方**を採用する。A へ加えるのは今回の bounded credit だけで、
-        // off-turn は 0、on-turn も同一手番累積で秒読み 1 回分が上限となる。
+        // 発火するよう、即時 alarm を貼り直す。deadline は以前の alarm へ今回の
+        // 差分を足すのでなく、固定の手番開始時刻 + 現在予算 + 永続化済み累積
+        // credit + 通信マージン + safety から絶対時刻として再構成する。これにより
+        // credit 保存と alarm 更新の間で isolate が失われても、次の cold rejoin が
+        // 復元済み credit を反映できる。off-turn は credit を付与しないため延長なし。
         let now = self.now_ms();
-        let candidate_b_total_ms = {
+        let turn_alarm_epoch_ms = {
             let core_borrow = self.core.borrow();
-            core_borrow.as_ref().map(|core| {
-                let remaining = core.current_turn_remaining_ms(now).unwrap_or(0);
+            core_borrow.as_ref().and_then(|core| {
                 let margin = self
                     .config
                     .borrow()
                     .as_ref()
                     .map(|c| c.time_margin_ms)
                     .unwrap_or(DEFAULT_TIME_MARGIN_MS);
-                remaining.saturating_add(margin).saturating_add(ALARM_SAFETY_MS)
+                core.current_turn_deadline_ms()
+                    .map(|deadline| deadline.saturating_add(margin).saturating_add(ALARM_SAFETY_MS))
             })
         };
-        if let Some(total_b) = candidate_b_total_ms {
-            let candidate_b_epoch = now.saturating_add(total_b);
-            let final_epoch = pending
-                .original_turn_alarm_epoch_ms
-                .map(|orig| orig.saturating_add(granted_credit_ms).min(candidate_b_epoch))
-                .unwrap_or(candidate_b_epoch);
+        if let Some(final_epoch) = turn_alarm_epoch_ms {
             // `set_alarm(Duration)` は「now から N ms 後」に発火する API なので
             // delay = final_epoch - now で渡す。`saturating_sub` は now が final_epoch
             // を既に過ぎている場合に 0 を返し、即時発火させて time_up に進める。
