@@ -141,6 +141,20 @@ live_jsonl = false # 対局中に JSONL を手単位で live 追記（下記）
 進行中対局（勝敗不明）として扱う。終局時は従来どおりの完全な内容（result 行込み）へ
 置き換わる。追記の失敗は警告のみで対局は続行する。`save_jsonl = false` なら効果なし。
 
+#### 再接続時の棋譜継続
+
+対局中の切断から `Reconnect_Token` で復帰した場合、`csa_client` は切断前にメモリへ
+蓄積した指し手を対局開始局面から replay し、再送された `Game_Summary` の現在局面
+（盤面・持ち駒・手番）および `Reconnect_State` の `Current_Turn` と照合する。
+一致すれば開始時刻と既存の指し手・探索情報を
+引き継ぎ、再接続を挟んでも `.csa` / `.sfen` / `.jsonl` を 1 局 1 ファイルの通し記録
+として保存する。ファイル名の `{datetime}` も最初の対局開始時刻のまま変わらない。
+
+局面または game ID・対局者・自手番が一致しない場合は `[REC] resume 局面不一致` の
+警告を出し、resume 局面以降だけを断片として保存する。この場合は全形式のファイル名に
+`_reconnect_fragment` が付き、CSA には `RECONNECT_FRAGMENT` コメントと不一致理由も
+記録される。
+
 ## 使い方の例
 
 ### floodgate で連続対局
@@ -374,5 +388,6 @@ floodgate = true
 ### 棋譜ファイル
 
 `records/` ディレクトリに対局ごとに保存:
+
 - `20260328_120030_rshogi_v1_vs_opponent.csa` — CSA形式（評価値コメント付き）
 - `20260328_120030_rshogi_v1_vs_opponent.sfen` — SFEN局面列（タブ区切り: SFEN, 指し手, 評価値）
