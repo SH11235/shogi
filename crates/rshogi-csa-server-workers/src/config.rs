@@ -127,6 +127,9 @@ impl ConfigKeys {
     /// 等から導出する global clock を全 `game_name` に適用する後方互換動作にとどまる。
     /// 1 件以上登録された場合は strict mode となり、未登録 `game_name` の LOGIN は
     /// `LOGIN_LOBBY:incorrect unknown_game_name` で拒否される。
+    ///
+    /// 各 entry は時計仕様に加えて省略可能な `max_moves` (手数上限、到達で
+    /// `%MAX_MOVES` 引き分け) を持てる。省略時は `DEFAULT_MAX_MOVES` (256)。
     pub const CLOCK_PRESETS: &'static str = "CLOCK_PRESETS";
     /// 管理 API トークン (Floodgate audit https://github.com/SH11235/rshogi/issues/560
     /// 由来)。WS 内 admin command (`%%ADMIN <token>`,
@@ -485,7 +488,16 @@ pub fn parse_clock_spec(
     }
 }
 
-/// `CLOCK_PRESETS` 環境変数 (JSON 配列文字列) から `game_name → ClockSpec` の
+/// `CLOCK_PRESETS` の 1 entry を解決した結果。時計仕様に加えて、preset 単位の
+/// 対局ルール上書き (現状は `max_moves` のみ) を保持する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GamePreset {
+    pub clock: ClockSpec,
+    /// 手数上限の上書き。`None` は既定 (`game_room` の `DEFAULT_MAX_MOVES`) を使う。
+    pub max_moves: Option<u32>,
+}
+
+/// `CLOCK_PRESETS` 環境変数 (JSON 配列文字列) から `game_name → GamePreset` の
 /// マップを構築する。
 ///
 /// `None` / 空文字 / `[]` は空 HashMap を返す（プリセット未宣言モード）。
@@ -497,9 +509,10 @@ pub fn parse_clock_spec(
 /// - 同一 `game_name` の重複は `Err`。
 /// - `total_time_*` が 0 の preset は `Err`（少なくとも 1 単位以上の本体時間を要求）。
 ///   `byoyomi_*` / `increment_sec` の 0 は sudden death として許容。
+/// - `max_moves` は省略可。指定時は 0 を `Err` (0 手上限は即引き分けで無意味)。
 pub fn parse_clock_presets(
     raw: Option<&str>,
-) -> Result<std::collections::HashMap<String, ClockSpec>, String> {
+) -> Result<std::collections::HashMap<String, GamePreset>, String> {
     use serde::Deserialize;
     let trimmed = raw.unwrap_or("").trim();
     if trimmed.is_empty() {
@@ -508,29 +521,43 @@ pub fn parse_clock_presets(
     #[derive(Deserialize)]
     struct Entry {
         game_name: String,
+        #[serde(default)]
+        max_moves: Option<u32>,
         #[serde(flatten)]
         spec: ClockSpec,
     }
     let entries: Vec<Entry> =
         serde_json::from_str(trimmed).map_err(|e| format!("CLOCK_PRESETS: invalid JSON: {e}"))?;
-    let mut out: std::collections::HashMap<String, ClockSpec> =
+    let mut out: std::collections::HashMap<String, GamePreset> =
         std::collections::HashMap::with_capacity(entries.len());
     for entry in entries {
         entry.spec.validate_total_time_nonzero().map_err(|field| {
             format!("CLOCK_PRESETS: clock preset {:?}: {field} must be > 0", entry.game_name)
         })?;
+        if entry.max_moves == Some(0) {
+            return Err(format!(
+                "CLOCK_PRESETS: clock preset {:?}: max_moves must be > 0",
+                entry.game_name
+            ));
+        }
         if out.contains_key(&entry.game_name) {
             return Err(format!(
                 "CLOCK_PRESETS: duplicate clock preset entry for game_name {:?}",
                 entry.game_name
             ));
         }
-        out.insert(entry.game_name, entry.spec);
+        out.insert(
+            entry.game_name,
+            GamePreset {
+                clock: entry.spec,
+                max_moves: entry.max_moves,
+            },
+        );
     }
     Ok(out)
 }
 
-/// `resolve_clock_spec_from_presets_map` の戻り値。
+/// `resolve_game_preset_from_presets_map` の戻り値。
 /// `parse_clock_presets` の結果から `game_name` の解決結果を 3 状態で表現する。
 #[derive(Debug, PartialEq, Eq)]
 pub enum PresetResolution {
@@ -538,22 +565,22 @@ pub enum PresetResolution {
     /// （後方互換モード）。
     Fallback,
     /// 該当 `game_name` の preset を返す。
-    Hit(ClockSpec),
+    Hit(GamePreset),
     /// presets 宣言済みかつ未登録 → strict mode で `Err` 化されるべき。
     Unknown,
 }
 
 /// `parse_clock_presets` で得たマップと `game_name` から `PresetResolution` を返す
 /// 純粋ロジック部。env-fetch を持たないため、host target テストから直接呼べる。
-pub fn resolve_clock_spec_from_presets_map(
-    presets: &std::collections::HashMap<String, ClockSpec>,
+pub fn resolve_game_preset_from_presets_map(
+    presets: &std::collections::HashMap<String, GamePreset>,
     game_name: &str,
 ) -> PresetResolution {
     if presets.is_empty() {
         return PresetResolution::Fallback;
     }
     match presets.get(game_name) {
-        Some(spec) => PresetResolution::Hit(spec.clone()),
+        Some(preset) => PresetResolution::Hit(preset.clone()),
         None => PresetResolution::Unknown,
     }
 }
@@ -901,18 +928,47 @@ mod tests {
         assert_eq!(map.len(), 3);
         assert!(matches!(
             map.get("byoyomi-600-10"),
-            Some(ClockSpec::Countdown {
-                total_time_sec: 600,
-                byoyomi_sec: 10
+            Some(GamePreset {
+                clock: ClockSpec::Countdown {
+                    total_time_sec: 600,
+                    byoyomi_sec: 10
+                },
+                max_moves: None
             })
         ));
         assert!(matches!(
             map.get("fischer-300-10F"),
-            Some(ClockSpec::Fischer {
-                total_time_sec: 300,
-                increment_sec: 10
+            Some(GamePreset {
+                clock: ClockSpec::Fischer {
+                    total_time_sec: 300,
+                    increment_sec: 10
+                },
+                max_moves: None
             })
         ));
+    }
+
+    /// `max_moves` は省略可能な per-preset 上書き。指定した preset のみ値を持ち、
+    /// 0 は拒否する。
+    #[test]
+    fn parse_clock_presets_accepts_optional_max_moves() {
+        let raw = r#"[
+            {"game_name":"floodgate-600-10-moves512","kind":"countdown","total_time_sec":600,"byoyomi_sec":10,"max_moves":512},
+            {"game_name":"floodgate-600-10","kind":"countdown","total_time_sec":600,"byoyomi_sec":10}
+        ]"#;
+        let map = parse_clock_presets(Some(raw)).unwrap();
+        assert_eq!(map.get("floodgate-600-10-moves512").unwrap().max_moves, Some(512));
+        assert_eq!(map.get("floodgate-600-10").unwrap().max_moves, None);
+    }
+
+    #[test]
+    fn parse_clock_presets_rejects_zero_max_moves() {
+        let raw = r#"[
+            {"game_name":"broken","kind":"countdown","total_time_sec":600,"byoyomi_sec":10,"max_moves":0}
+        ]"#;
+        let err = parse_clock_presets(Some(raw)).unwrap_err();
+        assert!(err.contains("max_moves"), "error must mention field: {err}");
+        assert!(err.contains("broken"), "error must mention game_name: {err}");
     }
 
     #[test]
@@ -961,10 +1017,10 @@ mod tests {
     /// global clock 解決を委ねる。
     #[test]
     fn resolve_returns_fallback_when_presets_empty() {
-        let presets: std::collections::HashMap<String, ClockSpec> =
+        let presets: std::collections::HashMap<String, GamePreset> =
             std::collections::HashMap::new();
         assert_eq!(
-            resolve_clock_spec_from_presets_map(&presets, "anything"),
+            resolve_game_preset_from_presets_map(&presets, "anything"),
             PresetResolution::Fallback
         );
     }
@@ -975,16 +1031,22 @@ mod tests {
         let mut presets = std::collections::HashMap::new();
         presets.insert(
             "byoyomi-600-10".to_owned(),
-            ClockSpec::Countdown {
-                total_time_sec: 600,
-                byoyomi_sec: 10,
+            GamePreset {
+                clock: ClockSpec::Countdown {
+                    total_time_sec: 600,
+                    byoyomi_sec: 10,
+                },
+                max_moves: None,
             },
         );
         assert_eq!(
-            resolve_clock_spec_from_presets_map(&presets, "byoyomi-600-10"),
-            PresetResolution::Hit(ClockSpec::Countdown {
-                total_time_sec: 600,
-                byoyomi_sec: 10
+            resolve_game_preset_from_presets_map(&presets, "byoyomi-600-10"),
+            PresetResolution::Hit(GamePreset {
+                clock: ClockSpec::Countdown {
+                    total_time_sec: 600,
+                    byoyomi_sec: 10
+                },
+                max_moves: None
             })
         );
     }
@@ -996,13 +1058,16 @@ mod tests {
         let mut presets = std::collections::HashMap::new();
         presets.insert(
             "byoyomi-600-10".to_owned(),
-            ClockSpec::Countdown {
-                total_time_sec: 600,
-                byoyomi_sec: 10,
+            GamePreset {
+                clock: ClockSpec::Countdown {
+                    total_time_sec: 600,
+                    byoyomi_sec: 10,
+                },
+                max_moves: None,
             },
         );
         assert_eq!(
-            resolve_clock_spec_from_presets_map(&presets, "unregistered"),
+            resolve_game_preset_from_presets_map(&presets, "unregistered"),
             PresetResolution::Unknown
         );
     }
