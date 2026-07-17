@@ -787,8 +787,8 @@ impl GameRoom {
         // Lobby 側の OnceCell キャッシュ廃止後は両 DO ともに env を毎回読み直す
         // ため deploy race による乖離は解消されたが、`CLOCK_PRESETS` 不正設定時の
         // fail-fast 経路は残す)。
-        let clock_spec = match resolve_clock_spec_for_game(&self.env, game_name) {
-            Ok(spec) => spec,
+        let preset = match resolve_game_preset_for_game(&self.env, game_name) {
+            Ok(preset) => preset,
             Err(e) => {
                 crate::structured_log!(
                     event: "clock_spec_resolution_failed",
@@ -873,13 +873,14 @@ impl GameRoom {
         // で参照するために `PersistedConfig` に保存する。`grace == 0` の構成では
         // `(None, None)` を返し token 配布も `PersistedConfig` への保存もスキップする。
         let (black_reconnect_token, white_reconnect_token) = issue_tokens_if_enabled(grace);
+        let clock_spec = preset.clock;
         let cfg = PersistedConfig {
             game_id: game_id.clone(),
             black_handle: black_handle.to_owned(),
             white_handle: white_handle.to_owned(),
             game_name: game_name.to_owned(),
             clock: clock_spec.clone(),
-            max_moves: DEFAULT_MAX_MOVES,
+            max_moves: preset.max_moves.unwrap_or(DEFAULT_MAX_MOVES),
             time_margin_ms: DEFAULT_TIME_MARGIN_MS,
             matched_at_ms: started,
             play_started_at_ms: None,
@@ -3699,13 +3700,16 @@ fn load_clock_spec_from_env(env: &Env) -> Result<ClockSpec> {
 /// 発生していたため、両 DO とも env を毎回読み直す方針に統一した。GameRoom DO は
 /// 1 対局 = 1 インスタンスで `start_match` のたった 1 回しか評価しないため
 /// もともと re-parse コストは問題にならない。
-fn resolve_clock_spec_for_game(env: &Env, game_name: &str) -> Result<ClockSpec> {
-    use crate::config::{PresetResolution, resolve_clock_spec_from_presets_map};
+fn resolve_game_preset_for_game(env: &Env, game_name: &str) -> Result<crate::config::GamePreset> {
+    use crate::config::{GamePreset, PresetResolution, resolve_game_preset_from_presets_map};
     let raw = env.var(ConfigKeys::CLOCK_PRESETS).ok().map(|v| v.to_string());
     let presets = parse_clock_presets(raw.as_deref()).map_err(Error::RustError)?;
-    match resolve_clock_spec_from_presets_map(&presets, game_name) {
-        PresetResolution::Fallback => load_clock_spec_from_env(env),
-        PresetResolution::Hit(spec) => Ok(spec),
+    match resolve_game_preset_from_presets_map(&presets, game_name) {
+        PresetResolution::Fallback => Ok(GamePreset {
+            clock: load_clock_spec_from_env(env)?,
+            max_moves: None,
+        }),
+        PresetResolution::Hit(preset) => Ok(preset),
         PresetResolution::Unknown => Err(Error::RustError(format!(
             "CLOCK_PRESETS: unknown game_name {game_name:?}; configure preset or remove strict mode"
         ))),

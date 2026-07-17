@@ -340,7 +340,7 @@ impl Lobby {
     /// ブロックされる事態を避ける安全側挙動。`CLOCK_PRESETS` 値そのものは
     /// `parse_clock_presets` の起動時テストでカバーする）。
     /// 空 HashMap = preset 未宣言 = strict mode 無効。
-    fn clock_presets(&self) -> HashMap<String, ClockSpec> {
+    fn clock_presets(&self) -> HashMap<String, crate::config::GamePreset> {
         let raw = self.env.var(ConfigKeys::CLOCK_PRESETS).ok().map(|v| v.to_string());
         match parse_clock_presets(raw.as_deref()) {
             Ok(map) => map,
@@ -938,7 +938,7 @@ impl Lobby {
         //    `unknown_clock_preset` で拒否する (TCP 側は `state.config.clock_presets`
         //    が同じく必須で、未登録は拒否される)。
         let presets = self.clock_presets();
-        let Some(clock_spec) = presets.get(&req.clock_preset).cloned() else {
+        let Some(preset) = presets.get(&req.clock_preset).cloned() else {
             // 早期 return でも、purge した reg は永続化する (取りこぼし回避)。
             if purged {
                 self.save_challenge_registry(&reg).await?;
@@ -967,7 +967,7 @@ impl Lobby {
             PlayerName::new(&req.inviter),
             PlayerName::new(&req.opponent),
             req.inviter_color,
-            clock_spec,
+            preset.clock,
             req.initial_sfen.clone(),
             ttl,
             now_ms,
