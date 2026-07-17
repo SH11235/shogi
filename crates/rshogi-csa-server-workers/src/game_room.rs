@@ -93,8 +93,9 @@ use crate::spectator_control::{
     MonitorDecision, resolve_monitor_target, resolve_monitor_target_with_finished,
 };
 use crate::spectator_snapshot::{
-    SpectatorClocks, SpectatorSnapshotInput, build_spectator_snapshot, initial_spectator_clocks,
-    is_move_broadcast, move_elapsed_secs, move_rows_from_exported_csa, parse_move_row_line,
+    SpectatorClocks, SpectatorSnapshotInput, build_spectator_clock_update,
+    build_spectator_snapshot, initial_spectator_clocks, is_move_broadcast, move_elapsed_secs,
+    move_rows_from_exported_csa, parse_move_row_line,
 };
 use crate::ws_route::{WsRoute, parse_ws_route};
 use crate::x1_paths::{
@@ -1827,7 +1828,26 @@ impl GameRoom {
     }
 
     /// HandleResult の broadcasts を宛先色に応じて ws に送出する。
+    ///
+    /// 指し手を観戦者へ送った直後には、CoreRoom が保持する ms 粒度の権威時計を
+    /// `##[CLOCK]` 行として観戦者だけへ追加送信する。対局者向け CSA wire は変更せず、
+    /// 旧観戦 client は未知の control 行を無視できる。clock payload の ply は指し手と
+    /// 揃える一方、pending queue 上は `None` として snapshot 後に必ず flush する。
+    /// snapshot が新しい指し手を取り込んでも、その直前に採取した古い snapshot 時計を
+    /// 毎手 clock で上書きできるようにするためである。
     async fn dispatch_broadcasts(&self, entries: &[BroadcastEntry]) -> Result<()> {
+        // borrow を await の外で完結させる。1 回の HandleResult に盤面を進める指し手は
+        // 高々 1 件なので、post-move の clock snapshot を全 move entry で共有できる。
+        let spectator_clocks = if entries.iter().any(is_move_broadcast) {
+            self.core.borrow().as_ref().map(|core| SpectatorClocks {
+                black_remaining_ms: core.clock_remaining_main_ms(Color::Black).max(0) as u64,
+                white_remaining_ms: core.clock_remaining_main_ms(Color::White).max(0) as u64,
+                side_to_move: core.current_turn(),
+            })
+        } else {
+            None
+        };
+
         for entry in entries {
             match entry.target {
                 BroadcastTarget::Black => {
@@ -1846,6 +1866,14 @@ impl GameRoom {
             }
             if matches!(entry.target, BroadcastTarget::All) {
                 self.send_to_spectators(entry.line.as_str(), entry.ply).await?;
+            }
+            if is_move_broadcast(entry)
+                && let (Some(clocks), Some(ply)) = (spectator_clocks.as_ref(), entry.ply)
+            {
+                let clock_line = build_spectator_clock_update(clocks, ply);
+                // payload の ply は client 側の position binding に使う。queue の ply は
+                // move 重複排除専用なので、clock は None として必ず flush する。
+                self.send_to_spectators(&clock_line, None).await?;
             }
         }
         Ok(())

@@ -47,6 +47,28 @@ pub struct SpectatorClocks {
     pub side_to_move: Color,
 }
 
+/// 1 手受理後に観戦者へ送る権威時計の wire 行を組み立てる。
+///
+/// 指し手の `<token>,T<sec>` 行だけでは、観戦 client が秒単位へ丸められた消費時間と
+/// clock 種別から残時間を再計算する必要がある。サーバーが保持する ms 粒度の本体残時間を
+/// 指し手直後に送ることで、client は表示用 countdown の anchor を毎手再同期できる。
+///
+/// `ply` は直前の指し手と同じ値を入れ、client が現在盤面と結び付ける。snapshot 送信中の
+/// pending queue では clock 行を non-move として必ず flush する。これにより snapshot の
+/// moves 読み込みと clock 採取が競合しても、最後の毎手 clock が古い snapshot clock を
+/// 上書きできる。JSON payload は旧 client が未知の `##[CLOCK]` 行を安全に無視できる追加
+/// wire である。
+pub(crate) fn build_spectator_clock_update(clocks: &SpectatorClocks, ply: u32) -> String {
+    let side_to_move = match clocks.side_to_move {
+        Color::Black => "sente",
+        Color::White => "gote",
+    };
+    format!(
+        "##[CLOCK] {{\"black_remaining_ms\":{},\"white_remaining_ms\":{},\"side_to_move\":\"{side_to_move}\",\"ply\":{ply}}}",
+        clocks.black_remaining_ms, clocks.white_remaining_ms
+    )
+}
+
 /// core を復元できない終局済み DO でも Game_Summary を返すための時計 fallback。
 pub(crate) fn initial_spectator_clocks(config: &PersistedConfig) -> SpectatorClocks {
     let clock = config.clock.build_clock();
@@ -652,5 +674,19 @@ PI
             ply: None,
         };
         assert!(!is_move_broadcast(&no_ply));
+    }
+
+    #[test]
+    fn spectator_clock_update_is_structured_and_ply_bound() {
+        let clocks = SpectatorClocks {
+            black_remaining_ms: 445_123,
+            white_remaining_ms: 405_987,
+            side_to_move: Color::White,
+        };
+
+        assert_eq!(
+            build_spectator_clock_update(&clocks, 48),
+            "##[CLOCK] {\"black_remaining_ms\":445123,\"white_remaining_ms\":405987,\"side_to_move\":\"gote\",\"ply\":48}"
+        );
     }
 }
