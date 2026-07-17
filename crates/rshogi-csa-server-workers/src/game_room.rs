@@ -95,7 +95,7 @@ use crate::spectator_control::{
 use crate::spectator_snapshot::{
     SpectatorClocks, SpectatorSnapshotInput, build_spectator_clock_update,
     build_spectator_snapshot, initial_spectator_clocks, is_move_broadcast, move_elapsed_secs,
-    move_rows_from_exported_csa, parse_move_row_line,
+    move_rows_from_exported_csa, parse_move_row_line, spectator_clock_insert_after,
 };
 use crate::ws_route::{WsRoute, parse_ws_route};
 use crate::x1_paths::{
@@ -1848,7 +1848,8 @@ impl GameRoom {
             None
         };
 
-        for entry in entries {
+        let clock_insert = spectator_clock_insert_after(entries);
+        for (index, entry) in entries.iter().enumerate() {
             match entry.target {
                 BroadcastTarget::Black => {
                     self.send_to_role(Role::Black, entry.line.as_str()).await?;
@@ -1867,8 +1868,9 @@ impl GameRoom {
             if matches!(entry.target, BroadcastTarget::All) {
                 self.send_to_spectators(entry.line.as_str(), entry.ply).await?;
             }
-            if is_move_broadcast(entry)
-                && let (Some(clocks), Some(ply)) = (spectator_clocks.as_ref(), entry.ply)
+            if let (Some(clocks), Some((insert_after, ply))) =
+                (spectator_clocks.as_ref(), clock_insert)
+                && index == insert_after
             {
                 let clock_line = build_spectator_clock_update(clocks, ply);
                 // payload の ply は client 側の position binding に使う。queue の ply は
