@@ -96,7 +96,7 @@ pub use protocol::{
 };
 pub use record::{GameRecord, RecordStatus, RecordedMove};
 pub use session::{
-    run_game_session, run_game_session_with_events, run_resumed_session,
+    RecordedSessionOutcome, run_game_session, run_game_session_with_events, run_resumed_session,
     run_resumed_session_with_events, run_resumed_session_with_record,
 };
 pub use transport::{ConnectOpts, CsaTransport, TransportTarget};

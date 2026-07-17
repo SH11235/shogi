@@ -30,8 +30,6 @@ pub struct GameRecord {
     /// 各要素は `moves[i]` に対応する。投了 / 勝ち宣言など `apply_csa_move` を経由しない
     /// 手は含まれず、ply ベースで一致する。
     pub jsonl_moves: Vec<JsonlMoveExtra>,
-    /// 通常の通し棋譜か、再接続時の局面不一致により作成した断片か。
-    pub status: RecordStatus,
 }
 
 /// 棋譜が対局全体を表すか、再接続後だけの断片かを示す。
@@ -57,6 +55,7 @@ pub(crate) enum ResumeRecordDecision {
     /// 局面または対局 identity が一致しないため、resume 局面から断片記録を始める。
     Fragment {
         record: Box<GameRecord>,
+        retained_record: Box<GameRecord>,
         reason: String,
     },
 }
@@ -131,7 +130,6 @@ impl GameRecord {
             start_time: Local::now(),
             my_color: summary.my_color,
             jsonl_moves: Vec::new(),
-            status: RecordStatus::Complete,
         }
     }
 
@@ -148,11 +146,14 @@ impl GameRecord {
     ) -> ResumeRecordDecision {
         let mismatch = |reason: String| {
             let mut record = GameRecord::new(summary);
-            record.status = RecordStatus::ReconnectFragment {
-                reason: reason.clone(),
-            };
+            // fallback でも対局開始時刻は維持する。ファイル名と $START_TIME が
+            // 再接続時刻へ巻き戻ると、元の欠損バグと同じ誤認を招くため。
+            record.start_time = self.start_time;
             ResumeRecordDecision::Fragment {
                 record: Box::new(record),
+                // live JSONL が有効だった場合、切断前の通常名ファイルを削除するため
+                // 元 record も返す（不一致時だけの clone）。
+                retained_record: Box::new(self.clone()),
                 reason,
             }
         };
@@ -239,14 +240,6 @@ impl GameRecord {
         }
     }
 
-    /// 断片棋譜なら、全形式のファイル名に付ける suffix を返す。
-    pub fn filename_suffix(&self) -> &'static str {
-        match &self.status {
-            RecordStatus::Complete => "",
-            RecordStatus::ReconnectFragment { .. } => "_reconnect_fragment",
-        }
-    }
-
     /// JSONL 出力モード向けの追加情報を 1 手分蓄積する。
     /// CSA 棋譜・SFEN 出力にはこのバッファは使われない。
     pub fn add_jsonl_move(&mut self, extra: JsonlMoveExtra) {
@@ -288,9 +281,14 @@ impl GameRecord {
 
     /// CSA形式の棋譜テキストを生成する
     pub fn to_csa(&self) -> String {
+        self.to_csa_with_status(&RecordStatus::Complete)
+    }
+
+    /// record の種別を明示して CSA 形式の棋譜テキストを生成する。
+    pub fn to_csa_with_status(&self, status: &RecordStatus) -> String {
         let mut out = String::new();
         writeln!(out, "V2.2").unwrap();
-        if let RecordStatus::ReconnectFragment { reason } = &self.status {
+        if let RecordStatus::ReconnectFragment { reason } = status {
             writeln!(out, "'RECONNECT_FRAGMENT: {reason}").unwrap();
         }
         writeln!(out, "N+{}", self.sente_name).unwrap();
@@ -389,6 +387,15 @@ impl GameRecord {
 
 /// 棋譜をファイルに保存する
 pub fn save_record(record: &GameRecord, config: &RecordConfig) -> Result<()> {
+    save_record_with_status(record, config, &RecordStatus::Complete)
+}
+
+/// 棋譜種別を明示してファイルへ保存する。
+pub fn save_record_with_status(
+    record: &GameRecord,
+    config: &RecordConfig,
+    status: &RecordStatus,
+) -> Result<()> {
     if !config.enabled {
         return Ok(());
     }
@@ -402,11 +409,11 @@ pub fn save_record(record: &GameRecord, config: &RecordConfig) -> Result<()> {
         .replace("{game_id}", &record.game_id)
         .replace("{sente}", &sanitize_filename(&record.sente_name))
         .replace("{gote}", &sanitize_filename(&record.gote_name));
-    filename_base.push_str(record.filename_suffix());
+    filename_base.push_str(status.filename_suffix());
 
     if config.save_csa {
         let path = config.dir.join(format!("{filename_base}.csa"));
-        std::fs::write(&path, record.to_csa())?;
+        std::fs::write(&path, record.to_csa_with_status(status))?;
         log::info!("[REC] 棋譜保存: {}", path.display());
     }
 
@@ -420,6 +427,16 @@ pub fn save_record(record: &GameRecord, config: &RecordConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+impl RecordStatus {
+    /// 断片棋譜なら、全形式のファイル名に付ける suffix を返す。
+    pub fn filename_suffix(&self) -> &'static str {
+        match self {
+            Self::Complete => "",
+            Self::ReconnectFragment { .. } => "_reconnect_fragment",
+        }
+    }
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -512,7 +529,6 @@ mod tests {
         assert_eq!(record.start_time, started_at);
         assert_eq!(record.moves.len(), 2);
         assert_eq!(record.jsonl_moves.len(), 2);
-        assert_eq!(record.status, RecordStatus::Complete);
         assert_eq!(position.to_sfen(), current.to_sfen());
         assert_eq!(usi_moves, ["2g2f", "8c8d"]);
     }
@@ -521,18 +537,26 @@ mod tests {
     fn resume_falls_back_to_marked_fragment_when_position_mismatches() {
         let initial = rshogi_csa::initial_position();
         let mut retained = GameRecord::new(&summary(initial.clone()));
+        let started_at = retained.start_time;
         retained.add_move("+2726FU", 1, None, Color::Black);
 
         let decision = retained.continue_for_resume(&summary(initial), Some(Color::Black));
-        let ResumeRecordDecision::Fragment { record, reason } = decision else {
+        let ResumeRecordDecision::Fragment {
+            record,
+            retained_record,
+            reason,
+        } = decision
+        else {
             panic!("不一致局面が通し棋譜として継続されました");
         };
 
         assert!(reason.contains("局面不一致"), "reason={reason}");
         assert!(record.moves.is_empty());
-        assert_eq!(record.filename_suffix(), "_reconnect_fragment");
-        assert!(matches!(record.status, RecordStatus::ReconnectFragment { .. }));
-        let csa = record.to_csa();
+        assert_eq!(record.start_time, started_at);
+        assert_eq!(retained_record.moves.len(), 1);
+        let status = RecordStatus::ReconnectFragment { reason };
+        assert_eq!(status.filename_suffix(), "_reconnect_fragment");
+        let csa = record.to_csa_with_status(&status);
         assert!(
             csa.lines().nth(1).is_some_and(|line| line.starts_with("'RECONNECT_FRAGMENT:")),
             "CSA 先頭に断片コメントがありません:\n{csa}"

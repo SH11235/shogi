@@ -27,7 +27,7 @@ use serde::Serialize;
 
 use crate::config::CsaClientConfig;
 use crate::protocol::GameResult;
-use crate::record::{GameRecord, JsonlMoveExtra, RecordedMove};
+use crate::record::{GameRecord, JsonlMoveExtra, RecordStatus, RecordedMove};
 
 /// CSA 経由対局で 1 局分の JSONL を書き出す。
 ///
@@ -39,11 +39,22 @@ pub fn write_game_jsonl(
     config: &CsaClientConfig,
     result: &GameResult,
 ) -> Result<PathBuf> {
+    write_game_jsonl_with_status(out_dir, record, config, result, &RecordStatus::Complete)
+}
+
+/// 棋譜種別を明示して CSA 経由対局の JSONL を書き出す。
+pub fn write_game_jsonl_with_status(
+    out_dir: &Path,
+    record: &GameRecord,
+    config: &CsaClientConfig,
+    result: &GameResult,
+    status: &RecordStatus,
+) -> Result<PathBuf> {
     fs::create_dir_all(out_dir).with_context(|| {
         format!("JSONL 出力ディレクトリを作成できません: {}", out_dir.display())
     })?;
 
-    let path = out_dir.join(jsonl_filename(record));
+    let path = out_dir.join(jsonl_filename(record, status));
     // live 追記 (`LiveJsonlWriter`) 有効時は同じパスを読者 (kifu_player --live 等) が
     // 開いていることがあるため、truncate 書き込みでなく tmp→rename で置き換え、
     // 読者が常に完全な内容だけを見るようにする。
@@ -102,10 +113,20 @@ impl LiveJsonlWriter {
     /// 対局開始時 (Game_Summary 確定後) に作る。record が既に持つ手 (途中局面開始・
     /// resume 済みの手) もすべて書き出してから追記を続ける。
     pub fn create(out_dir: &Path, record: &GameRecord, config: &CsaClientConfig) -> Result<Self> {
+        Self::create_with_status(out_dir, record, config, &RecordStatus::Complete)
+    }
+
+    /// 棋譜種別を明示して live JSONL を作る。
+    pub fn create_with_status(
+        out_dir: &Path,
+        record: &GameRecord,
+        config: &CsaClientConfig,
+        status: &RecordStatus,
+    ) -> Result<Self> {
         fs::create_dir_all(out_dir).with_context(|| {
             format!("JSONL 出力ディレクトリを作成できません: {}", out_dir.display())
         })?;
-        let path = out_dir.join(jsonl_filename(record));
+        let path = out_dir.join(jsonl_filename(record, status));
         let file = File::create(&path)
             .with_context(|| format!("live JSONL を作成できません: {}", path.display()))?;
         let mut writer = BufWriter::new(file);
@@ -135,11 +156,25 @@ impl LiveJsonlWriter {
 }
 
 /// `<datetime>_<sente>_vs_<gote>.jsonl` 形式のファイル名を生成する。
-fn jsonl_filename(record: &GameRecord) -> String {
+fn jsonl_filename(record: &GameRecord, status: &RecordStatus) -> String {
     let datetime = record.start_time.format("%Y%m%d_%H%M%S").to_string();
     let sente = sanitize_for_filename(&record.sente_name);
     let gote = sanitize_for_filename(&record.gote_name);
-    format!("{datetime}_{sente}_vs_{gote}{}.jsonl", record.filename_suffix())
+    format!("{datetime}_{sente}_vs_{gote}{}.jsonl", status.filename_suffix())
+}
+
+/// 切断前に作った通常名 live JSONL を削除する。
+///
+/// 局面不一致 fallback では以後 `_reconnect_fragment.jsonl` へ記録するため、通常名の
+/// 未完ファイルを残すと集計側が別対局として拾ってしまう。存在しない場合は成功扱い。
+pub(crate) fn remove_complete_live_jsonl(out_dir: &Path, record: &GameRecord) -> Result<()> {
+    let path = out_dir.join(jsonl_filename(record, &RecordStatus::Complete));
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err)
+            .with_context(|| format!("切断前 live JSONL を削除できません: {}", path.display())),
+    }
 }
 
 /// ファイル名・JSONL `engine` ラベルの名前正規化。英数字と `-` `_` 以外を `_` に置換する
@@ -539,7 +574,7 @@ mod tests {
         let mut record = GameRecord::new(&summary());
 
         let mut live = LiveJsonlWriter::create(&dir, &record, &config).unwrap();
-        let path = dir.join(jsonl_filename(&record));
+        let path = dir.join(jsonl_filename(&record, &RecordStatus::Complete));
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1, "作成直後は meta 行のみ");
         assert!(text.contains("\"type\":\"meta\""));
@@ -606,21 +641,47 @@ mod tests {
         push_move(&mut record, Color::White, "sfen2", "3c3d");
 
         let _live = LiveJsonlWriter::create(&dir, &record, &config).unwrap();
-        let path = dir.join(jsonl_filename(&record));
+        let path = dir.join(jsonl_filename(&record, &RecordStatus::Complete));
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn reconnect_fragment_filename_is_explicit() {
-        let mut record = GameRecord::new(&summary());
-        record.status = RecordStatus::ReconnectFragment {
+        let record = GameRecord::new(&summary());
+        let status = RecordStatus::ReconnectFragment {
             reason: "test mismatch".to_owned(),
         };
         assert!(
-            jsonl_filename(&record).ends_with("_reconnect_fragment.jsonl"),
+            jsonl_filename(&record, &status).ends_with("_reconnect_fragment.jsonl"),
             "filename={}",
-            jsonl_filename(&record)
+            jsonl_filename(&record, &status)
         );
+    }
+
+    #[test]
+    fn fragment_fallback_removes_complete_live_file_only() {
+        let dir = std::env::temp_dir().join("csa_live_jsonl_fragment_cleanup_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = CsaClientConfig::default();
+        let record = GameRecord::new(&summary());
+        let complete = dir.join(jsonl_filename(&record, &RecordStatus::Complete));
+        let fragment_status = RecordStatus::ReconnectFragment {
+            reason: "mismatch".to_owned(),
+        };
+        let fragment = dir.join(jsonl_filename(&record, &fragment_status));
+
+        let _complete_live = LiveJsonlWriter::create(&dir, &record, &config).unwrap();
+        let _fragment_live =
+            LiveJsonlWriter::create_with_status(&dir, &record, &config, &fragment_status).unwrap();
+        assert!(complete.exists());
+        assert!(fragment.exists());
+
+        remove_complete_live_jsonl(&dir, &record).unwrap();
+        assert!(!complete.exists());
+        assert!(fragment.exists());
+        // 2 回目も NotFound を成功扱いにする。
+        remove_complete_live_jsonl(&dir, &record).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

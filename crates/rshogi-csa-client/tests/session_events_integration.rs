@@ -31,6 +31,7 @@ use rshogi_csa_client::events::{
     DisconnectReason, MovePlayer, ReconnectState, SearchInfoEmitPolicy, SessionError,
     SessionEventSink, SessionProgress, SinkError,
 };
+use rshogi_csa_client::jsonl::LiveJsonlWriter;
 use rshogi_csa_client::protocol::{CsaConnection, GameSummary, TimeConfig};
 use rshogi_csa_client::record::{GameRecord, JsonlMoveExtra, RecordStatus};
 use rshogi_csa_client::session::{
@@ -627,13 +628,120 @@ fn resumed_session_keeps_pre_disconnect_record_and_start_time() {
     .expect("resumed session");
     engine.quit();
 
-    assert_eq!(outcome.record.start_time, original_start_time);
-    assert_eq!(outcome.record.moves.len(), 3);
-    assert_eq!(outcome.record.jsonl_moves.len(), 3);
-    assert_eq!(outcome.record.moves[0].csa_move, "+2726FU");
-    assert_eq!(outcome.record.moves[1].csa_move, "-8384FU");
-    assert_eq!(outcome.record.moves[2].csa_move, "+7776FU");
-    assert_eq!(outcome.record.status, RecordStatus::Complete);
+    assert_eq!(outcome.outcome.record.start_time, original_start_time);
+    assert_eq!(outcome.outcome.record.moves.len(), 3);
+    assert_eq!(outcome.outcome.record.jsonl_moves.len(), 3);
+    assert_eq!(outcome.outcome.record.moves[0].csa_move, "+2726FU");
+    assert_eq!(outcome.outcome.record.moves[1].csa_move, "-8384FU");
+    assert_eq!(outcome.outcome.record.moves[2].csa_move, "+7776FU");
+    assert_eq!(outcome.status, RecordStatus::Complete);
+}
+
+#[test]
+fn resumed_session_mismatch_keeps_start_time_and_removes_stale_live_jsonl() {
+    let initial = initial_position();
+    let retained_summary = GameSummary {
+        game_id: "g-resume-fragment".to_owned(),
+        my_color: Color::Black,
+        sente_name: "alice".to_owned(),
+        gote_name: "bob".to_owned(),
+        position: initial.clone(),
+        initial_moves: Vec::new(),
+        black_time: TimeConfig::default(),
+        white_time: TimeConfig::default(),
+        reconnect_token: Some("tok-xyz".to_owned()),
+    };
+    let mut retained = GameRecord::new(&retained_summary);
+    let original_start_time = retained.start_time;
+    retained.add_move("+2726FU", 1, None, Color::Black);
+    retained.add_jsonl_move(JsonlMoveExtra {
+        sfen_before: initial.to_sfen(),
+        move_usi: "2g2f".to_owned(),
+        engine_label: "alice".to_owned(),
+        elapsed_ms: 10,
+        think_limit_ms: 1000,
+        seldepth: None,
+        nodes: None,
+        time_ms: None,
+        nps: None,
+    });
+
+    let port = spawn_mock_tcp_server(|reader, writer| {
+        let _ = read_line(reader);
+        write_lines(writer, &["LOGIN:alice OK"]);
+        let resume_lines = game_summary_lines("g-resume-fragment");
+        let line_refs: Vec<&str> = resume_lines.iter().map(String::as_str).collect();
+        write_lines(writer, &line_refs);
+        write_lines(
+            writer,
+            &[
+                "BEGIN Reconnect_State",
+                "Current_Turn:+",
+                "Black_Time_Remaining_Ms:599500",
+                "White_Time_Remaining_Ms:599000",
+                "END Reconnect_State",
+            ],
+        );
+        let mv = read_line(reader);
+        assert!(mv.starts_with("+7776FU"), "expected +7776FU, got: {mv}");
+        write_lines(writer, &["+7776FU,T1", "#WIN"]);
+        let _ = read_line(reader);
+    });
+
+    let engine_path = mock_usi_engine_script();
+    let mut config = mock_config(engine_path, SearchInfoEmitPolicy::Disabled);
+    let jsonl_dir =
+        tempfile_root().join(format!("csa_resume_fragment_live_jsonl_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&jsonl_dir);
+    config.record.jsonl_out = Some(jsonl_dir.clone());
+    config.record.live_jsonl = true;
+    // 切断前 session が残した通常名 live JSONL を再現する。
+    let stale_writer = LiveJsonlWriter::create(&jsonl_dir, &retained, &config).unwrap();
+    drop(stale_writer);
+    assert_eq!(std::fs::read_dir(&jsonl_dir).unwrap().count(), 1);
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut conn = CsaConnection::connect("127.0.0.1", port, false).expect("connect");
+    conn.login_reconnect("alice", "pw", "g-resume-fragment", "tok-xyz")
+        .expect("login_reconnect");
+    let mut engine = common::spawn_engine(
+        &config.engine.path,
+        &config.engine.options,
+        SpawnOptions {
+            ponder: config.game.ponder,
+            startup_timeout: Duration::from_secs(5),
+            stderr_passthrough: false,
+        },
+    )
+    .expect("spawn engine");
+    let outcome = run_resumed_session_with_record(
+        &mut conn,
+        &mut engine,
+        &config,
+        shutdown.as_ref(),
+        retained,
+    )
+    .expect("resumed session");
+    engine.quit();
+
+    assert_eq!(outcome.outcome.record.start_time, original_start_time);
+    assert_eq!(outcome.outcome.record.moves.len(), 1);
+    let RecordStatus::ReconnectFragment { reason } = &outcome.status else {
+        panic!("局面不一致が fragment 扱いになっていません");
+    };
+    assert!(reason.contains("局面不一致"), "reason={reason}");
+    let paths: Vec<_> = std::fs::read_dir(&jsonl_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(paths.len(), 1, "通常名 live JSONL が残っています: {paths:?}");
+    let filename = paths[0].file_name().unwrap().to_string_lossy();
+    assert!(filename.contains("_reconnect_fragment.jsonl"), "filename={filename}");
+    assert!(
+        filename.starts_with(&original_start_time.format("%Y%m%d_%H%M%S").to_string()),
+        "filename={filename}"
+    );
+    let _ = std::fs::remove_dir_all(&jsonl_dir);
 }
 
 #[test]

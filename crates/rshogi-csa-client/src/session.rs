@@ -34,12 +34,19 @@ use crate::events::{
     SearchInfoSnapshot, SearchOrigin, SessionError, SessionEventSink, SessionOutcome,
     SessionProgress, Side, SinkError,
 };
-use crate::jsonl::LiveJsonlWriter;
+use crate::jsonl::{LiveJsonlWriter, remove_complete_live_jsonl};
 use crate::protocol::{
     CsaConnection, GameResult, GameSummary, ReconnectState as ProtocolReconnectState,
     parse_game_result, parse_server_move,
 };
-use crate::record::{GameRecord, JsonlMoveExtra, ResumeRecordDecision};
+use crate::record::{GameRecord, JsonlMoveExtra, RecordStatus, ResumeRecordDecision};
+
+/// record 引き継ぎ付き resume API の戻り値。
+#[derive(Debug)]
+pub struct RecordedSessionOutcome {
+    pub outcome: SessionOutcome,
+    pub status: RecordStatus,
+}
 
 // ────────────────────────────────────────────
 // 公開エントリポイント
@@ -64,7 +71,17 @@ where
     E: UsiEngineDriver + ?Sized,
     S: SessionEventSink + ?Sized,
 {
-    drive_session(config, conn, engine, shutdown.as_ref(), sink, SessionMode::Fresh, None)
+    let mut status = RecordStatus::Complete;
+    drive_session(
+        config,
+        conn,
+        engine,
+        shutdown.as_ref(),
+        sink,
+        SessionMode::Fresh,
+        None,
+        &mut status,
+    )
 }
 
 /// `LOGIN ... reconnect:<game_id>+<token>` 後の resume セッションを進捗通知付きで
@@ -84,7 +101,17 @@ where
     E: UsiEngineDriver + ?Sized,
     S: SessionEventSink + ?Sized,
 {
-    drive_session(config, conn, engine, shutdown.as_ref(), sink, SessionMode::Resumed, None)
+    let mut status = RecordStatus::Complete;
+    drive_session(
+        config,
+        conn,
+        engine,
+        shutdown.as_ref(),
+        sink,
+        SessionMode::Resumed,
+        None,
+        &mut status,
+    )
 }
 
 /// 進捗通知不要な consumer 向けの薄いラッパー。内部で [`NoopSessionEventSink`] を渡す。
@@ -97,7 +124,8 @@ pub fn run_game_session(
     shutdown: &AtomicBool,
 ) -> Result<SessionOutcome, SessionError> {
     let mut sink = NoopSessionEventSink;
-    drive_session(config, conn, engine, shutdown, &mut sink, SessionMode::Fresh, None)
+    let mut status = RecordStatus::Complete;
+    drive_session(config, conn, engine, shutdown, &mut sink, SessionMode::Fresh, None, &mut status)
 }
 
 /// 進捗通知不要な consumer 向けの薄いラッパー (resume 経路)。
@@ -108,7 +136,17 @@ pub fn run_resumed_session(
     shutdown: &AtomicBool,
 ) -> Result<SessionOutcome, SessionError> {
     let mut sink = NoopSessionEventSink;
-    drive_session(config, conn, engine, shutdown, &mut sink, SessionMode::Resumed, None)
+    let mut status = RecordStatus::Complete;
+    drive_session(
+        config,
+        conn,
+        engine,
+        shutdown,
+        &mut sink,
+        SessionMode::Resumed,
+        None,
+        &mut status,
+    )
 }
 
 /// 進捗通知不要な CLI 等に向けた、切断前 record 引き継ぎ付き resume entry point。
@@ -121,9 +159,10 @@ pub fn run_resumed_session_with_record(
     config: &CsaClientConfig,
     shutdown: &AtomicBool,
     retained_record: GameRecord,
-) -> Result<SessionOutcome, SessionError> {
+) -> Result<RecordedSessionOutcome, SessionError> {
     let mut sink = NoopSessionEventSink;
-    drive_session(
+    let mut status = RecordStatus::Complete;
+    let outcome = drive_session(
         config,
         conn,
         engine,
@@ -131,7 +170,9 @@ pub fn run_resumed_session_with_record(
         &mut sink,
         SessionMode::Resumed,
         Some(retained_record),
-    )
+        &mut status,
+    )?;
+    Ok(RecordedSessionOutcome { outcome, status })
 }
 
 // ────────────────────────────────────────────
@@ -152,6 +193,7 @@ fn drive_session<E, S>(
     sink: &mut S,
     mode: SessionMode,
     retained_record: Option<GameRecord>,
+    record_status: &mut RecordStatus,
 ) -> Result<SessionOutcome, SessionError>
 where
     E: UsiEngineDriver + ?Sized,
@@ -232,6 +274,7 @@ where
         reconnect_state_protocol,
         sink,
         retained_record,
+        record_status,
     );
 
     match loop_result {
@@ -347,6 +390,7 @@ fn run_session_loop<E, S>(
     resume_state: Option<ProtocolReconnectState>,
     sink: &mut S,
     retained_record: Option<GameRecord>,
+    record_status: &mut RecordStatus,
 ) -> LoopOutcome
 where
     E: UsiEngineDriver + ?Sized,
@@ -363,35 +407,54 @@ where
     }
 
     let reconnect_turn = resume_state.as_ref().and_then(|state| state.current_turn);
-    let (record, pos, initial_sfen, usi_moves, apply_summary_initial_moves) = match retained_record
-        .map(|record| record.continue_for_resume(&summary, reconnect_turn))
-    {
-        Some(ResumeRecordDecision::Continued {
-            record,
-            position,
-            usi_moves,
-        }) => {
-            log::info!(
-                "[REC] resume 局面一致。切断前の棋譜を継続: game_id={} retained_moves={}",
-                record.game_id,
-                record.moves.len()
-            );
-            let initial_sfen = record.initial_position.to_sfen();
-            (*record, *position, initial_sfen, usi_moves, false)
-        }
-        Some(ResumeRecordDecision::Fragment { record, reason }) => {
-            log::warn!("[REC] resume 局面不一致。再接続以降を断片棋譜として保存します: {reason}");
-            let pos = summary.position.clone();
-            let initial_sfen = pos.to_sfen();
-            (*record, pos, initial_sfen, Vec::new(), true)
-        }
-        None => {
-            let record = GameRecord::new(&summary);
-            let pos = summary.position.clone();
-            let initial_sfen = pos.to_sfen();
-            (record, pos, initial_sfen, Vec::new(), true)
-        }
-    };
+    let (record, pos, initial_sfen, usi_moves, apply_summary_initial_moves, status) =
+        match retained_record.map(|record| record.continue_for_resume(&summary, reconnect_turn)) {
+            Some(ResumeRecordDecision::Continued {
+                record,
+                position,
+                usi_moves,
+            }) => {
+                log::info!(
+                    "[REC] resume 局面一致。切断前の棋譜を継続: game_id={} retained_moves={}",
+                    record.game_id,
+                    record.moves.len()
+                );
+                let initial_sfen = record.initial_position.to_sfen();
+                (*record, *position, initial_sfen, usi_moves, false, RecordStatus::Complete)
+            }
+            Some(ResumeRecordDecision::Fragment {
+                record,
+                retained_record,
+                reason,
+            }) => {
+                log::warn!(
+                    "[REC] resume 局面不一致。再接続以降を断片棋譜として保存します: {reason}"
+                );
+                if config.record.live_jsonl
+                    && let Some(dir) = config.record.jsonl_dir()
+                    && let Err(err) = remove_complete_live_jsonl(&dir, &retained_record)
+                {
+                    log::warn!("[REC] 切断前 live JSONL の削除に失敗しました: {err:#}");
+                }
+                let pos = summary.position.clone();
+                let initial_sfen = pos.to_sfen();
+                (
+                    *record,
+                    pos,
+                    initial_sfen,
+                    Vec::new(),
+                    true,
+                    RecordStatus::ReconnectFragment { reason },
+                )
+            }
+            None => {
+                let record = GameRecord::new(&summary);
+                let pos = summary.position.clone();
+                let initial_sfen = pos.to_sfen();
+                (record, pos, initial_sfen, Vec::new(), true, RecordStatus::Complete)
+            }
+        };
+    *record_status = status.clone();
 
     let mut s = SessionState {
         pos,
@@ -443,7 +506,7 @@ where
 
     // initial_moves (途中局面開始) や resume 済みの手も含めて書き出すため、
     // 手順の反映が終わってから live ライターを作る。
-    s.live_jsonl = make_live_writer(config, &s.record);
+    s.live_jsonl = make_live_writer(config, &s.record, &status);
 
     loop {
         // 各イテレーション先頭で sink.should_continue() を確認
@@ -1635,12 +1698,16 @@ fn label_for_color(record: &GameRecord, color: Color) -> String {
 
 /// `[record] live_jsonl` 有効時に live ライターを作る。失敗は warn に留めて `None`
 /// (live 追記は補助機能で、対局の進行を妨げない)。`save_jsonl` 無効時も `None`。
-fn make_live_writer(config: &CsaClientConfig, record: &GameRecord) -> Option<LiveJsonlWriter> {
+fn make_live_writer(
+    config: &CsaClientConfig,
+    record: &GameRecord,
+    status: &RecordStatus,
+) -> Option<LiveJsonlWriter> {
     if !config.record.live_jsonl {
         return None;
     }
     let dir = config.record.jsonl_dir()?;
-    match LiveJsonlWriter::create(&dir, record, config) {
+    match LiveJsonlWriter::create_with_status(&dir, record, config, status) {
         Ok(w) => Some(w),
         Err(e) => {
             log::warn!("live JSONL の作成に失敗 (追記なしで続行): {e:#}");

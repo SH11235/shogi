@@ -24,9 +24,9 @@ use clap::{ArgAction, Parser, ValueEnum};
 use rshogi_csa_client::config::CsaClientConfig;
 use rshogi_csa_client::engine::{SpawnOptions, UsiEngine};
 use rshogi_csa_client::events::SessionOutcome;
-use rshogi_csa_client::jsonl::write_game_jsonl;
+use rshogi_csa_client::jsonl::write_game_jsonl_with_status;
 use rshogi_csa_client::protocol::{CsaConnection, GameResult, compute_effective_retry_delay};
-use rshogi_csa_client::record::save_record;
+use rshogi_csa_client::record::{RecordStatus, save_record_with_status};
 use rshogi_csa_client::session::{run_game_session, run_resumed_session_with_record};
 use rshogi_csa_client::transport::{ConnectOpts, TransportTarget};
 
@@ -357,15 +357,21 @@ fn main() -> Result<()> {
         };
 
         match run_one_game(&game_config, &mut engine, &shutdown, games_played) {
-            Ok((result, record)) => {
+            Ok((result, record, record_status)) => {
                 // 棋譜保存
-                if let Err(e) = save_record(&record, &config.record) {
+                if let Err(e) = save_record_with_status(&record, &config.record, &record_status) {
                     log::error!("棋譜保存エラー: {e}");
                 }
 
                 // analyze_selfplay 互換 JSONL（ON/OFF と出力先は RecordConfig::jsonl_dir）
                 if let Some(jsonl_dir) = config.record.jsonl_dir() {
-                    match write_game_jsonl(&jsonl_dir, &record, &config, &result) {
+                    match write_game_jsonl_with_status(
+                        &jsonl_dir,
+                        &record,
+                        &config,
+                        &result,
+                        &record_status,
+                    ) {
                         Ok(path) => log::info!("[REC] JSONL 保存: {}", path.display()),
                         Err(e) => log::error!("JSONL 保存エラー: {e}"),
                     }
@@ -440,7 +446,7 @@ fn run_one_game(
     engine: &mut UsiEngine,
     shutdown: &AtomicBool,
     games_played: u32,
-) -> Result<(GameResult, rshogi_csa_client::record::GameRecord)> {
+) -> Result<(GameResult, rshogi_csa_client::record::GameRecord, RecordStatus)> {
     let game_seq_str = games_played.to_string();
     let host = config.server.host.replace("{game_seq}", &game_seq_str);
     let id = config.server.id.replace("{game_seq}", &game_seq_str);
@@ -494,9 +500,9 @@ fn run_one_game(
             shutdown,
             retained_record,
         ) {
-            Ok((reconnect_result, reconnect_record)) => {
+            Ok((reconnect_result, reconnect_record, record_status)) => {
                 log::info!("[CSA] 再接続成功: 対局を継続して終局: {:?}", reconnect_result);
-                return Ok((reconnect_result, reconnect_record));
+                return Ok((reconnect_result, reconnect_record, record_status));
             }
             Err(e) => {
                 // engine は元 disconnect 経路で `gameover("lose")` 発射済み。
@@ -507,7 +513,7 @@ fn run_one_game(
                 log::warn!("[CSA] 再接続失敗: {e}。元の Interrupted 結果で終了します。");
                 let _ = engine.stop_and_wait();
                 return session_result
-                    .map(|outcome| (outcome.result, outcome.record))
+                    .map(|outcome| (outcome.result, outcome.record, RecordStatus::Complete))
                     .map_err(|e| anyhow::anyhow!("{}", e));
             }
         }
@@ -523,7 +529,7 @@ fn run_one_game(
 
     let _ = conn.logout();
     session_result
-        .map(|outcome| (outcome.result, outcome.record))
+        .map(|outcome| (outcome.result, outcome.record, RecordStatus::Complete))
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
@@ -567,14 +573,14 @@ fn attempt_reconnect(
     config: &CsaClientConfig,
     shutdown: &AtomicBool,
     retained_record: rshogi_csa_client::record::GameRecord,
-) -> Result<(GameResult, rshogi_csa_client::record::GameRecord)> {
+) -> Result<(GameResult, rshogi_csa_client::record::GameRecord, RecordStatus)> {
     let mut conn = CsaConnection::connect_with_target(target, opts)?;
     conn.login_reconnect(creds.id, creds.password, creds.game_id, creds.token)?;
     let outcome =
         run_resumed_session_with_record(&mut conn, engine, config, shutdown, retained_record)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
     let _ = conn.logout();
-    Ok((outcome.result, outcome.record))
+    Ok((outcome.outcome.result, outcome.outcome.record, outcome.status))
 }
 
 /// `--lobby` モードで成立したマッチ。`run_one_game` 直前に config を差し替えるための
@@ -1120,7 +1126,6 @@ mod tests {
                 start_time: chrono::Local::now(),
                 my_color: CsaColor::Black,
                 jsonl_moves: vec![],
-                status: rshogi_csa_client::record::RecordStatus::Complete,
             },
             summary: Some(summary),
         }
