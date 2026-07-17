@@ -3423,11 +3423,17 @@ impl GameRoom {
                     // Playing 以外 (Finished への遷移途中等の異常系)。合成しない。
                     return Ok(None);
                 };
-                Some(
-                    now.saturating_add(remaining)
-                        .saturating_add(cfg.time_margin_ms)
-                        .saturating_add(ALARM_SAFETY_MS),
-                )
+                if remaining == 0 {
+                    // 既に予算超過。margin/safety を再付与すると元 deadline より
+                    // 遅くなるため、即時発火の epoch を渡して time_up 判定に進める。
+                    Some(now)
+                } else {
+                    Some(
+                        now.saturating_add(remaining)
+                            .saturating_add(cfg.time_margin_ms)
+                            .saturating_add(ALARM_SAFETY_MS),
+                    )
+                }
             }
         };
         let pending =
