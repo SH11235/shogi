@@ -3355,6 +3355,55 @@ impl GameRoom {
         Ok(())
     }
 
+    /// grace registry が無い再接続要求への fallback。DO instance が
+    /// `websocket_close` を経ずに破棄されると (deploy 移行やランタイム都合の退避で
+    /// 実行中 invocation が cancel される)、`enter_grace_window` が走らず pending
+    /// entry が残らない。一方 `PersistedConfig` の reconnect_token は storage に
+    /// 残っているため、対局が進行中 (`KEY_FINISHED` 未設定) かつ該当 role の
+    /// player socket が現存しなければ、「いま切断された」ものとして現在状態から
+    /// `PendingReconnect` を合成し、通常の照合経路 (token 一致検証込み) に乗せる。
+    async fn build_cold_rejoin_pending(&self, role: Role) -> Result<Option<PendingReconnect>> {
+        if self.load_finished().await?.is_some() {
+            return Ok(None);
+        }
+        // reconnect 機能が無効な構成 (grace 0 / 設定不正) では合成しない。
+        let grace = match resolve_reconnect_grace(&self.env) {
+            Ok(g) if !g.is_zero() => g,
+            _ => return Ok(None),
+        };
+        // 同 role の player socket が生きているなら切断ではない (二重接続要求)。
+        for ws in self.state.get_websockets() {
+            if let Ok(Some(WsAttachment::Player {
+                role: attached_role,
+                ..
+            })) = ws.deserialize_attachment::<WsAttachment>()
+                && attached_role == role
+            {
+                return Ok(None);
+            }
+        }
+        let Some(cfg) = self.config.borrow().as_ref().cloned() else {
+            return Ok(None);
+        };
+        // 再起動を跨いで storage に残った turn deadline alarm を上限として引き継ぎ、
+        // 再接続によって相手手番の wall-clock deadline が延びないようにする。
+        let original_turn_alarm_epoch_ms = self
+            .state
+            .storage()
+            .get_alarm()
+            .await
+            .ok()
+            .flatten()
+            .and_then(|ms| u64::try_from(ms).ok());
+        let core_borrow = self.core.borrow();
+        let Some(core) = core_borrow.as_ref() else {
+            return Ok(None);
+        };
+        let pending =
+            self.build_pending_reconnect(core, &cfg, role, grace, original_turn_alarm_epoch_ms)?;
+        Ok(Some(pending))
+    }
+
     /// LOGIN 行で `reconnect:<game_id>+<token>` が指定されたクライアントを受理し、
     /// grace 中対局へ再参加させる。
     ///
@@ -3378,15 +3427,29 @@ impl GameRoom {
         self.ensure_core_loaded().await?;
         let pending: Option<PendingReconnect> =
             self.state.storage().get(KEY_GRACE_REGISTRY).await.ok().flatten();
-        let Some(pending) = pending else {
-            crate::structured_log!(
-                event: "reconnect_rejected",
-                component: "game_room",
-                reason: "no_pending_entry",
-                game_id: req.game_id.as_str(),
-            );
-            send_line(ws, "LOGIN:incorrect reconnect_rejected")?;
-            return Ok(());
+        let pending = match pending {
+            Some(pending) => pending,
+            None => match self.build_cold_rejoin_pending(role).await? {
+                Some(pending) => {
+                    crate::structured_log!(
+                        event: "reconnect_cold_rejoin",
+                        component: "game_room",
+                        game_id: req.game_id.as_str(),
+                        role: format!("{role:?}"),
+                    );
+                    pending
+                }
+                None => {
+                    crate::structured_log!(
+                        event: "reconnect_rejected",
+                        component: "game_room",
+                        reason: "no_pending_entry",
+                        game_id: req.game_id.as_str(),
+                    );
+                    send_line(ws, "LOGIN:incorrect reconnect_rejected")?;
+                    return Ok(());
+                }
+            },
         };
 
         // game_id 照合は registry 検索 (DO instance = 1 対局専属) で済むため、
