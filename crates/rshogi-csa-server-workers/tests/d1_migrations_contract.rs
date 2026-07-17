@@ -84,6 +84,7 @@ fn deploy_workflow_applies_d1_migrations_before_each_worker_deploy() {
 fn secret_sync_validates_player_keyring_without_printing_value() {
     let workflow = repo_file("../../.github/workflows/secret-sync.yml");
     for required in [
+        "pulumi env open \"${ESC_ENV}\" --format json",
         "required_keys=(ADMIN_API_TOKEN PLAYER_ID_SECRET)",
         "utf8bytelength >= 32",
         "length <= 8",
@@ -92,5 +93,6 @@ fn secret_sync_validates_player_keyring_without_printing_value() {
     ] {
         assert!(workflow.contains(required), "secret strength gate missing {required}");
     }
+    assert!(!workflow.contains("esc env open \"${ESC_ENV}\""));
     assert!(workflow.contains("値は非表示"));
 }
