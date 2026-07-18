@@ -9,6 +9,7 @@ fn validate_feature_combination(
     has_feature: &dyn Fn(&str) -> bool,
 ) -> Result<(), String> {
     let layerstack_arch = has_feature("layerstack-arch");
+    let runtime_dimensions = has_feature("nnue-runtime-dimensions");
 
     let mode_universal = has_feature("mode-universal");
     let mode_family = has_feature("mode-family");
@@ -101,13 +102,13 @@ fn validate_feature_combination(
         ));
     }
 
-    if layerstack_arch && layerstacks_count == 0 {
+    if layerstack_arch && layerstacks_count == 0 && !runtime_dimensions {
         return Err(
             "layerstack-arch を有効化するには layerstacks-* を 1 個以上必要です。".to_string(),
         );
     }
 
-    if layerstack_arch && ft_count == 0 {
+    if layerstack_arch && ft_count == 0 && !runtime_dimensions {
         return Err("layerstack-arch を有効化するには ft-* を 1 個以上必要です。".to_string());
     }
 

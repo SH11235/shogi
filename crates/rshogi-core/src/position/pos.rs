@@ -448,7 +448,7 @@ impl Position {
 
     #[inline]
     fn should_update_board_effects() -> bool {
-        if cfg!(feature = "nnue-effect-bucket") {
+        if cfg!(feature = "nnue-effect-bucket") || crate::nnue::nnue_requires_board_effects() {
             return true;
         }
         // halfkx-arch が無効な build は NNUE 経路のみで評価するため material fallback が

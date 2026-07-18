@@ -54,6 +54,19 @@ fn universal_alone_ok() {
 }
 
 #[test]
+fn runtime_dimension_universal_needs_no_static_slots() {
+    let has = lookup(&[
+        "mode-universal",
+        "layerstack-arch",
+        "halfkx-arch",
+        "nnue-runtime-dimensions",
+        "nnue-psqt",
+        "nnue-threat",
+    ]);
+    assert!(validate_feature_combination(&has).is_ok());
+}
+
+#[test]
 fn universal_plus_family_rejected() {
     let has = lookup(&["mode-universal", "mode-family"]);
     let err = validate_feature_combination(&has).unwrap_err();

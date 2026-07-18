@@ -302,11 +302,15 @@ pub fn parse_arch_dimensions(arch_str: &str) -> (usize, usize, usize) {
     // 例: AffineTransform[8<-1024] → L2=8
     //     AffineTransform[96<-8] → L3=96
     let mut layers: Vec<(usize, usize)> = Vec::new();
-    let pattern = "AffineTransform[";
+    let pattern = "AffineTransform";
 
     let mut search_start = 0;
     while let Some(start) = arch_str[search_start..].find(pattern) {
-        let abs_start = search_start + start + pattern.len();
+        let after_name = search_start + start + pattern.len();
+        let Some(open_offset) = arch_str[after_name..].find('[') else {
+            break;
+        };
+        let abs_start = after_name + open_offset + 1;
         if let Some(end) = arch_str[abs_start..].find(']') {
             let content = &arch_str[abs_start..abs_start + end];
             if let Some(arrow_idx) = content.find("<-") {
@@ -1404,6 +1408,10 @@ mod tests {
         // nnue-pytorch 形式 (1024次元)
         let arch = "Features=HalfKA_hm[73305->1024x2],Network=AffineTransform[1<-96](ClippedReLU[96](AffineTransform[96<-8](ClippedReLU[8](AffineTransform[8<-2048](InputSlice[2048(0:2048)])))))";
         assert_eq!(parse_arch_dimensions(arch), (1024, 8, 96));
+
+        // sparse-input dense layer も AffineTransform と同じ次元表記を持つ
+        let arch = "Features=HalfKA_hm[73305->512x2],Network=AffineTransform[1<-96](ClippedReLU[96](AffineTransform[96<-8](ClippedReLU[8](AffineTransformSparseInput[8<-1024](InputSlice[1024(0:1024)])))))";
+        assert_eq!(parse_arch_dimensions(arch), (512, 8, 96));
 
         // bullet-shogi 形式 (l2=, l3= パターン)
         let arch = "Features=HalfKA_hm^[73305->512x2]-SCReLU,fv_scale=13,l2=8,l3=96,qa=127,qb=64";

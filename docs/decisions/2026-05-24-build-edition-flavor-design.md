@@ -1,8 +1,22 @@
 # ビルド設定の Edition 軸設計 (Flavor 軸は非採用、Supplement 参照)
 
-- **Status**: Accepted (Edition 軸) / Flavor 軸は 2026-05-25 supplement で非採用に確定
-- **Date**: 2026-05-24 (本体) / 2026-05-25 (Flavor 軸 retire supplement)
+- **Status**: Accepted (Edition 軸) / Universal 実装は 2026-07-19 supplement で更新
+- **Date**: 2026-05-24 (本体) / 2026-05-25 (Flavor 軸 retire) / 2026-07-19 (dynamic universal)
 - **設計レビュー**: local Codex (REQUEST CHANGES → 反映済) / local Claude (APPROVE WITH SUGGESTIONS → 反映済) / GitHub Codex bot + Claude bot (PR #733 で auto-review、Critical 1 + Major 2 + Minor 2 + 事実誤り 1 を全て反映)
+
+## Supplement (2026-07-19): Universal を runtime-dimension 実装へ変更
+
+本 ADR の `edition-universal` に関する「全 const-generic variant / size をバイナリへ
+列挙し runtime dispatch する」という実装は廃止した。現在の universal は NNUE
+header から L1/L2/L3、FT、activation、拡張を読み、HalfKX / LayerStacks の推論器を
+実行時に構成する。この supplement は、以下に残る universal の内部展開例や
+「全 size feature を bundle」という記述を supersede する。
+
+- HalfKX / LayerStacks と 5 FT を runtime 構成し、次元追加ごとの再ビルドを不要にする。
+- LayerStacks は PSQT、Threat profile 0、EffectBucket、KingRank9 / Progress8KPAbs に対応する。
+- family / specific edition は const-generic 実装を維持する。固定モデルの大会・selfplay
+  では引き続き specific edition を性能基準とする。
+- `edition-universal` はアプリ配布サイズとモデル互換性を優先し、固定 edition を置換しない。
 
 ## Context
 

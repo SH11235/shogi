@@ -106,7 +106,7 @@ impl RuntimeFeatureSet {
     }
 }
 
-struct DynamicAffine {
+pub(crate) struct DynamicAffine {
     input_dim: usize,
     padded_input: usize,
     output_dim: usize,
@@ -115,7 +115,11 @@ struct DynamicAffine {
 }
 
 impl DynamicAffine {
-    fn read<R: Read>(reader: &mut R, input_dim: usize, output_dim: usize) -> io::Result<Self> {
+    pub(crate) fn read<R: Read>(
+        reader: &mut R,
+        input_dim: usize,
+        output_dim: usize,
+    ) -> io::Result<Self> {
         let padded_input = padded_input(input_dim);
         let mut biases = AlignedBox::new_zeroed(output_dim);
         let mut buf4 = [0; 4];
@@ -142,9 +146,93 @@ impl DynamicAffine {
     }
 
     #[inline]
-    fn propagate(&self, input: &[u8], output: &mut [i32]) {
+    pub(crate) fn propagate(&self, input: &[u8], output: &mut [i32]) {
         debug_assert!(input.len() >= self.padded_input);
         debug_assert!(output.len() >= self.output_dim);
+
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        unsafe {
+            use std::arch::wasm32::*;
+
+            use super::layers::{dot_i8x16_u8i8_preexpanded, haddx4, hsum_i32x4};
+
+            let chunks = self.padded_input / 16;
+            let input_ptr = input.as_ptr();
+            let weights_ptr = self.weights.as_ptr();
+            let mut output_index = 0;
+
+            while output_index + 4 <= self.output_dim {
+                let mut acc0 = i32x4_splat(0);
+                let mut acc1 = i32x4_splat(0);
+                let mut acc2 = i32x4_splat(0);
+                let mut acc3 = i32x4_splat(0);
+                let row0 = weights_ptr.add(output_index * self.padded_input);
+                let row1 = row0.add(self.padded_input);
+                let row2 = row1.add(self.padded_input);
+                let row3 = row2.add(self.padded_input);
+                for chunk in 0..chunks {
+                    let offset = chunk * 16;
+                    let input_vec = v128_load(input_ptr.add(offset).cast::<v128>());
+                    let input_lo = i16x8_extend_low_u8x16(input_vec);
+                    let input_hi = i16x8_extend_high_u8x16(input_vec);
+                    acc0 = i32x4_add(
+                        acc0,
+                        dot_i8x16_u8i8_preexpanded(
+                            input_lo,
+                            input_hi,
+                            v128_load(row0.add(offset).cast::<v128>()),
+                        ),
+                    );
+                    acc1 = i32x4_add(
+                        acc1,
+                        dot_i8x16_u8i8_preexpanded(
+                            input_lo,
+                            input_hi,
+                            v128_load(row1.add(offset).cast::<v128>()),
+                        ),
+                    );
+                    acc2 = i32x4_add(
+                        acc2,
+                        dot_i8x16_u8i8_preexpanded(
+                            input_lo,
+                            input_hi,
+                            v128_load(row2.add(offset).cast::<v128>()),
+                        ),
+                    );
+                    acc3 = i32x4_add(
+                        acc3,
+                        dot_i8x16_u8i8_preexpanded(
+                            input_lo,
+                            input_hi,
+                            v128_load(row3.add(offset).cast::<v128>()),
+                        ),
+                    );
+                }
+                let sums = haddx4(acc0, acc1, acc2, acc3);
+                let biases = v128_load(self.biases.as_ptr().add(output_index).cast::<v128>());
+                v128_store(
+                    output.as_mut_ptr().add(output_index).cast::<v128>(),
+                    i32x4_add(sums, biases),
+                );
+                output_index += 4;
+            }
+
+            while output_index < self.output_dim {
+                let mut acc = i32x4_splat(0);
+                let row = weights_ptr.add(output_index * self.padded_input);
+                for chunk in 0..chunks {
+                    let offset = chunk * 16;
+                    let input_vec = v128_load(input_ptr.add(offset).cast::<v128>());
+                    let weights_vec = v128_load(row.add(offset).cast::<v128>());
+                    acc = i32x4_add(acc, super::layers::dot_i8x16_u8i8(input_vec, weights_vec));
+                }
+                output[output_index] = self.biases[output_index] + hsum_i32x4(acc);
+                output_index += 1;
+            }
+            return;
+        }
+
+        #[allow(unreachable_code)]
         for (o, out) in output[..self.output_dim].iter_mut().enumerate() {
             let row = &self.weights[o * self.padded_input..(o + 1) * self.padded_input];
             let mut sum = self.biases[o];
@@ -200,9 +288,17 @@ impl DynamicHalfKxNetwork {
 
         let parsed = parse_architecture(arch).map_err(invalid_data)?;
         let feature_set = RuntimeFeatureSet::from_spec(parsed.feature_set)?;
-        validate_dimension("l1", parsed.l1)?;
-        validate_dimension("l2", parsed.l2)?;
-        validate_dimension("l3", parsed.l3)?;
+        let detected = super::spec::detect_architecture_from_size(
+            file_size,
+            arch_len,
+            Some(parsed.feature_set),
+        );
+        let (l1_dim, l2_dim, l3_dim) = detected
+            .map(|d| (d.spec.l1, d.spec.l2, d.spec.l3))
+            .unwrap_or((parsed.l1, parsed.l2, parsed.l3));
+        validate_dimension("l1", l1_dim)?;
+        validate_dimension("l2", l2_dim)?;
+        validate_dimension("l3", l3_dim)?;
         let input_dimensions = parse_feature_input_dimensions(arch)
             .ok_or_else(|| invalid_data("HalfKX architecture is missing FT input dimensions"))?;
         if input_dimensions != feature_set.dimensions() {
@@ -219,21 +315,20 @@ impl DynamicHalfKxNetwork {
         } else {
             Activation::CReLU
         };
-        let dense_input = parsed
-            .l1
+        let dense_input = l1_dim
             .checked_mul(2)
             .and_then(|v| v.checked_div(activation.output_dim_divisor()))
             .ok_or_else(|| invalid_data("invalid FT output dimensions"))?;
 
         reader.read_exact(&mut buf4)?; // feature transformer hash
-        let mut ft_biases = AlignedBox::new_zeroed(parsed.l1);
+        let mut ft_biases = AlignedBox::new_zeroed(l1_dim);
         let mut buf2 = [0; 2];
         for bias in ft_biases.iter_mut() {
             reader.read_exact(&mut buf2)?;
             *bias = i16::from_le_bytes(buf2);
         }
         let ft_weight_len = input_dimensions
-            .checked_mul(parsed.l1)
+            .checked_mul(l1_dim)
             .ok_or_else(|| invalid_data("FT weight dimensions overflow"))?;
         let mut ft_weights = AlignedBox::new_zeroed(ft_weight_len);
         for weight in ft_weights.iter_mut() {
@@ -242,14 +337,22 @@ impl DynamicHalfKxNetwork {
         }
 
         reader.read_exact(&mut buf4)?; // dense network hash
-        let l1 = DynamicAffine::read(reader, dense_input, parsed.l2)?;
-        let l2 = DynamicAffine::read(reader, parsed.l2, parsed.l3)?;
-        let output = DynamicAffine::read(reader, parsed.l3, 1)?;
+        let l1 = DynamicAffine::read(reader, dense_input, l2_dim)?;
+        let l2 = DynamicAffine::read(reader, l2_dim, l3_dim)?;
+        let output = DynamicAffine::read(reader, l3_dim, 1)?;
         let consumed = reader.stream_position()?;
         if consumed != file_size {
-            return Err(invalid_data(format!(
-                "NNUE payload size mismatch: consumed={consumed}, file_size={file_size}"
-            )));
+            let trailing_len = (file_size - consumed) as usize;
+            let mut trailing = vec![0; trailing_len];
+            reader.read_exact(&mut trailing)?;
+            let marker = b"bullet";
+            let is_bullet_marker = trailing_len <= 64
+                && trailing.iter().enumerate().all(|(i, &b)| b == marker[i % marker.len()]);
+            if !is_bullet_marker {
+                return Err(invalid_data(format!(
+                    "NNUE payload size mismatch: consumed={consumed}, file_size={file_size}"
+                )));
+            }
         }
 
         let fv_scale =
@@ -260,13 +363,7 @@ impl DynamicHalfKxNetwork {
             });
         let qa = parse_qa(arch).unwrap_or_else(|| default_qa_for_arch(arch));
         Ok(Self {
-            spec: ArchitectureSpec::new(
-                parsed.feature_set,
-                parsed.l1,
-                parsed.l2,
-                parsed.l3,
-                activation,
-            ),
+            spec: ArchitectureSpec::new(parsed.feature_set, l1_dim, l2_dim, l3_dim, activation),
             feature_set,
             input_dimensions,
             activation,
@@ -388,6 +485,7 @@ impl DynamicHalfKxNetwork {
 /// Per-search runtime accumulator and preallocated inference scratch.
 pub struct DynamicHalfKxStack {
     l1: usize,
+    halfkp: bool,
     current: usize,
     accumulations: AlignedBox<i16>,
     computed: Vec<bool>,
@@ -404,6 +502,7 @@ impl DynamicHalfKxStack {
     pub(crate) fn new(net: &DynamicHalfKxNetwork) -> Self {
         Self {
             l1: net.spec.l1,
+            halfkp: net.is_halfkp(),
             current: 0,
             accumulations: AlignedBox::new_zeroed(STACK_CAPACITY * 2 * net.spec.l1),
             computed: vec![false; STACK_CAPACITY],
@@ -419,6 +518,9 @@ impl DynamicHalfKxStack {
 
     pub(crate) fn l1_size(&self) -> usize {
         self.l1
+    }
+    pub(crate) fn is_halfkp(&self) -> bool {
+        self.halfkp
     }
     pub(crate) fn reset(&mut self) {
         self.current = 0;
@@ -476,7 +578,7 @@ fn parse_qa(arch: &str) -> Option<i16> {
     arch.split(',').find_map(|part| part.strip_prefix("qa=")?.parse().ok())
 }
 
-fn validate_dimension(name: &str, value: usize) -> io::Result<()> {
+pub(crate) fn validate_dimension(name: &str, value: usize) -> io::Result<()> {
     if value == 0 || value > MAX_RUNTIME_DIMENSION {
         Err(invalid_data(format!("invalid runtime {name} dimension: {value}")))
     } else {

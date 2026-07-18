@@ -44,7 +44,7 @@ rayon = { version = "1.10", optional = true }
 web-time = "1"
 
 [features]
-# default は universal edition (HalfKX 全 variant + LS 全 size + 全 ext を dispatch)。
+# default は universal edition (NNUE の次元と variant をモデル header から runtime 構成)。
 # 探索経路では pass_rights / PASS NMP を無効化。
 # Web/WASM で pass ルールを使う場合は default-features=false で個別指定する。
 default = ["search-no-pass-rules", "edition-universal"]
@@ -90,7 +90,7 @@ threat-profile-cross-side = []               # profile 10: 同 side / 同種を�
 # Architecture 経路 slot (include-only 意味論)。
 # - layerstack-arch:     LayerStack network 経路を含める
 # - halfkx-arch: HalfKX family (HalfKP / HalfKa*) 経路を含める
-# 両者を同時に立てることも可 (= universal dispatch build)。
+# 固定/family edition では両者を同時に立てることも可。
 layerstack-arch     = []
 halfkx-arch = []
 
@@ -121,7 +121,8 @@ effect-bucket-3x3-kingbucketed = []
 
 # FT (Feature Transformer) 種別 slot (5 variant)。
 # LS / HalfKX どちらの family でも 5 variant 全対応。mode-specific では 1 個固定、
-# family / universal では複数 OR を許容して runtime dispatch。
+# family では複数 OR を許容して const-generic variant を runtime dispatch。
+# universal はこれらの slot を立てず、nnue-runtime-dimensions を使う。
 ft-halfkp           = []
 ft-halfka_split     = []
 ft-halfka_merged    = []
@@ -135,7 +136,7 @@ halfkx-activation-pairwise = []
 
 # Build mode sentinel (preset edition がセット、build.rs 整合性チェック用)。
 # user が直接指定するものではなく、preset edition 経由でのみ有効化される想定。
-# - mode-universal: 全 architecture × 構成 dispatch、check 緩和
+# - mode-universal: header 駆動の runtime-dimension 構成、static slot check 緩和
 # - mode-family:    family dispatch、check 部分緩和
 # - mode-specific:  単一構成 build、check 厳格 (size/activation/ft 1 個固定)
 mode-universal = []
@@ -156,15 +157,13 @@ nnue-progress-diff = []
 # 参照。各 preset は mode sentinel + 必要な atomic feature 群を bundle する。
 # 主要な build target をここで整備し、残りは需要に応じて追加する。
 
-# 全 architecture × 全構成 dispatch (default)
+# 全 architecture × 任意次元を header から runtime 構成 (default)。
+# 固定 edition の const-generic / SIMD 経路は変更しない。
 edition-universal = [
   "mode-universal",
   "nnue-runtime-dimensions",
-  "layerstack-arch", "halfkx-arch",
-  "ft-halfkp", "ft-halfka_split", "ft-halfka_merged", "ft-halfka_hm_split", "ft-halfka_hm_merged",
-  "layerstacks-1536x16x32", "layerstacks-1536x32x32", "layerstacks-768x16x32", "layerstacks-768x8x32", "layerstacks-512x16x32", "layerstacks-1024x16x32", "layerstacks-3072x16x32",
+  "halfkx-arch",
   "nnue-psqt", "nnue-threat",
-  "halfkx-activation-crelu", "halfkx-activation-screlu", "halfkx-activation-pairwise",
 ]
 
 # HalfKX family (全 FT / activation dispatch)。
