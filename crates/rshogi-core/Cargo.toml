@@ -310,9 +310,11 @@ name = "rshogi_core"
 path = "src/lib.rs"
 
 # PSQT 統計ダンプツール。
-# `NetworkLayerStacks1536x16x32` のロードに `nnue-psqt` と `layerstacks-1536x16x32`
-# の両方が必要なため、`required-features` で明示する。
+# static `NetworkLayerStacks1536x16x32` のロードに必要な architecture / FT / PSQT を
+# `required-features` で明示する。default universal の dynamic 経路には依存しない。
 [[bin]]
 name = "dump_psqt_stats"
 path = "src/bin/dump_psqt_stats.rs"
-required-features = ["nnue-psqt", "layerstacks-1536x16x32"]
+required-features = [
+  "layerstack-arch", "nnue-psqt", "layerstacks-1536x16x32", "ft-halfka_hm_merged",
+]
