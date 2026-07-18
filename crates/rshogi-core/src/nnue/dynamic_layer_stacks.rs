@@ -164,7 +164,9 @@ impl DynamicLayerStacksNetwork {
             DEFAULT_NUM_BUCKETS
         };
         if !(1..=MAX_LAYER_STACK_BUCKETS).contains(&num_buckets) {
-            return Err(invalid("invalid LayerStacks bucket count"));
+            return Err(invalid(format!(
+                "invalid LayerStacks num_buckets={num_buckets}; expected 1..={MAX_LAYER_STACK_BUCKETS}"
+            )));
         }
 
         let (l1, l2, l3) = parse_arch_dimensions(arch);
