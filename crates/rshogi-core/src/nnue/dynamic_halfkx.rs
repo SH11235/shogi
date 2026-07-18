@@ -562,6 +562,22 @@ fn activate_i32(kind: Activation, input: &[i32], output: &mut [u8]) {
 
 #[inline]
 fn add_row(acc: &mut [i16], row: &[i16]) {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    unsafe {
+        use std::arch::wasm32::*;
+        let chunks = acc.len().min(row.len()) / 8;
+        for i in 0..chunks {
+            let offset = i * 8;
+            let a = v128_load(acc.as_ptr().add(offset).cast::<v128>());
+            let b = v128_load(row.as_ptr().add(offset).cast::<v128>());
+            v128_store(acc.as_mut_ptr().add(offset).cast::<v128>(), i16x8_add(a, b));
+        }
+        for (a, &w) in acc[chunks * 8..].iter_mut().zip(&row[chunks * 8..]) {
+            *a = a.wrapping_add(w);
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
     for (a, &w) in acc.iter_mut().zip(row) {
         *a = a.wrapping_add(w);
     }
@@ -569,6 +585,22 @@ fn add_row(acc: &mut [i16], row: &[i16]) {
 
 #[inline]
 fn sub_row(acc: &mut [i16], row: &[i16]) {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    unsafe {
+        use std::arch::wasm32::*;
+        let chunks = acc.len().min(row.len()) / 8;
+        for i in 0..chunks {
+            let offset = i * 8;
+            let a = v128_load(acc.as_ptr().add(offset).cast::<v128>());
+            let b = v128_load(row.as_ptr().add(offset).cast::<v128>());
+            v128_store(acc.as_mut_ptr().add(offset).cast::<v128>(), i16x8_sub(a, b));
+        }
+        for (a, &w) in acc[chunks * 8..].iter_mut().zip(&row[chunks * 8..]) {
+            *a = a.wrapping_sub(w);
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
     for (a, &w) in acc.iter_mut().zip(row) {
         *a = a.wrapping_sub(w);
     }

@@ -458,19 +458,7 @@ impl DynamicLayerStacksNetwork {
             [base + pos.side_to_move().index() * l1..base + (pos.side_to_move().index() + 1) * l1];
         let them_threat = &stack.threat_accumulations[base + (!pos.side_to_move()).index() * l1
             ..base + ((!pos.side_to_move()).index() + 1) * l1];
-        let half = l1 / 2;
-        for i in 0..half {
-            let us0 = us[i].wrapping_add(us_threat[i]);
-            let us1 = us[half + i].wrapping_add(us_threat[half + i]);
-            let them0 = them[i].wrapping_add(them_threat[i]);
-            let them1 = them[half + i].wrapping_add(them_threat[half + i]);
-            stack.transformed[i] = ((u32::from(us0.clamp(0, 127) as u16)
-                * u32::from(us1.clamp(0, 127) as u16))
-                >> 7) as u8;
-            stack.transformed[half + i] = ((u32::from(them0.clamp(0, 127) as u16)
-                * u32::from(them1.clamp(0, 127) as u16))
-                >> 7) as u8;
-        }
+        sqr_transform_with_threat(us, us_threat, them, them_threat, &mut stack.transformed[..l1]);
         let bucket_index = match get_layer_stack_bucket_mode() {
             LayerStackBucketMode::KingRank9 => compute_layer_stack_kingrank9_bucket_index(
                 pos,
@@ -622,11 +610,43 @@ fn read_i32s<R: Read>(reader: &mut R, dst: &mut [i32]) -> io::Result<()> {
     Ok(())
 }
 fn add_i16(a: &mut [i16], b: &[i16]) {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    unsafe {
+        use std::arch::wasm32::*;
+        let chunks = a.len().min(b.len()) / 8;
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = v128_load(a.as_ptr().add(offset).cast::<v128>());
+            let vb = v128_load(b.as_ptr().add(offset).cast::<v128>());
+            v128_store(a.as_mut_ptr().add(offset).cast::<v128>(), i16x8_add(va, vb));
+        }
+        for (a, &b) in a[chunks * 8..].iter_mut().zip(&b[chunks * 8..]) {
+            *a = a.wrapping_add(b);
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
     for (a, &b) in a.iter_mut().zip(b) {
         *a = a.wrapping_add(b);
     }
 }
 fn sub_i16(a: &mut [i16], b: &[i16]) {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    unsafe {
+        use std::arch::wasm32::*;
+        let chunks = a.len().min(b.len()) / 8;
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = v128_load(a.as_ptr().add(offset).cast::<v128>());
+            let vb = v128_load(b.as_ptr().add(offset).cast::<v128>());
+            v128_store(a.as_mut_ptr().add(offset).cast::<v128>(), i16x8_sub(va, vb));
+        }
+        for (a, &b) in a[chunks * 8..].iter_mut().zip(&b[chunks * 8..]) {
+            *a = a.wrapping_sub(b);
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
     for (a, &b) in a.iter_mut().zip(b) {
         *a = a.wrapping_sub(b);
     }
@@ -639,6 +659,80 @@ fn add_i32(a: &mut [i32], b: &[i32]) {
 fn sub_i32(a: &mut [i32], b: &[i32]) {
     for (a, &b) in a.iter_mut().zip(b) {
         *a = a.wrapping_sub(b);
+    }
+}
+
+fn sqr_transform_with_threat(
+    us: &[i16],
+    us_threat: &[i16],
+    them: &[i16],
+    them_threat: &[i16],
+    output: &mut [u8],
+) {
+    let half = us.len() / 2;
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    let mut processed = 0;
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    let processed = 0;
+
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    unsafe {
+        use std::arch::wasm32::*;
+        let zero = i16x8_splat(0);
+        let max127 = i16x8_splat(127);
+        for (acc, threat, out_offset) in [(us, us_threat, 0usize), (them, them_threat, half)] {
+            let mut offset = 0;
+            while offset + 16 <= half {
+                let a0 = i16x8_add(
+                    v128_load(acc.as_ptr().add(offset).cast::<v128>()),
+                    v128_load(threat.as_ptr().add(offset).cast::<v128>()),
+                );
+                let b0 = i16x8_add(
+                    v128_load(acc.as_ptr().add(half + offset).cast::<v128>()),
+                    v128_load(threat.as_ptr().add(half + offset).cast::<v128>()),
+                );
+                let a1 = i16x8_add(
+                    v128_load(acc.as_ptr().add(offset + 8).cast::<v128>()),
+                    v128_load(threat.as_ptr().add(offset + 8).cast::<v128>()),
+                );
+                let b1 = i16x8_add(
+                    v128_load(acc.as_ptr().add(half + offset + 8).cast::<v128>()),
+                    v128_load(threat.as_ptr().add(half + offset + 8).cast::<v128>()),
+                );
+                let product0 = u16x8_shr(
+                    i16x8_mul(
+                        i16x8_min(i16x8_max(a0, zero), max127),
+                        i16x8_min(i16x8_max(b0, zero), max127),
+                    ),
+                    7,
+                );
+                let product1 = u16x8_shr(
+                    i16x8_mul(
+                        i16x8_min(i16x8_max(a1, zero), max127),
+                        i16x8_min(i16x8_max(b1, zero), max127),
+                    ),
+                    7,
+                );
+                v128_store(
+                    output.as_mut_ptr().add(out_offset + offset).cast::<v128>(),
+                    u8x16_narrow_i16x8(product0, product1),
+                );
+                offset += 16;
+            }
+            processed = offset;
+        }
+    }
+
+    for i in processed..half {
+        let us0 = us[i].wrapping_add(us_threat[i]);
+        let us1 = us[half + i].wrapping_add(us_threat[half + i]);
+        let them0 = them[i].wrapping_add(them_threat[i]);
+        let them1 = them[half + i].wrapping_add(them_threat[half + i]);
+        output[i] = ((u32::from(us0.clamp(0, 127) as u16) * u32::from(us1.clamp(0, 127) as u16))
+            >> 7) as u8;
+        output[half + i] = ((u32::from(them0.clamp(0, 127) as u16)
+            * u32::from(them1.clamp(0, 127) as u16))
+            >> 7) as u8;
     }
 }
 fn invalid(msg: impl Into<String>) -> io::Error {
