@@ -32,7 +32,7 @@ use crate::types::{Color, Value};
 
 const STACK_CAPACITY: usize = 256;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeLsFeature {
     HalfKP,
     HalfKaHmMerged,
@@ -116,6 +116,17 @@ struct DynamicLsBucket {
     l1: DynamicAffine,
     l2: DynamicAffine,
     output: DynamicAffine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DynamicLayerStacksSignature {
+    feature: RuntimeLsFeature,
+    l1: usize,
+    l2: usize,
+    l3: usize,
+    num_buckets: usize,
+    has_psqt: bool,
+    threat_dimensions: usize,
 }
 
 /// Runtime-dimension LayerStacks network.
@@ -270,6 +281,8 @@ impl DynamicLayerStacksNetwork {
                 .ok_or_else(|| invalid("Threat dimensions overflow"))?,
         );
         if !threat_weights.is_empty() {
+            // SAFETY: `i8` and `u8` have identical size/alignment, and the slice retains the
+            // exact allocation length while only its byte signedness changes for `Read`.
             let bytes = unsafe {
                 std::slice::from_raw_parts_mut(
                     threat_weights.as_mut_ptr().cast::<u8>(),
@@ -323,6 +336,17 @@ impl DynamicLayerStacksNetwork {
     }
     pub(crate) fn new_stack(&self) -> DynamicLayerStacksStack {
         DynamicLayerStacksStack::new(self)
+    }
+    fn stack_signature(&self) -> DynamicLayerStacksSignature {
+        DynamicLayerStacksSignature {
+            feature: self.feature,
+            l1: self.spec.l1,
+            l2: self.spec.l2,
+            l3: self.spec.l3,
+            num_buckets: self.num_buckets,
+            has_psqt: !self.psqt_weights.is_empty(),
+            threat_dimensions: self.threat_dimensions,
+        }
     }
 
     pub(crate) fn refresh(&self, pos: &Position, stack: &mut DynamicLayerStacksStack) {
@@ -515,6 +539,7 @@ impl DynamicLayerStacksNetwork {
 }
 
 pub struct DynamicLayerStacksStack {
+    signature: DynamicLayerStacksSignature,
     current: usize,
     accumulations: AlignedBox<i16>,
     threat_accumulations: AlignedBox<i16>,
@@ -531,6 +556,7 @@ pub struct DynamicLayerStacksStack {
 impl DynamicLayerStacksStack {
     fn new(net: &DynamicLayerStacksNetwork) -> Self {
         Self {
+            signature: net.stack_signature(),
             current: 0,
             accumulations: AlignedBox::new_zeroed(STACK_CAPACITY * 2 * net.spec.l1),
             threat_accumulations: AlignedBox::new_zeroed(STACK_CAPACITY * 2 * net.spec.l1),
@@ -543,6 +569,9 @@ impl DynamicLayerStacksStack {
             l2_out: AlignedBox::new_zeroed(net.spec.l3),
             l3_input: AlignedBox::new_zeroed(padded_input(net.spec.l3)),
         }
+    }
+    pub(crate) fn matches_network(&self, net: &DynamicLayerStacksNetwork) -> bool {
+        self.signature == net.stack_signature()
     }
     pub(crate) fn reset(&mut self) {
         self.current = 0;
@@ -613,6 +642,8 @@ fn read_i32s<R: Read>(reader: &mut R, dst: &mut [i32]) -> io::Result<()> {
 }
 fn add_i16(a: &mut [i16], b: &[i16]) {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    // SAFETY: `chunks` is bounded by both slices; each v128 access covers eight in-range
+    // i16 elements and the scalar tail starts immediately after the last vector.
     unsafe {
         use std::arch::wasm32::*;
         let chunks = a.len().min(b.len()) / 8;
@@ -634,6 +665,8 @@ fn add_i16(a: &mut [i16], b: &[i16]) {
 }
 fn sub_i16(a: &mut [i16], b: &[i16]) {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    // SAFETY: `chunks` is bounded by both slices; each v128 access covers eight in-range
+    // i16 elements and the scalar tail starts immediately after the last vector.
     unsafe {
         use std::arch::wasm32::*;
         let chunks = a.len().min(b.len()) / 8;
@@ -678,6 +711,8 @@ fn sqr_transform_with_threat(
     let processed = 0;
 
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    // SAFETY: all four accumulator slices have the same even L1 length and `output` has L1
+    // elements. The loop condition reserves 16 elements in each half before every load/store.
     unsafe {
         use std::arch::wasm32::*;
         let zero = i16x8_splat(0);
@@ -741,17 +776,118 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-#[cfg(all(test, feature = "layerstack-arch"))]
+#[cfg(test)]
 mod tests {
+    #[cfg(feature = "layerstack-arch")]
     use std::fs::File;
+    #[cfg(feature = "layerstack-arch")]
     use std::io::BufReader;
+    use std::io::Cursor;
+    use std::sync::Arc;
 
     use super::*;
+    use crate::nnue::accumulator_stack_variant::AccumulatorStackVariant;
+    use crate::nnue::evaluator::NNUEEvaluator;
+    use crate::nnue::network::NNUENetwork;
+    #[cfg(feature = "layerstack-arch")]
     use crate::nnue::network::set_layer_stack_bucket_mode;
+    #[cfg(feature = "layerstack-arch")]
     use crate::nnue::network_layer_stacks::LayerStacksNetwork;
     use crate::position::SFEN_HIRATE;
     use crate::types::Move;
 
+    fn zero_affine(input_dim: usize, output_dim: usize) -> DynamicAffine {
+        let bytes = vec![0; output_dim * 4 + output_dim * padded_input(input_dim)];
+        DynamicAffine::read(&mut Cursor::new(bytes), input_dim, output_dim).unwrap()
+    }
+
+    fn test_network(
+        feature: RuntimeLsFeature,
+        l1: usize,
+        l2: usize,
+        l3: usize,
+        num_buckets: usize,
+        has_psqt: bool,
+        threat_dimensions: usize,
+    ) -> DynamicLayerStacksNetwork {
+        DynamicLayerStacksNetwork {
+            spec: ArchitectureSpec::new(FeatureSet::LayerStacks, l1, l2, l3, Activation::CReLU),
+            feature,
+            input_dimensions: feature.dimensions(),
+            num_buckets,
+            ft_biases: AlignedBox::new_zeroed(l1),
+            ft_weights: AlignedBox::new_zeroed(0),
+            psqt_biases: AlignedBox::new_zeroed(usize::from(has_psqt)),
+            psqt_weights: AlignedBox::new_zeroed(usize::from(has_psqt)),
+            threat_dimensions,
+            threat_weights: AlignedBox::new_zeroed(0),
+            buckets: Vec::new(),
+            fv_scale: FV_SCALE_HALFKA,
+        }
+    }
+
+    #[test]
+    fn stack_is_rebuilt_for_every_runtime_layer_stacks_identity_change() {
+        let base = NNUENetwork::DynamicLayerStacks(Box::new(test_network(
+            RuntimeLsFeature::HalfKaHmMerged,
+            8,
+            4,
+            3,
+            9,
+            false,
+            0,
+        )));
+        let stack = AccumulatorStackVariant::from_network(&base);
+        assert!(stack.matches_network(&base));
+
+        let switches = [
+            test_network(RuntimeLsFeature::HalfKaHmMerged, 10, 4, 3, 9, false, 0),
+            test_network(RuntimeLsFeature::HalfKaHmMerged, 8, 5, 3, 9, false, 0),
+            test_network(RuntimeLsFeature::HalfKaHmMerged, 8, 4, 5, 9, false, 0),
+            test_network(RuntimeLsFeature::HalfKaHmMerged, 8, 4, 3, 4, false, 0),
+            test_network(RuntimeLsFeature::HalfKP, 8, 4, 3, 9, false, 0),
+            test_network(RuntimeLsFeature::HalfKaHmMerged, 8, 4, 3, 9, true, 0),
+            test_network(RuntimeLsFeature::HalfKaHmMerged, 8, 4, 3, 9, false, 1),
+        ];
+        for switched_net in switches {
+            let switched = NNUENetwork::DynamicLayerStacks(Box::new(switched_net));
+            assert!(!stack.matches_network(&switched));
+            assert!(AccumulatorStackVariant::from_network(&switched).matches_network(&switched));
+        }
+    }
+
+    #[test]
+    fn public_evaluator_keeps_board_effects_for_runtime_effect_bucket() {
+        let feature = RuntimeLsFeature::EffectBucket(EffectBucketConfig::KINGFIXED_2X2);
+        let l1 = 2;
+        let l2 = 2;
+        let l3 = 1;
+        let num_buckets = DEFAULT_NUM_BUCKETS;
+        let mut net = test_network(feature, l1, l2, l3, num_buckets, false, 0);
+        net.ft_weights = AlignedBox::new_zeroed(feature.dimensions() * l1);
+        net.buckets = (0..num_buckets)
+            .map(|_| DynamicLsBucket {
+                l1: zero_affine(l1, l2),
+                l2: zero_affine(2 * (l2 - 1), l3),
+                output: zero_affine(l3, 1),
+            })
+            .collect();
+
+        let mut pos = Position::new();
+        pos.set_sfen(SFEN_HIRATE).unwrap();
+        let mut evaluator = NNUEEvaluator::new_with_position(
+            Arc::new(NNUENetwork::DynamicLayerStacks(Box::new(net))),
+            &pos,
+        );
+        assert_eq!(evaluator.evaluate(&pos), Value::ZERO);
+
+        let mv = Move::from_usi("7g7f").unwrap();
+        let dirty = pos.do_move(mv, pos.gives_check(mv));
+        evaluator.push(dirty);
+        assert_eq!(evaluator.evaluate(&pos), Value::ZERO);
+    }
+
+    #[cfg(feature = "layerstack-arch")]
     #[test]
     #[ignore]
     fn real_model_matches_const_generic() {

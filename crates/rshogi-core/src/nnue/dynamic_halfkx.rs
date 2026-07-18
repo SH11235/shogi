@@ -151,6 +151,8 @@ impl DynamicAffine {
         debug_assert!(output.len() >= self.output_dim);
 
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        // SAFETY: `input` covers `padded_input`, every weight row has exactly that padded
+        // length, and the four-row/output loops only load or store complete 16-byte groups.
         unsafe {
             use std::arch::wasm32::*;
 
@@ -484,6 +486,7 @@ impl DynamicHalfKxNetwork {
 
 /// Per-search runtime accumulator and preallocated inference scratch.
 pub struct DynamicHalfKxStack {
+    spec: ArchitectureSpec,
     l1: usize,
     halfkp: bool,
     current: usize,
@@ -501,6 +504,7 @@ pub struct DynamicHalfKxStack {
 impl DynamicHalfKxStack {
     pub(crate) fn new(net: &DynamicHalfKxNetwork) -> Self {
         Self {
+            spec: net.spec,
             l1: net.spec.l1,
             halfkp: net.is_halfkp(),
             current: 0,
@@ -516,8 +520,8 @@ impl DynamicHalfKxStack {
         }
     }
 
-    pub(crate) fn l1_size(&self) -> usize {
-        self.l1
+    pub(crate) fn matches_network(&self, net: &DynamicHalfKxNetwork) -> bool {
+        self.spec == net.spec
     }
     pub(crate) fn is_halfkp(&self) -> bool {
         self.halfkp
@@ -563,6 +567,8 @@ fn activate_i32(kind: Activation, input: &[i32], output: &mut [u8]) {
 #[inline]
 fn add_row(acc: &mut [i16], row: &[i16]) {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    // SAFETY: `chunks` is bounded by both slices; each v128 access covers eight in-range
+    // i16 elements and the scalar tail starts immediately after the last vector.
     unsafe {
         use std::arch::wasm32::*;
         let chunks = acc.len().min(row.len()) / 8;
@@ -586,6 +592,8 @@ fn add_row(acc: &mut [i16], row: &[i16]) {
 #[inline]
 fn sub_row(acc: &mut [i16], row: &[i16]) {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    // SAFETY: `chunks` is bounded by both slices; each v128 access covers eight in-range
+    // i16 elements and the scalar tail starts immediately after the last vector.
     unsafe {
         use std::arch::wasm32::*;
         let chunks = acc.len().min(row.len()) / 8;
@@ -628,8 +636,62 @@ mod tests {
     use std::io::BufReader;
 
     use super::*;
+    use crate::nnue::accumulator_stack_variant::AccumulatorStackVariant;
     use crate::nnue::halfkp::{HalfKPNetwork, HalfKPStack};
+    use crate::nnue::network::NNUENetwork;
     use crate::position::SFEN_HIRATE;
+
+    fn zero_affine(input_dim: usize, output_dim: usize) -> DynamicAffine {
+        DynamicAffine {
+            input_dim,
+            padded_input: padded_input(input_dim),
+            output_dim,
+            biases: AlignedBox::new_zeroed(output_dim),
+            weights: AlignedBox::new_zeroed(output_dim * padded_input(input_dim)),
+        }
+    }
+
+    fn test_network(spec: ArchitectureSpec) -> DynamicHalfKxNetwork {
+        let feature_set = RuntimeFeatureSet::from_spec(spec.feature_set).unwrap();
+        let dense_input = 2 * spec.l1 / spec.activation.output_dim_divisor();
+        DynamicHalfKxNetwork {
+            spec,
+            feature_set,
+            input_dimensions: feature_set.dimensions(),
+            activation: spec.activation,
+            ft_biases: AlignedBox::new_zeroed(spec.l1),
+            ft_weights: AlignedBox::new_zeroed(0),
+            l1: zero_affine(dense_input, spec.l2),
+            l2: zero_affine(spec.l2, spec.l3),
+            output: zero_affine(spec.l3, 1),
+            fv_scale: FV_SCALE,
+            qa: 127,
+        }
+    }
+
+    #[test]
+    fn stack_is_rebuilt_for_every_runtime_architecture_identity_change() {
+        let base_spec = ArchitectureSpec::new(FeatureSet::HalfKP, 8, 4, 3, Activation::CReLU);
+        let base = NNUENetwork::DynamicHalfKx(Box::new(test_network(base_spec)));
+        let stack = AccumulatorStackVariant::from_network(&base);
+        assert!(stack.matches_network(&base));
+
+        for switched_spec in [
+            ArchitectureSpec::new(FeatureSet::HalfKP, 10, 4, 3, Activation::CReLU),
+            ArchitectureSpec::new(FeatureSet::HalfKP, 8, 5, 3, Activation::CReLU),
+            ArchitectureSpec::new(FeatureSet::HalfKP, 8, 4, 5, Activation::CReLU),
+            ArchitectureSpec::new(FeatureSet::HalfKP, 8, 4, 3, Activation::SCReLU),
+            ArchitectureSpec::new(FeatureSet::HalfKP, 8, 4, 3, Activation::PairwiseCReLU),
+            ArchitectureSpec::new(FeatureSet::HalfKaHmMerged, 8, 4, 3, Activation::CReLU),
+        ] {
+            let switched = NNUENetwork::DynamicHalfKx(Box::new(test_network(switched_spec)));
+            assert!(!stack.matches_network(&switched), "switch to {switched_spec:?}");
+            assert!(
+                AccumulatorStackVariant::from_network(&switched).matches_network(&switched),
+                "replacement stack for {switched_spec:?}"
+            );
+        }
+    }
 
     /// 実ファイルを dynamic / const-generic の両方で読み、評価値を比較する。
     ///

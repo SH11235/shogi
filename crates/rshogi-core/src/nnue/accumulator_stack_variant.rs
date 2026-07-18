@@ -96,10 +96,12 @@ impl AccumulatorStackVariant {
         match (self, network) {
             #[cfg(feature = "nnue-runtime-dimensions")]
             (Self::DynamicHalfKx(stack), NNUENetwork::DynamicHalfKx(net)) => {
-                stack.borrow().l1_size() == net.l1_size()
+                stack.borrow().matches_network(net)
             }
             #[cfg(feature = "nnue-runtime-dimensions")]
-            (Self::DynamicLayerStacks(_), NNUENetwork::DynamicLayerStacks(_)) => true,
+            (Self::DynamicLayerStacks(stack), NNUENetwork::DynamicLayerStacks(net)) => {
+                stack.borrow().matches_network(net)
+            }
             (Self::HalfKaSplit(stack), NNUENetwork::HalfKaSplit(net)) => {
                 stack.l1_size() == net.l1_size()
             }

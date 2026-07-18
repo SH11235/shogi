@@ -463,7 +463,10 @@ impl NNUENetwork {
                 };
 
                 // LayerStacks は特殊処理（FT が LEB128 圧縮のためファイルサイズ検出の対象外）
-                if effective_feature_set == FeatureSet::LayerStacks {
+                if matches!(
+                    effective_feature_set,
+                    FeatureSet::LayerStacks | FeatureSet::HalfKaHmMergedEffectBucket
+                ) {
                     if cfg!(feature = "nnue-runtime-dimensions") {
                         #[cfg(feature = "nnue-runtime-dimensions")]
                         {
@@ -2429,6 +2432,25 @@ mod tests {
         bytes.extend_from_slice(arch);
         bytes.extend_from_slice(&num_buckets.to_le_bytes());
         bytes
+    }
+
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    #[test]
+    fn legacy_effect_bucket_auto_dispatches_to_dynamic_layer_stacks() {
+        let arch = b"Features=HalfKaHmMerged(Friend)[293220->2x2],EffectBucket=2x2fixed,l2=2,l3=1";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&NNUE_VERSION_HALFKA.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(arch.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(arch);
+
+        // The truncated payload must get as far as the LayerStacks reader. Before the dispatch
+        // fix it was rejected earlier by DynamicHalfKx as an unsupported feature set.
+        let err = match NNUENetwork::from_bytes(&bytes) {
+            Ok(_) => panic!("truncated legacy EffectBucket model must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
     }
 
     /// num_buckets-header layout で `num_buckets = 0` / 上限超過の値は
