@@ -727,14 +727,17 @@ mod tests {
         // LayerStacks 各 L1 バリアント（有効 feature のみ検証）。
         // 外側の `any(...)` でいずれかの variant が有効なときだけ import が使われる
         // ようにして unused-import 警告を抑える。
-        #[cfg(any(
-            feature = "layerstacks-1536x16x32",
-            feature = "layerstacks-1536x32x32",
-            feature = "layerstacks-768x16x32",
-            feature = "layerstacks-768x8x32",
-            feature = "layerstacks-512x16x32",
-            feature = "layerstacks-1024x16x32",
-            feature = "layerstacks-3072x16x32"
+        #[cfg(all(
+            feature = "layerstack-arch",
+            any(
+                feature = "layerstacks-1536x16x32",
+                feature = "layerstacks-1536x32x32",
+                feature = "layerstacks-768x16x32",
+                feature = "layerstacks-768x8x32",
+                feature = "layerstacks-512x16x32",
+                feature = "layerstacks-1024x16x32",
+                feature = "layerstacks-3072x16x32"
+            )
         ))]
         {
             use crate::nnue::accumulator_layer_stacks::{
