@@ -334,6 +334,7 @@ fn compute_layer_stack_bucket_index(
             get_layer_stack_progress_kpabs_weights(),
             num_buckets,
         ),
+        _ => unreachable!("unsupported LayerStack bucket mode"),
     }
 }
 
