@@ -295,7 +295,9 @@ impl DynamicLayerStacksNetwork {
             )));
         }
         Ok(Self {
-            spec: ArchitectureSpec::new(parsed_feature, l1, l2, l3, Activation::CReLU),
+            // Keep public introspection compatible with the const-generic LayerStacks path;
+            // the concrete FT remains in `feature` for runtime dispatch.
+            spec: ArchitectureSpec::new(FeatureSet::LayerStacks, l1, l2, l3, Activation::CReLU),
             feature,
             input_dimensions,
             num_buckets,
