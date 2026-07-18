@@ -123,6 +123,7 @@ pub fn parse_nnue_architecture(value: &str) -> Option<NNUEArchitectureOverride> 
 
 /// LayerStacks の bucket 選択モード
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LayerStackBucketMode {
     /// 両玉の相対段で 9 バケットを選択する YaneuraOu 互換方式
     KingRank9 = 0,
@@ -321,6 +322,7 @@ pub fn reset_layer_stack_progress_kpabs_weights() {
 ///
 /// L2/L3/活性化の追加時、このenumの変更は不要。
 /// 詳細は `halfka_split/` や `halfkp/` のモジュールで管理される。
+#[non_exhaustive]
 pub enum NNUENetwork {
     /// HalfKaSplit 特徴量セット（L256/L512/L1024）
     HalfKaSplit(HalfKaSplitNetwork),

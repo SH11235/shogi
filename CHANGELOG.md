@@ -7,13 +7,21 @@ marker として `vX.Y.Z` を打つ。crates.io 上の `rshogi-core` は別系�
 運用しており、library API の互換性は core のバージョンで判断する
 (`crates/rshogi-core/Cargo.toml`)。
 
-crates.io への `rshogi-core` publish は (v1.3.0 リリース以降) `vX.Y.Z` リリース時に、
-そのタグの commit から行う。release PR では前回 publish 以降に core へ変更があれば必ず
-バージョンを bump する (publish される tarball とタグの内容を常に一致させ、「バージョン
-番号が動いていない = core 変更なし」という誤推定を防ぐため)。
+crates.io への `rshogi-core` publish は engine release とは独立して行う。前回 publish 以降の
+core 変更を公開する PR では `crates/rshogi-core/Cargo.toml` のバージョンを必ず bump し、
+その PR の merge commit から publish する。`vX.Y.Z` タグは engine 全体の release marker
+専用であり、core 単独 publish のためのタグは打たない。
 
 ## Unreleased
 
+- **rshogi-core publish 規約の訂正**: v1.3.0 で追加した「engine の `vX.Y.Z` タグと同時に、
+  そのタグから publish する」という規約を撤回。core 単独変更や engine 以外の変更だけを
+  含む期間にも core を公開できるよう、core は engine release と独立して version bump・publish
+  する。core 用の release tag は設けない。
+- **rshogi-core 0.5.0 (crates.io)**: v1.3.0 で公開した 0.4.0 以降の core 変更を公開。
+  `LayerStackBucketMode::KingRank9`、探索の修正・調整、NNUE changed-index 更新の高速化を含む。
+  将来の NNUE architecture 追加を互換な 0.5.x update で行えるよう、公開 NNUE enum を
+  `#[non_exhaustive]` に変更。
 - **gensfen resume の互換性変更**: worker temp を永続 checkpoint として扱い、完了 `game_id` の
   欠番再実行、全 worker 成果物の result 境界復旧、既定毎対局 fsync、journal による冪等な複数成果物
   finalization、正常終了 worker 成果物の fail-closed 検証、final 長・staging 中 SHA-256・PSV/sidecar
