@@ -110,6 +110,9 @@ layerstacks-3072x16x32 = []
 nnue-psqt   = []
 nnue-threat = []
 nnue-effect-bucket = []
+# universal edition 用の runtime 次元 NNUE 実装。
+# 固定 edition は const-generic 実装を使い続ける。
+nnue-runtime-dimensions = []
 
 effect-bucket-2x2-kingfixed = []
 effect-bucket-2x2-kingbucketed = []
@@ -156,6 +159,7 @@ nnue-progress-diff = []
 # 全 architecture × 全構成 dispatch (default)
 edition-universal = [
   "mode-universal",
+  "nnue-runtime-dimensions",
   "layerstack-arch", "halfkx-arch",
   "ft-halfkp", "ft-halfka_split", "ft-halfka_merged", "ft-halfka_hm_split", "ft-halfka_hm_merged",
   "layerstacks-1536x16x32", "layerstacks-1536x32x32", "layerstacks-768x16x32", "layerstacks-768x8x32", "layerstacks-512x16x32", "layerstacks-1024x16x32", "layerstacks-3072x16x32",

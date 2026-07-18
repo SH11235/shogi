@@ -29,6 +29,8 @@ use super::constants::{
     MAX_ARCH_LEN, MAX_LAYER_STACK_BUCKETS, NNUE_VERSION, NNUE_VERSION_HALFKA,
     NNUE_VERSION_LAYERSTACK_NUM_BUCKETS,
 };
+#[cfg(feature = "nnue-runtime-dimensions")]
+use super::dynamic_halfkx::DynamicHalfKxNetwork;
 use super::halfka_hm_merged::{HalfKaHmMergedNetwork, HalfKaHmMergedStack};
 use super::halfka_hm_split::{HalfKaHmSplitNetwork, HalfKaHmSplitStack};
 use super::halfka_merged::{HalfKaMergedNetwork, HalfKaMergedStack};
@@ -324,6 +326,9 @@ pub fn reset_layer_stack_progress_kpabs_weights() {
 /// 詳細は `halfka_split/` や `halfkp/` のモジュールで管理される。
 #[non_exhaustive]
 pub enum NNUENetwork {
+    /// Runtime-dimension HalfKX（universal edition 専用）
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    DynamicHalfKx(Box<DynamicHalfKxNetwork>),
     /// HalfKaSplit 特徴量セット（L256/L512/L1024）
     HalfKaSplit(HalfKaSplitNetwork),
     /// HalfKaHmMerged 特徴量セット（L256/L512/L1024）
@@ -493,6 +498,18 @@ impl NNUENetwork {
                     }
                 }
 
+                // universal edition は HalfKX の次元をヘッダーから動的に構成する。
+                // 固定/family edition は従来どおり既知サイズの const-generic 経路を使う。
+                if cfg!(feature = "nnue-runtime-dimensions") {
+                    #[cfg(feature = "nnue-runtime-dimensions")]
+                    {
+                        reader.seek(SeekFrom::Start(0))?;
+                        return Ok(Self::DynamicHalfKx(Box::new(DynamicHalfKxNetwork::read(
+                            reader,
+                        )?)));
+                    }
+                }
+
                 // 4. ファイルサイズからアーキテクチャを検出
                 let detection = super::spec::detect_architecture_from_size(
                     file_size,
@@ -608,22 +625,36 @@ impl NNUENetwork {
 
     /// HalfKaSplit アーキテクチャかどうか
     pub fn is_halfka(&self) -> bool {
-        matches!(self, Self::HalfKaSplit(_))
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        let dynamic = matches!(self, Self::DynamicHalfKx(net) if net.spec().feature_set == FeatureSet::HalfKaSplit);
+        #[cfg(not(feature = "nnue-runtime-dimensions"))]
+        let dynamic = false;
+        matches!(self, Self::HalfKaSplit(_)) || dynamic
     }
 
     /// HalfKaHmMerged アーキテクチャかどうか
     pub fn is_halfka_hm(&self) -> bool {
-        matches!(self, Self::HalfKaHmMerged(_))
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        let dynamic = matches!(self, Self::DynamicHalfKx(net) if net.spec().feature_set == FeatureSet::HalfKaHmMerged);
+        #[cfg(not(feature = "nnue-runtime-dimensions"))]
+        let dynamic = false;
+        matches!(self, Self::HalfKaHmMerged(_)) || dynamic
     }
 
     /// HalfKP アーキテクチャかどうか
     pub fn is_halfkp(&self) -> bool {
-        matches!(self, Self::HalfKP(_))
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        let dynamic = matches!(self, Self::DynamicHalfKx(net) if net.is_halfkp());
+        #[cfg(not(feature = "nnue-runtime-dimensions"))]
+        let dynamic = false;
+        matches!(self, Self::HalfKP(_)) || dynamic
     }
 
     /// L1 サイズを取得
     pub fn l1_size(&self) -> usize {
         match self {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicHalfKx(net) => net.l1_size(),
             Self::HalfKaSplit(net) => net.l1_size(),
             Self::HalfKaHmMerged(net) => net.l1_size(),
             Self::HalfKaMerged(net) => net.l1_size(),
@@ -637,6 +668,8 @@ impl NNUENetwork {
     /// アーキテクチャ名を取得
     pub fn architecture_name(&self) -> String {
         match self {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicHalfKx(net) => net.spec().name(),
             Self::HalfKaSplit(net) => net.architecture_name(),
             Self::HalfKaHmMerged(net) => net.architecture_name(),
             Self::HalfKaMerged(net) => net.architecture_name(),
@@ -650,6 +683,8 @@ impl NNUENetwork {
     /// アーキテクチャ仕様を取得
     pub fn architecture_spec(&self) -> super::spec::ArchitectureSpec {
         match self {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicHalfKx(net) => net.spec(),
             Self::HalfKaSplit(net) => net.architecture_spec(),
             Self::HalfKaHmMerged(net) => net.architecture_spec(),
             Self::HalfKaMerged(net) => net.architecture_spec(),
@@ -1669,6 +1704,14 @@ pub fn evaluate_dispatch(
 
     // バリアントに応じて適切な評価関数を呼び出し
     match stack {
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        AccumulatorStackVariant::DynamicHalfKx(s) => {
+            let NNUENetwork::DynamicHalfKx(net) = &*network else {
+                unreachable!("Network/Stack type mismatch")
+            };
+            net.ensure(pos, s);
+            net.evaluate(pos, s)
+        }
         #[cfg(feature = "layerstack-arch")]
         AccumulatorStackVariant::LayerStacks(s) => {
             let net = network.as_layer_stacks();
@@ -1724,6 +1767,13 @@ pub fn ensure_accumulator_computed(
 
     // バリアントに応じてアキュムレータを更新（評価はしない）
     match stack {
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        AccumulatorStackVariant::DynamicHalfKx(s) => {
+            let NNUENetwork::DynamicHalfKx(net) = &*network else {
+                unreachable!("Network/Stack type mismatch")
+            };
+            net.ensure(pos, s);
+        }
         #[cfg(feature = "layerstack-arch")]
         AccumulatorStackVariant::LayerStacks(s) => {
             let net = network.as_layer_stacks();

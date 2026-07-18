@@ -35,6 +35,8 @@ mod bona_piece_halfka_merged;
 mod bona_piece_halfka_split;
 mod constants;
 mod diff;
+#[cfg(feature = "nnue-runtime-dimensions")]
+mod dynamic_halfkx;
 mod effect_bucket_features;
 mod evaluator;
 mod feature_transformer;

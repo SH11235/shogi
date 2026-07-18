@@ -221,8 +221,12 @@ impl NNUEEvaluator {
     /// アキュムレータが未計算の場合、不正な評価値が返る。
     /// 通常は `evaluate()` を使用すること。
     #[inline(always)]
-    pub fn evaluate_only(&self, pos: &Position) -> Value {
-        match (&*self.net, &self.stack) {
+    pub fn evaluate_only(&mut self, pos: &Position) -> Value {
+        match (&*self.net, &mut self.stack) {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            (NNUENetwork::DynamicHalfKx(net), AccumulatorStackVariant::DynamicHalfKx(st)) => {
+                net.evaluate(pos, st)
+            }
             (NNUENetwork::HalfKaSplit(net), AccumulatorStackVariant::HalfKaSplit(st)) => {
                 net.evaluate(pos, st)
             }
@@ -277,6 +281,10 @@ impl NNUEEvaluator {
     /// アキュムレータをフル再計算
     fn refresh_accumulator(&mut self, pos: &Position) {
         match (&*self.net, &mut self.stack) {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            (NNUENetwork::DynamicHalfKx(net), AccumulatorStackVariant::DynamicHalfKx(st)) => {
+                net.refresh(pos, st);
+            }
             (NNUENetwork::HalfKaSplit(net), AccumulatorStackVariant::HalfKaSplit(st)) => {
                 if let Some(cache) = &mut self.acc_cache_generic {
                     net.refresh_accumulator_with_cache(pos, st, cache);
@@ -323,6 +331,10 @@ impl NNUEEvaluator {
     /// アキュムレータが計算済みか確認し、必要に応じて更新
     fn ensure_accumulator_computed(&mut self, pos: &Position) {
         match (&*self.net, &mut self.stack) {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            (NNUENetwork::DynamicHalfKx(net), AccumulatorStackVariant::DynamicHalfKx(st)) => {
+                net.ensure(pos, st);
+            }
             (NNUENetwork::HalfKaSplit(net), AccumulatorStackVariant::HalfKaSplit(st)) => {
                 Self::update_halfka_accumulator(net, pos, st, &mut self.acc_cache_generic);
             }
