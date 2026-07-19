@@ -187,13 +187,57 @@ pub(crate) fn parse_feature_set_keyword(arch_str: &str) -> Option<&str> {
     Some(&after_key[..end])
 }
 
-/// アーキテクチャ文字列から FeatureSet を判定
-pub fn parse_feature_set_from_arch(arch_str: &str) -> Result<FeatureSet, String> {
+/// LayerStacks ヘッダーの `Features=` keyword から内部 FT を厳密に判定する。
+///
+/// family 判定では混在活性化や `Threat=` を優先して `LayerStacks` を返す必要があるが、
+/// 実際の入力特徴量はこの keyword から別途判定する。tatara の PascalCase 表記と
+/// bullet-shogi 系の underscore 表記を同じ FT に解決する。
+pub(crate) fn parse_layer_stacks_feature_set_keyword(
+    arch_str: &str,
+) -> Result<Option<FeatureSet>, String> {
     use super::constants::{
         HALFKA_DIMENSIONS, HALFKA_HM_DIMENSIONS, HALFKA_HM_SPLIT_DIMENSIONS,
         HALFKA_MERGED_DIMENSIONS,
     };
 
+    let Some(name) = parse_feature_set_keyword(arch_str) else {
+        return Ok(None);
+    };
+    let feature = match name {
+        "HalfKP" => FeatureSet::HalfKP,
+        "HalfKA_merged" | "HalfKaMerged" => FeatureSet::HalfKaMerged,
+        "HalfKA_hm_split" | "HalfKaHmSplit" => FeatureSet::HalfKaHmSplit,
+        "HalfKA_hm" | "HalfKaHmMerged" => FeatureSet::HalfKaHmMerged,
+        "HalfKaSplit" => FeatureSet::HalfKaSplit,
+        "HalfKaHmMergedEffectBucket" => FeatureSet::HalfKaHmMergedEffectBucket,
+        "HalfKA" => {
+            let reported_dim = parse_feature_input_dimensions(arch_str).ok_or_else(|| {
+                "HalfKA architecture is missing input dimensions in arch string.".to_string()
+            })?;
+            let threat_dim = arch_str
+                .split(',')
+                .find_map(|part| part.strip_prefix("Threat="))
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let resolve = |input_dim| match input_dim {
+                HALFKA_HM_DIMENSIONS => Some(FeatureSet::HalfKaHmMerged),
+                HALFKA_DIMENSIONS => Some(FeatureSet::HalfKaSplit),
+                HALFKA_MERGED_DIMENSIONS => Some(FeatureSet::HalfKaMerged),
+                HALFKA_HM_SPLIT_DIMENSIONS => Some(FeatureSet::HalfKaHmSplit),
+                _ => None,
+            };
+            resolve(reported_dim)
+                .or_else(|| reported_dim.checked_sub(threat_dim).and_then(resolve))
+                .ok_or_else(|| format!("Unknown HalfKA input dimensions: {reported_dim}"))?
+        }
+        "" => return Ok(None),
+        other => return Err(format!("Unknown feature set keyword: {other}")),
+    };
+    Ok(Some(feature))
+}
+
+/// アーキテクチャ文字列から FeatureSet を判定
+pub fn parse_feature_set_from_arch(arch_str: &str) -> Result<FeatureSet, String> {
     // 明示的な "LayerStacks" キーワードがあれば確定
     if arch_str.contains("LayerStacks") {
         return Ok(FeatureSet::LayerStacks);
@@ -227,40 +271,8 @@ pub fn parse_feature_set_from_arch(arch_str: &str) -> Result<FeatureSet, String>
     // Features= キーワードを切り出して `==` で完全一致判定する。
     // underscore 表記 (`HalfKA_hm` 等) と PascalCase 表記 (`HalfKaHmMerged` 等) の両方を
     // 同じ enum に解決して、両綴りで emit された .bin ヘッダを共通にロードできる。
-    if let Some(name) = parse_feature_set_keyword(arch_str) {
-        match name {
-            "HalfKP" => return Ok(FeatureSet::HalfKP),
-
-            // plane を明示する綴り (両表記)。
-            "HalfKA_merged" | "HalfKaMerged" => return Ok(FeatureSet::HalfKaMerged),
-            "HalfKA_hm_split" | "HalfKaHmSplit" => return Ok(FeatureSet::HalfKaHmSplit),
-            "HalfKaHmMergedEffectBucket" => return Ok(FeatureSet::HalfKaHmMergedEffectBucket),
-
-            // mirror + merged: underscore / PascalCase の同義綴り。
-            "HalfKA_hm" | "HalfKaHmMerged" => return Ok(FeatureSet::HalfKaHmMerged),
-            // 非ミラー + split: PascalCase 綴り (underscore 綴りは plane 暗黙の "HalfKA" 経由)。
-            "HalfKaSplit" => return Ok(FeatureSet::HalfKaSplit),
-
-            // "HalfKA" 単独は plane 暗黙: bullet-shogi 互換のため input_dim で
-            // disambiguate する (HALFKA_HM_DIMENSIONS なら HalfKA_hm、等)。
-            "HalfKA" => {
-                let input_dim = parse_feature_input_dimensions(arch_str).ok_or_else(|| {
-                    "HalfKA architecture is missing input dimensions in arch string.".to_string()
-                })?;
-                return match input_dim {
-                    HALFKA_HM_DIMENSIONS => Ok(FeatureSet::HalfKaHmMerged),
-                    HALFKA_DIMENSIONS => Ok(FeatureSet::HalfKaSplit),
-                    HALFKA_MERGED_DIMENSIONS => Ok(FeatureSet::HalfKaMerged),
-                    HALFKA_HM_SPLIT_DIMENSIONS => Ok(FeatureSet::HalfKaHmSplit),
-                    _ => Err(format!("Unknown HalfKA input dimensions: {input_dim}")),
-                };
-            }
-
-            // 空 keyword (`Features=,...` 形式) は LayerStacks フォールバックへ落とす。
-            "" => {}
-
-            other => return Err(format!("Unknown feature set keyword: {other}")),
-        }
+    if let Some(feature) = parse_layer_stacks_feature_set_keyword(arch_str)? {
+        return Ok(feature);
     }
 
     // HalfKX キーワードを持たないネスト形式 LayerStacks: FT_OUT パターンで補完判定
@@ -1268,6 +1280,48 @@ mod tests {
         assert_eq!(
             parse_feature_set_from_arch("Features=HalfKA[138510->512x2]").unwrap(),
             parse_feature_set_from_arch("Features=HalfKaSplit[138510->512x2]").unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_layer_stacks_internal_ft_accepts_both_header_styles() {
+        let cases: &[(&str, usize, FeatureSet)] = &[
+            ("HalfKP", 125_388, FeatureSet::HalfKP),
+            ("HalfKA", 138_510, FeatureSet::HalfKaSplit),
+            ("HalfKA_merged", 131_949, FeatureSet::HalfKaMerged),
+            ("HalfKA_hm_split", 76_950, FeatureSet::HalfKaHmSplit),
+            ("HalfKA_hm", 73_305, FeatureSet::HalfKaHmMerged),
+            ("HalfKaSplit", 138_510, FeatureSet::HalfKaSplit),
+            ("HalfKaMerged", 131_949, FeatureSet::HalfKaMerged),
+            ("HalfKaHmSplit", 76_950, FeatureSet::HalfKaHmSplit),
+            ("HalfKaHmMerged", 73_305, FeatureSet::HalfKaHmMerged),
+        ];
+        for &(keyword, input_dim, expected) in cases {
+            let arch = format!(
+                "Features={keyword}(Friend)[{input_dim}->1536x2],Network=AffineTransform[1<-32](ClippedReLU[32](SqrClippedReLU[30](AffineTransform[16<-3072])))"
+            );
+            assert_eq!(parse_feature_set_from_arch(&arch).unwrap(), FeatureSet::LayerStacks);
+            assert_eq!(
+                parse_layer_stacks_feature_set_keyword(&arch).unwrap(),
+                Some(expected),
+                "keyword={keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_layer_stacks_internal_ft_rejects_unknown_keyword_substrings() {
+        let arch = "Features=UnknownHalfKaHmMerged(Friend)[73305->1536x2],Network=(ClippedReLU[32](SqrClippedReLU[30]))";
+        let err = parse_layer_stacks_feature_set_keyword(arch).unwrap_err();
+        assert!(err.contains("Unknown feature set keyword"));
+    }
+
+    #[test]
+    fn test_layer_stacks_implicit_halfka_accepts_combined_threat_dimensions() {
+        let arch = "Features=HalfKA(Friend)[355230->1536x2],Threat=216720,Network=(ClippedReLU[32](SqrClippedReLU[30]))";
+        assert_eq!(
+            parse_layer_stacks_feature_set_keyword(arch).unwrap(),
+            Some(FeatureSet::HalfKaSplit)
         );
     }
 
