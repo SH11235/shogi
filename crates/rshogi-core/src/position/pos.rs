@@ -3011,6 +3011,56 @@ mod tests {
         assert_eq!(pos.declaration_win(EnteringKingRule::Point27), Move::NONE);
     }
 
+    // 24点法(31点)と27点法(先手28/後手27点)の判定が分かれる境界局面。
+    // 実対局由来: 27点法設定のエンジンが宣言し、24点法のサーバーに拒否され得る帯
+    // (27〜30点) の局面で、ルールごとの結果が食い違うことを固定する。
+
+    #[test]
+    fn test_declaration_win_point24_rejects_29_points_black() {
+        // 先手29点(敵陣: 馬・角・飛5点×3 + 小駒7枚、持駒: 金1銀2歩4)、玉2段目、敵陣10枚
+        let sfen = "+B+N4R+Pl/KBG2g2l/P+P2P+N3/6p2/2p3s2/4S2L1/G8/7p+l/7+pk b G2S4Pr2n6p 1";
+        let pos = make_pos(sfen);
+        let info = pos.entering_king_point_info(Color::Black);
+        assert_eq!(info.points, 29);
+        assert_eq!(pos.declaration_win(EnteringKingRule::Point24), Move::NONE);
+        assert_eq!(pos.declaration_win(EnteringKingRule::Point27), Move::WIN);
+    }
+
+    #[test]
+    fn test_declaration_win_point24_rejects_27_points_white() {
+        // 後手27点(敵陣: 龍・飛・馬5点×3 + 小駒7枚、持駒: 銀1香1歩3)、玉9段目、敵陣10枚
+        let sfen = "K+P7/L+N+P3P2/8+P/B8/9/4s1g2/p+ns3g1+n/2l5+p/1+r2r1+b1k w 2GSNL9Psl3p 1";
+        let pos = make_pos(sfen);
+        let info = pos.entering_king_point_info(Color::White);
+        assert_eq!(info.points, 27);
+        assert_eq!(pos.declaration_win(EnteringKingRule::Point24), Move::NONE);
+        assert_eq!(pos.declaration_win(EnteringKingRule::Point27), Move::WIN);
+    }
+
+    #[test]
+    fn test_declaration_win_point24_rejects_27_points_white_dense_zone() {
+        // 後手27点だが敵陣15枚(小駒中心)の別パターン。持駒: 桂1歩3
+        let sfen =
+            "K+P7/+SP1+b1+B3/9/9/P+L2p4/5g+p2/1pg+lsn2+l/1+rp3+pPk/1+p1rgg1+l+s w S2N5Pn3p 1";
+        let pos = make_pos(sfen);
+        let info = pos.entering_king_point_info(Color::White);
+        assert_eq!(info.points, 27);
+        assert_eq!(info.enemy_zone_pieces, 15);
+        assert_eq!(pos.declaration_win(EnteringKingRule::Point24), Move::NONE);
+        assert_eq!(pos.declaration_win(EnteringKingRule::Point27), Move::WIN);
+    }
+
+    #[test]
+    fn test_declaration_win_point24_accepts_31_points_white() {
+        // 後手31点(敵陣: 馬・龍5点×2 + 小駒8枚、持駒: 桂2香1歩10)ちょうどで宣言成立
+        let sfen = "1+R4+L1K/7PP/6g2/5P1sp/4b2g1/2P4n1/1g1P2Psg/1+bl2+r2l/3sP+n1sk w 2nl10p 1";
+        let pos = make_pos(sfen);
+        let info = pos.entering_king_point_info(Color::White);
+        assert_eq!(info.points, 31);
+        assert_eq!(pos.declaration_win(EnteringKingRule::Point24), Move::WIN);
+        assert_eq!(pos.declaration_win(EnteringKingRule::Point27), Move::WIN);
+    }
+
     #[test]
     fn test_count_total_piece_points_startpos() {
         let pos = make_pos("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1");
