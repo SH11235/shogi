@@ -226,7 +226,7 @@ pub struct ServerConfig {
     /// 超過時は切断扱いにする。5 秒は「localhost / LAN の健常クライアント
     /// では十分、stall した client を抱え込み続けるには長すぎる」レンジ。
     pub x1_reply_write_timeout: Duration,
-    /// 入玉ルール。既定は 24 点法。
+    /// 入玉ルール。既定は 27 点法 (電竜戦・WCSC・floodgate と同じ標準宣言ルール)。
     pub entering_king_rule: EnteringKingRule,
     /// 既定の対局開始局面 SFEN。`None` なら平手。
     ///
@@ -326,7 +326,7 @@ impl ServerConfig {
             login_timeout: Duration::from_secs(30),
             agree_timeout: Duration::from_secs(5 * 60),
             x1_reply_write_timeout: Duration::from_secs(5),
-            entering_king_rule: EnteringKingRule::Point24,
+            entering_king_rule: EnteringKingRule::Point27,
             initial_sfen: None,
             admin_handles: Vec::new(),
             allow_floodgate_features: false,

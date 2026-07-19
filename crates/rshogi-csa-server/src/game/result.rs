@@ -11,7 +11,7 @@ pub enum IllegalReason {
     Generic,
     /// 打ち歩詰。
     Uchifuzume,
-    /// `%KACHI` 宣言が 24 点法で不成立。
+    /// `%KACHI` 宣言が入玉宣言ルールで不成立。
     IllegalKachi,
 }
 
@@ -35,7 +35,7 @@ pub enum GameResult {
         /// 反則の種別。
         reason: IllegalReason,
     },
-    /// `%KACHI` → `#JISHOGI`（24 点法成立）。
+    /// `%KACHI` → `#JISHOGI`（入玉宣言成立）。
     Kachi {
         /// 入玉宣言が成立した側（勝者）。
         winner: Color,

@@ -17,7 +17,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use rshogi_core::types::EnteringKingRule;
 use rshogi_csa_server::ClockSpec;
 use rshogi_csa_server::game::room::{GameRoom as CoreRoom, GameRoomConfig};
 use rshogi_csa_server::types::{Color, CsaLine, GameId, PlayerName};
@@ -235,7 +234,7 @@ pub fn replay_core_room(cfg: &PersistedConfig, moves: &[MoveRow]) -> ReplaySumma
             white: PlayerName::new(cfg.white_handle.clone()),
             max_moves: cfg.max_moves,
             time_margin_ms: cfg.time_margin_ms,
-            entering_king_rule: EnteringKingRule::Point24,
+            entering_king_rule: crate::config::ENTERING_KING_RULE,
             initial_sfen: cfg.initial_sfen.clone(),
         },
         clock,
@@ -349,7 +348,7 @@ mod tests {
                 white: PlayerName::new(cfg.white_handle.clone()),
                 max_moves: cfg.max_moves,
                 time_margin_ms: cfg.time_margin_ms,
-                entering_king_rule: EnteringKingRule::Point24,
+                entering_king_rule: crate::config::ENTERING_KING_RULE,
                 initial_sfen: cfg.initial_sfen.clone(),
             },
             cfg.clock.build_clock(),

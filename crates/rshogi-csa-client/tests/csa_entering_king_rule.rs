@@ -39,15 +39,19 @@ fn write_lines(writer: &mut dyn Write, lines: &[&str]) {
     writer.flush().expect("flush");
 }
 
-/// `extra` をヘッダフィールド部に挿入した最小 Game_Summary を送出する mock を立て、
-/// login + recv_game_summary した結果を返す。
-fn recv_summary_with(extra: &'static [&'static str]) -> rshogi_csa_client::GameSummary {
+/// 最小 Game_Summary を送出する mock を立て、login + recv_game_summary した結果を
+/// 返す。`header_extra` はヘッダフィールド部 (rshogi サーバーの `Declaration:` 位置)、
+/// `tail_extra` は `END Position` 後 (同 `Entering_King_Rule:` 拡張行の位置) に挿入する。
+fn recv_summary_with(
+    header_extra: &'static [&'static str],
+    tail_extra: &'static [&'static str],
+) -> rshogi_csa_client::GameSummary {
     let port = spawn_mock_tcp_server(move |reader, writer| {
         let _ = read_line(reader);
         write_lines(writer, &["LOGIN:alice OK"]);
-        let mut lines = vec![
-            "BEGIN Game_Summary",
-            "Protocol_Version:1.2",
+        let mut lines = vec!["BEGIN Game_Summary", "Protocol_Version:1.2"];
+        lines.extend_from_slice(header_extra);
+        lines.extend_from_slice(&[
             "Game_ID:game-ekr",
             "Name+:black",
             "Name-:white",
@@ -56,15 +60,13 @@ fn recv_summary_with(extra: &'static [&'static str]) -> rshogi_csa_client::GameS
             "Time_Unit:1sec",
             "Total_Time:600",
             "Byoyomi:10",
-        ];
-        lines.extend_from_slice(extra);
-        lines.extend_from_slice(&[
             "BEGIN Position",
             "PI",
             "+",
             "END Position",
-            "END Game_Summary",
         ]);
+        lines.extend_from_slice(tail_extra);
+        lines.push("END Game_Summary");
         write_lines(writer, &lines);
     });
 
@@ -75,13 +77,13 @@ fn recv_summary_with(extra: &'static [&'static str]) -> rshogi_csa_client::GameS
 
 #[test]
 fn extension_line_maps_usi_token() {
-    let summary = recv_summary_with(&["Entering_King_Rule:CSARule24"]);
+    let summary = recv_summary_with(&[], &["Entering_King_Rule:CSARule24"]);
     assert_eq!(summary.entering_king_rule, Some(EnteringKingRule::Point24));
 }
 
 #[test]
 fn declaration_jishogi_maps_to_point27() {
-    let summary = recv_summary_with(&["Declaration:Jishogi 1.1"]);
+    let summary = recv_summary_with(&["Declaration:Jishogi 1.1"], &[]);
     assert_eq!(summary.entering_king_rule, Some(EnteringKingRule::Point27));
 }
 
@@ -89,18 +91,19 @@ fn declaration_jishogi_maps_to_point27() {
 fn extension_line_wins_over_declaration() {
     // 本リポサーバーが将来 Point24 のまま `Declaration:` も出すような構成でも
     // 拡張行 (正確なルール) を優先する。
-    let summary = recv_summary_with(&["Declaration:Jishogi 1.1", "Entering_King_Rule:CSARule24"]);
+    let summary =
+        recv_summary_with(&["Declaration:Jishogi 1.1"], &["Entering_King_Rule:CSARule24"]);
     assert_eq!(summary.entering_king_rule, Some(EnteringKingRule::Point24));
 }
 
 #[test]
 fn absent_advertisement_yields_none() {
-    let summary = recv_summary_with(&[]);
+    let summary = recv_summary_with(&[], &[]);
     assert_eq!(summary.entering_king_rule, None);
 }
 
 #[test]
 fn unknown_token_yields_none() {
-    let summary = recv_summary_with(&["Entering_King_Rule:BogusRule"]);
+    let summary = recv_summary_with(&[], &["Entering_King_Rule:BogusRule"]);
     assert_eq!(summary.entering_king_rule, None);
 }

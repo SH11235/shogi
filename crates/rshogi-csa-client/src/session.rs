@@ -387,7 +387,7 @@ enum MoveAction {
 /// config の `engine.options` に `EnteringKingRule` が明示されている場合は
 /// ユーザー設定を優先し、広告値と異なるときは warn のみ出す。未指定なら
 /// `setoption` で広告値を注入する。広告が無いサーバーでは何もしない
-/// (エンジン既定のまま)。
+/// (エンジンは既定値、または同一プロセスで前局に注入された値のまま)。
 fn apply_advertised_entering_king_rule<E>(
     config: &CsaClientConfig,
     engine: &mut E,

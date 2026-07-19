@@ -122,7 +122,7 @@ pub struct GameRoomConfig {
     /// `compute_deadline` / turn alarm の予約で加算し、`consume`（課金）からは
     /// 差し引かない。
     pub time_margin_ms: u64,
-    /// `%KACHI` 判定に使う入玉ルール（既定は 24 点法 = `Point24`）。
+    /// `%KACHI` 判定に使う入玉ルール（本番配備は 27 点法 = `Point27`）。
     pub entering_king_rule: EnteringKingRule,
     /// 対局の開始局面を表す SFEN。`None` なら平手（`SFEN_HIRATE`）を使う。
     ///

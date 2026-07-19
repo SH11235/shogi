@@ -349,6 +349,8 @@ mod tests {
         let begin_time = pos("BEGIN Time");
         let begin_pos = pos("BEGIN Position");
         let end_pos = pos("END Position");
+        let ekr = pos("Entering_King_Rule:");
+        let end_summary = pos("END Game_Summary");
         assert!(pv < pm);
         assert!(pm < fmt);
         assert!(fmt < decl);
@@ -361,6 +363,8 @@ mod tests {
         assert!(to_move < begin_time);
         assert!(begin_time < begin_pos);
         assert!(begin_pos < end_pos);
+        assert!(end_pos < ekr);
+        assert!(ekr < end_summary);
     }
 
     #[test]
@@ -463,7 +467,11 @@ mod tests {
         let end_game = txt
             .find("END Game_Summary\n")
             .unwrap_or_else(|| panic!("missing END Game_Summary: {txt}"));
-        assert!(end_position < token_line, "token must follow END Position");
+        let ekr_line = txt
+            .find("\nEntering_King_Rule:")
+            .unwrap_or_else(|| panic!("missing Entering_King_Rule line: {txt}"));
+        assert!(end_position < ekr_line, "rule line must follow END Position");
+        assert!(ekr_line < token_line, "token must follow rule line");
         assert!(token_line < end_game, "token must precede END Game_Summary");
     }
 

@@ -62,8 +62,8 @@ pub enum KachiOutcome {
 
 /// 合法性・千日手・入玉宣言を判定するサービス。
 ///
-/// `entering_king_rule` で `%KACHI` 判定方式を切替可能にしている（既定は
-/// CSA 24 点法 = `Point24`。27 点法やトライルールも選択可能）。
+/// `entering_king_rule` で `%KACHI` 判定方式を切替可能にしている
+/// （27 点法 / 24 点法 / トライルール等を選択可能）。
 #[derive(Debug, Clone, Copy)]
 pub struct Validator {
     entering_king_rule: EnteringKingRule,
@@ -181,8 +181,8 @@ impl Validator {
 
     /// `%KACHI`（入玉宣言）が `pos` の手番側で成立するか判定する。
     ///
-    /// 内部は `rshogi_core::Position::declaration_win` に委譲する。CSA 24 点法
-    /// （`Point24`）を既定とし、`Point27`/`Point24H`/`Point27H` も同 API で扱える。
+    /// 内部は `rshogi_core::Position::declaration_win` に委譲する。27 点法
+    /// （`Point27`）/ 24 点法（`Point24`）/ 駒落ち variant を同 API で扱える。
     /// `TryRule` も API 契約上は宣言成立を示す任意の `Move` を Accepted として
     /// 受け付けるため、`entering_king_rule` を切替えても呼び出し側のコードは変更不要。
     pub fn evaluate_kachi(&self, pos: &Position) -> KachiOutcome {
