@@ -32,6 +32,7 @@ use super::piece_list::PieceNumber;
 use super::spec::{
     Activation, ArchitectureSpec, FeatureSet, parse_arch_dimensions,
     parse_feature_input_dimensions, parse_feature_set_from_arch,
+    parse_layer_stacks_feature_set_keyword,
 };
 use super::stats::{count_refresh, count_update};
 use crate::position::Position;
@@ -1019,6 +1020,9 @@ fn detect_feature(arch: &str) -> io::Result<FeatureSet> {
     if arch.contains("EffectBucket=") || arch.contains("E4=") {
         return Ok(FeatureSet::HalfKaHmMergedEffectBucket);
     }
+    if let Some(feature) = parse_layer_stacks_feature_set_keyword(arch).map_err(invalid)? {
+        return Ok(feature);
+    }
     if let Ok(feature) = parse_feature_set_from_arch(arch)
         && feature != FeatureSet::LayerStacks
     {
@@ -1359,6 +1363,29 @@ mod tests {
     use crate::nnue::network_layer_stacks::LayerStacksNetwork;
     use crate::position::SFEN_HIRATE;
     use crate::types::Move;
+
+    #[test]
+    fn layer_stacks_ft_detection_accepts_underscore_headers() {
+        let cases = [
+            ("HalfKP", 125_388, FeatureSet::HalfKP),
+            ("HalfKA", 138_510, FeatureSet::HalfKaSplit),
+            ("HalfKA_merged", 131_949, FeatureSet::HalfKaMerged),
+            ("HalfKA_hm_split", 76_950, FeatureSet::HalfKaHmSplit),
+            ("HalfKA_hm", 73_305, FeatureSet::HalfKaHmMerged),
+        ];
+        for (keyword, input_dim, expected) in cases {
+            let arch = format!(
+                "Features={keyword}(Friend)[{input_dim}->1536x2],Network=(ClippedReLU[32](SqrClippedReLU[30]))"
+            );
+            assert_eq!(detect_feature(&arch).unwrap(), expected, "keyword={keyword}");
+        }
+    }
+
+    #[test]
+    fn layer_stacks_ft_detection_rejects_unknown_keyword_substrings() {
+        let arch = "Features=UnknownHalfKaHmMerged(Friend)[73305->1536x2],Network=(ClippedReLU[32](SqrClippedReLU[30]))";
+        assert_eq!(detect_feature(arch).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
 
     fn zero_affine(input_dim: usize, output_dim: usize) -> DynamicAffine {
         let bytes = vec![0; output_dim * 4 + output_dim * padded_input(input_dim)];

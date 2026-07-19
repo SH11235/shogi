@@ -2035,7 +2035,8 @@ fn peek_layer_stacks_feature_set<R: Read + Seek>(
         let mut arch = vec![0u8; arch_len];
         reader.read_exact(&mut arch)?;
         let arch_str = String::from_utf8_lossy(&arch);
-        Ok(detect_layer_stacks_feature_set(&arch_str))
+        detect_layer_stacks_feature_set(&arch_str)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))
     })();
     reader.seek(SeekFrom::Start(original))?;
     result
@@ -2043,23 +2044,15 @@ fn peek_layer_stacks_feature_set<R: Read + Seek>(
 
 /// arch_str から LS の FT を判別する pure helper (peek の純粋ロジック部分)。
 #[cfg(feature = "layerstack-arch")]
-fn detect_layer_stacks_feature_set(arch_str: &str) -> super::spec::FeatureSet {
+fn detect_layer_stacks_feature_set(arch_str: &str) -> Result<super::spec::FeatureSet, String> {
     use super::spec::FeatureSet as Fs;
     if arch_str.contains("EffectBucket=") {
-        return Fs::HalfKaHmMergedEffectBucket;
+        return Ok(Fs::HalfKaHmMergedEffectBucket);
     }
-    if let Some(name) = super::spec::parse_feature_set_keyword(arch_str) {
-        match name {
-            "HalfKP" => return Fs::HalfKP,
-            "HalfKaSplit" => return Fs::HalfKaSplit,
-            "HalfKaMerged" => return Fs::HalfKaMerged,
-            "HalfKaHmSplit" => return Fs::HalfKaHmSplit,
-            "HalfKaHmMergedEffectBucket" => return Fs::HalfKaHmMergedEffectBucket,
-            "HalfKaHmMerged" => return Fs::HalfKaHmMerged,
-            _ => {}
-        }
+    if let Some(feature) = super::spec::parse_layer_stacks_feature_set_keyword(arch_str)? {
+        return Ok(feature);
     }
-    super::spec::parse_feature_set_from_arch(arch_str).unwrap_or(Fs::LayerStacks)
+    Ok(super::spec::parse_feature_set_from_arch(arch_str).unwrap_or(Fs::LayerStacks))
 }
 
 #[cfg(feature = "nnue-effect-bucket")]
@@ -2365,7 +2358,7 @@ mod tests {
         }
     }
 
-    /// `detect_layer_stacks_feature_set` が tatara emit 形式の arch_str (PascalCase) を
+    /// `detect_layer_stacks_feature_set` が underscore / PascalCase の arch_str を
     /// 5 FT 全てで正しく分岐することを確認する。
     ///
     /// 実 NNUE の arch_str は `LayerStacks` キーワードを含まないため、`SqrClippedReLU`
@@ -2378,6 +2371,22 @@ mod tests {
         use crate::nnue::spec::FeatureSet as Fs;
 
         let cases: &[(&str, Fs)] = &[
+            (
+                "Features=HalfKA(Friend)[138510->1536x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
+                Fs::HalfKaSplit,
+            ),
+            (
+                "Features=HalfKA_merged(Friend)[131949->1536x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
+                Fs::HalfKaMerged,
+            ),
+            (
+                "Features=HalfKA_hm_split(Friend)[76950->1536x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
+                Fs::HalfKaHmSplit,
+            ),
+            (
+                "Features=HalfKA_hm(Friend)[73305->1536x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
+                Fs::HalfKaHmMerged,
+            ),
             (
                 "Features=HalfKP(Friend)[125388->1536x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
                 Fs::HalfKP,
@@ -2413,7 +2422,7 @@ mod tests {
         ];
 
         for (arch_str, expected) in cases {
-            let got = detect_layer_stacks_feature_set(arch_str);
+            let got = detect_layer_stacks_feature_set(arch_str).unwrap();
             assert_eq!(
                 got, *expected,
                 "arch_str={arch_str:?} → expected {expected:?}, got {got:?}"
@@ -2421,17 +2430,22 @@ mod tests {
         }
     }
 
-    /// `Features=` keyword が見つからない / 不明な FT のみ、`LayerStacks` fallback に
-    /// 落ちることを確認する。
+    /// `Features=` keyword が無い場合のみ `LayerStacks` fallback に落ち、明示された
+    /// 未知 keyword は拒否することを確認する。
     #[cfg(feature = "layerstack-arch")]
     #[test]
     fn test_detect_feature_set_fallback() {
         use crate::nnue::spec::FeatureSet as Fs;
         // Features= が無く LayerStacks キーワードがあるケース → fallback で LayerStacks
-        let got = detect_layer_stacks_feature_set("LayerStacks(...)");
+        let got = detect_layer_stacks_feature_set("LayerStacks(...)").unwrap();
         assert_eq!(got, Fs::LayerStacks);
         // 完全に未知 → fallback の unwrap_or で LayerStacks
-        let got = detect_layer_stacks_feature_set("unknown-arch-string");
+        let got = detect_layer_stacks_feature_set("unknown-arch-string").unwrap();
         assert_eq!(got, Fs::LayerStacks);
+        let err = detect_layer_stacks_feature_set(
+            "Features=UnknownHalfKaHmMerged(Friend)[73305->1536x2]",
+        )
+        .unwrap_err();
+        assert!(err.contains("Unknown feature set keyword"));
     }
 }
