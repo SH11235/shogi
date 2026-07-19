@@ -11,6 +11,8 @@
 
 name = "rshogi-csa-server-workers"
 main = "build/worker/shim.mjs"
+# Custom Domain binding。DNS record (AAAA 100:: proxied) は iac repo (Pulumi) が正典
+routes = [{ pattern = "rshogi-csa-server.sh11235.com", custom_domain = true }]
 # 2026-04-21 時点の最新 compatibility flag 日付に追従する。
 # 主要 opt-in 機能:
 # - `web_socket_auto_reply_to_close` (2026-04-07): WS が close フレームに自動応答
