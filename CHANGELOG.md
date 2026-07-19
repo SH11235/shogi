@@ -14,6 +14,11 @@ core 変更を公開する PR では `crates/rshogi-core/Cargo.toml` のバー�
 
 ## Unreleased
 
+- **rshogi-core 0.5.1 (crates.io)**: default の `edition-universal` をモデルヘッダー駆動の
+  runtime-dimension構成へ変更。HalfKXの5 FT・3活性化と、LayerStacksの5 FT・任意次元・
+  PSQT・full Threatを、次元ごとの固定editionを列挙せず読み込めるようにした。動的
+  LayerStacksの差分更新性能を改善し、従来のPascalCase形式に加えて一般的なunderscore形式
+  (`HalfKA_hm`等) のFTヘッダーも受理する。EffectBucketとThreat非fullプロファイルは未対応。
 - **rshogi-core publish 規約の訂正**: v1.3.0 で追加した「engine の `vX.Y.Z` タグと同時に、
   そのタグから publish する」という規約を撤回。core 単独変更や engine 以外の変更だけを
   含む期間にも core を公開できるよう、core は engine release と独立して version bump・publish
