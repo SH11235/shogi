@@ -1,6 +1,6 @@
 [package]
 name = "rshogi-core"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 authors = ["SH11235"]
 description = "A high-performance shogi engine core library with NNUE evaluation"
@@ -20,7 +20,7 @@ rand_xoshiro.workspace = true
 serde.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.186"
 
 [target.'cfg(windows)'.dependencies]
 # Keep in sync with clap's transitive windows-sys (0.60.x) to avoid duplicate versions on Windows.

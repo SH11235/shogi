@@ -14,6 +14,9 @@ core 変更を公開する PR では `crates/rshogi-core/Cargo.toml` のバー�
 
 ## Unreleased
 
+- **rshogi-core 0.5.2 (crates.io)**: Linux で使用する `libc::NAME_MAX` が公開された
+  `libc 0.2.186` を最小依存バージョンとして明示。既存の lockfile が古い `libc` を選択した
+  consumer で 0.5.1 がコンパイルできない問題を修正。
 - **rshogi-core 0.5.1 (crates.io)**: default の `edition-universal` をモデルヘッダー駆動の
   runtime-dimension構成へ変更。HalfKXの5 FT・3活性化と、LayerStacksの5 FT・任意次元・
   PSQT・full Threatを、次元ごとの固定editionを列挙せず読み込めるようにした。動的
