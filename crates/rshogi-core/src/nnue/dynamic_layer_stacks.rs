@@ -5,6 +5,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use super::accumulator::{
     AlignedBox, DirtyPiece, IndexList, MAX_ACTIVE_FEATURES, MAX_CHANGED_FEATURES,
 };
+use super::bona_piece::{BonaPiece, FE_END};
 use super::bona_piece_effect_bucket::EffectBucketConfig;
 use super::constants::{
     DEFAULT_NUM_BUCKETS, FV_SCALE_HALFKA, MAX_ARCH_LEN, MAX_LAYER_STACK_BUCKETS,
@@ -18,17 +19,23 @@ use super::features::{
 };
 use super::layers::padded_input;
 use super::leb128::read_compressed_tensor_i16_all;
+use super::ls_feature_spec::{
+    HalfKaHmMergedSpec, HalfKaHmSplitSpec, HalfKaMergedSpec, HalfKaSplitSpec, HalfKpSpec,
+    LsFeatureSpec,
+};
 use super::network::{
     LayerStackBucketMode, compute_layer_stack_progress8kpabs_bucket_index, get_fv_scale_override,
     get_layer_stack_bucket_mode, get_layer_stack_progress_kpabs_weights, parse_fv_scale_from_arch,
 };
 use super::network_layer_stacks::compute_layer_stack_kingrank9_bucket_index;
+use super::piece_list::PieceNumber;
 use super::spec::{
     Activation, ArchitectureSpec, FeatureSet, parse_arch_dimensions,
     parse_feature_input_dimensions, parse_feature_set_from_arch,
 };
+use super::stats::{count_refresh, count_update};
 use crate::position::Position;
-use crate::types::{Color, Value};
+use crate::types::{Color, Square, Value};
 
 const STACK_CAPACITY: usize = 256;
 
@@ -109,6 +116,51 @@ impl RuntimeLsFeature {
             Self::HalfKaHmSplit => HalfKaHmSplitFeatureSet::needs_refresh(dirty, perspective),
             Self::EffectBucket(_) => true,
         }
+    }
+
+    fn includes_king_in_piece_list(self) -> bool {
+        !matches!(self, Self::HalfKP)
+    }
+
+    fn feature_index(self, bp: BonaPiece, perspective: Color, king_sq: Square) -> Option<usize> {
+        match self {
+            Self::HalfKP => Some(HalfKpSpec::feature_index(bp, perspective, king_sq)),
+            Self::HalfKaHmMerged => {
+                Some(HalfKaHmMergedSpec::feature_index(bp, perspective, king_sq))
+            }
+            Self::HalfKaSplit => Some(HalfKaSplitSpec::feature_index(bp, perspective, king_sq)),
+            Self::HalfKaMerged => Some(HalfKaMergedSpec::feature_index(bp, perspective, king_sq)),
+            Self::HalfKaHmSplit => Some(HalfKaHmSplitSpec::feature_index(bp, perspective, king_sq)),
+            Self::EffectBucket(_) => None,
+        }
+    }
+}
+
+struct DynamicLayerStacksCache {
+    accumulations: AlignedBox<i16>,
+    psqt: AlignedBox<i32>,
+    piece_lists: Box<[[BonaPiece; PieceNumber::NB]]>,
+    valid: Box<[bool]>,
+}
+
+impl DynamicLayerStacksCache {
+    fn new(l1: usize, num_buckets: usize, has_psqt: bool) -> Self {
+        let entries = Square::NUM * Color::NUM;
+        Self {
+            accumulations: AlignedBox::new_zeroed(entries * l1),
+            psqt: AlignedBox::new_zeroed(entries * num_buckets * usize::from(has_psqt)),
+            piece_lists: vec![[BonaPiece::ZERO; PieceNumber::NB]; entries].into_boxed_slice(),
+            valid: vec![false; entries].into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    fn entry_index(king_sq: Square, perspective: Color) -> usize {
+        king_sq.raw() as usize * Color::NUM + perspective.index()
+    }
+
+    fn clear(&mut self) {
+        self.valid.fill(false);
     }
 }
 
@@ -353,27 +405,156 @@ impl DynamicLayerStacksNetwork {
         perspective: Color,
         stack: &mut DynamicLayerStacksStack,
     ) {
+        count_refresh!();
         let current = stack.current;
         let p = perspective.index();
         let start = (current * 2 + p) * self.spec.l1;
-        let acc = &mut stack.accumulations[start..start + self.spec.l1];
-        acc.copy_from_slice(&self.ft_biases);
         let psqt_start = (current * 2 + p) * self.num_buckets;
-        let psqt = &mut stack.psqt[psqt_start..psqt_start + self.num_buckets];
-        if self.psqt_biases.is_empty() {
-            psqt.fill(0);
-        } else {
-            psqt.copy_from_slice(&self.psqt_biases);
+
+        if matches!(self.feature, RuntimeLsFeature::EffectBucket(_)) {
+            let acc = &mut stack.accumulations[start..start + self.spec.l1];
+            acc.copy_from_slice(&self.ft_biases);
+            let psqt = &mut stack.psqt[psqt_start..psqt_start + self.num_buckets];
+            if self.psqt_biases.is_empty() {
+                psqt.fill(0);
+            } else {
+                psqt.copy_from_slice(&self.psqt_biases);
+            }
+            for index in self.feature.active(pos, perspective).iter() {
+                add_i16(acc, self.ft_row(index));
+                if !self.psqt_weights.is_empty() {
+                    add_i32(
+                        psqt,
+                        &self.psqt_weights
+                            [index * self.num_buckets..(index + 1) * self.num_buckets],
+                    );
+                }
+            }
+            self.refresh_threat(pos, perspective, stack);
+            return;
         }
-        for index in self.feature.active(pos, perspective).iter() {
-            add_i16(acc, self.ft_row(index));
+
+        let king_sq = pos.king_square(perspective);
+        let raw_piece_list = if perspective == Color::Black {
+            pos.piece_list().piece_list_fb()
+        } else {
+            pos.piece_list().piece_list_fw()
+        };
+        let piece_list_owned;
+        let piece_list = if self.feature.includes_king_in_piece_list() {
+            raw_piece_list
+        } else {
+            piece_list_owned = {
+                let mut pieces = *raw_piece_list;
+                pieces[PieceNumber::KING as usize] = BonaPiece::ZERO;
+                pieces[(PieceNumber::KING + 1) as usize] = BonaPiece::ZERO;
+                pieces
+            };
+            &piece_list_owned
+        };
+
+        let entry = DynamicLayerStacksCache::entry_index(king_sq, perspective);
+        let cache_acc_start = entry * self.spec.l1;
+        let cache_psqt_start = entry * self.num_buckets;
+        let DynamicLayerStacksStack {
+            accumulations,
+            psqt,
+            cache,
+            ..
+        } = stack;
+        let acc = &mut accumulations[start..start + self.spec.l1];
+        let current_psqt = &mut psqt[psqt_start..psqt_start + self.num_buckets];
+
+        if cache.valid[entry] {
+            super::stats::count_cache_hit!();
+            acc.copy_from_slice(
+                &cache.accumulations[cache_acc_start..cache_acc_start + self.spec.l1],
+            );
             if !self.psqt_weights.is_empty() {
-                add_i32(
-                    psqt,
-                    &self.psqt_weights[index * self.num_buckets..(index + 1) * self.num_buckets],
+                current_psqt.copy_from_slice(
+                    &cache.psqt[cache_psqt_start..cache_psqt_start + self.num_buckets],
                 );
             }
+
+            let mut diff_count = 0;
+            for (&cached, &current) in cache.piece_lists[entry].iter().zip(piece_list) {
+                if cached == current {
+                    continue;
+                }
+                let cached_index = (cached != BonaPiece::ZERO).then(|| {
+                    self.feature
+                        .feature_index(cached, perspective, king_sq)
+                        .expect("non-EffectBucket feature")
+                });
+                let current_index = (current != BonaPiece::ZERO).then(|| {
+                    self.feature
+                        .feature_index(current, perspective, king_sq)
+                        .expect("non-EffectBucket feature")
+                });
+                match (cached_index, current_index) {
+                    (Some(sub), Some(add)) => sub_add_i16(acc, self.ft_row(sub), self.ft_row(add)),
+                    (Some(sub), None) => sub_i16(acc, self.ft_row(sub)),
+                    (None, Some(add)) => add_i16(acc, self.ft_row(add)),
+                    (None, None) => {}
+                }
+                if !self.psqt_weights.is_empty() {
+                    if let Some(index) = cached_index {
+                        sub_i32(
+                            current_psqt,
+                            &self.psqt_weights
+                                [index * self.num_buckets..(index + 1) * self.num_buckets],
+                        );
+                    }
+                    if let Some(index) = current_index {
+                        add_i32(
+                            current_psqt,
+                            &self.psqt_weights
+                                [index * self.num_buckets..(index + 1) * self.num_buckets],
+                        );
+                    }
+                }
+                if cached_index.is_some() {
+                    diff_count += 1;
+                }
+                if current_index.is_some() {
+                    diff_count += 1;
+                }
+            }
+            super::stats::count_refresh_diff!(diff_count);
+        } else {
+            super::stats::count_cache_miss!();
+            acc.copy_from_slice(&self.ft_biases);
+            if self.psqt_biases.is_empty() {
+                current_psqt.fill(0);
+            } else {
+                current_psqt.copy_from_slice(&self.psqt_biases);
+            }
+            for &bp in piece_list {
+                if bp == BonaPiece::ZERO {
+                    continue;
+                }
+                let index = self
+                    .feature
+                    .feature_index(bp, perspective, king_sq)
+                    .expect("non-EffectBucket feature");
+                add_i16(acc, self.ft_row(index));
+                if !self.psqt_weights.is_empty() {
+                    add_i32(
+                        current_psqt,
+                        &self.psqt_weights
+                            [index * self.num_buckets..(index + 1) * self.num_buckets],
+                    );
+                }
+            }
         }
+
+        cache.accumulations[cache_acc_start..cache_acc_start + self.spec.l1].copy_from_slice(acc);
+        if !self.psqt_weights.is_empty() {
+            cache.psqt[cache_psqt_start..cache_psqt_start + self.num_buckets]
+                .copy_from_slice(current_psqt);
+        }
+        cache.piece_lists[entry].copy_from_slice(piece_list);
+        cache.valid[entry] = true;
         self.refresh_threat(pos, perspective, stack);
     }
 
@@ -383,33 +564,52 @@ impl DynamicLayerStacksNetwork {
         perspective: Color,
         stack: &mut DynamicLayerStacksStack,
     ) {
+        if self.threat_dimensions == 0 {
+            return;
+        }
         let start = (stack.current * 2 + perspective.index()) * self.spec.l1;
         let threat = &mut stack.threat_accumulations[start..start + self.spec.l1];
         threat.fill(0);
-        if self.threat_dimensions != 0 {
-            #[cfg(feature = "nnue-threat")]
-            super::threat_features::for_each_active_threat_index(
-                pos,
-                perspective,
-                pos.king_square(perspective),
-                |idx| {
-                    let row = &self.threat_weights[idx * self.spec.l1..(idx + 1) * self.spec.l1];
-                    for (a, &w) in threat.iter_mut().zip(row) {
-                        *a = a.wrapping_add(i16::from(w));
-                    }
-                },
-            );
-        }
+        #[cfg(feature = "nnue-threat")]
+        super::threat_features::for_each_active_threat_index(
+            pos,
+            perspective,
+            pos.king_square(perspective),
+            |idx| {
+                let row = &self.threat_weights[idx * self.spec.l1..(idx + 1) * self.spec.l1];
+                for (a, &w) in threat.iter_mut().zip(row) {
+                    *a = a.wrapping_add(i16::from(w));
+                }
+            },
+        );
     }
 
     pub(crate) fn ensure(&self, pos: &Position, stack: &mut DynamicLayerStacksStack) {
         if stack.computed[stack.current] {
             return;
         }
-        if stack.current == 0 || !stack.computed[stack.current - 1] {
+        if stack.current == 0 {
             self.refresh(pos, stack);
             return;
         }
+
+        if stack.computed[stack.current - 1] {
+            self.update_from_previous(pos, stack);
+            return;
+        }
+
+        if self.threat_dimensions == 0
+            && !matches!(self.feature, RuntimeLsFeature::EffectBucket(_))
+            && let Some(source) = stack.find_usable_accumulator(4)
+            && self.forward_update(pos, stack, source)
+        {
+            return;
+        }
+
+        self.refresh(pos, stack);
+    }
+
+    fn update_from_previous(&self, pos: &Position, stack: &mut DynamicLayerStacksStack) {
         let current = stack.current;
         let dirty = stack.dirty[current];
         for perspective in [Color::Black, Color::White] {
@@ -417,10 +617,7 @@ impl DynamicLayerStacksNetwork {
                 self.refresh_perspective(pos, perspective, stack);
                 continue;
             }
-            let Some((removed, added)) = self.feature.changed(&dirty, perspective, pos) else {
-                self.refresh_perspective(pos, perspective, stack);
-                continue;
-            };
+            count_update!();
             let p = perspective.index();
             let l1 = self.spec.l1;
             let prev_start = ((current - 1) * 2 + p) * l1;
@@ -429,11 +626,20 @@ impl DynamicLayerStacksNetwork {
             let prev = &before[prev_start..prev_start + l1];
             let curr = &mut after[..l1];
             curr.copy_from_slice(prev);
-            for index in removed.iter() {
-                sub_i16(curr, self.ft_row(index));
-            }
-            for index in added.iter() {
-                add_i16(curr, self.ft_row(index));
+            let fast_applied = self.try_apply_dirty_piece_fast(
+                curr,
+                &dirty,
+                perspective,
+                pos.king_square(perspective),
+            );
+            let changes = if !fast_applied || !self.psqt_weights.is_empty() {
+                self.feature.changed(&dirty, perspective, pos)
+            } else {
+                None
+            };
+            if !fast_applied {
+                let (removed, added) = changes.as_ref().expect("non-EffectBucket feature");
+                self.apply_feature_changes(curr, removed, added);
             }
 
             let prev_psqt_start = ((current - 1) * 2 + p) * self.num_buckets;
@@ -443,24 +649,209 @@ impl DynamicLayerStacksNetwork {
             let curr = &mut after[..self.num_buckets];
             curr.copy_from_slice(prev);
             if !self.psqt_weights.is_empty() {
-                for index in removed.iter() {
-                    sub_i32(
-                        curr,
-                        &self.psqt_weights
-                            [index * self.num_buckets..(index + 1) * self.num_buckets],
-                    );
-                }
-                for index in added.iter() {
-                    add_i32(
-                        curr,
-                        &self.psqt_weights
-                            [index * self.num_buckets..(index + 1) * self.num_buckets],
-                    );
-                }
+                let (removed, added) = changes.as_ref().expect("non-EffectBucket feature");
+                self.apply_psqt_changes(curr, removed, added);
             }
             self.refresh_threat(pos, perspective, stack);
         }
         stack.computed[current] = true;
+    }
+
+    fn forward_update(
+        &self,
+        pos: &Position,
+        stack: &mut DynamicLayerStacksStack,
+        source: usize,
+    ) -> bool {
+        let current = stack.current;
+        debug_assert!(source < current);
+        for perspective in [Color::Black, Color::White] {
+            let p = perspective.index();
+            let l1 = self.spec.l1;
+            let source_start = (source * 2 + p) * l1;
+            let current_start = (current * 2 + p) * l1;
+            let (before, after) = stack.accumulations.split_at_mut(current_start);
+            let source_acc = &before[source_start..source_start + l1];
+            let current_acc = &mut after[..l1];
+            current_acc.copy_from_slice(source_acc);
+
+            let source_psqt_start = (source * 2 + p) * self.num_buckets;
+            let current_psqt_start = (current * 2 + p) * self.num_buckets;
+            let (before, after) = stack.psqt.split_at_mut(current_psqt_start);
+            let source_psqt = &before[source_psqt_start..source_psqt_start + self.num_buckets];
+            let current_psqt = &mut after[..self.num_buckets];
+            current_psqt.copy_from_slice(source_psqt);
+
+            for index in source + 1..=current {
+                let dirty = stack.dirty[index];
+                count_update!();
+                let fast_applied = self.try_apply_dirty_piece_fast(
+                    current_acc,
+                    &dirty,
+                    perspective,
+                    pos.king_square(perspective),
+                );
+                let changes = if !fast_applied || !self.psqt_weights.is_empty() {
+                    self.feature.changed(&dirty, perspective, pos)
+                } else {
+                    None
+                };
+                if !fast_applied {
+                    let Some((removed, added)) = changes.as_ref() else {
+                        return false;
+                    };
+                    self.apply_feature_changes(current_acc, removed, added);
+                }
+                if !self.psqt_weights.is_empty() {
+                    let Some((removed, added)) = changes.as_ref() else {
+                        return false;
+                    };
+                    self.apply_psqt_changes(current_psqt, removed, added);
+                }
+            }
+        }
+        stack.computed[current] = true;
+        true
+    }
+
+    #[inline]
+    fn apply_feature_changes(
+        &self,
+        accumulation: &mut [i16],
+        removed: &IndexList<MAX_CHANGED_FEATURES>,
+        added: &IndexList<MAX_CHANGED_FEATURES>,
+    ) {
+        match (removed.len(), added.len()) {
+            (1, 1) => {
+                sub_add_i16(accumulation, self.ft_row(removed.get(0)), self.ft_row(added.get(0)))
+            }
+            (2, 2) => double_sub_add_i16(
+                accumulation,
+                self.ft_row(removed.get(0)),
+                self.ft_row(added.get(0)),
+                self.ft_row(removed.get(1)),
+                self.ft_row(added.get(1)),
+            ),
+            _ => {
+                for index in removed.iter() {
+                    sub_i16(accumulation, self.ft_row(index));
+                }
+                for index in added.iter() {
+                    add_i16(accumulation, self.ft_row(index));
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn try_apply_dirty_piece_fast(
+        &self,
+        accumulation: &mut [i16],
+        dirty: &DirtyPiece,
+        perspective: Color,
+        king_sq: Square,
+    ) -> bool {
+        if matches!(self.feature, RuntimeLsFeature::EffectBucket(_)) {
+            return false;
+        }
+
+        let changed = &dirty.changed_piece;
+        let old_new = |index: usize| {
+            let entry = &changed[index];
+            if perspective == Color::Black {
+                (entry.old_piece.fb, entry.new_piece.fb)
+            } else {
+                (entry.old_piece.fw, entry.new_piece.fw)
+            }
+        };
+
+        if !self.feature.includes_king_in_piece_list() {
+            for entry in changed.iter().take(dirty.dirty_num as usize) {
+                let (old, new) = if perspective == Color::Black {
+                    (entry.old_piece.fb, entry.new_piece.fb)
+                } else {
+                    (entry.old_piece.fw, entry.new_piece.fw)
+                };
+                if old.value() as usize >= FE_END || new.value() as usize >= FE_END {
+                    return false;
+                }
+            }
+        }
+
+        match dirty.dirty_num as usize {
+            1 => {
+                let (old, new) = old_new(0);
+                if old == BonaPiece::ZERO || new == BonaPiece::ZERO {
+                    return false;
+                }
+                let sub = self
+                    .feature
+                    .feature_index(old, perspective, king_sq)
+                    .expect("non-EffectBucket feature");
+                let add = self
+                    .feature
+                    .feature_index(new, perspective, king_sq)
+                    .expect("non-EffectBucket feature");
+                sub_add_i16(accumulation, self.ft_row(sub), self.ft_row(add));
+                true
+            }
+            2 => {
+                let (old0, new0) = old_new(0);
+                let (old1, new1) = old_new(1);
+                if [old0, new0, old1, new1].contains(&BonaPiece::ZERO) {
+                    return false;
+                }
+                let sub0 = self
+                    .feature
+                    .feature_index(old0, perspective, king_sq)
+                    .expect("non-EffectBucket feature");
+                let add0 = self
+                    .feature
+                    .feature_index(new0, perspective, king_sq)
+                    .expect("non-EffectBucket feature");
+                let sub1 = self
+                    .feature
+                    .feature_index(old1, perspective, king_sq)
+                    .expect("non-EffectBucket feature");
+                let add1 = self
+                    .feature
+                    .feature_index(new1, perspective, king_sq)
+                    .expect("non-EffectBucket feature");
+                double_sub_add_i16(
+                    accumulation,
+                    self.ft_row(sub0),
+                    self.ft_row(add0),
+                    self.ft_row(sub1),
+                    self.ft_row(add1),
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn apply_psqt_changes(
+        &self,
+        accumulation: &mut [i32],
+        removed: &IndexList<MAX_CHANGED_FEATURES>,
+        added: &IndexList<MAX_CHANGED_FEATURES>,
+    ) {
+        if self.psqt_weights.is_empty() {
+            return;
+        }
+        for index in removed.iter() {
+            sub_i32(
+                accumulation,
+                &self.psqt_weights[index * self.num_buckets..(index + 1) * self.num_buckets],
+            );
+        }
+        for index in added.iter() {
+            add_i32(
+                accumulation,
+                &self.psqt_weights[index * self.num_buckets..(index + 1) * self.num_buckets],
+            );
+        }
     }
 
     pub(crate) fn evaluate(&self, pos: &Position, stack: &mut DynamicLayerStacksStack) -> Value {
@@ -470,11 +861,21 @@ impl DynamicLayerStacksNetwork {
             [base + pos.side_to_move().index() * l1..base + (pos.side_to_move().index() + 1) * l1];
         let them = &stack.accumulations[base + (!pos.side_to_move()).index() * l1
             ..base + ((!pos.side_to_move()).index() + 1) * l1];
-        let us_threat = &stack.threat_accumulations
-            [base + pos.side_to_move().index() * l1..base + (pos.side_to_move().index() + 1) * l1];
-        let them_threat = &stack.threat_accumulations[base + (!pos.side_to_move()).index() * l1
-            ..base + ((!pos.side_to_move()).index() + 1) * l1];
-        sqr_transform_with_threat(us, us_threat, them, them_threat, &mut stack.transformed[..l1]);
+        if self.threat_dimensions == 0 {
+            sqr_transform_without_threat(us, them, &mut stack.transformed[..l1]);
+        } else {
+            let us_threat = &stack.threat_accumulations[base + pos.side_to_move().index() * l1
+                ..base + (pos.side_to_move().index() + 1) * l1];
+            let them_threat = &stack.threat_accumulations[base + (!pos.side_to_move()).index() * l1
+                ..base + ((!pos.side_to_move()).index() + 1) * l1];
+            sqr_transform_with_threat(
+                us,
+                us_threat,
+                them,
+                them_threat,
+                &mut stack.transformed[..l1],
+            );
+        }
         let bucket_index = match get_layer_stack_bucket_mode() {
             LayerStackBucketMode::KingRank9 => compute_layer_stack_kingrank9_bucket_index(
                 pos,
@@ -536,6 +937,7 @@ pub struct DynamicLayerStacksStack {
     psqt: AlignedBox<i32>,
     computed: Vec<bool>,
     dirty: Vec<DirtyPiece>,
+    cache: DynamicLayerStacksCache,
     transformed: AlignedBox<u8>,
     l1_out: AlignedBox<i32>,
     l2_input: AlignedBox<u8>,
@@ -549,10 +951,17 @@ impl DynamicLayerStacksStack {
             signature: net.stack_signature(),
             current: 0,
             accumulations: AlignedBox::new_zeroed(STACK_CAPACITY * 2 * net.spec.l1),
-            threat_accumulations: AlignedBox::new_zeroed(STACK_CAPACITY * 2 * net.spec.l1),
+            threat_accumulations: AlignedBox::new_zeroed(
+                STACK_CAPACITY * 2 * net.spec.l1 * usize::from(net.threat_dimensions != 0),
+            ),
             psqt: AlignedBox::new_zeroed(STACK_CAPACITY * 2 * net.num_buckets),
             computed: vec![false; STACK_CAPACITY],
             dirty: (0..STACK_CAPACITY).map(|_| DirtyPiece::default()).collect(),
+            cache: DynamicLayerStacksCache::new(
+                net.spec.l1,
+                net.num_buckets,
+                !net.psqt_weights.is_empty(),
+            ),
             transformed: AlignedBox::new_zeroed(padded_input(net.spec.l1)),
             l1_out: AlignedBox::new_zeroed(net.spec.l2),
             l2_input: AlignedBox::new_zeroed(padded_input(2 * (net.spec.l2 - 1))),
@@ -567,6 +976,9 @@ impl DynamicLayerStacksStack {
         self.current = 0;
         self.computed[0] = false;
         self.dirty[0].clear();
+        // A same-shaped EvalFile reuses this stack. Its cached accumulators were
+        // computed from the previous network weights and must not survive reset.
+        self.cache.clear();
     }
     pub(crate) fn push(&mut self, dirty: DirtyPiece) {
         assert!(self.current + 1 < STACK_CAPACITY, "dynamic NNUE accumulator stack overflow");
@@ -578,6 +990,28 @@ impl DynamicLayerStacksStack {
         if self.current > 0 {
             self.current -= 1;
         }
+    }
+
+    fn find_usable_accumulator(&self, max_depth: usize) -> Option<usize> {
+        if self.current == 0
+            || self.dirty[self.current].king_moved[Color::Black.index()]
+            || self.dirty[self.current].king_moved[Color::White.index()]
+        {
+            return None;
+        }
+
+        for depth in 1..=max_depth.min(self.current) {
+            let index = self.current - depth;
+            if self.computed[index] {
+                return Some(index);
+            }
+            if self.dirty[index].king_moved[Color::Black.index()]
+                || self.dirty[index].king_moved[Color::White.index()]
+            {
+                return None;
+            }
+        }
+        None
     }
 }
 
@@ -676,6 +1110,67 @@ fn sub_i16(a: &mut [i16], b: &[i16]) {
         *a = a.wrapping_sub(b);
     }
 }
+fn sub_add_i16(a: &mut [i16], sub: &[i16], add: &[i16]) {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    // SAFETY: all slices have the same validated L1 length. Each v128 access covers
+    // eight in-range i16 elements and the scalar tail follows the last vector.
+    unsafe {
+        use std::arch::wasm32::*;
+        let chunks = a.len().min(sub.len()).min(add.len()) / 8;
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = v128_load(a.as_ptr().add(offset).cast::<v128>());
+            let vs = v128_load(sub.as_ptr().add(offset).cast::<v128>());
+            let vd = v128_load(add.as_ptr().add(offset).cast::<v128>());
+            v128_store(a.as_mut_ptr().add(offset).cast::<v128>(), i16x8_add(i16x8_sub(va, vs), vd));
+        }
+        for ((a, &sub), &add) in
+            a[chunks * 8..].iter_mut().zip(&sub[chunks * 8..]).zip(&add[chunks * 8..])
+        {
+            *a = a.wrapping_sub(sub).wrapping_add(add);
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    for ((a, &sub), &add) in a.iter_mut().zip(sub).zip(add) {
+        *a = a.wrapping_sub(sub).wrapping_add(add);
+    }
+}
+fn double_sub_add_i16(a: &mut [i16], sub0: &[i16], add0: &[i16], sub1: &[i16], add1: &[i16]) {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    // SAFETY: all slices have the same validated L1 length. Each v128 access covers
+    // eight in-range i16 elements and the scalar tail follows the last vector.
+    unsafe {
+        use std::arch::wasm32::*;
+        let chunks = a.len().min(sub0.len()).min(add0.len()).min(sub1.len()).min(add1.len()) / 8;
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = v128_load(a.as_ptr().add(offset).cast::<v128>());
+            let vs0 = v128_load(sub0.as_ptr().add(offset).cast::<v128>());
+            let vd0 = v128_load(add0.as_ptr().add(offset).cast::<v128>());
+            let vs1 = v128_load(sub1.as_ptr().add(offset).cast::<v128>());
+            let vd1 = v128_load(add1.as_ptr().add(offset).cast::<v128>());
+            let result = i16x8_add(i16x8_sub(i16x8_add(i16x8_sub(va, vs0), vd0), vs1), vd1);
+            v128_store(a.as_mut_ptr().add(offset).cast::<v128>(), result);
+        }
+        for ((((a, &sub0), &add0), &sub1), &add1) in a[chunks * 8..]
+            .iter_mut()
+            .zip(&sub0[chunks * 8..])
+            .zip(&add0[chunks * 8..])
+            .zip(&sub1[chunks * 8..])
+            .zip(&add1[chunks * 8..])
+        {
+            *a = a.wrapping_sub(sub0).wrapping_add(add0).wrapping_sub(sub1).wrapping_add(add1);
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    for ((((a, &sub0), &add0), &sub1), &add1) in
+        a.iter_mut().zip(sub0).zip(add0).zip(sub1).zip(add1)
+    {
+        *a = a.wrapping_sub(sub0).wrapping_add(add0).wrapping_sub(sub1).wrapping_add(add1);
+    }
+}
 fn add_i32(a: &mut [i32], b: &[i32]) {
     for (a, &b) in a.iter_mut().zip(b) {
         *a = a.wrapping_add(b);
@@ -684,6 +1179,61 @@ fn add_i32(a: &mut [i32], b: &[i32]) {
 fn sub_i32(a: &mut [i32], b: &[i32]) {
     for (a, &b) in a.iter_mut().zip(b) {
         *a = a.wrapping_sub(b);
+    }
+}
+
+fn sqr_transform_without_threat(us: &[i16], them: &[i16], output: &mut [u8]) {
+    let half = us.len() / 2;
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    let mut processed = 0;
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    let processed = 0;
+
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    // SAFETY: both accumulator slices have the same even L1 length and `output` has L1
+    // elements. The loop condition reserves 16 elements in each half before every load/store.
+    unsafe {
+        use std::arch::wasm32::*;
+        let zero = i16x8_splat(0);
+        let max127 = i16x8_splat(127);
+        for (acc, out_offset) in [(us, 0usize), (them, half)] {
+            let mut offset = 0;
+            while offset + 16 <= half {
+                let a0 = v128_load(acc.as_ptr().add(offset).cast::<v128>());
+                let b0 = v128_load(acc.as_ptr().add(half + offset).cast::<v128>());
+                let a1 = v128_load(acc.as_ptr().add(offset + 8).cast::<v128>());
+                let b1 = v128_load(acc.as_ptr().add(half + offset + 8).cast::<v128>());
+                let product0 = u16x8_shr(
+                    i16x8_mul(
+                        i16x8_min(i16x8_max(a0, zero), max127),
+                        i16x8_min(i16x8_max(b0, zero), max127),
+                    ),
+                    7,
+                );
+                let product1 = u16x8_shr(
+                    i16x8_mul(
+                        i16x8_min(i16x8_max(a1, zero), max127),
+                        i16x8_min(i16x8_max(b1, zero), max127),
+                    ),
+                    7,
+                );
+                v128_store(
+                    output.as_mut_ptr().add(out_offset + offset).cast::<v128>(),
+                    u8x16_narrow_i16x8(product0, product1),
+                );
+                offset += 16;
+            }
+            processed = offset;
+        }
+    }
+
+    for i in processed..half {
+        output[i] = ((u32::from(us[i].clamp(0, 127) as u16)
+            * u32::from(us[half + i].clamp(0, 127) as u16))
+            >> 7) as u8;
+        output[half + i] = ((u32::from(them[i].clamp(0, 127) as u16)
+            * u32::from(them[half + i].clamp(0, 127) as u16))
+            >> 7) as u8;
     }
 }
 
@@ -860,6 +1410,145 @@ mod tests {
             buckets: Vec::new(),
             fv_scale: FV_SCALE_HALFKA,
         }
+    }
+
+    fn weighted_test_network() -> DynamicLayerStacksNetwork {
+        let mut net =
+            test_network(RuntimeLsFeature::HalfKaHmMerged, 8, 4, 3, DEFAULT_NUM_BUCKETS, false, 0);
+        for (i, bias) in net.ft_biases.iter_mut().enumerate() {
+            *bias = i as i16 - 4;
+        }
+        net.ft_weights = AlignedBox::new_zeroed(net.input_dimensions * net.spec.l1);
+        for (i, weight) in net.ft_weights.iter_mut().enumerate() {
+            *weight = (i % 251) as i16 - 125;
+        }
+        net
+    }
+
+    fn assert_current_accumulators_equal(
+        left: &DynamicLayerStacksStack,
+        right: &DynamicLayerStacksStack,
+        l1: usize,
+    ) {
+        let left_start = left.current * 2 * l1;
+        let right_start = right.current * 2 * l1;
+        assert_eq!(
+            &left.accumulations[left_start..left_start + 2 * l1],
+            &right.accumulations[right_start..right_start + 2 * l1]
+        );
+    }
+
+    #[test]
+    fn no_threat_stack_does_not_allocate_threat_accumulators() {
+        let net = weighted_test_network();
+        let stack = net.new_stack();
+        assert!(stack.threat_accumulations.is_empty());
+    }
+
+    #[test]
+    fn finny_cache_refresh_matches_uncached_refresh() {
+        let net = weighted_test_network();
+        let mut pos = Position::new();
+        pos.set_sfen(SFEN_HIRATE).unwrap();
+        let mut cached = net.new_stack();
+        net.refresh(&pos, &mut cached);
+
+        let mv = Move::from_usi("7g7f").unwrap();
+        let gives_check = pos.gives_check(mv);
+        pos.do_move(mv, gives_check);
+        cached.reset();
+        net.refresh(&pos, &mut cached);
+
+        let mut uncached = net.new_stack();
+        net.refresh(&pos, &mut uncached);
+        assert_current_accumulators_equal(&cached, &uncached, net.spec.l1);
+    }
+
+    #[test]
+    fn reset_invalidates_finny_cache_before_same_shape_network_switch() {
+        let first = weighted_test_network();
+        let mut second = weighted_test_network();
+        for bias in second.ft_biases.iter_mut() {
+            *bias = bias.wrapping_add(37);
+        }
+        for weight in second.ft_weights.iter_mut() {
+            *weight = weight.wrapping_mul(3).wrapping_add(11);
+        }
+
+        let mut pos = Position::new();
+        pos.set_sfen(SFEN_HIRATE).unwrap();
+        let mut reused = first.new_stack();
+        first.refresh(&pos, &mut reused);
+
+        let mv = Move::from_usi("7g7f").unwrap();
+        let gives_check = pos.gives_check(mv);
+        pos.do_move(mv, gives_check);
+        reused.reset();
+        assert!(reused.cache.valid.iter().all(|&valid| !valid));
+        second.refresh(&pos, &mut reused);
+
+        let mut fresh = second.new_stack();
+        second.refresh(&pos, &mut fresh);
+        assert_current_accumulators_equal(&reused, &fresh, second.spec.l1);
+    }
+
+    #[test]
+    fn ancestor_update_matches_full_refresh() {
+        let net = weighted_test_network();
+        let mut pos = Position::new();
+        pos.set_sfen(SFEN_HIRATE).unwrap();
+        let mut incremental = net.new_stack();
+        net.refresh(&pos, &mut incremental);
+
+        for move_text in ["7g7f", "3c3d"] {
+            let mv = Move::from_usi(move_text).unwrap();
+            let gives_check = pos.gives_check(mv);
+            let dirty = pos.do_move(mv, gives_check);
+            incremental.push(dirty);
+        }
+        assert!(!incremental.computed[1]);
+        net.ensure(&pos, &mut incremental);
+
+        let mut refreshed = net.new_stack();
+        net.refresh(&pos, &mut refreshed);
+        assert_current_accumulators_equal(&incremental, &refreshed, net.spec.l1);
+    }
+
+    #[test]
+    fn king_move_cache_update_matches_full_refresh() {
+        let net = weighted_test_network();
+        let mut pos = Position::new();
+        pos.set_sfen("4k4/9/9/9/9/9/9/9/4K4 b - 1").unwrap();
+        let mut incremental = net.new_stack();
+        net.refresh(&pos, &mut incremental);
+
+        for move_text in ["5i6h", "5a6b", "6h5i"] {
+            let mv = Move::from_usi(move_text).unwrap();
+            let gives_check = pos.gives_check(mv);
+            let dirty = pos.do_move(mv, gives_check);
+            incremental.push(dirty);
+            net.ensure(&pos, &mut incremental);
+
+            let mut refreshed = net.new_stack();
+            net.refresh(&pos, &mut refreshed);
+            assert_current_accumulators_equal(&incremental, &refreshed, net.spec.l1);
+        }
+    }
+
+    #[test]
+    fn fused_updates_match_separate_add_and_subtract() {
+        let mut expected = [11i16, -22, 33, -44, 55, -66, 77, -88];
+        let mut actual = expected;
+        let sub0 = [1i16, 2, 3, 4, 5, 6, 7, 8];
+        let add0 = [8i16, 7, 6, 5, 4, 3, 2, 1];
+        let sub1 = [-2i16, 4, -6, 8, -10, 12, -14, 16];
+        let add1 = [16i16, -14, 12, -10, 8, -6, 4, -2];
+        sub_i16(&mut expected, &sub0);
+        add_i16(&mut expected, &add0);
+        sub_i16(&mut expected, &sub1);
+        add_i16(&mut expected, &add1);
+        double_sub_add_i16(&mut actual, &sub0, &add0, &sub1, &add1);
+        assert_eq!(actual, expected);
     }
 
     #[test]
