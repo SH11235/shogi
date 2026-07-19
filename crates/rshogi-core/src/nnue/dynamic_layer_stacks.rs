@@ -187,8 +187,6 @@ impl DynamicLayerStacksNetwork {
         validate_dimension("LayerStacks l1", l1)?;
         validate_dimension("LayerStacks l2", l2)?;
         validate_dimension("LayerStacks l3", l3)?;
-        let reported_input_dimensions = parse_feature_input_dimensions(arch)
-            .ok_or_else(|| invalid("missing FT input dimensions"))?;
         let threat_dimensions = parse_token_usize(arch, "Threat=").unwrap_or(0);
         if arch.contains("Threat=") && threat_dimensions == 0 {
             return Err(invalid("malformed Threat token"));
@@ -208,9 +206,6 @@ impl DynamicLayerStacksNetwork {
                 "Threat model requires nnue-threat",
             ));
         }
-        let input_dimensions = reported_input_dimensions
-            .checked_sub(threat_dimensions)
-            .ok_or_else(|| invalid("Threat dimensions exceed reported FT input dimensions"))?;
         let parsed_feature = detect_feature(arch)?;
         let feature = match parsed_feature {
             FeatureSet::HalfKP => RuntimeLsFeature::HalfKP,
@@ -227,12 +222,7 @@ impl DynamicLayerStacksNetwork {
                 return Err(invalid("LayerStacks header does not identify its FT feature set"));
             }
         };
-        if input_dimensions != feature.dimensions() {
-            return Err(invalid(format!(
-                "FT input dimension mismatch: header={input_dimensions}, runtime={}",
-                feature.dimensions()
-            )));
-        }
+        let input_dimensions = parse_ft_input_dimensions(arch, feature, threat_dimensions)?;
 
         reader.read_exact(&mut buf4)?;
         let first = read_compressed_tensor_i16_all(reader)?;
@@ -776,6 +766,30 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
+fn parse_ft_input_dimensions(
+    arch: &str,
+    feature: RuntimeLsFeature,
+    threat_dimensions: usize,
+) -> io::Result<usize> {
+    let reported = parse_feature_input_dimensions(arch)
+        .ok_or_else(|| invalid("missing FT input dimensions"))?;
+    let input_dimensions = feature.dimensions();
+
+    // Threat weights are stored in a separate block after the FT (and optional PSQT) data. Some
+    // exporters report only the FT dimension in `Features=...`, while older tatara models report
+    // FT + Threat there. Normalize both header conventions to the actual FT row count.
+    if reported == input_dimensions {
+        return Ok(input_dimensions);
+    }
+    if threat_dimensions != 0 && input_dimensions.checked_add(threat_dimensions) == Some(reported) {
+        return Ok(input_dimensions);
+    }
+
+    Err(invalid(format!(
+        "FT input dimension mismatch: header={reported}, runtime={input_dimensions}, threat={threat_dimensions}"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "layerstack-arch")]
@@ -799,6 +813,28 @@ mod tests {
     fn zero_affine(input_dim: usize, output_dim: usize) -> DynamicAffine {
         let bytes = vec![0; output_dim * 4 + output_dim * padded_input(input_dim)];
         DynamicAffine::read(&mut Cursor::new(bytes), input_dim, output_dim).unwrap()
+    }
+
+    #[test]
+    fn threat_headers_accept_separate_and_combined_reported_dimensions() {
+        let feature = RuntimeLsFeature::HalfKaHmMerged;
+        let separate = format!(
+            "Features=HalfKaHmMerged(Friend)[{}->1024x2],Threat=216720,Network=...",
+            feature.dimensions()
+        );
+        let combined = format!(
+            "Features=HalfKaHmMerged(Friend)[{}->1024x2],Threat=216720,Network=...",
+            feature.dimensions() + 216_720
+        );
+
+        assert_eq!(
+            parse_ft_input_dimensions(&separate, feature, 216_720).unwrap(),
+            feature.dimensions()
+        );
+        assert_eq!(
+            parse_ft_input_dimensions(&combined, feature, 216_720).unwrap(),
+            feature.dimensions()
+        );
     }
 
     fn test_network(
