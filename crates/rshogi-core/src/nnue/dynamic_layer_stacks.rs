@@ -158,6 +158,10 @@ impl DynamicLayerStacksCache {
     fn entry_index(king_sq: Square, perspective: Color) -> usize {
         king_sq.raw() as usize * Color::NUM + perspective.index()
     }
+
+    fn clear(&mut self) {
+        self.valid.fill(false);
+    }
 }
 
 struct DynamicLsBucket {
@@ -972,6 +976,9 @@ impl DynamicLayerStacksStack {
         self.current = 0;
         self.computed[0] = false;
         self.dirty[0].clear();
+        // A same-shaped EvalFile reuses this stack. Its cached accumulators were
+        // computed from the previous network weights and must not survive reset.
+        self.cache.clear();
     }
     pub(crate) fn push(&mut self, dirty: DirtyPiece) {
         assert!(self.current + 1 < STACK_CAPACITY, "dynamic NNUE accumulator stack overflow");
@@ -1455,6 +1462,34 @@ mod tests {
         let mut uncached = net.new_stack();
         net.refresh(&pos, &mut uncached);
         assert_current_accumulators_equal(&cached, &uncached, net.spec.l1);
+    }
+
+    #[test]
+    fn reset_invalidates_finny_cache_before_same_shape_network_switch() {
+        let first = weighted_test_network();
+        let mut second = weighted_test_network();
+        for bias in second.ft_biases.iter_mut() {
+            *bias = bias.wrapping_add(37);
+        }
+        for weight in second.ft_weights.iter_mut() {
+            *weight = weight.wrapping_mul(3).wrapping_add(11);
+        }
+
+        let mut pos = Position::new();
+        pos.set_sfen(SFEN_HIRATE).unwrap();
+        let mut reused = first.new_stack();
+        first.refresh(&pos, &mut reused);
+
+        let mv = Move::from_usi("7g7f").unwrap();
+        let gives_check = pos.gives_check(mv);
+        pos.do_move(mv, gives_check);
+        reused.reset();
+        assert!(reused.cache.valid.iter().all(|&valid| !valid));
+        second.refresh(&pos, &mut reused);
+
+        let mut fresh = second.new_stack();
+        second.refresh(&pos, &mut fresh);
+        assert_current_accumulators_equal(&reused, &fresh, second.spec.l1);
     }
 
     #[test]
