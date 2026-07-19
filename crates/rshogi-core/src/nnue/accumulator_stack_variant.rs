@@ -4,17 +4,19 @@
 //!
 //! # 設計
 //!
-//! **「Accumulator は L1 だけで決まる」** を活用し、4バリアントに集約:
-//! - HalfKaSplit(HalfKaSplitStack): L256/L512/L1024 を内包
-//! - HalfKaHmMerged(HalfKaHmMergedStack): L256/L512/L1024 を内包
-//! - HalfKP(HalfKPStack): L256/L512 を内包
-//! - LayerStacks: 1536次元 + 9バケット
-//!
-//! L2/L3/活性化の追加時にこのファイルの変更は不要。
+//! 固定 edition の const-generic stack と、universal edition の runtime-dimension
+//! stack を同じ探索 API で扱う。
+
+#[cfg(feature = "nnue-runtime-dimensions")]
+use std::cell::RefCell;
 
 use super::accumulator::DirtyPiece;
 #[cfg(feature = "layerstack-arch")]
 use super::accumulator_layer_stacks::LayerStacksAccStack;
+#[cfg(feature = "nnue-runtime-dimensions")]
+use super::dynamic_halfkx::DynamicHalfKxStack;
+#[cfg(feature = "nnue-runtime-dimensions")]
+use super::dynamic_layer_stacks::DynamicLayerStacksStack;
 use super::halfka_hm_merged::HalfKaHmMergedStack;
 use super::halfka_hm_split::HalfKaHmSplitStack;
 use super::halfka_merged::HalfKaMergedStack;
@@ -27,15 +29,14 @@ use super::network::NNUENetwork;
 /// NNUEアーキテクチャに応じた適切なスタックを1つだけ保持する。
 /// これにより、メモリ使用量を削減し、do_move/undo_moveの効率を向上させる。
 ///
-/// # 4バリアント構造
-///
-/// L1 サイズのみで分類し、L2/L3/活性化は内部で処理:
-/// - **HalfKaSplit**: L256/L512/L1024 を HalfKaSplitStack で管理
-/// - **HalfKaHmMerged**: L256/L512/L1024 を HalfKaHmMergedStack で管理
-/// - **HalfKP**: L256/L512 を HalfKPStack で管理
-/// - **LayerStacks**: 1536次元 + 9バケット
 #[non_exhaustive]
 pub enum AccumulatorStackVariant {
+    /// Runtime-dimension HalfKX（universal edition 専用）
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    DynamicHalfKx(Box<RefCell<DynamicHalfKxStack>>),
+    /// Runtime-dimension LayerStacks（universal edition 専用）
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    DynamicLayerStacks(Box<RefCell<DynamicLayerStacksStack>>),
     /// HalfKaSplit 特徴量セット（L256/L512/L1024）
     HalfKaSplit(HalfKaSplitStack),
     /// HalfKaHmMerged 特徴量セット（L256/L512/L1024）
@@ -57,6 +58,14 @@ impl AccumulatorStackVariant {
     /// 指定されたネットワークのアーキテクチャに対応するスタックバリアントを生成する。
     pub fn from_network(network: &NNUENetwork) -> Self {
         match network {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            NNUENetwork::DynamicHalfKx(net) => {
+                Self::DynamicHalfKx(Box::new(RefCell::new(DynamicHalfKxStack::new(net))))
+            }
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            NNUENetwork::DynamicLayerStacks(net) => {
+                Self::DynamicLayerStacks(Box::new(RefCell::new(net.new_stack())))
+            }
             NNUENetwork::HalfKaSplit(net) => Self::HalfKaSplit(HalfKaSplitStack::from_network(net)),
             NNUENetwork::HalfKaHmMerged(net) => {
                 Self::HalfKaHmMerged(HalfKaHmMergedStack::from_network(net))
@@ -85,6 +94,14 @@ impl AccumulatorStackVariant {
     /// 一致しない場合は `from_network` で再作成が必要。
     pub fn matches_network(&self, network: &NNUENetwork) -> bool {
         match (self, network) {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            (Self::DynamicHalfKx(stack), NNUENetwork::DynamicHalfKx(net)) => {
+                stack.borrow().matches_network(net)
+            }
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            (Self::DynamicLayerStacks(stack), NNUENetwork::DynamicLayerStacks(net)) => {
+                stack.borrow().matches_network(net)
+            }
             (Self::HalfKaSplit(stack), NNUENetwork::HalfKaSplit(net)) => {
                 stack.l1_size() == net.l1_size()
             }
@@ -115,6 +132,10 @@ impl AccumulatorStackVariant {
     #[inline]
     pub fn reset(&mut self) {
         match self {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicHalfKx(stack) => stack.get_mut().reset(),
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicLayerStacks(stack) => stack.get_mut().reset(),
             Self::HalfKaSplit(stack) => stack.reset(),
             Self::HalfKaHmMerged(stack) => stack.reset(),
             Self::HalfKaMerged(stack) => stack.reset(),
@@ -129,6 +150,10 @@ impl AccumulatorStackVariant {
     #[inline]
     pub fn push(&mut self, dirty_piece: DirtyPiece) {
         match self {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicHalfKx(stack) => stack.get_mut().push(dirty_piece),
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicLayerStacks(stack) => stack.get_mut().push(dirty_piece),
             Self::HalfKaSplit(stack) => stack.push(dirty_piece),
             Self::HalfKaHmMerged(stack) => stack.push(dirty_piece),
             Self::HalfKaMerged(stack) => stack.push(dirty_piece),
@@ -146,6 +171,10 @@ impl AccumulatorStackVariant {
     #[inline]
     pub fn pop(&mut self) {
         match self {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicHalfKx(stack) => stack.get_mut().pop(),
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicLayerStacks(stack) => stack.get_mut().pop(),
             Self::HalfKaSplit(stack) => stack.pop(),
             Self::HalfKaHmMerged(stack) => stack.pop(),
             Self::HalfKaMerged(stack) => stack.pop(),
@@ -159,7 +188,17 @@ impl AccumulatorStackVariant {
     /// 現在のバリアントがHalfKPかどうか
     #[inline]
     pub fn is_halfkp(&self) -> bool {
-        matches!(self, Self::HalfKP(_))
+        if matches!(self, Self::HalfKP(_)) {
+            return true;
+        }
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        {
+            matches!(self, Self::DynamicHalfKx(stack) if stack.borrow().is_halfkp())
+        }
+        #[cfg(not(feature = "nnue-runtime-dimensions"))]
+        {
+            false
+        }
     }
 }
 

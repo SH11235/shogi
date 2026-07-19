@@ -17,6 +17,7 @@ default = ["nnue-arch", "dlshogi-onnx", "kifu-player"]
 
 # 解析対象 NNUE アーキテクチャ (LayerStack L1 サイズ + FT variant 5 種) の既定集合。
 nnue-arch = [
+    "rshogi-core/layerstack-arch",
     "layerstacks-1536x16x32",
     "ft-halfkp",
     "ft-halfka_split",
@@ -35,8 +36,8 @@ threat-profile-cross-side = ["rshogi-core/threat-profile-cross-side"]
 
 # === Edition 軸 atomic feature 群 (本 crate で必要なものだけ forward) ===
 # 設計は docs/decisions/2026-05-24-build-edition-flavor-design.md を参照。
-# tools は LS network 上の解析ユーティリティ前提なので architecture 経路 (layerstack-arch /
-# halfkx-arch) や FT slot は forward しない。必要になったら追加する。
+# tools は静的 LS network の内部を解析するため、nnue-arch から layerstack-arch と
+# size / FT slot を明示的に forward する。rshogi-core の default universal には依存しない。
 # LS L1 サイズ slot
 layerstacks-1536x16x32 = ["rshogi-core/layerstacks-1536x16x32"]
 layerstacks-1536x32x32 = ["rshogi-core/layerstacks-1536x32x32"]
@@ -112,7 +113,7 @@ env_logger.workspace = true
 log.workspace = true
 
 # Local dependencies
-rshogi-core = { path = "../rshogi-core" }
+rshogi-core = { path = "../rshogi-core", default-features = false }
 rshogi-csa = { path = "../rshogi-csa" }
 # 定跡リーダ(book_from_csa の roundtrip テストで生成 .db を読み戻すのに使う)。
 # edition(NNUE)軸には触れないため default-features=false とし、rshogi-core の feature は

@@ -6,7 +6,8 @@
 //!
 //! 使用例:
 //! ```bash
-//! cargo run --release --bin dump_psqt_stats --features nnue-psqt -- \
+//! cargo run --release --bin dump_psqt_stats --no-default-features \
+//!   --features layerstack-arch,nnue-psqt,layerstacks-1536x16x32,ft-halfka_hm_merged -- \
 //!   /path/to/v101-100/quantised.bin \
 //!   /path/to/v101-200/quantised.bin \
 //!   /path/to/v101-380/quantised.bin

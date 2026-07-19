@@ -83,7 +83,7 @@ build target で、5 カテゴリ × 複数 concrete preset の構造を持つ�
 
 | カテゴリ | 用途 | preset 名の例 | 含まれる arch |
 |---|---|---|---|
-| **universal** | 開発 / debug、全 arch runtime dispatch | `edition-universal` | 全 5 FT × 全 size × 全 ext |
+| **universal** | アプリ / 開発、header 駆動の動的推論 | `edition-universal` | HalfKX / LS、全 5 FT、任意次元 |
 | **HalfKX family** | 旧 NNUE 系統 (HalfKP / HalfKa\*) を dispatch | `edition-halfkx`, `edition-halfkx-any` | HalfKX 全 variant |
 | **HalfKX specific** | HalfKX 単一 architecture 専用 | `edition-halfkp-crelu`, `edition-halfka_hm_merged-screlu` | 1 architecture 固定 |
 | **LayerStack family** | LS 全 FT / size / ext を dispatch | `edition-layerstacks`, `edition-layerstacks-any-any-any` | LS 全構成 |
@@ -97,7 +97,19 @@ build target で、5 カテゴリ × 複数 concrete preset の構造を持つ�
 | 同じ NNUE モデルで SPRT / selfplay を回したい | specific preset (例 `edition-layerstacks-halfka_hm_merged-1536x16x32-psqt`) | dispatch 除去で最大 perf、再現性高い |
 | HalfKX 系モデル数本を切替えながら触りたい | `edition-halfkx-any` | activation 含む全 HalfKX を 1 binary でカバー |
 | LS 系を size 違いで切替えたい | `edition-layerstacks-any-any-any` | size / ext を runtime dispatch |
-| 全 arch / 全 size をまとめて動作確認したい | `edition-universal` | runtime dispatch で 1 binary が全 NNUE モデルを読み込める |
+| 全 arch / 任意 size をまとめて動作確認したい | `edition-universal` | header 駆動で対応 family を 1 binary に集約できる |
+
+`edition-universal` は NNUE header にある L1/L2/L3 を実行時に読み、HalfKX と
+LayerStacks のバッファおよび dense layer を動的に構成する。従って、新しい次元を
+追加するたびに Cargo feature とバイナリを増やす必要はない。HalfKP / HalfKaSplit /
+HalfKaMerged / HalfKaHmSplit / HalfKaHmMerged、HalfKX の CReLU / SCReLU /
+PairwiseCReLU、LayerStacks の PSQT / Threat profile 0 / EffectBucket、および
+KingRank9 / Progress8KPAbs bucket mode を扱う。
+
+一方、family / specific preset は従来どおり const-generic 実装を使う。大会、selfplay、
+SPRT など同じモデルを長時間使う用途では、SIMD 最適化と dispatch 除去を得られる
+specific preset を選ぶ。universal の目的はモデル互換性と配布サイズであり、固定
+edition の置き換えではない。
 
 ### 命名規則
 

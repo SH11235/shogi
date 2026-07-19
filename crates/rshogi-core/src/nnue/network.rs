@@ -29,6 +29,10 @@ use super::constants::{
     MAX_ARCH_LEN, MAX_LAYER_STACK_BUCKETS, NNUE_VERSION, NNUE_VERSION_HALFKA,
     NNUE_VERSION_LAYERSTACK_NUM_BUCKETS,
 };
+#[cfg(feature = "nnue-runtime-dimensions")]
+use super::dynamic_halfkx::DynamicHalfKxNetwork;
+#[cfg(feature = "nnue-runtime-dimensions")]
+use super::dynamic_layer_stacks::DynamicLayerStacksNetwork;
 use super::halfka_hm_merged::{HalfKaHmMergedNetwork, HalfKaHmMergedStack};
 use super::halfka_hm_split::{HalfKaHmSplitNetwork, HalfKaHmSplitStack};
 use super::halfka_merged::{HalfKaMergedNetwork, HalfKaMergedStack};
@@ -58,6 +62,7 @@ static NETWORK: LazyLock<RwLock<Option<Arc<NNUENetwork>>>> = LazyLock::new(|| Rw
 /// NNUE ロード時に true、クリア時に false に設定する。
 /// `should_update_board_effects()` 等のホットパスから RwLock::read を回避するため。
 static NNUE_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static NNUE_REQUIRES_BOARD_EFFECTS: AtomicBool = AtomicBool::new(false);
 
 /// FV_SCALE のグローバルオーバーライド設定
 ///
@@ -312,18 +317,18 @@ pub fn reset_layer_stack_progress_kpabs_weights() {
 // NNUENetwork - アーキテクチャを抽象化するenum
 // =============================================================================
 
-/// NNUEネットワーク（4バリアント階層構造）
+/// NNUEネットワークの runtime dispatch。
 ///
-/// **「Accumulator は L1 だけで決まる」** を活用した設計:
-/// - HalfKaSplit(HalfKaSplitNetwork): L256/L512/L1024 を内包
-/// - HalfKaHmMerged(HalfKaHmMergedNetwork): L256/L512/L1024 を内包
-/// - HalfKP(HalfKPNetwork): L256/L512 を内包
-/// - LayerStacks: 1536次元 + 9バケット
-///
-/// L2/L3/活性化の追加時、このenumの変更は不要。
-/// 詳細は `halfka_split/` や `halfkp/` のモジュールで管理される。
+/// 固定 edition は既存の const-generic variant、universal edition は header 駆動の
+/// `DynamicHalfKx` / `DynamicLayerStacks` を使う。
 #[non_exhaustive]
 pub enum NNUENetwork {
+    /// Runtime-dimension HalfKX（universal edition 専用）
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    DynamicHalfKx(Box<DynamicHalfKxNetwork>),
+    /// Runtime-dimension LayerStacks（universal edition 専用）
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    DynamicLayerStacks(Box<DynamicLayerStacksNetwork>),
     /// HalfKaSplit 特徴量セット（L256/L512/L1024）
     HalfKaSplit(HalfKaSplitNetwork),
     /// HalfKaHmMerged 特徴量セット（L256/L512/L1024）
@@ -340,6 +345,14 @@ pub enum NNUENetwork {
 }
 
 impl NNUENetwork {
+    fn requires_board_effects(&self) -> bool {
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        if let Self::DynamicLayerStacks(net) = self {
+            return net.requires_board_effects();
+        }
+        cfg!(feature = "nnue-effect-bucket")
+    }
+
     /// HalfKP でサポートされているアーキテクチャ一覧
     pub fn supported_halfkp_specs() -> Vec<super::spec::ArchitectureSpec> {
         HalfKPNetwork::supported_specs()
@@ -450,7 +463,24 @@ impl NNUENetwork {
                 };
 
                 // LayerStacks は特殊処理（FT が LEB128 圧縮のためファイルサイズ検出の対象外）
-                if effective_feature_set == FeatureSet::LayerStacks {
+                if matches!(
+                    effective_feature_set,
+                    FeatureSet::LayerStacks | FeatureSet::HalfKaHmMergedEffectBucket
+                ) {
+                    if cfg!(feature = "nnue-runtime-dimensions") {
+                        #[cfg(feature = "nnue-runtime-dimensions")]
+                        {
+                            let psqt_override = match arch_override {
+                                NNUEArchitectureOverride::LayerStacks => Some(false),
+                                NNUEArchitectureOverride::LayerStacksPSQT => Some(true),
+                                _ => None,
+                            };
+                            reader.seek(SeekFrom::Start(0))?;
+                            return Ok(Self::DynamicLayerStacks(Box::new(
+                                DynamicLayerStacksNetwork::read(reader, psqt_override)?,
+                            )));
+                        }
+                    }
                     #[cfg(feature = "layerstack-arch")]
                     {
                         // PSQT オーバーライド:
@@ -490,6 +520,18 @@ impl NNUENetwork {
                             "LayerStacks NNUE model requires the `layerstack-arch` feature; \
                              rebuild rshogi-core with an Edition that enables it.",
                         ));
+                    }
+                }
+
+                // universal edition は HalfKX の次元をヘッダーから動的に構成する。
+                // 固定/family edition は従来どおり既知サイズの const-generic 経路を使う。
+                if cfg!(feature = "nnue-runtime-dimensions") {
+                    #[cfg(feature = "nnue-runtime-dimensions")]
+                    {
+                        reader.seek(SeekFrom::Start(0))?;
+                        return Ok(Self::DynamicHalfKx(Box::new(DynamicHalfKxNetwork::read(
+                            reader,
+                        )?)));
                     }
                 }
 
@@ -579,6 +621,10 @@ impl NNUENetwork {
 
     /// LayerStacks アーキテクチャかどうか
     pub fn is_layer_stacks(&self) -> bool {
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        if matches!(self, Self::DynamicLayerStacks(_)) {
+            return true;
+        }
         #[cfg(feature = "layerstack-arch")]
         {
             matches!(self, Self::LayerStacks(_))
@@ -593,6 +639,10 @@ impl NNUENetwork {
     ///
     /// LayerStacks 以外、または LayerStacks feature 無効ビルドでは `None` を返す。
     pub fn layer_stack_num_buckets(&self) -> Option<usize> {
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        if let Self::DynamicLayerStacks(network) = self {
+            return Some(network.num_buckets());
+        }
         #[cfg(feature = "layerstack-arch")]
         {
             match self {
@@ -608,22 +658,38 @@ impl NNUENetwork {
 
     /// HalfKaSplit アーキテクチャかどうか
     pub fn is_halfka(&self) -> bool {
-        matches!(self, Self::HalfKaSplit(_))
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        let dynamic = matches!(self, Self::DynamicHalfKx(net) if net.spec().feature_set == FeatureSet::HalfKaSplit);
+        #[cfg(not(feature = "nnue-runtime-dimensions"))]
+        let dynamic = false;
+        matches!(self, Self::HalfKaSplit(_)) || dynamic
     }
 
     /// HalfKaHmMerged アーキテクチャかどうか
     pub fn is_halfka_hm(&self) -> bool {
-        matches!(self, Self::HalfKaHmMerged(_))
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        let dynamic = matches!(self, Self::DynamicHalfKx(net) if net.spec().feature_set == FeatureSet::HalfKaHmMerged);
+        #[cfg(not(feature = "nnue-runtime-dimensions"))]
+        let dynamic = false;
+        matches!(self, Self::HalfKaHmMerged(_)) || dynamic
     }
 
     /// HalfKP アーキテクチャかどうか
     pub fn is_halfkp(&self) -> bool {
-        matches!(self, Self::HalfKP(_))
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        let dynamic = matches!(self, Self::DynamicHalfKx(net) if net.is_halfkp());
+        #[cfg(not(feature = "nnue-runtime-dimensions"))]
+        let dynamic = false;
+        matches!(self, Self::HalfKP(_)) || dynamic
     }
 
     /// L1 サイズを取得
     pub fn l1_size(&self) -> usize {
         match self {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicHalfKx(net) => net.l1_size(),
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicLayerStacks(net) => net.spec().l1,
             Self::HalfKaSplit(net) => net.l1_size(),
             Self::HalfKaHmMerged(net) => net.l1_size(),
             Self::HalfKaMerged(net) => net.l1_size(),
@@ -637,6 +703,10 @@ impl NNUENetwork {
     /// アーキテクチャ名を取得
     pub fn architecture_name(&self) -> String {
         match self {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicHalfKx(net) => net.spec().name(),
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicLayerStacks(net) => net.spec().name(),
             Self::HalfKaSplit(net) => net.architecture_name(),
             Self::HalfKaHmMerged(net) => net.architecture_name(),
             Self::HalfKaMerged(net) => net.architecture_name(),
@@ -650,6 +720,10 @@ impl NNUENetwork {
     /// アーキテクチャ仕様を取得
     pub fn architecture_spec(&self) -> super::spec::ArchitectureSpec {
         match self {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicHalfKx(net) => net.spec(),
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            Self::DynamicLayerStacks(net) => net.spec(),
             Self::HalfKaSplit(net) => net.architecture_spec(),
             Self::HalfKaHmMerged(net) => net.architecture_spec(),
             Self::HalfKaMerged(net) => net.architecture_spec(),
@@ -1096,6 +1170,7 @@ pub fn progress_sum_to_bucket(sum: f32, num_buckets: usize) -> usize {
 /// NNUEを初期化（バージョン自動判別）
 pub fn init_nnue<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let network = Arc::new(NNUENetwork::load(path)?);
+    NNUE_REQUIRES_BOARD_EFFECTS.store(network.requires_board_effects(), Ordering::Release);
     *NETWORK.write().expect("NNUE lock poisoned") = Some(network);
     NNUE_INITIALIZED.store(true, Ordering::Release);
     Ok(())
@@ -1104,6 +1179,7 @@ pub fn init_nnue<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// バイト列からNNUEを初期化（バージョン自動判別）
 pub fn init_nnue_from_bytes(bytes: &[u8]) -> io::Result<()> {
     let network = Arc::new(NNUENetwork::from_bytes(bytes)?);
+    NNUE_REQUIRES_BOARD_EFFECTS.store(network.requires_board_effects(), Ordering::Release);
     *NETWORK.write().expect("NNUE lock poisoned") = Some(network);
     NNUE_INITIALIZED.store(true, Ordering::Release);
     Ok(())
@@ -1115,6 +1191,7 @@ pub fn clear_nnue() {
     // 逆順にすると is_nnue_initialized() == true の直後に get_network() が None を返す
     // 短い窓が生じる。false-negative（ロード済みなのに false に見える瞬間）は安全。
     NNUE_INITIALIZED.store(false, Ordering::Release);
+    NNUE_REQUIRES_BOARD_EFFECTS.store(false, Ordering::Release);
     *NETWORK.write().expect("NNUE lock poisoned") = None;
 }
 
@@ -1125,6 +1202,11 @@ pub fn clear_nnue() {
 #[inline]
 pub fn is_nnue_initialized() -> bool {
     NNUE_INITIALIZED.load(Ordering::Acquire)
+}
+
+#[inline]
+pub(crate) fn nnue_requires_board_effects() -> bool {
+    NNUE_REQUIRES_BOARD_EFFECTS.load(Ordering::Acquire)
 }
 
 // =============================================================================
@@ -1669,6 +1751,24 @@ pub fn evaluate_dispatch(
 
     // バリアントに応じて適切な評価関数を呼び出し
     match stack {
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        AccumulatorStackVariant::DynamicLayerStacks(s) => {
+            let NNUENetwork::DynamicLayerStacks(net) = &*network else {
+                unreachable!("Network/Stack type mismatch")
+            };
+            let stack = s.get_mut();
+            net.ensure(pos, stack);
+            net.evaluate(pos, stack)
+        }
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        AccumulatorStackVariant::DynamicHalfKx(s) => {
+            let NNUENetwork::DynamicHalfKx(net) = &*network else {
+                unreachable!("Network/Stack type mismatch")
+            };
+            let stack = s.get_mut();
+            net.ensure(pos, stack);
+            net.evaluate(pos, stack)
+        }
         #[cfg(feature = "layerstack-arch")]
         AccumulatorStackVariant::LayerStacks(s) => {
             let net = network.as_layer_stacks();
@@ -1724,6 +1824,20 @@ pub fn ensure_accumulator_computed(
 
     // バリアントに応じてアキュムレータを更新（評価はしない）
     match stack {
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        AccumulatorStackVariant::DynamicLayerStacks(s) => {
+            let NNUENetwork::DynamicLayerStacks(net) = &*network else {
+                unreachable!("Network/Stack type mismatch")
+            };
+            net.ensure(pos, s.get_mut());
+        }
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        AccumulatorStackVariant::DynamicHalfKx(s) => {
+            let NNUENetwork::DynamicHalfKx(net) = &*network else {
+                unreachable!("Network/Stack type mismatch")
+            };
+            net.ensure(pos, s.get_mut());
+        }
         #[cfg(feature = "layerstack-arch")]
         AccumulatorStackVariant::LayerStacks(s) => {
             let net = network.as_layer_stacks();
@@ -2318,6 +2432,25 @@ mod tests {
         bytes.extend_from_slice(arch);
         bytes.extend_from_slice(&num_buckets.to_le_bytes());
         bytes
+    }
+
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    #[test]
+    fn legacy_effect_bucket_auto_dispatches_to_dynamic_layer_stacks() {
+        let arch = b"Features=HalfKaHmMerged(Friend)[293220->2x2],EffectBucket=2x2fixed,l2=2,l3=1";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&NNUE_VERSION_HALFKA.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(arch.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(arch);
+
+        // The truncated payload must get as far as the LayerStacks reader. Before the dispatch
+        // fix it was rejected earlier by DynamicHalfKx as an unsupported feature set.
+        let err = match NNUENetwork::from_bytes(&bytes) {
+            Ok(_) => panic!("truncated legacy EffectBucket model must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
     }
 
     /// num_buckets-header layout で `num_buckets = 0` / 上限超過の値は

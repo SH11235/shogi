@@ -87,11 +87,7 @@ impl NNUEEvaluator {
         } else {
             None
         };
-        let acc_cache_generic = if !net.is_layer_stacks() {
-            Some(AccumulatorCacheGeneric::new(net.l1_size()))
-        } else {
-            None
-        };
+        let acc_cache_generic = Self::new_generic_cache(&net);
         let mut evaluator = Self {
             net,
             stack,
@@ -119,11 +115,7 @@ impl NNUEEvaluator {
         } else {
             None
         };
-        let acc_cache_generic = if !self.net.is_layer_stacks() {
-            Some(AccumulatorCacheGeneric::new(self.net.l1_size()))
-        } else {
-            None
-        };
+        let acc_cache_generic = Self::new_generic_cache(&self.net);
         let mut evaluator = Self {
             net: Arc::clone(&self.net),
             stack: AccumulatorStackVariant::from_network(&self.net),
@@ -223,6 +215,15 @@ impl NNUEEvaluator {
     #[inline(always)]
     pub fn evaluate_only(&self, pos: &Position) -> Value {
         match (&*self.net, &self.stack) {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            (
+                NNUENetwork::DynamicLayerStacks(net),
+                AccumulatorStackVariant::DynamicLayerStacks(st),
+            ) => net.evaluate(pos, &mut st.borrow_mut()),
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            (NNUENetwork::DynamicHalfKx(net), AccumulatorStackVariant::DynamicHalfKx(st)) => {
+                net.evaluate(pos, &mut st.borrow_mut())
+            }
             (NNUENetwork::HalfKaSplit(net), AccumulatorStackVariant::HalfKaSplit(st)) => {
                 net.evaluate(pos, st)
             }
@@ -274,9 +275,30 @@ impl NNUEEvaluator {
     // 内部実装
     // =========================================================================
 
+    fn new_generic_cache(net: &NNUENetwork) -> Option<AccumulatorCacheGeneric> {
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        if matches!(net, NNUENetwork::DynamicHalfKx(_)) {
+            return None;
+        }
+        if net.is_layer_stacks() {
+            None
+        } else {
+            Some(AccumulatorCacheGeneric::new(net.l1_size()))
+        }
+    }
+
     /// アキュムレータをフル再計算
     fn refresh_accumulator(&mut self, pos: &Position) {
         match (&*self.net, &mut self.stack) {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            (
+                NNUENetwork::DynamicLayerStacks(net),
+                AccumulatorStackVariant::DynamicLayerStacks(st),
+            ) => net.refresh(pos, st.get_mut()),
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            (NNUENetwork::DynamicHalfKx(net), AccumulatorStackVariant::DynamicHalfKx(st)) => {
+                net.refresh(pos, st.get_mut());
+            }
             (NNUENetwork::HalfKaSplit(net), AccumulatorStackVariant::HalfKaSplit(st)) => {
                 if let Some(cache) = &mut self.acc_cache_generic {
                     net.refresh_accumulator_with_cache(pos, st, cache);
@@ -323,6 +345,15 @@ impl NNUEEvaluator {
     /// アキュムレータが計算済みか確認し、必要に応じて更新
     fn ensure_accumulator_computed(&mut self, pos: &Position) {
         match (&*self.net, &mut self.stack) {
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            (
+                NNUENetwork::DynamicLayerStacks(net),
+                AccumulatorStackVariant::DynamicLayerStacks(st),
+            ) => net.ensure(pos, st.get_mut()),
+            #[cfg(feature = "nnue-runtime-dimensions")]
+            (NNUENetwork::DynamicHalfKx(net), AccumulatorStackVariant::DynamicHalfKx(st)) => {
+                net.ensure(pos, st.get_mut());
+            }
             (NNUENetwork::HalfKaSplit(net), AccumulatorStackVariant::HalfKaSplit(st)) => {
                 Self::update_halfka_accumulator(net, pos, st, &mut self.acc_cache_generic);
             }
@@ -696,14 +727,17 @@ mod tests {
         // LayerStacks 各 L1 バリアント（有効 feature のみ検証）。
         // 外側の `any(...)` でいずれかの variant が有効なときだけ import が使われる
         // ようにして unused-import 警告を抑える。
-        #[cfg(any(
-            feature = "layerstacks-1536x16x32",
-            feature = "layerstacks-1536x32x32",
-            feature = "layerstacks-768x16x32",
-            feature = "layerstacks-768x8x32",
-            feature = "layerstacks-512x16x32",
-            feature = "layerstacks-1024x16x32",
-            feature = "layerstacks-3072x16x32"
+        #[cfg(all(
+            feature = "layerstack-arch",
+            any(
+                feature = "layerstacks-1536x16x32",
+                feature = "layerstacks-1536x32x32",
+                feature = "layerstacks-768x16x32",
+                feature = "layerstacks-768x8x32",
+                feature = "layerstacks-512x16x32",
+                feature = "layerstacks-1024x16x32",
+                feature = "layerstacks-3072x16x32"
+            )
         ))]
         {
             use crate::nnue::accumulator_layer_stacks::{

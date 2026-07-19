@@ -35,6 +35,10 @@ mod bona_piece_halfka_merged;
 mod bona_piece_halfka_split;
 mod constants;
 mod diff;
+#[cfg(feature = "nnue-runtime-dimensions")]
+mod dynamic_halfkx;
+#[cfg(feature = "nnue-runtime-dimensions")]
+mod dynamic_layer_stacks;
 mod effect_bucket_features;
 mod evaluator;
 mod feature_transformer;
@@ -109,6 +113,7 @@ pub use ls_feature_spec::{
 };
 #[cfg(feature = "layerstack-arch")]
 pub use network::evaluate_layer_stacks;
+pub(crate) use network::nnue_requires_board_effects;
 #[cfg(feature = "layerstack-arch")]
 pub(crate) use network::update_and_evaluate_layer_stacks_cached;
 pub use network::{
