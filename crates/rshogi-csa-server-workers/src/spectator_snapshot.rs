@@ -21,6 +21,7 @@
 //! クライアント側は `##[MONITOR2] BEGIN <id>` と `##[MONITOR2] END` の間で本関数の
 //! 戻り値を順次受信し、`END` 受信を hard delimiter として state を全置換する。
 
+use rshogi_core::types::EnteringKingRule;
 use rshogi_csa_server::protocol::summary::{
     GameSummaryBuilder, position_section_from_sfen, side_to_move_from_sfen,
     standard_initial_position_block,
@@ -128,7 +129,7 @@ pub fn build_spectator_snapshot(input: SpectatorSnapshotInput<'_>) -> Vec<String
         position_section,
         rematch_on_draw: false,
         to_move,
-        declaration: String::new(),
+        entering_king_rule: EnteringKingRule::Point24,
         // 観戦者向け builder は token を出力しないため、`None` 固定で渡す
         // (関数内部でも player 経路と異なり token 行は出さない契約)。
         black_reconnect_token: None,

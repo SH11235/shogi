@@ -154,6 +154,13 @@ pub trait UsiEngineDriver {
     /// USI `usinewgame` 相当を実装する。対局開始前に 1 度呼ばれる。
     fn new_game(&mut self) -> Result<()>;
 
+    /// USI `setoption name <name> value <value>` を送信する。
+    ///
+    /// session はサーバーが Game_Summary で広告した入玉ルールをエンジンへ伝える
+    /// ために [`UsiEngineDriver::new_game`] の直前に呼ぶ。同期は後続 `new_game`
+    /// (usinewgame + isready) の readyok 待ちに委ねてよい。
+    fn set_option(&mut self, name: &str, value: &str) -> Result<()>;
+
     /// `position` + `go` を送信し、bestmove または server interrupt まで block する。
     ///
     /// 実装の責任:
@@ -218,6 +225,10 @@ pub trait UsiEngineDriver {
 impl UsiEngineDriver for UsiEngine {
     fn new_game(&mut self) -> Result<()> {
         UsiEngine::new_game(self)
+    }
+
+    fn set_option(&mut self, name: &str, value: &str) -> Result<()> {
+        self.send(&format!("setoption name {name} value {value}"))
     }
 
     fn go_with_info(

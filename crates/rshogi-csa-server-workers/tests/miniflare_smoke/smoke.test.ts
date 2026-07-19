@@ -45,6 +45,9 @@ describe("miniflare smoke: 1 対局 E2E", () => {
     const whiteSummary = await white.drainGameSummary();
     expect(blackSummary.some((l) => l === "Your_Turn:+")).toBe(true);
     expect(whiteSummary.some((l) => l === "Your_Turn:-")).toBe(true);
+    // 入玉ルール広告の拡張行 (24 点法固定の本番構成)
+    expect(blackSummary.some((l) => l === "Entering_King_Rule:CSARule24")).toBe(true);
+    expect(whiteSummary.some((l) => l === "Entering_King_Rule:CSARule24")).toBe(true);
 
     black.send("AGREE");
     white.send("AGREE");

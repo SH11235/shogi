@@ -992,7 +992,7 @@ impl GameRoom {
             position_section,
             rematch_on_draw: false,
             to_move,
-            declaration: String::new(),
+            entering_king_rule: EnteringKingRule::Point24,
             black_reconnect_token,
             white_reconnect_token,
         };
@@ -3412,7 +3412,7 @@ impl GameRoom {
             position_section,
             rematch_on_draw: false,
             to_move: core.current_turn(),
-            declaration: String::new(),
+            entering_king_rule: EnteringKingRule::Point24,
             black_reconnect_token: cfg.black_reconnect_token.as_deref().map(ReconnectToken::new),
             white_reconnect_token: cfg.white_reconnect_token.as_deref().map(ReconnectToken::new),
         };

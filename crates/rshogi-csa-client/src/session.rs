@@ -252,6 +252,7 @@ where
     {
         return Err(map_anyhow_to_session_error(err));
     }
+    apply_advertised_entering_king_rule(config, engine, &summary)?;
     if let Err(err) = engine.new_game() {
         return Err(SessionError::Engine(format!("{err}")));
     }
@@ -380,6 +381,42 @@ enum MoveAction {
 // ────────────────────────────────────────────
 // メインループ
 // ────────────────────────────────────────────
+
+/// サーバーが Game_Summary で広告した入玉ルールをエンジンへ伝える。
+///
+/// config の `engine.options` に `EnteringKingRule` が明示されている場合は
+/// ユーザー設定を優先し、広告値と異なるときは warn のみ出す。未指定なら
+/// `setoption` で広告値を注入する。広告が無いサーバーでは何もしない
+/// (エンジン既定のまま)。
+fn apply_advertised_entering_king_rule<E>(
+    config: &CsaClientConfig,
+    engine: &mut E,
+    summary: &GameSummary,
+) -> Result<(), SessionError>
+where
+    E: UsiEngineDriver + ?Sized,
+{
+    let Some(rule) = summary.entering_king_rule else {
+        return Ok(());
+    };
+    let advertised = rule.to_usi();
+    if let Some(configured) = config.engine.options.get("EnteringKingRule") {
+        let configured = match configured {
+            toml::Value::String(v) => v.clone(),
+            other => other.to_string(),
+        };
+        if configured != advertised {
+            log::warn!(
+                "[CSA] EnteringKingRule 設定 ({configured}) がサーバー広告 ({advertised}) と一致しません。設定値を優先します"
+            );
+        }
+        return Ok(());
+    }
+    log::info!("[CSA] サーバー広告に従い EnteringKingRule={advertised} を設定します");
+    engine
+        .set_option("EnteringKingRule", advertised)
+        .map_err(|err| SessionError::Engine(format!("{err}")))
+}
 
 fn run_session_loop<E, S>(
     conn: &mut CsaConnection,
@@ -2185,6 +2222,7 @@ mod tests {
             black_time: crate::protocol::TimeConfig::default(),
             white_time: crate::protocol::TimeConfig::default(),
             reconnect_token: None,
+            entering_king_rule: None,
         };
         let proto_state = ProtocolReconnectState {
             current_turn: Some(Color::Black),
@@ -2197,6 +2235,105 @@ mod tests {
         assert_eq!(pub_state.side_to_move, Side::Black);
         assert_eq!(pub_state.remaining_time_sec_self, Some(10));
         assert_eq!(pub_state.remaining_time_sec_opp, Some(5));
+    }
+
+    /// set_option 呼び出しだけを記録する stub。他の driver method は
+    /// apply_advertised_entering_king_rule から呼ばれない契約なので panic でよい。
+    struct RecordingEngine {
+        set_options: Vec<(String, String)>,
+    }
+
+    impl UsiEngineDriver for RecordingEngine {
+        fn new_game(&mut self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn set_option(&mut self, name: &str, value: &str) -> anyhow::Result<()> {
+            self.set_options.push((name.to_owned(), value.to_owned()));
+            Ok(())
+        }
+        fn go_with_info(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &std::sync::atomic::AtomicBool,
+            _: &std::sync::mpsc::Receiver<Event>,
+            _: &mut crate::engine::InfoCallback<'_>,
+        ) -> anyhow::Result<SearchOutcome> {
+            unreachable!()
+        }
+        fn go_ponder(&mut self, _: &str, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn ponderhit_with_info(
+            &mut self,
+            _: &std::sync::atomic::AtomicBool,
+            _: &std::sync::mpsc::Receiver<Event>,
+            _: &mut crate::engine::InfoCallback<'_>,
+        ) -> anyhow::Result<SearchOutcome> {
+            unreachable!()
+        }
+        fn stop_and_wait(&mut self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn gameover(&mut self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
+    fn summary_with_rule(rule: Option<rshogi_core::types::EnteringKingRule>) -> GameSummary {
+        use rshogi_csa::{Color, initial_position};
+        GameSummary {
+            game_id: "g".to_owned(),
+            my_color: Color::Black,
+            sente_name: "b".to_owned(),
+            gote_name: "w".to_owned(),
+            position: initial_position(),
+            initial_moves: Vec::new(),
+            black_time: crate::protocol::TimeConfig::default(),
+            white_time: crate::protocol::TimeConfig::default(),
+            reconnect_token: None,
+            entering_king_rule: rule,
+        }
+    }
+
+    #[test]
+    fn advertised_rule_is_injected_when_config_unset() {
+        let config = CsaClientConfig::default();
+        let mut engine = RecordingEngine {
+            set_options: Vec::new(),
+        };
+        let summary = summary_with_rule(Some(rshogi_core::types::EnteringKingRule::Point24));
+        apply_advertised_entering_king_rule(&config, &mut engine, &summary).unwrap();
+        assert_eq!(
+            engine.set_options,
+            vec![("EnteringKingRule".to_owned(), "CSARule24".to_owned())]
+        );
+    }
+
+    #[test]
+    fn configured_rule_wins_over_advertised() {
+        let mut config = CsaClientConfig::default();
+        config
+            .engine
+            .options
+            .insert("EnteringKingRule".to_owned(), toml::Value::String("CSARule27".to_owned()));
+        let mut engine = RecordingEngine {
+            set_options: Vec::new(),
+        };
+        let summary = summary_with_rule(Some(rshogi_core::types::EnteringKingRule::Point24));
+        apply_advertised_entering_king_rule(&config, &mut engine, &summary).unwrap();
+        assert!(engine.set_options.is_empty());
+    }
+
+    #[test]
+    fn no_advertisement_leaves_engine_untouched() {
+        let config = CsaClientConfig::default();
+        let mut engine = RecordingEngine {
+            set_options: Vec::new(),
+        };
+        let summary = summary_with_rule(None);
+        apply_advertised_entering_king_rule(&config, &mut engine, &summary).unwrap();
+        assert!(engine.set_options.is_empty());
     }
 
     #[test]
@@ -2212,6 +2349,7 @@ mod tests {
             black_time: crate::protocol::TimeConfig::default(),
             white_time: crate::protocol::TimeConfig::default(),
             reconnect_token: None,
+            entering_king_rule: None,
         };
         let proto_state = ProtocolReconnectState {
             current_turn: Some(Color::White),
@@ -2243,6 +2381,7 @@ mod tests {
             black_time: time.clone(),
             white_time: time,
             reconnect_token: None,
+            entering_king_rule: None,
         }
     }
 
@@ -2263,6 +2402,7 @@ mod tests {
             black_time: time.clone(),
             white_time: time,
             reconnect_token: None,
+            entering_king_rule: None,
         }
     }
 

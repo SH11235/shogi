@@ -556,6 +556,7 @@ fn resumed_session_keeps_pre_disconnect_record_and_start_time() {
             increment_ms: 0,
         },
         reconnect_token: Some("tok-xyz".to_owned()),
+        entering_king_rule: None,
     };
     let mut retained = GameRecord::new(&retained_summary);
     let original_start_time = retained.start_time;
@@ -650,6 +651,7 @@ fn resumed_session_mismatch_keeps_start_time_and_removes_stale_live_jsonl() {
         black_time: TimeConfig::default(),
         white_time: TimeConfig::default(),
         reconnect_token: Some("tok-xyz".to_owned()),
+        entering_king_rule: None,
     };
     let mut retained = GameRecord::new(&retained_summary);
     let original_start_time = retained.start_time;

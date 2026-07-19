@@ -2441,7 +2441,7 @@ where
         position_section,
         rematch_on_draw: false,
         to_move,
-        declaration: "Jishogi 1.1".to_owned(),
+        entering_king_rule: state.config.entering_king_rule,
         black_reconnect_token: black_reconnect_token.clone(),
         white_reconnect_token: white_reconnect_token.clone(),
     };
