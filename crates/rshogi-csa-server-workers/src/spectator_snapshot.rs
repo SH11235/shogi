@@ -128,7 +128,7 @@ pub fn build_spectator_snapshot(input: SpectatorSnapshotInput<'_>) -> Vec<String
         position_section,
         rematch_on_draw: false,
         to_move,
-        declaration: String::new(),
+        entering_king_rule: crate::config::ENTERING_KING_RULE,
         // 観戦者向け builder は token を出力しないため、`None` 固定で渡す
         // (関数内部でも player 経路と異なり token 行は出さない契約)。
         black_reconnect_token: None,
@@ -611,7 +611,6 @@ PI
         //   が同一手で一致すること。通信マージンを課金から差し引かなくなったため、両者とも
         //   「(到着 at_ms − 直前手 at_ms) を秒切り捨て」した同じ値になる (旧実装ではライブ側が
         //   margin を引いて 1 秒/手ずれていた)。
-        use rshogi_core::types::EnteringKingRule;
         use rshogi_csa_server::{CsaLine, FischerClock, GameRoom, GameRoomConfig, HandleOutcome};
 
         let play_started_ms: u64 = 1_000_000;
@@ -622,7 +621,7 @@ PI
             max_moves: 256,
             // margin を課金へ持ち込まないことを確認するため 0 でなく 1000ms を設定する。
             time_margin_ms: 1_000,
-            entering_king_rule: EnteringKingRule::Point24,
+            entering_king_rule: crate::config::ENTERING_KING_RULE,
             initial_sfen: None,
         };
         let clock = Box::new(FischerClock::new(60, 5));

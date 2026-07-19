@@ -256,7 +256,7 @@ fn main() -> anyhow::Result<()> {
         login_timeout: std::time::Duration::from_secs(30),
         agree_timeout: std::time::Duration::from_secs(cli.agree_timeout_sec),
         x1_reply_write_timeout: std::time::Duration::from_secs(5),
-        entering_king_rule: rshogi_core::types::EnteringKingRule::Point24,
+        entering_king_rule: rshogi_core::types::EnteringKingRule::Point27,
         initial_sfen: None,
         admin_handles: cli.admin_handle.clone(),
         allow_floodgate_features: cli.allow_floodgate_features,

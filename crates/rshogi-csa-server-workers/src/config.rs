@@ -15,6 +15,14 @@ use rshogi_csa_server::config::{
 
 use crate::origin;
 
+/// Workers 配備の `%KACHI` 判定に使う入玉ルール。CoreRoom (判定側) と
+/// Game_Summary の広告 (`Declaration:` / `Entering_King_Rule:` 行) の両方が
+/// この値を参照する。別々の literal にすると判定と広告がずれ、client が
+/// 誤ったルールをエンジンへ自動注入してしまう。
+/// 27 点法は電竜戦・世界コンピュータ将棋選手権・wdoor floodgate と同じ標準宣言ルール。
+pub const ENTERING_KING_RULE: rshogi_core::types::EnteringKingRule =
+    rshogi_core::types::EnteringKingRule::Point27;
+
 /// 起動時にバインディング名として参照する環境変数キー群。
 ///
 /// # 新規定数を追加するときは

@@ -186,11 +186,20 @@ CSA v1.2.1 標準 `BEGIN Game_Summary` / `END Game_Summary` の組み立ては
 | `summary.rs::position_section_from_sfen` | 任意 SFEN から Position ブロック |
 
 `build_for` は CSA v1.2.1 標準項目を以下の順で出す: `Protocol_Version` →
-`Protocol_Mode` → `Format` → `Declaration` (任意) → `Game_ID` → `Name+` → `Name-` →
+`Protocol_Mode` → `Format` → `Declaration` (27 点法のときのみ `Jishogi 1.1`) →
+`Game_ID` → `Name+` → `Name-` →
 `Your_Turn` → `Rematch_On_Draw` → `To_Move` → `BEGIN Time` ... `END Time` →
-`BEGIN Position` ... `END Position` → (本リポ拡張) `Reconnect_Token:` →
+`BEGIN Position` ... `END Position` → (本リポ拡張) `Entering_King_Rule:` →
+`Reconnect_Token:` →
 `END Game_Summary`。順序は `summary.rs::tests::build_for_includes_required_csa_fields_in_order`
 で固定されている。
+
+`Entering_King_Rule:` 拡張行は `%KACHI` 判定に使う入玉ルールを USI トークン
+(`CSARule24` / `CSARule27` 等、`EnteringKingRule::to_usi`) で広告する。CSA 標準の
+`Declaration:` には 27 点法のトークンしか存在しないため、24 点法等も正確に伝える
+目的で常に出力する。csa_client は本行 (無ければ `Declaration:Jishogi 1.1` → 27 点法)
+を解釈し、config で `EnteringKingRule` が明示されていない場合にエンジンへ
+`setoption` で注入する。
 
 ## 8. 終局メッセージ
 

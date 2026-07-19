@@ -45,6 +45,10 @@ describe("miniflare smoke: 1 対局 E2E", () => {
     const whiteSummary = await white.drainGameSummary();
     expect(blackSummary.some((l) => l === "Your_Turn:+")).toBe(true);
     expect(whiteSummary.some((l) => l === "Your_Turn:-")).toBe(true);
+    // 入玉ルール広告 (本番構成 = 27 点法): 標準 Declaration 行と拡張行の両方
+    expect(blackSummary.some((l) => l === "Declaration:Jishogi 1.1")).toBe(true);
+    expect(blackSummary.some((l) => l === "Entering_King_Rule:CSARule27")).toBe(true);
+    expect(whiteSummary.some((l) => l === "Entering_King_Rule:CSARule27")).toBe(true);
 
     black.send("AGREE");
     white.send("AGREE");

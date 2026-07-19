@@ -279,7 +279,7 @@ Total_Time:600 / Byoyomi:10) ではこのレートで時間切れにはならな
 | 終局トークン | 意味 | history JSON `result_code` | broadcast 通知行 (各 client) | 記録経路 |
 |---|---|---|---|---|
 | `%TORYO` | 投了 | `#RESIGN` | `#RESIGN` + 勝者 `#WIN` / 敗者 `#LOSE` | client が `engine bestmove resign` で送出 |
-| `%KACHI` | 入玉宣言勝ち (24点法成立) | `#JISHOGI` | `#JISHOGI` + 勝者 `#WIN` / 敗者 `#LOSE` | client が `engine bestmove win` で送出 |
+| `%KACHI` | 入玉宣言勝ち (27点法成立) | `#JISHOGI` | `#JISHOGI` + 勝者 `#WIN` / 敗者 `#LOSE` | client が `engine bestmove win` で送出 |
 | `%CHUDAN` | 中断 (合意中断、winner 無し) | `#ABNORMAL` | `#ABNORMAL` 単独 | サーバ側で `force_abnormal(None)` 経由 |
 | (`force_abnormal` 切断経路) | 切断 grace 超過 / 運営権限による強制終了 | `#ABNORMAL` | `#ABNORMAL` + 残存側 `#WIN` / 切断側 `#LOSE` | サーバ側で `force_abnormal(Some(loser))` 経由 |
 | `%TIME_UP` | 時間切れ | `#TIME_UP` | `#TIME_UP` + 勝者 `#WIN` / 敗者 `#LOSE` | サーバ側 alarm 発火、`force_time_up` で確定 |

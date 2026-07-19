@@ -466,6 +466,7 @@ mod tests {
             black_time: TimeConfig::default(),
             white_time: TimeConfig::default(),
             reconnect_token: Some("token".to_owned()),
+            entering_king_rule: None,
         }
     }
 

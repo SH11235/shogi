@@ -7,7 +7,7 @@
 use std::fmt::Write as _;
 
 use rshogi_core::position::Position;
-use rshogi_core::types::{Color as CoreColor, File, PieceType, Rank, Square};
+use rshogi_core::types::{Color as CoreColor, EnteringKingRule, File, PieceType, Rank, Square};
 
 use crate::types::{Color, GameId, PlayerName, ReconnectToken};
 
@@ -30,8 +30,9 @@ pub struct GameSummaryBuilder {
     pub rematch_on_draw: bool,
     /// 開始時の手番。CSA 仕様 `To_Move:` に直接書ける `+`/`-` 文字。
     pub to_move: Color,
-    /// 入玉宣言ルール表示（`Declaration:Jishogi 1.1` など）。空ならデフォルト省略。
-    pub declaration: String,
+    /// `%KACHI` 判定に使う入玉ルール。CSA 標準の `Declaration:` 行と本リポ拡張の
+    /// `Entering_King_Rule:` 行の両方をここから導出する（値の食い違いを構造的に防ぐ）。
+    pub entering_king_rule: EnteringKingRule,
     /// 先手向けの再接続トークン。`Some` の場合、`build_for(Color::Black)` 出力に
     /// 標準項目の後・`END Game_Summary` の直前で `Reconnect_Token:<token>` 拡張行
     /// として埋め込む。`None` なら拡張行を出さず CSA v1.2.1 標準互換の出力に戻る。
@@ -59,8 +60,8 @@ impl GameSummaryBuilder {
         out.push_str("Protocol_Version:1.2\n");
         out.push_str("Protocol_Mode:Server\n");
         out.push_str("Format:Shogi 1.0\n");
-        if !self.declaration.is_empty() {
-            let _ = writeln!(out, "Declaration:{}", self.declaration);
+        if let Some(decl) = declaration_of(self.entering_king_rule) {
+            let _ = writeln!(out, "Declaration:{decl}");
         }
         let _ = writeln!(out, "Game_ID:{}", self.game_id);
         let _ = writeln!(out, "Name+:{}", self.black);
@@ -78,6 +79,7 @@ impl GameSummaryBuilder {
         if !self.position_section.ends_with('\n') {
             out.push('\n');
         }
+        let _ = writeln!(out, "Entering_King_Rule:{}", self.entering_king_rule.to_usi());
         // 観戦者向け拡張行: 残時間 (ms 粒度)。Workers reconnect 経路の
         // `Black/White_Time_Remaining_Ms:` 行と同形式。
         let _ = writeln!(out, "Black_Time_Remaining_Ms:{black_remaining_ms}");
@@ -95,8 +97,8 @@ impl GameSummaryBuilder {
         out.push_str("Protocol_Version:1.2\n");
         out.push_str("Protocol_Mode:Server\n");
         out.push_str("Format:Shogi 1.0\n");
-        if !self.declaration.is_empty() {
-            let _ = writeln!(out, "Declaration:{}", self.declaration);
+        if let Some(decl) = declaration_of(self.entering_king_rule) {
+            let _ = writeln!(out, "Declaration:{decl}");
         }
         let _ = writeln!(out, "Game_ID:{}", self.game_id);
         let _ = writeln!(out, "Name+:{}", self.black);
@@ -115,8 +117,11 @@ impl GameSummaryBuilder {
         if !self.position_section.ends_with('\n') {
             out.push('\n');
         }
-        // CSA v1.2.1 標準項目の後に続く拡張行として再接続トークンを末尾追加する。
-        // 標準互換クライアントは未知キーを無視できるため、CSA v1.2.1 とは後方互換。
+        // CSA v1.2.1 標準項目の後に続く拡張行。標準互換クライアントは未知キーを
+        // 無視できるため、CSA v1.2.1 とは後方互換。
+        // 入玉ルールの広告: `Declaration:` は CSA 標準に 27 点法のトークンしか無い
+        // ため、24 点法等も含めた正確なルールは USI トークンの拡張行で伝える。
+        let _ = writeln!(out, "Entering_King_Rule:{}", self.entering_king_rule.to_usi());
         let token = match you {
             Color::Black => self.black_reconnect_token.as_ref(),
             Color::White => self.white_reconnect_token.as_ref(),
@@ -133,6 +138,15 @@ fn color_char(c: Color) -> char {
     match c {
         Color::Black => '+',
         Color::White => '-',
+    }
+}
+
+/// CSA 標準 `Declaration:` 行の値。標準仕様にトークンが存在するのは 27 点法
+/// (`Jishogi 1.1`) のみで、他ルールでは行自体を省略する。
+fn declaration_of(rule: EnteringKingRule) -> Option<&'static str> {
+    match rule {
+        EnteringKingRule::Point27 | EnteringKingRule::Point27H => Some("Jishogi 1.1"),
+        _ => None,
     }
 }
 
@@ -297,7 +311,7 @@ mod tests {
             position_section: standard_initial_position_block(),
             rematch_on_draw: false,
             to_move: Color::Black,
-            declaration: "Jishogi 1.1".to_owned(),
+            entering_king_rule: EnteringKingRule::Point27,
             black_reconnect_token: None,
             white_reconnect_token: None,
         }
@@ -335,6 +349,8 @@ mod tests {
         let begin_time = pos("BEGIN Time");
         let begin_pos = pos("BEGIN Position");
         let end_pos = pos("END Position");
+        let ekr = pos("Entering_King_Rule:");
+        let end_summary = pos("END Game_Summary");
         assert!(pv < pm);
         assert!(pm < fmt);
         assert!(fmt < decl);
@@ -347,14 +363,32 @@ mod tests {
         assert!(to_move < begin_time);
         assert!(begin_time < begin_pos);
         assert!(begin_pos < end_pos);
+        assert!(end_pos < ekr);
+        assert!(ekr < end_summary);
     }
 
     #[test]
-    fn declaration_is_optional() {
+    fn declaration_line_only_for_point27() {
         let mut b = skeleton();
-        b.declaration = String::new();
+        b.entering_king_rule = EnteringKingRule::Point24;
         let txt = b.build_for(Color::Black);
         assert!(!txt.contains("Declaration:"));
+        assert!(txt.contains("\nEntering_King_Rule:CSARule24\n"));
+    }
+
+    #[test]
+    fn entering_king_rule_extension_line_for_point27() {
+        let txt = skeleton().build_for(Color::Black);
+        assert!(txt.contains("Declaration:Jishogi 1.1"));
+        assert!(txt.contains("\nEntering_King_Rule:CSARule27\n"));
+    }
+
+    #[test]
+    fn spectator_summary_includes_entering_king_rule() {
+        let mut b = skeleton();
+        b.entering_king_rule = EnteringKingRule::Point24;
+        let txt = b.build_for_spectator(1000, 2000);
+        assert!(txt.contains("\nEntering_King_Rule:CSARule24\n"));
     }
 
     #[test]
@@ -433,7 +467,11 @@ mod tests {
         let end_game = txt
             .find("END Game_Summary\n")
             .unwrap_or_else(|| panic!("missing END Game_Summary: {txt}"));
-        assert!(end_position < token_line, "token must follow END Position");
+        let ekr_line = txt
+            .find("\nEntering_King_Rule:")
+            .unwrap_or_else(|| panic!("missing Entering_King_Rule line: {txt}"));
+        assert!(end_position < ekr_line, "rule line must follow END Position");
+        assert!(ekr_line < token_line, "token must follow rule line");
         assert!(token_line < end_game, "token must precede END Game_Summary");
     }
 

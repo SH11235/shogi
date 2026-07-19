@@ -50,6 +50,11 @@ pub struct GameSummary {
     /// `Some(token)` の場合、WS 切断時に `LOGIN <id> <pw> reconnect:<game_id>+<token>`
     /// で同一対局へ復帰できる (Workers の `RECONNECT_GRACE_SECONDS` 以内)。
     pub reconnect_token: Option<String>,
+    /// サーバーが広告した `%KACHI` 判定の入玉ルール。`Entering_King_Rule:` 拡張行
+    /// (USI トークン、本リポサーバー) を優先し、無ければ CSA 標準の
+    /// `Declaration:Jishogi 1.1` (27 点法、wdoor 等) から導出する。どちらも
+    /// 無ければ `None` (サーバーのルール不明。エンジン設定は変更しない)。
+    pub entering_king_rule: Option<rshogi_core::types::EnteringKingRule>,
 }
 
 /// 再接続成立時にサーバから送られる `BEGIN Reconnect_State` ブロックの
@@ -242,6 +247,8 @@ impl CsaConnection {
         let mut position_lines = Vec::new();
         let mut in_position = false;
         let mut reconnect_token: Option<String> = None;
+        let mut entering_king_rule: Option<rshogi_core::types::EnteringKingRule> = None;
+        let mut declaration_jishogi = false;
 
         // 時間設定: 共通 / 先手別 / 後手別の3レイヤー
         // Time_Unit のデフォルトは秒 (1000ms)
@@ -340,6 +347,14 @@ impl CsaConnection {
             } else if let Some(val) = line.strip_prefix("Increment:") {
                 let v: i64 = val.trim().parse().unwrap_or(0);
                 common_time.increment_ms = v * header_time_unit_ms;
+            } else if let Some(val) = line.strip_prefix("Entering_King_Rule:") {
+                let val = val.trim();
+                entering_king_rule = rshogi_core::types::EnteringKingRule::from_usi(val);
+                if entering_king_rule.is_none() {
+                    log::warn!("[CSA] 未知の Entering_King_Rule '{val}' を無視します");
+                }
+            } else if let Some(val) = line.strip_prefix("Declaration:") {
+                declaration_jishogi = val.trim() == "Jishogi 1.1";
             } else if let Some(val) = line.strip_prefix("Reconnect_Token:") {
                 // 自色用 token は `END Game_Summary` 直前に 1 行だけ届く拡張行。
                 // 相手色 token は届かない（サーバ側 `build_for(my_color)` で除外）。
@@ -362,6 +377,12 @@ impl CsaConnection {
             })
             .collect();
 
+        // 拡張行が無いサーバー (wdoor 等) では CSA 標準 `Declaration:Jishogi 1.1`
+        // (= 27 点法) から導出する。
+        if entering_king_rule.is_none() && declaration_jishogi {
+            entering_king_rule = Some(rshogi_core::types::EnteringKingRule::Point27);
+        }
+
         let summary = GameSummary {
             game_id,
             my_color,
@@ -372,6 +393,7 @@ impl CsaConnection {
             black_time: final_black_time,
             white_time: final_white_time,
             reconnect_token,
+            entering_king_rule,
         };
         log::info!(
             "[CSA] 対局情報受信: {} ({}手目から) {}vs{} 先手:{}ms+{}ms+{}ms 後手:{}ms+{}ms+{}ms",

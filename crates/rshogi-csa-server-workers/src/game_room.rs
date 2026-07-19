@@ -38,7 +38,6 @@ use worker::{
     WebSocket, WebSocketIncomingMessage, WebSocketPair, durable_object, wasm_bindgen,
 };
 
-use rshogi_core::types::EnteringKingRule;
 use rshogi_csa_server::ClockSpec;
 use rshogi_csa_server::config::{
     FloodgateFeatureIntent, parse_allow_floodgate_features, validate_floodgate_feature_gate,
@@ -969,7 +968,7 @@ impl GameRoom {
                 white: PlayerName::new(cfg.white_handle.clone()),
                 max_moves: cfg.max_moves,
                 time_margin_ms: cfg.time_margin_ms,
-                entering_king_rule: EnteringKingRule::Point24,
+                entering_king_rule: crate::config::ENTERING_KING_RULE,
                 initial_sfen: cfg.initial_sfen.clone(),
             },
             clock,
@@ -992,7 +991,7 @@ impl GameRoom {
             position_section,
             rematch_on_draw: false,
             to_move,
-            declaration: String::new(),
+            entering_king_rule: crate::config::ENTERING_KING_RULE,
             black_reconnect_token,
             white_reconnect_token,
         };
@@ -3412,7 +3411,7 @@ impl GameRoom {
             position_section,
             rematch_on_draw: false,
             to_move: core.current_turn(),
-            declaration: String::new(),
+            entering_king_rule: crate::config::ENTERING_KING_RULE,
             black_reconnect_token: cfg.black_reconnect_token.as_deref().map(ReconnectToken::new),
             white_reconnect_token: cfg.white_reconnect_token.as_deref().map(ReconnectToken::new),
         };

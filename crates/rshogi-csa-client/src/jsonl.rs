@@ -548,6 +548,7 @@ mod tests {
             black_time: TimeConfig::default(),
             white_time: TimeConfig::default(),
             reconnect_token: None,
+            entering_king_rule: None,
         }
     }
 

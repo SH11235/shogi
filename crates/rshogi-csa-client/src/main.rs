@@ -1111,6 +1111,7 @@ mod tests {
                 increment_ms: 0,
             },
             reconnect_token,
+            entering_king_rule: None,
         };
         SessionOutcome {
             result,
