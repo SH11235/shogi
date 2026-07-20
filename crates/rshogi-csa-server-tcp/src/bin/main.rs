@@ -106,8 +106,8 @@ struct Cli {
     /// 最大手数。
     #[arg(long, default_value_t = 256)]
     max_moves: u32,
-    /// `%KACHI` 判定の入玉ルール。`csarule27` (27点法・既定) / `csarule24` (24点法) 等。
-    /// 電竜戦・従来 WCSC・floodgate は 27点法、WCSC 2028 は 24点法。
+    /// `%KACHI` 判定の入玉ルール (USI トークン)。`CSARule27` (27点法・既定) /
+    /// `CSARule24` (24点法) 等。電竜戦・従来 WCSC・floodgate は 27点法、WCSC 2028 は 24点法。
     #[arg(long, value_enum, default_value_t = EnteringKingRuleArg::CsaRule27)]
     entering_king_rule: EnteringKingRuleArg,
     /// AGREE 受信の最大待機時間（秒）。GUI/エンジンの起動待ちを許容するため長めの既定値。
@@ -153,19 +153,27 @@ enum ClockKindArg {
 }
 
 /// `--entering-king-rule` の CLI バリアント。`EnteringKingRule` の core enum へ写す。
+/// value 名は Workers の `ENTERING_KING_RULE` env と同じ USI トークンに揃える
+/// (両配備で綴りを 1 つにし、`EnteringKingRule::to_usi`/`from_usi` と一致させる)。
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
 enum EnteringKingRuleArg {
     /// 27点法 (先手28点/後手27点、電竜戦・従来 WCSC・floodgate 標準)。
+    #[value(name = "CSARule27")]
     CsaRule27,
     /// 24点法 (先後共 31点、WCSC 2028)。
+    #[value(name = "CSARule24")]
     CsaRule24,
     /// 27点法 (駒落ち対応)。
+    #[value(name = "CSARule27H")]
     CsaRule27H,
     /// 24点法 (駒落ち対応)。
+    #[value(name = "CSARule24H")]
     CsaRule24H,
     /// 宣言勝ち無効。
+    #[value(name = "NoEnteringKing")]
     NoEnteringKing,
     /// トライルール。
+    #[value(name = "TryRule")]
     TryRule,
 }
 
@@ -807,6 +815,19 @@ mod tests {
     fn entering_king_rule_defaults_to_point27() {
         let cli = Cli::parse_from(["prog", "--players", "players.yaml"]);
         assert_eq!(cli.entering_king_rule.to_rule(), rshogi_core::types::EnteringKingRule::Point27);
+    }
+
+    /// CLI の value 名が USI トークンと同じ綴りで受理される (Workers env と統一)。
+    #[test]
+    fn entering_king_rule_accepts_usi_token_spelling() {
+        let cli = Cli::parse_from([
+            "prog",
+            "--players",
+            "players.yaml",
+            "--entering-king-rule",
+            "CSARule24",
+        ]);
+        assert_eq!(cli.entering_king_rule.to_rule(), rshogi_core::types::EnteringKingRule::Point24);
     }
 
     /// `validate_handicap_sfen` がフィールド数不足を弾く契約。
