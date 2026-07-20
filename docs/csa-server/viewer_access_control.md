@@ -70,7 +70,7 @@ production 中に viewer / spectate を即時無効化する必要が生じた�
 
 ## 5. smoke 確認 curl コマンド例
 
-`<host>` は `rshogi-csa-server-workers.<account>.workers.dev`、
+`<host>` は `rshogi-csa-server.sh11235.com` (Custom Domain)、
 `<allowed-origin>` は `WS_ALLOWED_ORIGINS` に登録した Origin、
 `<other-origin>` は登録していない Origin に置き換える。
 

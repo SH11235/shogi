@@ -13,6 +13,12 @@ main = "build/worker/shim.mjs"
 # https://developers.cloudflare.com/workers/configuration/compatibility-flags/ 参照。
 compatibility_date = "2026-04-21"
 
+# workers.dev 直 URL / preview URL は zone の WAF・Rate Limiting を経由しないため
+# 既定で公開しない (`wrangler dev` でのローカル開発には影響しない)。
+# 個人環境で workers.dev 公開したい場合はコピー後に true へ変更する
+workers_dev = false
+preview_urls = false
+
 [build]
 # worker-build が cdylib を wasm32 向けにビルドし、`build/worker/shim.mjs` を生成する。
 command = "cargo install -q worker-build@^0.8 && worker-build --release"

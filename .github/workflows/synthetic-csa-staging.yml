@@ -67,7 +67,8 @@ jobs:
             --description "CSA Worker synthetic check failure detected by synthetic-csa-*.yml" \
             --color B60205 \
             || true
-      # `WORKERS_STAGING_BASE_URL` は staging の `https://...workers.dev` (path なし)。
+      # `WORKERS_STAGING_BASE_URL` は staging の Custom Domain
+      # `https://stg.rshogi-csa-server.sh11235.com` (path なし)。
       # 未設定時は warning + skip でジョブを green に倒す (drift-check 等の他 workflow
       # と揃えた fail-safe; 環境セットアップ未完で merge を block しない)。
       - name: Check Environment variables
@@ -142,7 +143,7 @@ jobs:
           OPTS="MaterialLevel=9,USI_Hash=16,Threads=1,NetworkDelay=0,NetworkDelay2=0,MinimumThinkingTime=100,PvInterval=0"
 
           # `--target staging` を渡しているので host / Origin は csa_client 内蔵
-          # プリセット (sh11235.workers.dev + Origin csa-client-local) が適用される。
+          # プリセット (stg.rshogi-csa-server.sh11235.com + Origin csa-client-local) が適用される。
           # 利用 account が異なる場合は別途 `--host` / `--ws-origin` を渡す経路を
           # 用意する必要があるが、本リポ標準 deploy 先のみ想定。
 
