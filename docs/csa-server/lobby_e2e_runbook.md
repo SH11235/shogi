@@ -12,7 +12,7 @@
 
 ## 1. 前提条件
 
-- staging Worker が `https://rshogi-csa-server-workers-staging.<account>.workers.dev/`
+- staging Worker が `https://stg.rshogi-csa-server.sh11235.com/`
   に deploy 済み (LobbyDO バインディング含む)。`/health` が `rshogi-csa-server-workers v0.1.0`
   を返すこと。
 - `target/release/rshogi-csa-client` と `target/release/rshogi-usi` がローカルに
@@ -67,7 +67,7 @@ cd /tmp/lobby-run-white && \
 
 ```text
 [INFO] CSA対局クライアント起動
-[INFO] サーバー: wss://...workers.dev/ws/lobby:0 (ID: alice+lobby+black)        ← apply_target_preset 後
+[INFO] サーバー: wss://stg.rshogi-csa-server.sh11235.com/ws/lobby:0 (ID: alice+lobby+black) ← apply_target_preset 後
 [INFO] エンジン: /path/to/rshogi-usi
 [INFO] [USI] エンジン準備完了: Shogi Engine 0.1.0                                 ← USI handshake OK
 [INFO] [CSA/WS] 接続中: wss://.../ws/lobby

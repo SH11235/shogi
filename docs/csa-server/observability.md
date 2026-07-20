@@ -281,7 +281,7 @@ pulumi up
 
 **設計概要 (詳細は別 PR で起票・実装):**
 
-1. Pulumi で `cloudflare.HealthCheck` resource を declare (HTTP probe で `https://rshogi-csa-server-workers.sh11235.workers.dev/health` 等を 1 分間隔で probe)
+1. Pulumi で `cloudflare.HealthCheck` resource を declare (HTTP probe で `https://rshogi-csa-server.sh11235.com/health` 等を 1 分間隔で probe)
 2. Pulumi で `cloudflare.NotificationPolicy` (alertType=`health_check_status_notification`) を declare、`filters.healthCheckId` に上記 Health Check の id を指定、`mechanisms.webhooks` で既存 `alertWebhook` (rshogi-{stg,prod}-alerts) へ routing
 3. これで Worker `/health` endpoint が DOWN を検知 → Slack 通知 が完成
 

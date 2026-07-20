@@ -360,7 +360,7 @@ jobs:
         run: |
           if [ -z "$DRAIN_URL" ]; then
             echo "::error::WORKERS_DRAIN_URL not set on rshogi-csa-server-workers-production Environment"
-            echo "::error::Configure the variable to the live API full URL (e.g. https://...workers.dev/api/v1/games/live)"
+            echo "::error::Configure the variable to the live API full URL (e.g. https://rshogi-csa-server.sh11235.com/api/v1/games/live)"
             echo "::error::See docs/csa-server/deployment.md §12 for the configuration procedure"
             exit 1
           fi

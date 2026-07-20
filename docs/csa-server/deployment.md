@@ -355,12 +355,10 @@ credential から旧 ID を導出できず、過去結果を統合できない�
 
 | Name | 値（例） |
 |---|---|
-| `WORKERS_HEALTH_URL` | staging: `https://rshogi-csa-server-workers-staging.<your-subdomain>.workers.dev/health`<br>production: `https://rshogi-csa-server-workers.<your-subdomain>.workers.dev/health` |
+| `WORKERS_HEALTH_URL` | staging: `https://stg.rshogi-csa-server.sh11235.com/health`<br>production: `https://rshogi-csa-server.sh11235.com/health` |
 
-`<your-subdomain>` は Cloudflare アカウント固有の workers.dev サブドメイン
-（例: `your-name`）。**§3.1 / §3.2 の `wrangler deploy` 実行ログ末尾に
-`Published ... https://...workers.dev` という形で完全な URL が出力される**ので、
-その値を流用する。
+URL は各環境の wrangler toml が `routes` で宣言する Custom Domain
+(`workers_dev = false` のため workers.dev 直 URL は公開されない)。
 [Cloudflare Dashboard → Workers & Pages → 各 worker → Triggers → Routes] でも
 確認できる。
 
@@ -415,14 +413,13 @@ vp run deploy:staging
 `wrangler.staging.toml` の `[build] command = "worker-build --release"` が
 `wrangler deploy` の前段で自動実行される。
 
-成功すると `https://rshogi-csa-server-workers-staging.<your-subdomain>.workers.dev/`
-にデプロイされ、URL が標準出力に表示される。
+成功すると Custom Domain `https://stg.rshogi-csa-server.sh11235.com/`
+(wrangler.staging.toml の `routes` 宣言) にデプロイされる。
 
 #### Smoke check
 
 ```bash
-SUBDOMAIN=<your-subdomain>
-curl "https://rshogi-csa-server-workers-staging.${SUBDOMAIN}.workers.dev/health"
+curl "https://stg.rshogi-csa-server.sh11235.com/health"
 # → "rshogi-csa-server-workers v0.1.0"
 ```
 
@@ -432,11 +429,11 @@ WebSocket 疎通は別途 ws client で確認:
 # `websocat` が無い場合は `cargo install websocat` か `brew install websocat` で入れる
 
 # (a) ネイティブ CSA クライアント経路（Origin ヘッダなし）の確認:
-websocat "wss://rshogi-csa-server-workers-staging.${SUBDOMAIN}.workers.dev/ws/test-room-1"
+websocat "wss://stg.rshogi-csa-server.sh11235.com/ws/test-room-1"
 # 接続が確立すれば OK。Origin が無いリクエストは allowlist に関係なく素通しする。
 
 # (b) ブラウザ経路（Origin 付き）の allowlist 確認:
-websocat "wss://rshogi-csa-server-workers-staging.${SUBDOMAIN}.workers.dev/ws/test-room-1" \
+websocat "wss://stg.rshogi-csa-server.sh11235.com/ws/test-room-1" \
   -H "Origin: https://csa-client-local"
 # `wrangler.staging.toml` の `WS_ALLOWED_ORIGINS` に含まれている Origin を指定する。
 # 含まれない値を渡すと `403 Forbidden Origin` で拒否される（allowlist の挙動確認）。
@@ -458,7 +455,7 @@ cd crates/rshogi-csa-server-workers
 vp run deploy:prod    # Vite+ 非使用時は `pnpm run deploy:prod`（§1 末尾参照）
 ```
 
-`https://rshogi-csa-server-workers.<your-subdomain>.workers.dev/` にデプロイされる。
+`https://rshogi-csa-server.sh11235.com/` にデプロイされる。
 同様に smoke check し、`/health` URL を `rshogi-csa-server-workers-production`
 Environment の variable に登録する。
 
@@ -470,7 +467,7 @@ deploy 後、環境ごとに既存の `ADMIN_API_TOKEN` を Authorization header
 bounded warmup を実行する（token を query string や log に載せない）:
 
 ```bash
-WORKER_URL="https://rshogi-csa-server-workers-staging.<your-subdomain>.workers.dev"
+WORKER_URL="https://stg.rshogi-csa-server.sh11235.com"
 curl --fail-with-body -X POST \
   -H "Authorization: Bearer ${ADMIN_API_TOKEN}" \
   "${WORKER_URL}/api/v1/admin/player-ratings/warmup"
@@ -1258,7 +1255,7 @@ admission gate (案 A: Worker 全体 maintenance flag / 案 B: cron で
 ### 12.2 ローカル手動 deploy 経路
 
 ```bash
-LIVE_URL="https://rshogi-csa-server-workers.sh11235.workers.dev/api/v1/games/live"
+LIVE_URL="https://rshogi-csa-server.sh11235.com/api/v1/games/live"
 bash scripts/check-csa-drain.sh \
   --live-url "$LIVE_URL" \
   --max-wait-sec 3900 \
@@ -1288,7 +1285,7 @@ job が `actions/checkout@v5` 後に `Drain in-flight games (production)` step
 #### 必須 environment variable
 
 GitHub Environment `rshogi-csa-server-workers-production` の variables に
-`WORKERS_DRAIN_URL` を登録 (例: `https://rshogi-csa-server-workers.sh11235.workers.dev/api/v1/games/live`)。
+`WORKERS_DRAIN_URL` を登録 (例: `https://rshogi-csa-server.sh11235.com/api/v1/games/live`)。
 未設定で production deploy を起動すると drain step が `::error::` で fail する
 (staging job は drain step を持たないため変数も不要)。
 
@@ -1400,11 +1397,11 @@ DO storage を喪失したシナリオでの運用方針を本節で確定する
 3. **DO instance の状態確認**:
    ```bash
    # 進行中対局が API 上見えるか
-   curl -s "https://rshogi-csa-server-workers.sh11235.workers.dev/api/v1/games/live" | jq
+   curl -s "https://rshogi-csa-server.sh11235.com/api/v1/games/live" | jq
    # DO 側が応答しているか (room_id を 1 件試す)
    # ※ websocat 未インストールなら `cargo install websocat` で入れる。
    #   本コマンドは WS 到達性の確認のみで、DO state (対局データ) の健全性は判定不可
-   websocat "wss://rshogi-csa-server-workers.sh11235.workers.dev/ws/<room_id>"
+   websocat "wss://rshogi-csa-server.sh11235.com/ws/<room_id>"
    ```
 4. **復旧**:
    - 部分的喪失 (一部 DO instance のみ): 該当 instance に `start_match` してきた
@@ -1420,7 +1417,7 @@ DO storage を喪失したシナリオでの運用方針を本節で確定する
      ```bash
      # 影響 game_id を抽出: cutoff_ms = DO 喪失発生時刻 (epoch ms)、それ以前に
      # 開始 (started_at_ms < cutoff_ms) した対局が abort 対象 (= 喪失時に進行中)
-     curl -s "https://rshogi-csa-server-workers.sh11235.workers.dev/api/v1/games/live" \
+     curl -s "https://rshogi-csa-server.sh11235.com/api/v1/games/live" \
        | jq -r '.live_games[] | select(.started_at_ms < <cutoff_ms>) | .game_id'
      # 各 game_id に対応する live-games-index key を計算 (started_at_ms から prefix 構築)
      # 詳細は live_games_index::live_games_index_key を参照
