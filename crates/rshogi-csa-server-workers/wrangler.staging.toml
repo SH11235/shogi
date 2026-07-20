@@ -208,6 +208,11 @@ CLOCK_PRESETS = '''[
   {"game_name":"floodgate-600-10-moves512","kind":"countdown","total_time_sec":600,"byoyomi_sec":10,"max_moves":512}
 ]'''
 
+# `%KACHI` 判定の入玉ルール (USI トークン)。未設定 / 空 / 不正は 27点法にフォールバック。
+# WCSC 2028 の 24点法インスタンスでのみ `CSARule24` を明示する。意図は production toml の
+# 同等行を参照。
+ENTERING_KING_RULE = "CSARule27"
+
 # 切断時の再接続猶予秒数。`0` または未設定で再接続プロトコルを無効化（保守的既定）。
 # `> 0` を指定する構成は ALLOW_FLOODGATE_FEATURES=true との同時設定が必須。
 # staging では reconnect protocol / history bucket / rating 応答などの Floodgate 系

@@ -15,12 +15,12 @@ use rshogi_csa_server::config::{
 
 use crate::origin;
 
-/// Workers 配備の `%KACHI` 判定に使う入玉ルール。CoreRoom (判定側) と
-/// Game_Summary の広告 (`Declaration:` / `Entering_King_Rule:` 行) の両方が
-/// この値を参照する。別々の literal にすると判定と広告がずれ、client が
-/// 誤ったルールをエンジンへ自動注入してしまう。
-/// 27 点法は電竜戦・世界コンピュータ将棋選手権・wdoor floodgate と同じ標準宣言ルール。
-pub const ENTERING_KING_RULE: rshogi_core::types::EnteringKingRule =
+/// `%KACHI` 判定に使う入玉ルールの既定値。`ENTERING_KING_RULE` env 未設定・空・
+/// 不正トークン時のフォールバックに使う。27 点法は電竜戦・従来の世界コンピュータ将棋
+/// 選手権・wdoor floodgate と同じ標準宣言ルールで、エンジン USI 既定 `CSARule27` とも
+/// 一致する。実際に使う値は対局開始時に env から解決して `PersistedConfig` に焼き込む
+/// ため、判定 (CoreRoom) と広告 (Game_Summary) は常に同じ永続値を参照する。
+pub const DEFAULT_ENTERING_KING_RULE: rshogi_core::types::EnteringKingRule =
     rshogi_core::types::EnteringKingRule::Point27;
 
 /// 起動時にバインディング名として参照する環境変数キー群。
@@ -188,6 +188,11 @@ impl ConfigKeys {
     /// 構成は `--allow-floodgate-features` (Workers では `ALLOW_FLOODGATE_FEATURES`)
     /// を要求する Floodgate features の opt-in 経路に乗る。
     pub const RECONNECT_GRACE_SECONDS: &'static str = "RECONNECT_GRACE_SECONDS";
+    /// `%KACHI` 判定に使う入玉ルールを USI トークンで指定する (`CSARule27` /
+    /// `CSARule24` 等、`EnteringKingRule::from_usi` が受理する値)。未設定・空・
+    /// 不正トークンは [`DEFAULT_ENTERING_KING_RULE`] にフォールバックする。
+    /// 配備インスタンス単位でルールを切替える (電竜戦=27点法 / WCSC 2028=24点法) 用途。
+    pub const ENTERING_KING_RULE: &'static str = "ENTERING_KING_RULE";
     /// LOGIN OK 後の AGREE 待ち TTL (秒)。`start_match` で Game_Summary を送信した
     /// 直後に予約し、両者 AGREE 受領 (`HandleOutcome::GameStarted`) で cancel する。
     /// 発火時は対局が成立する前に部屋を解放する (https://github.com/SH11235/rshogi/issues/600)。
@@ -293,6 +298,7 @@ impl ConfigKeys {
         Self::TOTAL_TIME_MIN,
         Self::BYOYOMI_MIN,
         Self::CLOCK_PRESETS,
+        Self::ENTERING_KING_RULE,
         Self::RECONNECT_GRACE_SECONDS,
         Self::AGREE_TIMEOUT_SECONDS,
         Self::ALLOW_FLOODGATE_FEATURES,
@@ -459,6 +465,28 @@ pub(crate) fn resolve_reconnect_grace_from_strings(
     };
     validate_floodgate_feature_gate(allow, intent)?;
     Ok(grace)
+}
+
+/// `ENTERING_KING_RULE` env 文字列から `%KACHI` 判定ルールを解決する pure helper。
+///
+/// - `None` / 空文字 → `Ok(default)` (env 未設定は既定運用)
+/// - `EnteringKingRule::from_usi` が受理するトークン → `Ok(その値)`
+/// - 未知トークン → `Err(トークン)` (呼び出し側でログして default にフォールバックする。
+///   1 台の typo で全対局を落とすより、標準ルールで走らせて運用者に気付かせる方が安全)
+///
+/// `default` を引数に取るのは host テストで既定非依存に検証するため。実運用の
+/// フォールバック先は [`DEFAULT_ENTERING_KING_RULE`]。
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn resolve_entering_king_rule_from_string(
+    raw: Option<&str>,
+    default: rshogi_core::types::EnteringKingRule,
+) -> Result<rshogi_core::types::EnteringKingRule, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(default),
+        Some(token) => {
+            rshogi_core::types::EnteringKingRule::from_usi(token).ok_or_else(|| token.to_owned())
+        }
+    }
 }
 
 /// Workers `[vars]` 文字列群から時計設定を解決する。
@@ -862,6 +890,37 @@ mod tests {
             err.contains("allow_floodgate_features") || err.contains("reconnect_protocol"),
             "err must mention gate mismatch: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_entering_king_rule_defaults_when_unset_or_blank() {
+        use rshogi_core::types::EnteringKingRule;
+        let d = EnteringKingRule::Point27;
+        assert_eq!(resolve_entering_king_rule_from_string(None, d), Ok(d));
+        assert_eq!(resolve_entering_king_rule_from_string(Some(""), d), Ok(d));
+        assert_eq!(resolve_entering_king_rule_from_string(Some("  "), d), Ok(d));
+    }
+
+    #[test]
+    fn resolve_entering_king_rule_parses_usi_tokens() {
+        use rshogi_core::types::EnteringKingRule;
+        let d = EnteringKingRule::Point27;
+        assert_eq!(
+            resolve_entering_king_rule_from_string(Some("CSARule24"), d),
+            Ok(EnteringKingRule::Point24)
+        );
+        assert_eq!(
+            resolve_entering_king_rule_from_string(Some("CSARule27"), d),
+            Ok(EnteringKingRule::Point27)
+        );
+    }
+
+    #[test]
+    fn resolve_entering_king_rule_rejects_unknown_token() {
+        use rshogi_core::types::EnteringKingRule;
+        let err = resolve_entering_king_rule_from_string(Some("Bogus"), EnteringKingRule::Point27)
+            .unwrap_err();
+        assert_eq!(err, "Bogus");
     }
 
     /// `CHALLENGE_TTL_SEC` が未設定 / 空文字なら既定 3600 秒。

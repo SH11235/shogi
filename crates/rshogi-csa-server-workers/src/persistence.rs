@@ -73,6 +73,26 @@ pub struct PersistedConfig {
     /// 後手向けの再接続トークン。挙動・契約は [`Self::black_reconnect_token`] と同様。
     #[serde(default)]
     pub(crate) white_reconnect_token: Option<String>,
+    /// 対局開始時に確定した `%KACHI` 判定の入玉ルール (USI トークン、例 `CSARule27`)。
+    ///
+    /// env `ENTERING_KING_RULE` を対局中に変えても進行中の局が別ルールで判定されない
+    /// よう、マッチ単位で固定した値を保存する ([`Self::reconnect_grace_ms`] と同じ理由)。
+    /// 旧 schema には存在しないため `#[serde(default)]` で `None` として読み、
+    /// [`Self::entering_king_rule`] が [`crate::config::DEFAULT_ENTERING_KING_RULE`] に
+    /// フォールバックする。
+    #[serde(default)]
+    pub(crate) entering_king_rule: Option<String>,
+}
+
+impl PersistedConfig {
+    /// 保存した USI トークンから `%KACHI` 判定ルールを復元する。`None` / 不正
+    /// トークン (旧 schema・手書き改変) は [`crate::config::DEFAULT_ENTERING_KING_RULE`]。
+    pub(crate) fn entering_king_rule(&self) -> rshogi_core::types::EnteringKingRule {
+        self.entering_king_rule
+            .as_deref()
+            .and_then(rshogi_core::types::EnteringKingRule::from_usi)
+            .unwrap_or(crate::config::DEFAULT_ENTERING_KING_RULE)
+    }
 }
 
 /// 終局フラグ。一度 `Some` になったらその DO は同じ対局を二度開始しない。
@@ -234,7 +254,7 @@ pub fn replay_core_room(cfg: &PersistedConfig, moves: &[MoveRow]) -> ReplaySumma
             white: PlayerName::new(cfg.white_handle.clone()),
             max_moves: cfg.max_moves,
             time_margin_ms: cfg.time_margin_ms,
-            entering_king_rule: crate::config::ENTERING_KING_RULE,
+            entering_king_rule: cfg.entering_king_rule(),
             initial_sfen: cfg.initial_sfen.clone(),
         },
         clock,
@@ -324,6 +344,7 @@ mod tests {
             reconnect_grace_ms: Some(0),
             black_reconnect_token: None,
             white_reconnect_token: None,
+            entering_king_rule: None,
         }
     }
 
@@ -348,7 +369,7 @@ mod tests {
                 white: PlayerName::new(cfg.white_handle.clone()),
                 max_moves: cfg.max_moves,
                 time_margin_ms: cfg.time_margin_ms,
-                entering_king_rule: crate::config::ENTERING_KING_RULE,
+                entering_king_rule: cfg.entering_king_rule(),
                 initial_sfen: cfg.initial_sfen.clone(),
             },
             cfg.clock.build_clock(),
@@ -376,6 +397,40 @@ mod tests {
                 .expect("move in directly_played");
         }
         core
+    }
+
+    #[test]
+    fn entering_king_rule_accessor_maps_token_and_falls_back() {
+        use rshogi_core::types::EnteringKingRule;
+        let mut cfg = baseline_config();
+        // 既定 (None) はフォールバック値。
+        assert_eq!(cfg.entering_king_rule(), crate::config::DEFAULT_ENTERING_KING_RULE);
+        cfg.entering_king_rule = Some("CSARule24".to_owned());
+        assert_eq!(cfg.entering_king_rule(), EnteringKingRule::Point24);
+        cfg.entering_king_rule = Some("bogus".to_owned());
+        assert_eq!(cfg.entering_king_rule(), crate::config::DEFAULT_ENTERING_KING_RULE);
+    }
+
+    #[test]
+    fn old_snapshot_without_rule_field_deserializes_to_default() {
+        // 本フィールド導入前に永続化された snapshot (entering_king_rule 欠落) を
+        // deserialize しても失敗せず、accessor は既定へフォールバックする。
+        let mut cfg = baseline_config();
+        cfg.entering_king_rule = Some("CSARule24".to_owned());
+        let mut json: serde_json::Value = serde_json::to_value(&cfg).unwrap();
+        json.as_object_mut().unwrap().remove("entering_king_rule");
+        let restored: PersistedConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.entering_king_rule, None);
+        assert_eq!(restored.entering_king_rule(), crate::config::DEFAULT_ENTERING_KING_RULE);
+    }
+
+    #[test]
+    fn persisted_rule_survives_serde_round_trip() {
+        let mut cfg = baseline_config();
+        cfg.entering_king_rule = Some("CSARule24".to_owned());
+        let round: PersistedConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(round.entering_king_rule(), rshogi_core::types::EnteringKingRule::Point24);
     }
 
     #[test]

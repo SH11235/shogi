@@ -398,6 +398,9 @@ CI 自動 deploy 前に、ローカルから 1 度手動で deploy して動作�
   （未確定なら空のままで OK。空のままでもネイティブ CSA クライアントは Origin 欠落で
   素通し。web client 化したときだけ Origin の追加が必要）
 - 時計設定（`CLOCK_KIND` / `TOTAL_TIME_*` / `BYOYOMI_*`）を運用方針に合わせる
+- `ENTERING_KING_RULE`（`%KACHI` 入玉ルール、USI トークン）を大会方針に合わせる。既定
+  `CSARule27`（電竜戦・従来 WCSC・floodgate）。WCSC 2028 の 24点法インスタンスでは
+  `CSARule24` を明示。未設定 / 不正値は `CSARule27` にフォールバック
 - `ADMIN_API_TOKEN` と `PLAYER_ID_SECRET` を staging Cloudflare secret に登録済みか確認（§2.5 / [`admin_auth.md`](admin_auth.md)）。
   確認: `vp exec wrangler secret list --config wrangler.staging.toml`
 

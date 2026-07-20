@@ -152,6 +152,10 @@ BYOYOMI_MIN = "1"
 #   ]'''
 # 命名規則・各方式の field 名・strict mode 仕様は `docs/csa-server/clock_defaults.md` 参照。
 CLOCK_PRESETS = "[]"
+# `%KACHI` 判定の入玉ルール (USI トークン)。未設定 / 空 / 不正は 27点法
+# (`CSARule27`、電竜戦・従来 WCSC・floodgate 標準) にフォールバック。WCSC 2028 の
+# 24点法インスタンスでのみ `CSARule24` を明示する。
+ENTERING_KING_RULE = "CSARule27"
 # admin 認可基盤 (WS 内 `%%ADMIN <token>` / 将来の HTTP admin endpoint で共用
 # される static API token、https://github.com/SH11235/rshogi/issues/560 +
 # https://github.com/SH11235/rshogi/issues/621)。
