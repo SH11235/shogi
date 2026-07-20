@@ -106,6 +106,10 @@ struct Cli {
     /// 最大手数。
     #[arg(long, default_value_t = 256)]
     max_moves: u32,
+    /// `%KACHI` 判定の入玉ルール。`csarule27` (27点法・既定) / `csarule24` (24点法) 等。
+    /// 電竜戦・従来 WCSC・floodgate は 27点法、WCSC 2028 は 24点法。
+    #[arg(long, value_enum, default_value_t = EnteringKingRuleArg::CsaRule27)]
+    entering_king_rule: EnteringKingRuleArg,
     /// AGREE 受信の最大待機時間（秒）。GUI/エンジンの起動待ちを許容するため長めの既定値。
     #[arg(long, default_value_t = 300)]
     agree_timeout_sec: u64,
@@ -146,6 +150,37 @@ enum ClockKindArg {
     Countdown,
     Fischer,
     Stopwatch,
+}
+
+/// `--entering-king-rule` の CLI バリアント。`EnteringKingRule` の core enum へ写す。
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+enum EnteringKingRuleArg {
+    /// 27点法 (先手28点/後手27点、電竜戦・従来 WCSC・floodgate 標準)。
+    CsaRule27,
+    /// 24点法 (先後共 31点、WCSC 2028)。
+    CsaRule24,
+    /// 27点法 (駒落ち対応)。
+    CsaRule27H,
+    /// 24点法 (駒落ち対応)。
+    CsaRule24H,
+    /// 宣言勝ち無効。
+    NoEnteringKing,
+    /// トライルール。
+    TryRule,
+}
+
+impl EnteringKingRuleArg {
+    fn to_rule(self) -> rshogi_core::types::EnteringKingRule {
+        use rshogi_core::types::EnteringKingRule as R;
+        match self {
+            Self::CsaRule27 => R::Point27,
+            Self::CsaRule24 => R::Point24,
+            Self::CsaRule27H => R::Point27H,
+            Self::CsaRule24H => R::Point24H,
+            Self::NoEnteringKing => R::None,
+            Self::TryRule => R::TryRule,
+        }
+    }
 }
 
 impl ClockKindArg {
@@ -256,7 +291,7 @@ fn main() -> anyhow::Result<()> {
         login_timeout: std::time::Duration::from_secs(30),
         agree_timeout: std::time::Duration::from_secs(cli.agree_timeout_sec),
         x1_reply_write_timeout: std::time::Duration::from_secs(5),
-        entering_king_rule: rshogi_core::types::EnteringKingRule::Point27,
+        entering_king_rule: cli.entering_king_rule.to_rule(),
         initial_sfen: None,
         admin_handles: cli.admin_handle.clone(),
         allow_floodgate_features: cli.allow_floodgate_features,
@@ -753,6 +788,25 @@ mod tests {
             ALLOW_FLOODGATE_FEATURES_FLAG,
             "ALLOW_FLOODGATE_FEATURES_FLAG must stay in sync with clap-generated flag",
         );
+    }
+
+    /// `--entering-king-rule` の各バリアントが core enum に正しく写ることを固定する。
+    #[test]
+    fn entering_king_rule_arg_maps_to_core_enum() {
+        use rshogi_core::types::EnteringKingRule as R;
+        assert_eq!(EnteringKingRuleArg::CsaRule27.to_rule(), R::Point27);
+        assert_eq!(EnteringKingRuleArg::CsaRule24.to_rule(), R::Point24);
+        assert_eq!(EnteringKingRuleArg::CsaRule27H.to_rule(), R::Point27H);
+        assert_eq!(EnteringKingRuleArg::CsaRule24H.to_rule(), R::Point24H);
+        assert_eq!(EnteringKingRuleArg::NoEnteringKing.to_rule(), R::None);
+        assert_eq!(EnteringKingRuleArg::TryRule.to_rule(), R::TryRule);
+    }
+
+    /// `--entering-king-rule` 未指定時の既定は 27点法。
+    #[test]
+    fn entering_king_rule_defaults_to_point27() {
+        let cli = Cli::parse_from(["prog", "--players", "players.yaml"]);
+        assert_eq!(cli.entering_king_rule.to_rule(), rshogi_core::types::EnteringKingRule::Point27);
     }
 
     /// `validate_handicap_sfen` がフィールド数不足を弾く契約。

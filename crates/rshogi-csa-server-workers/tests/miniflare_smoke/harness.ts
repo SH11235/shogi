@@ -67,6 +67,9 @@ export interface HarnessOptions {
   /// 切って必ず指定する契約。`makeTempPersistRoot()` のヘルパで作るのが基本経路。
   persistRoot: string;
   reconnectGraceSeconds?: number;
+  /// `%KACHI` 判定の入玉ルール (USI トークン、例 `CSARule24`)。未指定時は binding を
+  /// 出さず server 側 fallback (= 27点法) を使う。
+  enteringKingRule?: string;
   /// AGREE 待ち TTL (秒)。`start_match` 直後に予約され、両者 AGREE で cancel
   /// される (Issue #600)。テストで stuck 経路を再現する際は短めの値 (例: 1) を
   /// 渡し、`alarm()` 発火で部屋解放されることを assert する。未指定時は server
@@ -178,6 +181,9 @@ export async function createMiniflare(opts: HarnessOptions): Promise<Miniflare> 
       // 出て reconnect 経路が有効化される。Issue #591 hotfix 後は server 側 token
       // 配布も grace に応じた gate を通る。
       RECONNECT_GRACE_SECONDS: String(opts.reconnectGraceSeconds ?? 0),
+      // 未指定時は空文字を渡して server 側 fallback (= DEFAULT_ENTERING_KING_RULE
+      // = 27点法) を使う。24点法インスタンスの検証時のみ `CSARule24` を明示する。
+      ENTERING_KING_RULE: opts.enteringKingRule ?? "",
       // 未指定時は空文字を渡して server 側 fallback (= 60 秒既定) を使う。
       // 数値を指定したテストでは start_match 直後に AGREE 待ち alarm が予約される。
       AGREE_TIMEOUT_SECONDS:

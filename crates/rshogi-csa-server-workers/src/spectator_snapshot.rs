@@ -128,7 +128,7 @@ pub fn build_spectator_snapshot(input: SpectatorSnapshotInput<'_>) -> Vec<String
         position_section,
         rematch_on_draw: false,
         to_move,
-        entering_king_rule: crate::config::ENTERING_KING_RULE,
+        entering_king_rule: input.config.entering_king_rule(),
         // 観戦者向け builder は token を出力しないため、`None` 固定で渡す
         // (関数内部でも player 経路と異なり token 行は出さない契約)。
         black_reconnect_token: None,
@@ -324,6 +324,7 @@ mod tests {
             reconnect_grace_ms: Some(30_000),
             black_reconnect_token: Some("blk-token".to_owned()),
             white_reconnect_token: Some("wht-token".to_owned()),
+            entering_king_rule: None,
         }
     }
 
@@ -621,7 +622,7 @@ PI
             max_moves: 256,
             // margin を課金へ持ち込まないことを確認するため 0 でなく 1000ms を設定する。
             time_margin_ms: 1_000,
-            entering_king_rule: crate::config::ENTERING_KING_RULE,
+            entering_king_rule: crate::config::DEFAULT_ENTERING_KING_RULE,
             initial_sfen: None,
         };
         let clock = Box::new(FischerClock::new(60, 5));

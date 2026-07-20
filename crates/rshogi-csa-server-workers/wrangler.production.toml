@@ -215,6 +215,12 @@ CLOCK_PRESETS = '''[
   {"game_name":"floodgate-600-10-moves512","kind":"countdown","total_time_sec":600,"byoyomi_sec":10,"max_moves":512}
 ]'''
 
+# `%KACHI` 判定の入玉ルール (USI トークン)。未設定 / 空 / 不正トークンは 27点法
+# (`CSARule27`、電竜戦・従来 WCSC・floodgate 標準) にフォールバック。WCSC 2028 の
+# 24点法インスタンスを立てるときのみ `CSARule24` を明示する。対局開始時に確定して
+# PersistedConfig に固定されるため、途中で変更しても進行中の局は開始時ルールで判定。
+ENTERING_KING_RULE = "CSARule27"
+
 # 切断時の再接続猶予秒数。`0` または未設定で再接続プロトコルを無効化。
 # `> 0` を指定する構成は ALLOW_FLOODGATE_FEATURES=true との同時設定が必須。
 RECONNECT_GRACE_SECONDS = "30"

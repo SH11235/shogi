@@ -66,8 +66,8 @@ use crate::attachment::{
     parse_login_handle,
 };
 use crate::config::{
-    ConfigKeys, parse_agree_timeout_duration, parse_clock_presets, parse_clock_spec,
-    resolve_reconnect_grace_from_strings,
+    ConfigKeys, DEFAULT_ENTERING_KING_RULE, parse_agree_timeout_duration, parse_clock_presets,
+    parse_clock_spec, resolve_entering_king_rule_from_string, resolve_reconnect_grace_from_strings,
 };
 use crate::datetime::{format_csa_datetime, format_date_path, format_rfc3339_utc};
 use crate::export_retry::{is_exhausted, next_retry_delay_ms};
@@ -923,6 +923,9 @@ impl GameRoom {
         // で参照するために `PersistedConfig` に保存する。`grace == 0` の構成では
         // `(None, None)` を返し token 配布も `PersistedConfig` への保存もスキップする。
         let (black_reconnect_token, white_reconnect_token) = issue_tokens_if_enabled(grace);
+        // 入玉ルールを env から解決してマッチ単位で固定する。対局中に env を
+        // 変えても進行中の局は開始時ルールで判定する ([`PersistedConfig::entering_king_rule`])。
+        let entering_king_rule = resolve_entering_king_rule(&self.env);
         let clock_spec = preset.clock;
         let cfg = PersistedConfig {
             game_id: game_id.clone(),
@@ -942,6 +945,7 @@ impl GameRoom {
             })?),
             black_reconnect_token: black_reconnect_token.as_ref().map(|t| t.as_str().to_owned()),
             white_reconnect_token: white_reconnect_token.as_ref().map(|t| t.as_str().to_owned()),
+            entering_king_rule: Some(entering_king_rule.to_usi().to_owned()),
         };
         self.state.storage().put(KEY_CONFIG, &cfg).await?;
 
@@ -968,7 +972,7 @@ impl GameRoom {
                 white: PlayerName::new(cfg.white_handle.clone()),
                 max_moves: cfg.max_moves,
                 time_margin_ms: cfg.time_margin_ms,
-                entering_king_rule: crate::config::ENTERING_KING_RULE,
+                entering_king_rule,
                 initial_sfen: cfg.initial_sfen.clone(),
             },
             clock,
@@ -991,7 +995,7 @@ impl GameRoom {
             position_section,
             rematch_on_draw: false,
             to_move,
-            entering_king_rule: crate::config::ENTERING_KING_RULE,
+            entering_king_rule,
             black_reconnect_token,
             white_reconnect_token,
         };
@@ -3411,7 +3415,7 @@ impl GameRoom {
             position_section,
             rematch_on_draw: false,
             to_move: core.current_turn(),
-            entering_king_rule: crate::config::ENTERING_KING_RULE,
+            entering_king_rule: cfg.entering_king_rule(),
             black_reconnect_token: cfg.black_reconnect_token.as_deref().map(ReconnectToken::new),
             white_reconnect_token: cfg.white_reconnect_token.as_deref().map(ReconnectToken::new),
         };
@@ -3998,6 +4002,26 @@ fn resolve_reconnect_grace(env: &Env) -> std::result::Result<Duration, String> {
     let grace_raw = env.var(ConfigKeys::RECONNECT_GRACE_SECONDS).ok().map(|v| v.to_string());
     let allow_raw = env.var(ConfigKeys::ALLOW_FLOODGATE_FEATURES).ok().map(|v| v.to_string());
     resolve_reconnect_grace_from_strings(grace_raw.as_deref(), allow_raw.as_deref())
+}
+
+/// `ENTERING_KING_RULE` env を読み、`%KACHI` 判定ルールを解決する。
+///
+/// 不正トークンは grace と違って対局を abort せず、ログを出して
+/// [`crate::config::DEFAULT_ENTERING_KING_RULE`] にフォールバックする (1 台の typo で
+/// 全対局を落とさず、標準ルールで走らせて運用者に気付かせる)。
+fn resolve_entering_king_rule(env: &Env) -> rshogi_core::types::EnteringKingRule {
+    let raw = env.var(ConfigKeys::ENTERING_KING_RULE).ok().map(|v| v.to_string());
+    match resolve_entering_king_rule_from_string(raw.as_deref(), DEFAULT_ENTERING_KING_RULE) {
+        Ok(rule) => rule,
+        Err(token) => {
+            crate::structured_log!(
+                event: "entering_king_rule_config_error",
+                component: "game_room",
+                token: token,
+            );
+            DEFAULT_ENTERING_KING_RULE
+        }
+    }
 }
 
 /// `ALLOW_FLOODGATE_FEATURES` env と `FLOODGATE_HISTORY_BUCKET` binding を読み、
