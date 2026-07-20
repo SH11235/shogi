@@ -5,10 +5,12 @@ user-invocable: true
 
 # CSA server E2E スキル (Workers staging / production)
 
-`rshogi-csa-server-workers` を deploy した Worker (本リポ既定では
-`rshogi-csa-server-workers-staging.<account>.workers.dev` /
-`rshogi-csa-server-workers.<account>.workers.dev`) に対し、`csa_client` を 2
-プロセス起動して各シナリオを実機で通電する。
+`rshogi-csa-server-workers` を deploy した Worker (本リポ既定では Custom Domain
+`stg.rshogi-csa-server.sh11235.com` / `rshogi-csa-server.sh11235.com`) に対し、
+`csa_client` を 2 プロセス起動して各シナリオを実機で通電する。
+Worker は `workers_dev = false` で workers.dev 直 URL を公開しないため、
+到達経路は `wrangler.{staging,production}.toml` の `routes` が宣言する
+Custom Domain のみ。独自 deploy の fork はその route の host に読み替える。
 
 ## 0a. シナリオ選定 (どの change にどの scenario を流すか)
 
@@ -35,14 +37,14 @@ test 側で済んでいる前提で、本 skill は実機しか取れない通�
 事前に以下が揃っていることを確認する。揃っていなければユーザに質問して埋めて
 もらう:
 
-- **Cloudflare account 名** (`<account>`): 本リポ標準では `sh11235`。OSS 利用者
-  が独自 deploy している場合は別の値を入れる。CSA Worker URL の subdomain
-  (`rshogi-csa-server-workers-staging.<account>.workers.dev`) と一致する。
+- **到達 host**: 本リポ標準では staging = `stg.rshogi-csa-server.sh11235.com`、
+  production = `rshogi-csa-server.sh11235.com` (`wrangler.{staging,production}.toml`
+  の `routes` が正典)。独自 deploy の fork は自分の Custom Domain host に読み替える。
 - **Worker deploy 状態**: `vp exec wrangler deploy --config wrangler.staging.toml`
   または `gh workflow run deploy-workers.yml -f target=staging` 済。`/health` で
   生存確認:
   ```bash
-  curl -sf https://rshogi-csa-server-workers-staging.<account>.workers.dev/health
+  curl -sf https://stg.rshogi-csa-server.sh11235.com/health
   ```
 - **CLOCK_PRESETS 既定**: 同梱の `wrangler.{staging,production}.toml` に登録された
   3 preset (`byoyomi-msec-10-100` / `byoyomi-120-5` / `floodgate-600-10`) が
@@ -122,7 +124,6 @@ quit する。`<room_id>` は黒/白で完全一致、`<preset>` も完全一致
 ```bash
 ROOM=e2e-$(date +%Y%m%d%H%M%S)
 PRESET=floodgate-600-10
-ACC=<account>  # 本リポでは sh11235
 ENGINE=/path/to/your/usi-engine
 # YaneuraOu sfnnwop1536 用 options 例 (HalfKP 系なら EvalFile に置き換え):
 OPTS="EvalDir=/path/to/eval_v100_300,FV_SCALE=28,LS_BUCKET_MODE=progress8kpabs,LS_PROGRESS_COEFF=/path/to/progress.bin,BookFile=no_book,NetworkDelay=0,NetworkDelay2=0,MinimumThinkingTime=1000,PvInterval=0,Threads=1,USI_Hash=512"
@@ -167,7 +168,7 @@ wait
 
 | field | 役割 | 書き換え例 |
 |---|---|---|
-| `server.host` | Worker URL。末尾 `/ws/<room_id>` の `<room_id>` を黒/白で完全一致させる | `wss://rshogi-csa-server-workers-staging.<account>.workers.dev/ws/e2e-20260505...` |
+| `server.host` | Worker URL。末尾 `/ws/<room_id>` の `<room_id>` を黒/白で完全一致させる | `wss://stg.rshogi-csa-server.sh11235.com/ws/e2e-20260505...` |
 | `server.id` | LOGIN handle。`<handle>+<game_name>+<color>` の `<game_name>` は **必ず CLOCK_PRESETS 登録 preset 名**(strict mode、未登録名は `LOGIN_LOBBY:incorrect unknown_game_name` で reject される) | 黒: `alice+floodgate-600-10+black` / 白: `bob+floodgate-600-10+white` |
 | `engine.path` | ローカル USI engine 絶対パス | `/abs/path/to/your/usi-engine` |
 | `engine.options` 内 `EvalFile` 等 | 実機 engine が要求するモデルパス | engine 仕様による |
@@ -199,7 +200,7 @@ preset 選び:
   追加される。viewer API で取得確認:
 
 ```bash
-curl -sf "https://rshogi-csa-server-workers-staging.<account>.workers.dev/api/v1/games/<game_id>" \
+curl -sf "https://stg.rshogi-csa-server.sh11235.com/api/v1/games/<game_id>" \
   | python3 -c "import json,sys; d=json.load(sys.stdin)['meta']; print(f'end_reason={d[\"end_reason\"]} result={d[\"result_kind\"]} moves={d[\"moves_count\"]}')"
 ```
 
@@ -214,7 +215,7 @@ DO instance = 1 対局の設計のため、終局後の同 room_id 再 LOGIN は
 入れることで対応する (csa_client が 0,1,2,...,(max_games-1) を埋める)。
 
 ```toml
-host = "wss://rshogi-csa-server-workers-staging.<account>.workers.dev/ws/myroom-{game_seq}"
+host = "wss://stg.rshogi-csa-server.sh11235.com/ws/myroom-{game_seq}"
 id = "alice-{game_seq}+byoyomi-msec-10-100+black"
 [game]
 max_games = 5
@@ -294,7 +295,7 @@ preset は `byoyomi-120-5` (中時間) を選び、grace 30 秒の中で reconne
 `csa_client` は観戦モード未実装のため `wscat` 等の汎用 WS client で擬似する。
 
 ```bash
-wscat -c "wss://rshogi-csa-server-workers-staging.<account>.workers.dev/ws/<room_id>"
+wscat -c "wss://stg.rshogi-csa-server.sh11235.com/ws/<room_id>"
 > LOGIN spectator+<preset_name>+spectator anything
 < LOGIN:spectator+<preset_name>+spectator OK
 > %%MONITOR2ON <game_id>
@@ -313,7 +314,7 @@ ADMIN 権限で運用権限コマンドを送り、中盤局面からの対局�
 
 ```bash
 # `<ADMIN_HANDLE>` は staging/production の wrangler secret に設定された値。
-wscat -c "wss://rshogi-csa-server-workers-staging.<account>.workers.dev/ws/<room_id>"
+wscat -c "wss://stg.rshogi-csa-server.sh11235.com/ws/<room_id>"
 > LOGIN <ADMIN_HANDLE>+<preset_name>+black anything
 < LOGIN:... OK
 > %%SETBUOY <preset_name> +7776FU -3334FU 1
@@ -354,7 +355,7 @@ wscat -c "wss://rshogi-csa-server-workers-staging.<account>.workers.dev/ws/<room
 // /tmp/agree_timeout_test.js
 const WebSocket = require("ws");
 const room = process.argv[2];
-const baseUrl = "wss://rshogi-csa-server-workers-staging.<account>.workers.dev/ws";
+const baseUrl = "wss://stg.rshogi-csa-server.sh11235.com/ws";
 const preset = "byoyomi-msec-10-100";
 // パスワードは `CSA_TEST_PASSWORD` 環境変数から読み、未設定時のみ "testpw" にフォールバック
 const password = process.env.CSA_TEST_PASSWORD ?? "testpw";
