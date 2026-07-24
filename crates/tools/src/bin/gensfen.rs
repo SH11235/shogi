@@ -17,7 +17,7 @@ use rand::seq::SliceRandom;
 use rshogi_core::movegen::{MoveList, generate_legal, is_legal_with_pass};
 use rshogi_core::nnue::{
     compute_layer_stack_progress8kpabs_bucket_index, get_layer_stack_progress_kpabs_weights,
-    get_network, init_nnue_from_bytes, load_progress_coeff_kpabs_from_bytes,
+    get_network, init_nnue_from_bytes, load_progress_coeff_kpabs_from_bytes, set_fv_scale_override,
     set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::{EnteringKingPointInfo, Position};
@@ -292,6 +292,11 @@ struct Cli {
     #[arg(long)]
     progress_file: Option<PathBuf>,
 
+    /// FV_SCALE オーバーライド（0=arch 文字列から自動判定、1 以上=指定値。NativeBackend 専用。
+    /// arch 文字列の fv_scale が実際の学習スケールと食い違うネットで使用する）
+    #[arg(long, default_value_t = 0)]
+    fv_scale: i32,
+
     /// 置換表を対局間で保持する（TT をクリアしない）。
     /// tanuki- は毎対局クリアするため、デフォルト false。実験用。
     /// --keep-tt=true で有効化、--keep-tt=false で明示的に無効化。
@@ -413,6 +418,9 @@ struct MetaSettings {
     /// progress_file 内容の SHA-256（resume 時に同一パスへの係数差し替えを検出する）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     progress_file_sha256: Option<String>,
+    /// FV_SCALE オーバーライド（未指定 = arch 文字列から自動判定）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fv_scale: Option<i32>,
 }
 
 fn default_skip_in_check() -> bool {
@@ -4143,6 +4151,19 @@ fn main() -> Result<()> {
              In USI mode, pass the engine option directly with --usi-option LS_PROGRESS_COEFF=<path>."
         );
     }
+    if cli.fv_scale < 0 {
+        bail!("--fv-scale must be 0 (auto) or a positive value");
+    }
+    if !native_mode && cli.fv_scale != 0 {
+        bail!(
+            "--fv-scale is only supported with --native=true. \
+             In USI mode, pass the engine option directly with --usi-option FV_SCALE=<value>."
+        );
+    }
+    if native_mode && cli.fv_scale > 0 {
+        set_fv_scale_override(cli.fv_scale);
+        eprintln!("NativeBackend: FV_SCALE override {}", cli.fv_scale);
+    }
     let entering_king_rule_black = if native_mode {
         EnteringKingRule::default()
     } else {
@@ -4285,15 +4306,20 @@ fn main() -> Result<()> {
     } else {
         usi_option_path_fingerprints(&white_usi_opts)?
     };
+    let mut model_fingerprint = serde_json::json!({
+        "native": native_mode,
+        "eval_file": cli.eval_file.as_ref().map(|path| path.display().to_string()),
+        "eval_file_sha256": eval_file_sha256,
+        "progress_file": cli.progress_file.as_ref().map(|path| path.display().to_string()),
+        "progress_file_sha256": native_progress_file_sha256,
+    });
+    if cli.fv_scale > 0 {
+        // 未指定時はキー自体を出さない（既存 run の fingerprint と一致させ resume を壊さないため）
+        model_fingerprint["fv_scale"] = serde_json::json!(cli.fv_scale);
+    }
     let generation_fingerprint = serde_json::json!({
         "schema": 2,
-        "model": serde_json::json!({
-            "native": native_mode,
-            "eval_file": cli.eval_file.as_ref().map(|path| path.display().to_string()),
-            "eval_file_sha256": eval_file_sha256,
-            "progress_file": cli.progress_file.as_ref().map(|path| path.display().to_string()),
-            "progress_file_sha256": native_progress_file_sha256,
-        }),
+        "model": model_fingerprint,
         "engine": serde_json::json!({
             "path_black": engine_paths.black.path.display().to_string(),
             "path_white": engine_paths.white.path.display().to_string(),
@@ -4422,6 +4448,7 @@ fn main() -> Result<()> {
                 shuffle_seed: shuffle_seed_resolved,
                 progress_file: cli.progress_file.as_ref().map(|p| p.display().to_string()),
                 progress_file_sha256: native_progress_file_sha256.clone(),
+                fv_scale: (cli.fv_scale > 0).then_some(cli.fv_scale),
             },
             engine_cmd: EngineCommandMeta {
                 path_black: engine_paths.black.path.display().to_string(),

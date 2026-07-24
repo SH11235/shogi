@@ -85,6 +85,11 @@ progress8kpabs 係数ファイルを指定する。未指定ならゼロ係数�
 native LayerStacks 実行時は stderr に `LayerStacks num_buckets=N` と、ワーカー終了時の
 `progress bucket distribution: [...] (used X/N)` を出力するため、短時間ランでも bucket 使用状況を確認できる。
 
+FV_SCALE は arch 文字列の `fv_scale` トークンから自動判定される。実際の学習スケールと
+食い違うネット（例: nnue2score を変えた学習で arch 文字列が旧値のままのもの）では
+`--fv-scale N` で上書きする。指定値は meta 行の `settings.fv_scale` と fingerprint に
+記録され、resume 時に同一指定を要求する。
+
 USI モードを使う場合は `--native=false --engine-path /path/to/usi-engine` を指定する。
 このとき `--engine-path-black/white` で先後を別エンジンにすることも可能。
 USI モードでは `--progress-file` は使わず、必要な場合は `--usi-option LS_PROGRESS_COEFF=/path/to/progress.bin`
@@ -126,6 +131,7 @@ TT/履歴が共有されるため棋力評価には不向きだが、教師局�
 | `--native[=BOOL]` | true | NativeBackend を使用（`--eval-file` 必須） |
 | `--eval-file PATH` | (native 時必須) | NNUE 評価関数ファイル |
 | `--progress-file PATH` | (LS native 時必須) | native LayerStacks 用 progress8kpabs 係数ファイル |
+| `--fv-scale N` | 0（自動判定） | FV_SCALE オーバーライド（NativeBackend 専用）。arch 文字列の fv_scale が実際の学習スケールと食い違うネットで指定する。USI モードでは `--usi-option FV_SCALE=N` を使う |
 | `--keep-tt[=BOOL]` | false | TT を対局間で保持（実験用） |
 | `--engine-path PATH` | (USI 時必須) | エンジンバイナリパス |
 | `--engine-path-black/white PATH` | — | 先後別エンジン |
