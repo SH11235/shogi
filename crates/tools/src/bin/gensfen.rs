@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
@@ -2838,6 +2839,113 @@ fn usi_option_path_fingerprints(options: &[String]) -> Result<Vec<Value>> {
     Ok(fingerprints)
 }
 
+/// `control.json` をポーリングする間隔。対局は秒オーダーなので 500ms で十分応答できる。
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// `control.json` の受理スキーマ。存在するフィールドだけ反映する。
+#[derive(Deserialize)]
+struct ControlFile {
+    concurrency: Option<usize>,
+    target_games: Option<u32>,
+}
+
+/// `control_history.jsonl` の 1 レコード。再現性のため変更を時系列で残す。
+#[derive(Serialize)]
+struct ControlHistoryEntry {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    concurrency: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_games: Option<u32>,
+    /// 変更を適用した時点で完了していた対局数。
+    completed: u32,
+}
+
+/// `control.json` を読み、同時 in-flight 対局数の上限を更新する。
+///
+/// worker スレッド数（= `--concurrency`、per-worker checkpoint 数と fingerprint に固定）
+/// は変えられないため、上限を超える指定は `--concurrency` に clamp する。
+/// 長時間 background 運用での堅牢性を優先し、ファイル不在 / 読込失敗 / パース失敗 /
+/// history 追記失敗はいずれも警告のみで実行を継続する（対局を落とさない）。
+fn apply_control(
+    control_path: &Path,
+    history_path: &Path,
+    effective_concurrency: &mut usize,
+    max_concurrency: usize,
+    target_games: &mut u32,
+    min_target_games: u32,
+    completed: u32,
+) {
+    let Ok(text) = std::fs::read_to_string(control_path) else {
+        return;
+    };
+    let parsed: ControlFile = match serde_json::from_str(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[control] {} のパースに失敗したため無視します: {e}", control_path.display());
+            return;
+        }
+    };
+    let mut changed_conc: Option<usize> = None;
+    if let Some(requested) = parsed.concurrency {
+        if requested == 0 {
+            eprintln!("[control] concurrency=0 は不正のため無視します");
+        } else {
+            let clamped = requested.min(max_concurrency);
+            if clamped != *effective_concurrency {
+                if requested > max_concurrency {
+                    eprintln!(
+                        "[control] concurrency={requested} は worker 数の上限 --concurrency {max_concurrency} に clamp します"
+                    );
+                }
+                *effective_concurrency = clamped;
+                changed_conc = Some(clamped);
+            }
+        }
+    }
+    let mut changed_target: Option<u32> = None;
+    if let Some(requested) = parsed.target_games {
+        // 発行済み game_id は取り消せないため、下げる場合は発行済み範囲へ clamp する
+        // (= 供給停止 + in-flight 完走の安全な drain になる)。
+        let clamped = requested.max(min_target_games);
+        if clamped != *target_games {
+            if requested < min_target_games {
+                eprintln!(
+                    "[control] target_games={requested} は発行済み対局数 {min_target_games} に clamp します (in-flight 完走後に finalize)"
+                );
+            }
+            *target_games = clamped;
+            changed_target = Some(clamped);
+        }
+    }
+    if changed_conc.is_none() && changed_target.is_none() {
+        return;
+    }
+    println!(
+        "[control] applied: concurrency={changed_conc:?} target_games={changed_target:?} (completed={completed})"
+    );
+    let entry = ControlHistoryEntry {
+        kind: "control",
+        timestamp: Local::now().to_rfc3339(),
+        concurrency: changed_conc,
+        target_games: changed_target,
+        completed,
+    };
+    let result = serde_json::to_string(&entry).map_err(anyhow::Error::from).and_then(|line| {
+        let mut file = OpenOptions::new().create(true).append(true).open(history_path)?;
+        writeln!(file, "{line}")?;
+        Ok(())
+    });
+    if let Err(e) = result {
+        eprintln!(
+            "[control] {} への履歴追記に失敗しました（実行は継続）: {e}",
+            history_path.display()
+        );
+    }
+}
+
 fn validate_resume_fingerprint(meta: Option<&Value>, current: &Value) -> Result<()> {
     let meta = meta.context(
         "--resume: meta has no generation fingerprint; move existing outputs aside and start a new run",
@@ -4729,33 +4837,34 @@ fn main() -> Result<()> {
         bail!("--games is smaller than an already completed game_id");
     }
     let mut next_game_idx = 0u32;
-    let next_incomplete_ticket =
-        |next_game_idx: &mut u32,
-         rng: &mut rand::rngs::StdRng,
-         shuffled: &mut Option<ShuffledStartpos>,
-         completed_games: &CompletedGames| {
-            while *next_game_idx < cli.games {
-                let game_idx = *next_game_idx;
-                *next_game_idx += 1;
-                let ticket = if let Some(s) = shuffled.as_mut() {
-                    GameTicket {
-                        game_idx,
-                        startpos_idx: s.next(),
-                    }
-                } else {
-                    make_game_ticket(game_idx, cli.random_startpos, startpos_count, rng)
-                };
-                if !completed_games.contains(game_idx + 1) {
-                    return Some(ticket);
+    let next_incomplete_ticket = |next_game_idx: &mut u32,
+                                  rng: &mut rand::rngs::StdRng,
+                                  shuffled: &mut Option<ShuffledStartpos>,
+                                  completed_games: &CompletedGames,
+                                  target_games: u32| {
+        while *next_game_idx < target_games {
+            let game_idx = *next_game_idx;
+            *next_game_idx += 1;
+            let ticket = if let Some(s) = shuffled.as_mut() {
+                GameTicket {
+                    game_idx,
+                    startpos_idx: s.next(),
                 }
+            } else {
+                make_game_ticket(game_idx, cli.random_startpos, startpos_count, rng)
+            };
+            if !completed_games.contains(game_idx + 1) {
+                return Some(ticket);
             }
-            None
-        };
+        }
+        None
+    };
     let mut next_ticket = next_incomplete_ticket(
         &mut next_game_idx,
         &mut rng,
         &mut shuffled_startpos,
         &completed_games,
+        cli.games,
     );
     let mut completed = completed_games.len();
     let mut black_wins = resume_state.as_ref().map_or(0, |s| s.black_wins);
@@ -4767,7 +4876,8 @@ fn main() -> Result<()> {
                          black_wins: &mut u32,
                          white_wins: &mut u32,
                          draws: &mut u32,
-                         completed: &mut u32|
+                         completed: &mut u32,
+                         target_games: u32|
      -> Result<()> {
         if !completed_games.insert(result.game_id) {
             bail!("worker returned duplicate completed game_id {}", result.game_id);
@@ -4782,7 +4892,7 @@ fn main() -> Result<()> {
         println!(
             "game {}/{}: {} ({}) - black {} / white {} / draw {}",
             completed,
-            cli.games,
+            target_games,
             result.outcome.label(),
             result.outcome_reason.as_str(),
             black_wins,
@@ -4792,33 +4902,63 @@ fn main() -> Result<()> {
         Ok(())
     };
 
-    while completed < cli.games && !shutdown.load(Ordering::Relaxed) {
-        match next_ticket.take() {
-            None => {
-                // All tickets dispatched, just wait for results
-                match result_rx.recv() {
-                    Ok(result) => {
-                        handle_result(
-                            result,
-                            &mut completed_games,
-                            &mut black_wins,
-                            &mut white_wins,
-                            &mut draws,
-                            &mut completed,
-                        )?;
-                    }
-                    Err(_) => break,
-                }
+    // 実行中の動的制御: <out-dir>/control.json の concurrency を対局境界で反映する。
+    // worker スレッド数は固定のまま、同時 in-flight 対局数を絞る方式
+    // (供給を止められた worker は ticket recv でブロックし CPU を消費しない)。
+    let control_dir = output_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let control_path = control_dir.join("control.json");
+    let control_history_path = control_dir.join("control_history.jsonl");
+    let mut effective_concurrency = cli.concurrency;
+    let mut target_games = cli.games;
+    let mut last_control_poll: Option<Instant> = None;
+    println!(
+        "[control] 実行中の動的制御: {} を {}ms 間隔でポーリング (例: echo '{{\"concurrency\":M,\"target_games\":N}}' > {}、concurrency 上限は --concurrency {}。target_games を発行済み対局数まで下げると安全に drain して finalize する)",
+        control_path.display(),
+        CONTROL_POLL_INTERVAL.as_millis(),
+        control_path.display(),
+        cli.concurrency,
+    );
+    let mut dispatched: u32 = 0;
+    let mut session_completed: u32 = 0;
+    while completed < target_games && !shutdown.load(Ordering::Relaxed) {
+        if last_control_poll.is_none_or(|t| t.elapsed() >= CONTROL_POLL_INTERVAL) {
+            last_control_poll = Some(Instant::now());
+            // 発行済み game_id を無効化できない (per-worker checkpoint と resume 検証が
+            // game_id ≤ games を前提とする) ため、target の下限は発行済み範囲。
+            let min_target = next_game_idx.max(completed_games.max_id().unwrap_or(0));
+            apply_control(
+                &control_path,
+                &control_history_path,
+                &mut effective_concurrency,
+                cli.concurrency,
+                &mut target_games,
+                min_target,
+                completed,
+            );
+            if next_ticket.is_none() {
+                // target 引き上げ直後は供給を再開する。
+                next_ticket = next_incomplete_ticket(
+                    &mut next_game_idx,
+                    &mut rng,
+                    &mut shuffled_startpos,
+                    &completed_games,
+                    target_games,
+                );
             }
-            Some(t) => {
+        }
+        let in_flight = dispatched.saturating_sub(session_completed) as usize;
+        match next_ticket.take() {
+            Some(t) if in_flight < effective_concurrency => {
                 chan::select! {
                     send(ticket_tx, Some(t.clone())) -> res => {
                         if res.is_ok() {
+                            dispatched += 1;
                             next_ticket = next_incomplete_ticket(
                                 &mut next_game_idx,
                                 &mut rng,
                                 &mut shuffled_startpos,
                                 &completed_games,
+                                target_games,
                             );
                         }
                     }
@@ -4826,9 +4966,31 @@ fn main() -> Result<()> {
                         // Put the ticket back since we received a result instead of sending
                         next_ticket = Some(t);
                         if let Ok(result) = result {
-                            handle_result(result, &mut completed_games, &mut black_wins, &mut white_wins, &mut draws, &mut completed)?;
+                            session_completed += 1;
+                            handle_result(result, &mut completed_games, &mut black_wins, &mut white_wins, &mut draws, &mut completed, target_games)?;
                         }
                     }
+                }
+            }
+            // 供給するものが無い、または in-flight が制御値まで達している。
+            // control.json の引き上げを取りこぼさないよう timeout 付きで結果を待つ。
+            other => {
+                next_ticket = other;
+                match result_rx.recv_timeout(CONTROL_POLL_INTERVAL) {
+                    Ok(result) => {
+                        session_completed += 1;
+                        handle_result(
+                            result,
+                            &mut completed_games,
+                            &mut black_wins,
+                            &mut white_wins,
+                            &mut draws,
+                            &mut completed,
+                            target_games,
+                        )?;
+                    }
+                    Err(chan::RecvTimeoutError::Timeout) => {}
+                    Err(chan::RecvTimeoutError::Disconnected) => break,
                 }
             }
         }
@@ -4851,6 +5013,7 @@ fn main() -> Result<()> {
             &mut white_wins,
             &mut draws,
             &mut completed,
+            target_games,
         )?;
     }
 
@@ -6111,6 +6274,70 @@ mod tests {
             }
         }
         assert!(saw_gap);
+    }
+
+    #[test]
+    fn apply_control_clamps_to_max_and_ignores_invalid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = dir.path().join("control.json");
+        let history = dir.path().join("control_history.jsonl");
+        let mut effective = 8usize;
+        let mut target = 1000u32;
+
+        // ファイル不在は無視
+        apply_control(&control, &history, &mut effective, 8, &mut target, 0, 0);
+        assert_eq!(effective, 8);
+
+        std::fs::write(&control, r#"{"concurrency":3}"#).unwrap();
+        apply_control(&control, &history, &mut effective, 8, &mut target, 0, 10);
+        assert_eq!(effective, 3);
+
+        // 上限超過は --concurrency に clamp
+        std::fs::write(&control, r#"{"concurrency":100}"#).unwrap();
+        apply_control(&control, &history, &mut effective, 8, &mut target, 0, 20);
+        assert_eq!(effective, 8);
+
+        // 0 とパース不能は無視して現状維持
+        std::fs::write(&control, r#"{"concurrency":0}"#).unwrap();
+        apply_control(&control, &history, &mut effective, 8, &mut target, 0, 30);
+        assert_eq!(effective, 8);
+        std::fs::write(&control, "not json").unwrap();
+        apply_control(&control, &history, &mut effective, 8, &mut target, 0, 40);
+        assert_eq!(effective, 8);
+        assert_eq!(target, 1000);
+
+        // 変更 2 回分だけ履歴が残る
+        let lines = std::fs::read_to_string(&history).unwrap();
+        assert_eq!(lines.lines().count(), 2);
+    }
+
+    #[test]
+    fn apply_control_target_games_clamps_to_issued_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = dir.path().join("control.json");
+        let history = dir.path().join("control_history.jsonl");
+        let mut effective = 4usize;
+        let mut target = 1000u32;
+
+        // 引き上げは無制限
+        std::fs::write(&control, r#"{"target_games":2000}"#).unwrap();
+        apply_control(&control, &history, &mut effective, 4, &mut target, 50, 40);
+        assert_eq!(target, 2000);
+
+        // 発行済み範囲より下へは clamp (= drain)
+        std::fs::write(&control, r#"{"target_games":0}"#).unwrap();
+        apply_control(&control, &history, &mut effective, 4, &mut target, 50, 45);
+        assert_eq!(target, 50);
+        assert_eq!(effective, 4);
+
+        // 同時指定も反映される
+        std::fs::write(&control, r#"{"concurrency":2,"target_games":60}"#).unwrap();
+        apply_control(&control, &history, &mut effective, 4, &mut target, 50, 50);
+        assert_eq!(effective, 2);
+        assert_eq!(target, 60);
+
+        let lines = std::fs::read_to_string(&history).unwrap();
+        assert_eq!(lines.lines().count(), 3);
     }
 
     #[test]

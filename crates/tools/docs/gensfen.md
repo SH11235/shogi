@@ -600,6 +600,29 @@ NVMe/ext4 上へ出力し、fault 無効で各 5 回測定した。判定あり�
 - 同一 seed の通し実行と resume は完了 `game_id` 集合と各 game_id の開始局面・乱択列を一致させる。
   並列 scheduling と resume 時に空へ戻る共有 dedup table のため、成果物全体の bit 一致は保証しない
 
+## 実行中の動的制御（control.json）
+
+`<out-dir>/control.json` を書き換えると、再起動せず対局境界で同時対局数と目標対局数を
+変更できる（500ms 間隔でポーリング。フィールドは任意で、存在するものだけ反映）:
+
+```bash
+echo '{"concurrency":8}' > <out-dir>/control.json          # 並列度を絞る
+echo '{"target_games":2000000}' > <out-dir>/control.json   # 目標対局数を引き上げ
+echo '{"target_games":0}' > <out-dir>/control.json         # 安全な drain（下記）
+```
+
+- `concurrency` の上限は起動時の `--concurrency`（worker スレッド数と per-worker checkpoint
+  数は固定で、超過指定は上限へ clamp）。絞られた worker は ticket 待ちでブロックし CPU を
+  消費しない。`0` は無視
+- `target_games` の引き上げは無制限。引き下げは発行済み game_id を取り消せないため
+  発行済み対局数へ clamp する。つまり現在値未満（`0` 等）を書くと **安全な drain** になる:
+  新規対局の供給を止め、in-flight を完走させ、通常どおり finalize して終了する
+  （Ctrl-C と違い checkpoint 状態でなく確定成果物が残る）。drain 後も `--resume` +
+  元の `--games` で続きを生成できる
+- パース不能な内容は無視して現状維持。変更は `<out-dir>/control_history.jsonl` に追記される
+- resume 時の fingerprint 照合対象は CLI の `--concurrency` のみ（`--games` は従来どおり対象外）。
+  restart 後に絞りたい場合は同じ `--concurrency` で resume し、control.json で下げる
+
 ## 使用例
 
 ### YaneuraOu USI で学習データ生成
