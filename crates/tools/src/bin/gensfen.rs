@@ -2872,12 +2872,30 @@ struct ControlHistoryEntry {
 fn apply_control(
     control_path: &Path,
     history_path: &Path,
+    control_baseline: std::time::SystemTime,
+    stale_control_warned: &mut bool,
     effective_concurrency: &mut usize,
     max_concurrency: usize,
     target_games: &mut u32,
     min_target_games: u32,
     completed: u32,
 ) {
+    // 前回 run の drain 指定などが残った control.json を resume が拾って即終了しないよう、
+    // 本プロセス開始より古い mtime のファイルは無視する (反映したければ書き直す)。
+    match std::fs::metadata(control_path).and_then(|m| m.modified()) {
+        Ok(mtime) if mtime > control_baseline => {}
+        Ok(_) => {
+            if !*stale_control_warned {
+                *stale_control_warned = true;
+                eprintln!(
+                    "[control] {} は本プロセス開始前の内容のため無視します (反映するには書き直してください)",
+                    control_path.display()
+                );
+            }
+            return;
+        }
+        Err(_) => return,
+    }
     let Ok(text) = std::fs::read_to_string(control_path) else {
         return;
     };
@@ -4911,6 +4929,8 @@ fn main() -> Result<()> {
     let mut effective_concurrency = cli.concurrency;
     let mut target_games = cli.games;
     let mut last_control_poll: Option<Instant> = None;
+    let control_baseline = std::time::SystemTime::now();
+    let mut stale_control_warned = false;
     println!(
         "[control] 実行中の動的制御: {} を {}ms 間隔でポーリング (例: echo '{{\"concurrency\":M,\"target_games\":N}}' > {}、concurrency 上限は --concurrency {}。target_games を発行済み対局数まで下げると安全に drain して finalize する)",
         control_path.display(),
@@ -4936,6 +4956,8 @@ fn main() -> Result<()> {
             apply_control(
                 &control_path,
                 &control_history_path,
+                control_baseline,
+                &mut stale_control_warned,
                 &mut effective_concurrency,
                 cli.concurrency,
                 &mut target_games,
@@ -6301,26 +6323,77 @@ mod tests {
         let history = dir.path().join("control_history.jsonl");
         let mut effective = 8usize;
         let mut target = 1000u32;
+        let mut warned = false;
 
         // ファイル不在は無視
-        apply_control(&control, &history, &mut effective, 8, &mut target, 0, 0);
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            8,
+            &mut target,
+            0,
+            0,
+        );
         assert_eq!(effective, 8);
 
         std::fs::write(&control, r#"{"concurrency":3}"#).unwrap();
-        apply_control(&control, &history, &mut effective, 8, &mut target, 0, 10);
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            8,
+            &mut target,
+            0,
+            10,
+        );
         assert_eq!(effective, 3);
 
         // 上限超過は --concurrency に clamp
         std::fs::write(&control, r#"{"concurrency":100}"#).unwrap();
-        apply_control(&control, &history, &mut effective, 8, &mut target, 0, 20);
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            8,
+            &mut target,
+            0,
+            20,
+        );
         assert_eq!(effective, 8);
 
         // 0 とパース不能は無視して現状維持
         std::fs::write(&control, r#"{"concurrency":0}"#).unwrap();
-        apply_control(&control, &history, &mut effective, 8, &mut target, 0, 30);
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            8,
+            &mut target,
+            0,
+            30,
+        );
         assert_eq!(effective, 8);
         std::fs::write(&control, "not json").unwrap();
-        apply_control(&control, &history, &mut effective, 8, &mut target, 0, 40);
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            8,
+            &mut target,
+            0,
+            40,
+        );
         assert_eq!(effective, 8);
         assert_eq!(target, 1000);
 
@@ -6336,26 +6409,85 @@ mod tests {
         let history = dir.path().join("control_history.jsonl");
         let mut effective = 4usize;
         let mut target = 1000u32;
+        let mut warned = false;
 
         // 引き上げは無制限
         std::fs::write(&control, r#"{"target_games":2000}"#).unwrap();
-        apply_control(&control, &history, &mut effective, 4, &mut target, 50, 40);
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            4,
+            &mut target,
+            50,
+            40,
+        );
         assert_eq!(target, 2000);
 
         // 発行済み範囲より下へは clamp (= drain)
         std::fs::write(&control, r#"{"target_games":0}"#).unwrap();
-        apply_control(&control, &history, &mut effective, 4, &mut target, 50, 45);
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            4,
+            &mut target,
+            50,
+            45,
+        );
         assert_eq!(target, 50);
         assert_eq!(effective, 4);
 
         // 同時指定も反映される
         std::fs::write(&control, r#"{"concurrency":2,"target_games":60}"#).unwrap();
-        apply_control(&control, &history, &mut effective, 4, &mut target, 50, 50);
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            4,
+            &mut target,
+            50,
+            50,
+        );
         assert_eq!(effective, 2);
         assert_eq!(target, 60);
 
         let lines = std::fs::read_to_string(&history).unwrap();
         assert_eq!(lines.lines().count(), 3);
+    }
+
+    #[test]
+    fn apply_control_ignores_file_older_than_baseline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = dir.path().join("control.json");
+        let history = dir.path().join("control_history.jsonl");
+        let mut effective = 8usize;
+        let mut target = 1000u32;
+        let mut warned = false;
+
+        std::fs::write(&control, r#"{"concurrency":2,"target_games":0}"#).unwrap();
+        let baseline = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        apply_control(
+            &control,
+            &history,
+            baseline,
+            &mut warned,
+            &mut effective,
+            8,
+            &mut target,
+            0,
+            0,
+        );
+        assert_eq!(effective, 8);
+        assert_eq!(target, 1000);
+        assert!(warned);
+        assert!(!history.exists());
     }
 
     #[test]
