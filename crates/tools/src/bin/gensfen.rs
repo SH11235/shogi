@@ -2710,7 +2710,9 @@ fn parse_resume_state(path: &Path, max_game_id: u32) -> Result<ResumeState> {
                     .context("game_id exceeds u32")?;
                 if gid == 0 || gid > max_game_id {
                     bail!(
-                        "result game_id {gid} is outside 1..={max_game_id} in {}",
+                        "result game_id {gid} is outside 1..={max_game_id} in {} \
+                         (control.json で target_games を引き上げた run は、引き上げ後の値以上を \
+                         --games に指定して resume する)",
                         path.display()
                     );
                 }
@@ -2839,6 +2841,53 @@ fn usi_option_path_fingerprints(options: &[String]) -> Result<Vec<Value>> {
     Ok(fingerprints)
 }
 
+/// fingerprint の model 節を構築する。
+///
+/// `fv_scale` は 0 (自動判定) のときキー自体を出さない。旧バージョンで生成した run の
+/// fingerprint と bit 一致させ、resume を壊さないための互換要件。
+fn build_model_fingerprint(
+    native_mode: bool,
+    eval_file: Option<String>,
+    eval_file_sha256: Option<String>,
+    progress_file: Option<String>,
+    progress_file_sha256: Option<String>,
+    fv_scale: i32,
+) -> Value {
+    let mut model = serde_json::json!({
+        "native": native_mode,
+        "eval_file": eval_file,
+        "eval_file_sha256": eval_file_sha256,
+        "progress_file": progress_file,
+        "progress_file_sha256": progress_file_sha256,
+    });
+    if fv_scale > 0 {
+        model["fv_scale"] = serde_json::json!(fv_scale);
+    }
+    model
+}
+
+/// target_games の動的変更後に保留 ticket と退避 ticket を整合させる。
+///
+/// - 供給対象外 (game_id > target) になった保留 ticket は破棄せず退避する。ticket の
+///   startpos は game_idx 順の乱数消費で決まるため、破棄・再生成すると resume の再現と
+///   食い違う。
+/// - target が戻ったら退避 ticket を新規生成より優先して供給に戻す (game_idx 順を保つ)。
+///
+/// 戻り値: 保留が空のままで、呼び出し側が新規 ticket 生成を試みるべきなら true。
+fn reconcile_pending_ticket(
+    next_ticket: &mut Option<GameTicket>,
+    parked_ticket: &mut Option<GameTicket>,
+    target_games: u32,
+) -> bool {
+    if next_ticket.as_ref().is_some_and(|t| t.game_idx + 1 > target_games) {
+        *parked_ticket = next_ticket.take();
+    }
+    if next_ticket.is_none() && parked_ticket.as_ref().is_some_and(|t| t.game_idx < target_games) {
+        *next_ticket = parked_ticket.take();
+    }
+    next_ticket.is_none()
+}
+
 /// `control.json` をポーリングする間隔。対局は秒オーダーなので 500ms で十分応答できる。
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -2931,7 +2980,7 @@ fn apply_control(
         if clamped != *target_games {
             if requested < min_target_games {
                 eprintln!(
-                    "[control] target_games={requested} は発行済み対局数 {min_target_games} に clamp します (in-flight 完走後に finalize)"
+                    "[control] target_games={requested} は送信済み game_id の最大値 {min_target_games} に clamp します (in-flight 完走後に finalize)"
                 );
             }
             *target_games = clamped;
@@ -2941,9 +2990,14 @@ fn apply_control(
     if changed_conc.is_none() && changed_target.is_none() {
         return;
     }
-    println!(
-        "[control] applied: concurrency={changed_conc:?} target_games={changed_target:?} (completed={completed})"
-    );
+    let mut applied_parts = Vec::new();
+    if let Some(c) = changed_conc {
+        applied_parts.push(format!("concurrency={c}"));
+    }
+    if let Some(t) = changed_target {
+        applied_parts.push(format!("target_games={t}"));
+    }
+    println!("[control] applied: {} (completed={completed})", applied_parts.join(" "));
     let entry = ControlHistoryEntry {
         kind: "control",
         timestamp: Local::now().to_rfc3339(),
@@ -3086,7 +3140,9 @@ fn recover_worker_checkpoint(
             .context("worker game_id exceeds u32")?;
         if game_id == 0 || game_id > max_game_id {
             bail!(
-                "worker game_id {game_id} is outside 1..={max_game_id} in {}",
+                "worker game_id {game_id} is outside 1..={max_game_id} in {} \
+                 (control.json で target_games を引き上げた run は、引き上げ後の値以上を \
+                 --games に指定して resume する)",
                 jsonl_path.display()
             );
         }
@@ -4432,17 +4488,14 @@ fn main() -> Result<()> {
     } else {
         usi_option_path_fingerprints(&white_usi_opts)?
     };
-    let mut model_fingerprint = serde_json::json!({
-        "native": native_mode,
-        "eval_file": cli.eval_file.as_ref().map(|path| path.display().to_string()),
-        "eval_file_sha256": eval_file_sha256,
-        "progress_file": cli.progress_file.as_ref().map(|path| path.display().to_string()),
-        "progress_file_sha256": native_progress_file_sha256,
-    });
-    if cli.fv_scale > 0 {
-        // 未指定時はキー自体を出さない（既存 run の fingerprint と一致させ resume を壊さないため）
-        model_fingerprint["fv_scale"] = serde_json::json!(cli.fv_scale);
-    }
+    let model_fingerprint = build_model_fingerprint(
+        native_mode,
+        cli.eval_file.as_ref().map(|path| path.display().to_string()),
+        eval_file_sha256,
+        cli.progress_file.as_ref().map(|path| path.display().to_string()),
+        native_progress_file_sha256.clone(),
+        cli.fv_scale,
+    );
     let generation_fingerprint = serde_json::json!({
         "schema": 2,
         "model": model_fingerprint,
@@ -4964,24 +5017,15 @@ fn main() -> Result<()> {
                 min_target,
                 completed,
             );
-            if next_ticket.as_ref().is_some_and(|t| t.game_idx + 1 > target_games) {
-                // 引き下げで対象外になった保留 ticket は送信せず退避する。
-                parked_ticket = next_ticket.take();
-            }
-            if next_ticket.is_none() {
-                // target 引き上げ直後は供給を再開する。退避 ticket が対象に戻る場合は
-                // 新規生成より優先する (game_idx 順を保つため)。
-                if parked_ticket.as_ref().is_some_and(|t| t.game_idx < target_games) {
-                    next_ticket = parked_ticket.take();
-                } else {
-                    next_ticket = next_incomplete_ticket(
-                        &mut next_game_idx,
-                        &mut rng,
-                        &mut shuffled_startpos,
-                        &completed_games,
-                        target_games,
-                    );
-                }
+            if reconcile_pending_ticket(&mut next_ticket, &mut parked_ticket, target_games) {
+                // target 引き上げ直後は供給を再開する。
+                next_ticket = next_incomplete_ticket(
+                    &mut next_game_idx,
+                    &mut rng,
+                    &mut shuffled_startpos,
+                    &completed_games,
+                    target_games,
+                );
             }
         }
         let in_flight = dispatched.saturating_sub(session_completed) as usize;
@@ -5218,6 +5262,14 @@ fn main() -> Result<()> {
         println!();
         println!("--- Training Data ---");
         println!("Positions written in this invocation: {}", training_stats.total_written);
+        if target_games != cli.games {
+            println!(
+                "target_games (final, via control.json): {} (--games {}; resume には {} 以上を指定)",
+                target_games,
+                cli.games,
+                target_games.max(cli.games)
+            );
+        }
         println!(
             "Skipped (initial ply 1-{}): {}",
             cli.skip_initial_ply, training_stats.skipped_initial
@@ -6488,6 +6540,40 @@ mod tests {
         assert_eq!(target, 1000);
         assert!(warned);
         assert!(!history.exists());
+    }
+
+    #[test]
+    fn model_fingerprint_omits_fv_scale_key_when_auto() {
+        let auto = build_model_fingerprint(true, None, None, None, None, 0);
+        assert!(auto.get("fv_scale").is_none());
+        let overridden = build_model_fingerprint(true, None, None, None, None, 14);
+        assert_eq!(overridden.get("fv_scale").and_then(|v| v.as_i64()), Some(14));
+    }
+
+    #[test]
+    fn reconcile_pending_ticket_parks_and_restores_same_ticket() {
+        let ticket = GameTicket {
+            game_idx: 50,
+            startpos_idx: 7,
+        };
+        let mut next = Some(ticket.clone());
+        let mut parked = None;
+
+        // target 引き下げ (game_id 51 > 50) → park され、新規生成も不要 (target まで供給済み)
+        assert!(reconcile_pending_ticket(&mut next, &mut parked, 50));
+        assert!(next.is_none());
+        assert_eq!(parked.as_ref().map(|t| t.game_idx), Some(50));
+
+        // target 据え置きの間は park されたまま
+        assert!(reconcile_pending_ticket(&mut next, &mut parked, 50));
+        assert!(parked.is_some());
+
+        // target 引き上げ → 同じ ticket (同じ startpos_idx) が供給に戻る
+        assert!(!reconcile_pending_ticket(&mut next, &mut parked, 51));
+        let restored = next.expect("restored");
+        assert_eq!(restored.game_idx, ticket.game_idx);
+        assert_eq!(restored.startpos_idx, ticket.startpos_idx);
+        assert!(parked.is_none());
     }
 
     #[test]

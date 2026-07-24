@@ -614,11 +614,15 @@ echo '{"target_games":0}' > <out-dir>/control.json         # 安全な drain（�
 - `concurrency` の上限は起動時の `--concurrency`（worker スレッド数と per-worker checkpoint
   数は固定で、超過指定は上限へ clamp）。絞られた worker は ticket 待ちでブロックし CPU を
   消費しない。`0` は無視
-- `target_games` の引き上げは無制限。引き下げは発行済み game_id を取り消せないため
-  発行済み対局数へ clamp する。つまり現在値未満（`0` 等）を書くと **安全な drain** になる:
-  新規対局の供給を止め、in-flight を完走させ、通常どおり finalize して終了する
-  （Ctrl-C と違い checkpoint 状態でなく確定成果物が残る）。drain 後も `--resume` +
-  元の `--games` で続きを生成できる
+- `target_games` の引き上げは無制限。引き下げは送信済み game_id を取り消せないため
+  送信済み game_id の最大値へ clamp する。つまり現在値未満（`0` 等）を書くと **安全な drain**
+  になる: 新規対局の供給を止め、in-flight を完走させ、通常どおり finalize して終了する
+  （単発 Ctrl-C も同じ finalize 経路を通るが、進行中の対局を放棄する点が異なる。drain は
+  in-flight を完走させる）
+- drain 後も `--resume` で続きを生成できる。ただし `target_games` を CLI の `--games` より
+  引き上げていた run の resume は、**引き上げ後の値以上を `--games` に指定する**こと
+  （resume 時の checkpoint 検証は `--games` を game_id 上限として使うため）。最終的な有効
+  target は終了サマリーと `control_history.jsonl` に出力される
 - パース不能な内容は無視して現状維持。変更は `<out-dir>/control_history.jsonl` に追記される
 - **プロセス開始より古い mtime の control.json は無視される**（drain 後の `--resume` が
   前回の指定を拾って即終了しないため）。restart 後にも反映したい指定は書き直す
