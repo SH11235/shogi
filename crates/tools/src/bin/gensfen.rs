@@ -6544,8 +6544,20 @@ mod tests {
 
     #[test]
     fn model_fingerprint_omits_fv_scale_key_when_auto() {
-        let auto = build_model_fingerprint(true, None, None, None, None, 0);
+        let auto = build_model_fingerprint(
+            true,
+            Some("eval.bin".into()),
+            Some("evalsha".into()),
+            Some("progress.bin".into()),
+            Some("progsha".into()),
+            0,
+        );
         assert!(auto.get("fv_scale").is_none());
+        // 同型 4 引数の位置対応を pin する (取り違えると既存 run の resume が全滅する)
+        assert_eq!(auto.get("eval_file").and_then(|v| v.as_str()), Some("eval.bin"));
+        assert_eq!(auto.get("eval_file_sha256").and_then(|v| v.as_str()), Some("evalsha"));
+        assert_eq!(auto.get("progress_file").and_then(|v| v.as_str()), Some("progress.bin"));
+        assert_eq!(auto.get("progress_file_sha256").and_then(|v| v.as_str()), Some("progsha"));
         let overridden = build_model_fingerprint(true, None, None, None, None, 14);
         assert_eq!(overridden.get("fv_scale").and_then(|v| v.as_i64()), Some(14));
     }
@@ -6559,7 +6571,8 @@ mod tests {
         let mut next = Some(ticket.clone());
         let mut parked = None;
 
-        // target 引き下げ (game_id 51 > 50) → park され、新規生成も不要 (target まで供給済み)
+        // target 引き下げ (game_id 51 > 50) → park。戻り値 true で呼び出し側は新規生成を
+        // 試みるが、next_game_idx が target に達しているため None が返るだけ
         assert!(reconcile_pending_ticket(&mut next, &mut parked, 50));
         assert!(next.is_none());
         assert_eq!(parked.as_ref().map(|t| t.game_idx), Some(50));
