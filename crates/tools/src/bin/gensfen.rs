@@ -4920,12 +4920,19 @@ fn main() -> Result<()> {
     );
     let mut dispatched: u32 = 0;
     let mut session_completed: u32 = 0;
+    // 送信済み game_id の最大値。drain 時の target 下限は「実際に worker へ送った範囲」
+    // だけを含める (生成済みでも未送信の保留 ticket は取り消せるため含めない)。
+    let mut max_dispatched_id: u32 = 0;
+    // target 引き下げで供給対象外になった未送信 ticket の退避先。ticket の startpos は
+    // game_idx 順の乱数消費で決まるため、破棄して再生成すると resume の再現と食い違う。
+    // target が再度引き上げられたらここから供給に戻す。
+    let mut parked_ticket: Option<GameTicket> = None;
     while completed < target_games && !shutdown.load(Ordering::Relaxed) {
         if last_control_poll.is_none_or(|t| t.elapsed() >= CONTROL_POLL_INTERVAL) {
             last_control_poll = Some(Instant::now());
-            // 発行済み game_id を無効化できない (per-worker checkpoint と resume 検証が
-            // game_id ≤ games を前提とする) ため、target の下限は発行済み範囲。
-            let min_target = next_game_idx.max(completed_games.max_id().unwrap_or(0));
+            // 送信済み game_id は無効化できない (per-worker checkpoint と resume 検証が
+            // game_id ≤ games を前提とする) ため、target の下限は送信済み範囲。
+            let min_target = max_dispatched_id.max(completed_games.max_id().unwrap_or(0));
             apply_control(
                 &control_path,
                 &control_history_path,
@@ -4935,15 +4942,24 @@ fn main() -> Result<()> {
                 min_target,
                 completed,
             );
+            if next_ticket.as_ref().is_some_and(|t| t.game_idx + 1 > target_games) {
+                // 引き下げで対象外になった保留 ticket は送信せず退避する。
+                parked_ticket = next_ticket.take();
+            }
             if next_ticket.is_none() {
-                // target 引き上げ直後は供給を再開する。
-                next_ticket = next_incomplete_ticket(
-                    &mut next_game_idx,
-                    &mut rng,
-                    &mut shuffled_startpos,
-                    &completed_games,
-                    target_games,
-                );
+                // target 引き上げ直後は供給を再開する。退避 ticket が対象に戻る場合は
+                // 新規生成より優先する (game_idx 順を保つため)。
+                if parked_ticket.as_ref().is_some_and(|t| t.game_idx < target_games) {
+                    next_ticket = parked_ticket.take();
+                } else {
+                    next_ticket = next_incomplete_ticket(
+                        &mut next_game_idx,
+                        &mut rng,
+                        &mut shuffled_startpos,
+                        &completed_games,
+                        target_games,
+                    );
+                }
             }
         }
         let in_flight = dispatched.saturating_sub(session_completed) as usize;
@@ -4953,6 +4969,7 @@ fn main() -> Result<()> {
                     send(ticket_tx, Some(t.clone())) -> res => {
                         if res.is_ok() {
                             dispatched += 1;
+                            max_dispatched_id = max_dispatched_id.max(t.game_idx + 1);
                             next_ticket = next_incomplete_ticket(
                                 &mut next_game_idx,
                                 &mut rng,
@@ -5039,7 +5056,8 @@ fn main() -> Result<()> {
                 cli.emit_metrics.then(|| temp_metrics_paths[worker_id].as_path()),
                 training_format,
                 worker_id,
-                cli.games,
+                // 実行中に target を引き上げた場合は cli.games を超える game_id が正当に存在する
+                cli.games.max(target_games),
             )?;
         }
     } else if !worker_errors.is_empty() {
@@ -5053,7 +5071,7 @@ fn main() -> Result<()> {
                 cli.emit_metrics.then(|| temp_metrics_paths[worker_id].as_path()),
                 training_format,
                 worker_id,
-                cli.games,
+                cli.games.max(target_games),
             )?;
         }
     }
