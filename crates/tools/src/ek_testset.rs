@@ -527,8 +527,11 @@ fn run_eval(args: &EvalArgs) -> Result<()> {
         );
     }
     let mut stack = AccumulatorStackVariant::from_network(&network);
-    let mut acc_cache: Option<LayerStacksAccCache> =
-        Some(network.as_layer_stacks().new_acc_cache());
+    // acc_cache (Finny Tables) は静的 LayerStacks variant 専用の API で、
+    // runtime-dimensions ビルドでは同じ net でも DynamicLayerStacks として load され
+    // `as_layer_stacks()` が panic する (`is_layer_stacks()` は Dynamic でも true)。
+    // `evaluate_dispatch` は None でも全 variant を正しく評価するため cache は使わない。
+    let mut acc_cache: Option<LayerStacksAccCache> = None;
 
     let mut builder = EvalMetricBuilder::default();
     let file = File::open(&args.testset)
