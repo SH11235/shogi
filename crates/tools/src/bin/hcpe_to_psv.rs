@@ -185,20 +185,32 @@ fn main() -> Result<()> {
         anyhow::bail!("入力ファイルが見つかりません");
     }
 
-    // 入力と出力が同一実体だと File::create が読み取り前に入力を truncate してしまうため拒否する。
-    // パス比較 (canonicalize) では hardlink (別パス・同一 inode) を検出できないので (dev, ino) で判定する。
-    let file_id = |p: &std::path::Path| -> Option<(u64, u64)> {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
+    // 一時ファイルに書き、正常完了時のみ最終パスへ rename する（中断時の途中書き PSV は
+    // バイト長がほぼ確実に 40 の倍数になり、下流の整合チェックをすり抜けるため）。
+    let tmp_output = {
+        let mut s = args.output.clone().into_os_string();
+        s.push(".partial");
+        PathBuf::from(s)
     };
+
+    // 入力と出力（一時ファイル含む）が同一実体だと File::create が読み取り前に入力を
+    // truncate してしまうため拒否する。パス比較 (canonicalize) では hardlink
+    // (別パス・同一 inode) を検出できないので same-file の Handle (unix: dev/ino、
+    // Windows: volume serial + file index) で判定する。Handle はファイルを開いたまま
+    // 保持するため、入力分を Vec に溜めず 1 件ずつ比較して即 drop する
+    // (入力が多数でも fd を占有しない)。
+    let file_id = |p: &std::path::Path| same_file::Handle::from_path(p).ok();
     let out_id = file_id(&args.output);
+    let tmp_id = file_id(&tmp_output);
     let mut total_records = 0u64;
-    let mut in_ids = Vec::with_capacity(paths.len());
     for p in &paths {
         let id =
             file_id(p).with_context(|| format!("入力のメタデータ取得に失敗: {}", p.display()))?;
-        if out_id.is_some() && out_id == Some(id) {
+        if out_id.as_ref() == Some(&id) {
             anyhow::bail!("入力と出力が同一ファイルです: {}", p.display());
+        }
+        if tmp_id.as_ref() == Some(&id) {
+            anyhow::bail!("一時ファイル {} が入力と同一です", tmp_output.display());
         }
         let len = std::fs::metadata(p)?.len();
         if len % HCPE_RECORD_SIZE as u64 != 0 {
@@ -208,8 +220,11 @@ fn main() -> Result<()> {
             );
         }
         total_records += len / HCPE_RECORD_SIZE as u64;
-        in_ids.push(id);
     }
+    // File::create の前に Handle を閉じる（same-file は共有フラグ付きで開くが、
+    // 明示的に手放しておく方が安全）。
+    drop(out_id);
+    drop(tmp_id);
 
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
@@ -224,18 +239,6 @@ fn main() -> Result<()> {
     })
     .context("Ctrl-C ハンドラの設定に失敗")?;
 
-    // 一時ファイルに書き、正常完了時のみ最終パスへ rename する（中断時の途中書き PSV は
-    // バイト長がほぼ確実に 40 の倍数になり、下流の整合チェックをすり抜けるため）。
-    let tmp_output = {
-        let mut s = args.output.clone().into_os_string();
-        s.push(".partial");
-        PathBuf::from(s)
-    };
-    if let Some(tmp_id) = file_id(&tmp_output)
-        && in_ids.contains(&tmp_id)
-    {
-        anyhow::bail!("一時ファイル {} が入力と同一です", tmp_output.display());
-    }
     let out_file = File::create(&tmp_output)
         .with_context(|| format!("{} を作成できません", tmp_output.display()))?;
     let mut writer = BufWriter::with_capacity(IO_BUF_SIZE, out_file);
