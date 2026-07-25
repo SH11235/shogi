@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
@@ -17,7 +18,7 @@ use rand::seq::SliceRandom;
 use rshogi_core::movegen::{MoveList, generate_legal, is_legal_with_pass};
 use rshogi_core::nnue::{
     compute_layer_stack_progress8kpabs_bucket_index, get_layer_stack_progress_kpabs_weights,
-    get_network, init_nnue_from_bytes, load_progress_coeff_kpabs_from_bytes,
+    get_network, init_nnue_from_bytes, load_progress_coeff_kpabs_from_bytes, set_fv_scale_override,
     set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::{EnteringKingPointInfo, Position};
@@ -292,6 +293,11 @@ struct Cli {
     #[arg(long)]
     progress_file: Option<PathBuf>,
 
+    /// FV_SCALE オーバーライド（0=arch 文字列から自動判定、1 以上=指定値。NativeBackend 専用。
+    /// arch 文字列の fv_scale が実際の学習スケールと食い違うネットで使用する）
+    #[arg(long, default_value_t = 0)]
+    fv_scale: i32,
+
     /// 置換表を対局間で保持する（TT をクリアしない）。
     /// tanuki- は毎対局クリアするため、デフォルト false。実験用。
     /// --keep-tt=true で有効化、--keep-tt=false で明示的に無効化。
@@ -413,6 +419,9 @@ struct MetaSettings {
     /// progress_file 内容の SHA-256（resume 時に同一パスへの係数差し替えを検出する）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     progress_file_sha256: Option<String>,
+    /// FV_SCALE オーバーライド（未指定 = arch 文字列から自動判定）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fv_scale: Option<i32>,
 }
 
 fn default_skip_in_check() -> bool {
@@ -2701,7 +2710,9 @@ fn parse_resume_state(path: &Path, max_game_id: u32) -> Result<ResumeState> {
                     .context("game_id exceeds u32")?;
                 if gid == 0 || gid > max_game_id {
                     bail!(
-                        "result game_id {gid} is outside 1..={max_game_id} in {}",
+                        "result game_id {gid} is outside 1..={max_game_id} in {} \
+                         (control.json で target_games を引き上げた run は、引き上げ後の値以上を \
+                         --games に指定して resume する)",
                         path.display()
                     );
                 }
@@ -2830,6 +2841,185 @@ fn usi_option_path_fingerprints(options: &[String]) -> Result<Vec<Value>> {
     Ok(fingerprints)
 }
 
+/// fingerprint の model 節を構築する。
+///
+/// `fv_scale` は 0 (自動判定) のときキー自体を出さない。旧バージョンで生成した run の
+/// fingerprint と bit 一致させ、resume を壊さないための互換要件。
+fn build_model_fingerprint(
+    native_mode: bool,
+    eval_file: Option<String>,
+    eval_file_sha256: Option<String>,
+    progress_file: Option<String>,
+    progress_file_sha256: Option<String>,
+    fv_scale: i32,
+) -> Value {
+    let mut model = serde_json::json!({
+        "native": native_mode,
+        "eval_file": eval_file,
+        "eval_file_sha256": eval_file_sha256,
+        "progress_file": progress_file,
+        "progress_file_sha256": progress_file_sha256,
+    });
+    if fv_scale > 0 {
+        model["fv_scale"] = serde_json::json!(fv_scale);
+    }
+    model
+}
+
+/// target_games の動的変更後に保留 ticket と退避 ticket を整合させる。
+///
+/// - 供給対象外 (game_id > target) になった保留 ticket は破棄せず退避する。ticket の
+///   startpos は game_idx 順の乱数消費で決まるため、破棄・再生成すると resume の再現と
+///   食い違う。
+/// - target が戻ったら退避 ticket を新規生成より優先して供給に戻す (game_idx 順を保つ)。
+///
+/// 戻り値: 保留が空のままで、呼び出し側が新規 ticket 生成を試みるべきなら true。
+fn reconcile_pending_ticket(
+    next_ticket: &mut Option<GameTicket>,
+    parked_ticket: &mut Option<GameTicket>,
+    target_games: u32,
+) -> bool {
+    if next_ticket.as_ref().is_some_and(|t| t.game_idx + 1 > target_games) {
+        *parked_ticket = next_ticket.take();
+    }
+    if next_ticket.is_none() && parked_ticket.as_ref().is_some_and(|t| t.game_idx < target_games) {
+        *next_ticket = parked_ticket.take();
+    }
+    next_ticket.is_none()
+}
+
+/// `control.json` をポーリングする間隔。対局は秒オーダーなので 500ms で十分応答できる。
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// `control.json` の受理スキーマ。存在するフィールドだけ反映する。
+#[derive(Deserialize)]
+struct ControlFile {
+    concurrency: Option<usize>,
+    target_games: Option<u32>,
+}
+
+/// `control_history.jsonl` の 1 レコード。再現性のため変更を時系列で残す。
+#[derive(Serialize)]
+struct ControlHistoryEntry {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    concurrency: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_games: Option<u32>,
+    /// 変更を適用した時点で完了していた対局数。
+    completed: u32,
+}
+
+/// `control.json` を読み、同時 in-flight 対局数の上限を更新する。
+///
+/// worker スレッド数（= `--concurrency`、per-worker checkpoint 数と fingerprint に固定）
+/// は変えられないため、上限を超える指定は `--concurrency` に clamp する。
+/// 長時間 background 運用での堅牢性を優先し、ファイル不在 / 読込失敗 / パース失敗 /
+/// history 追記失敗はいずれも警告のみで実行を継続する（対局を落とさない）。
+fn apply_control(
+    control_path: &Path,
+    history_path: &Path,
+    control_baseline: std::time::SystemTime,
+    stale_control_warned: &mut bool,
+    effective_concurrency: &mut usize,
+    max_concurrency: usize,
+    target_games: &mut u32,
+    min_target_games: u32,
+    completed: u32,
+) {
+    // 前回 run の drain 指定などが残った control.json を resume が拾って即終了しないよう、
+    // 本プロセス開始より古い mtime のファイルは無視する (反映したければ書き直す)。
+    match std::fs::metadata(control_path).and_then(|m| m.modified()) {
+        // >= : baseline は秒に切り捨て済みなので、mtime が秒粒度でもプロセス開始と
+        // 同一秒に書かれた指定を握り潰さない
+        Ok(mtime) if mtime >= control_baseline => {}
+        Ok(_) => {
+            if !*stale_control_warned {
+                *stale_control_warned = true;
+                eprintln!(
+                    "[control] {} は本プロセス開始前の内容のため無視します (反映するには書き直してください)",
+                    control_path.display()
+                );
+            }
+            return;
+        }
+        Err(_) => return,
+    }
+    let Ok(text) = std::fs::read_to_string(control_path) else {
+        return;
+    };
+    let parsed: ControlFile = match serde_json::from_str(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[control] {} のパースに失敗したため無視します: {e}", control_path.display());
+            return;
+        }
+    };
+    let mut changed_conc: Option<usize> = None;
+    if let Some(requested) = parsed.concurrency {
+        if requested == 0 {
+            eprintln!("[control] concurrency=0 は不正のため無視します");
+        } else {
+            let clamped = requested.min(max_concurrency);
+            if clamped != *effective_concurrency {
+                if requested > max_concurrency {
+                    eprintln!(
+                        "[control] concurrency={requested} は worker 数の上限 --concurrency {max_concurrency} に clamp します"
+                    );
+                }
+                *effective_concurrency = clamped;
+                changed_conc = Some(clamped);
+            }
+        }
+    }
+    let mut changed_target: Option<u32> = None;
+    if let Some(requested) = parsed.target_games {
+        // 発行済み game_id は取り消せないため、下げる場合は発行済み範囲へ clamp する
+        // (= 供給停止 + in-flight 完走の安全な drain になる)。
+        let clamped = requested.max(min_target_games);
+        if clamped != *target_games {
+            if requested < min_target_games {
+                eprintln!(
+                    "[control] target_games={requested} は送信済み game_id の最大値 {min_target_games} に clamp します (in-flight 完走後に finalize)"
+                );
+            }
+            *target_games = clamped;
+            changed_target = Some(clamped);
+        }
+    }
+    if changed_conc.is_none() && changed_target.is_none() {
+        return;
+    }
+    let mut applied_parts = Vec::new();
+    if let Some(c) = changed_conc {
+        applied_parts.push(format!("concurrency={c}"));
+    }
+    if let Some(t) = changed_target {
+        applied_parts.push(format!("target_games={t}"));
+    }
+    println!("[control] applied: {} (completed={completed})", applied_parts.join(" "));
+    let entry = ControlHistoryEntry {
+        kind: "control",
+        timestamp: Local::now().to_rfc3339(),
+        concurrency: changed_conc,
+        target_games: changed_target,
+        completed,
+    };
+    let result = serde_json::to_string(&entry).map_err(anyhow::Error::from).and_then(|line| {
+        let mut file = OpenOptions::new().create(true).append(true).open(history_path)?;
+        writeln!(file, "{line}")?;
+        Ok(())
+    });
+    if let Err(e) = result {
+        eprintln!(
+            "[control] {} への履歴追記に失敗しました（実行は継続）: {e}",
+            history_path.display()
+        );
+    }
+}
+
 fn validate_resume_fingerprint(meta: Option<&Value>, current: &Value) -> Result<()> {
     let meta = meta.context(
         "--resume: meta has no generation fingerprint; move existing outputs aside and start a new run",
@@ -2952,7 +3142,9 @@ fn recover_worker_checkpoint(
             .context("worker game_id exceeds u32")?;
         if game_id == 0 || game_id > max_game_id {
             bail!(
-                "worker game_id {game_id} is outside 1..={max_game_id} in {}",
+                "worker game_id {game_id} is outside 1..={max_game_id} in {} \
+                 (control.json で target_games を引き上げた run は、引き上げ後の値以上を \
+                 --games に指定して resume する)",
                 jsonl_path.display()
             );
         }
@@ -3912,6 +4104,18 @@ fn append_file_to_stage(
 }
 
 fn main() -> Result<()> {
+    // control.json の鮮度判定の基準点。NNUE ロードや resume 解析より前 (= プロセス開始
+    // 直後) に取らないと、初期化中にオペレータが書いた指定が「古い」と誤判定される。
+    // 秒粒度 mtime の FS では書き込み時刻が秒に切り捨てられるため、基準点も秒に切り捨てて
+    // 「開始と同一秒の書き込みを無視しない」側に倒す (stale ファイルは分単位で古いので
+    // 1 秒未満の窓で誤適用する実害はない)。
+    let control_baseline = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
     let mut cli = Cli::parse();
     validate_cli(&cli)?;
     let _ = fault_spec();
@@ -4143,6 +4347,19 @@ fn main() -> Result<()> {
              In USI mode, pass the engine option directly with --usi-option LS_PROGRESS_COEFF=<path>."
         );
     }
+    if cli.fv_scale < 0 {
+        bail!("--fv-scale must be 0 (auto) or a positive value");
+    }
+    if !native_mode && cli.fv_scale != 0 {
+        bail!(
+            "--fv-scale is only supported with --native=true. \
+             In USI mode, pass the engine option directly with --usi-option FV_SCALE=<value>."
+        );
+    }
+    if native_mode && cli.fv_scale > 0 {
+        set_fv_scale_override(cli.fv_scale);
+        eprintln!("NativeBackend: FV_SCALE override {}", cli.fv_scale);
+    }
     let entering_king_rule_black = if native_mode {
         EnteringKingRule::default()
     } else {
@@ -4285,15 +4502,17 @@ fn main() -> Result<()> {
     } else {
         usi_option_path_fingerprints(&white_usi_opts)?
     };
+    let model_fingerprint = build_model_fingerprint(
+        native_mode,
+        cli.eval_file.as_ref().map(|path| path.display().to_string()),
+        eval_file_sha256,
+        cli.progress_file.as_ref().map(|path| path.display().to_string()),
+        native_progress_file_sha256.clone(),
+        cli.fv_scale,
+    );
     let generation_fingerprint = serde_json::json!({
         "schema": 2,
-        "model": serde_json::json!({
-            "native": native_mode,
-            "eval_file": cli.eval_file.as_ref().map(|path| path.display().to_string()),
-            "eval_file_sha256": eval_file_sha256,
-            "progress_file": cli.progress_file.as_ref().map(|path| path.display().to_string()),
-            "progress_file_sha256": native_progress_file_sha256,
-        }),
+        "model": model_fingerprint,
         "engine": serde_json::json!({
             "path_black": engine_paths.black.path.display().to_string(),
             "path_white": engine_paths.white.path.display().to_string(),
@@ -4422,6 +4641,7 @@ fn main() -> Result<()> {
                 shuffle_seed: shuffle_seed_resolved,
                 progress_file: cli.progress_file.as_ref().map(|p| p.display().to_string()),
                 progress_file_sha256: native_progress_file_sha256.clone(),
+                fv_scale: (cli.fv_scale > 0).then_some(cli.fv_scale),
             },
             engine_cmd: EngineCommandMeta {
                 path_black: engine_paths.black.path.display().to_string(),
@@ -4702,33 +4922,34 @@ fn main() -> Result<()> {
         bail!("--games is smaller than an already completed game_id");
     }
     let mut next_game_idx = 0u32;
-    let next_incomplete_ticket =
-        |next_game_idx: &mut u32,
-         rng: &mut rand::rngs::StdRng,
-         shuffled: &mut Option<ShuffledStartpos>,
-         completed_games: &CompletedGames| {
-            while *next_game_idx < cli.games {
-                let game_idx = *next_game_idx;
-                *next_game_idx += 1;
-                let ticket = if let Some(s) = shuffled.as_mut() {
-                    GameTicket {
-                        game_idx,
-                        startpos_idx: s.next(),
-                    }
-                } else {
-                    make_game_ticket(game_idx, cli.random_startpos, startpos_count, rng)
-                };
-                if !completed_games.contains(game_idx + 1) {
-                    return Some(ticket);
+    let next_incomplete_ticket = |next_game_idx: &mut u32,
+                                  rng: &mut rand::rngs::StdRng,
+                                  shuffled: &mut Option<ShuffledStartpos>,
+                                  completed_games: &CompletedGames,
+                                  target_games: u32| {
+        while *next_game_idx < target_games {
+            let game_idx = *next_game_idx;
+            *next_game_idx += 1;
+            let ticket = if let Some(s) = shuffled.as_mut() {
+                GameTicket {
+                    game_idx,
+                    startpos_idx: s.next(),
                 }
+            } else {
+                make_game_ticket(game_idx, cli.random_startpos, startpos_count, rng)
+            };
+            if !completed_games.contains(game_idx + 1) {
+                return Some(ticket);
             }
-            None
-        };
+        }
+        None
+    };
     let mut next_ticket = next_incomplete_ticket(
         &mut next_game_idx,
         &mut rng,
         &mut shuffled_startpos,
         &completed_games,
+        cli.games,
     );
     let mut completed = completed_games.len();
     let mut black_wins = resume_state.as_ref().map_or(0, |s| s.black_wins);
@@ -4740,7 +4961,8 @@ fn main() -> Result<()> {
                          black_wins: &mut u32,
                          white_wins: &mut u32,
                          draws: &mut u32,
-                         completed: &mut u32|
+                         completed: &mut u32,
+                         target_games: u32|
      -> Result<()> {
         if !completed_games.insert(result.game_id) {
             bail!("worker returned duplicate completed game_id {}", result.game_id);
@@ -4755,7 +4977,7 @@ fn main() -> Result<()> {
         println!(
             "game {}/{}: {} ({}) - black {} / white {} / draw {}",
             completed,
-            cli.games,
+            target_games,
             result.outcome.label(),
             result.outcome_reason.as_str(),
             black_wins,
@@ -4765,33 +4987,74 @@ fn main() -> Result<()> {
         Ok(())
     };
 
-    while completed < cli.games && !shutdown.load(Ordering::Relaxed) {
-        match next_ticket.take() {
-            None => {
-                // All tickets dispatched, just wait for results
-                match result_rx.recv() {
-                    Ok(result) => {
-                        handle_result(
-                            result,
-                            &mut completed_games,
-                            &mut black_wins,
-                            &mut white_wins,
-                            &mut draws,
-                            &mut completed,
-                        )?;
-                    }
-                    Err(_) => break,
-                }
+    // 実行中の動的制御: <out-dir>/control.json の concurrency を対局境界で反映する。
+    // worker スレッド数は固定のまま、同時 in-flight 対局数を絞る方式
+    // (供給を止められた worker は ticket recv でブロックし CPU を消費しない)。
+    let control_dir = output_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let control_path = control_dir.join("control.json");
+    let control_history_path = control_dir.join("control_history.jsonl");
+    let mut effective_concurrency = cli.concurrency;
+    let mut target_games = cli.games;
+    let mut last_control_poll: Option<Instant> = None;
+    let mut stale_control_warned = false;
+    println!(
+        "[control] 実行中の動的制御: {} を {}ms 間隔でポーリング (例: echo '{{\"concurrency\":M,\"target_games\":N}}' > {}、concurrency 上限は --concurrency {}。target_games を発行済み対局数まで下げると安全に drain して finalize する)",
+        control_path.display(),
+        CONTROL_POLL_INTERVAL.as_millis(),
+        control_path.display(),
+        cli.concurrency,
+    );
+    let mut dispatched: u32 = 0;
+    let mut session_completed: u32 = 0;
+    // 送信済み game_id の最大値。drain 時の target 下限は「実際に worker へ送った範囲」
+    // だけを含める (生成済みでも未送信の保留 ticket は取り消せるため含めない)。
+    let mut max_dispatched_id: u32 = 0;
+    // target 引き下げで供給対象外になった未送信 ticket の退避先。ticket の startpos は
+    // game_idx 順の乱数消費で決まるため、破棄して再生成すると resume の再現と食い違う。
+    // target が再度引き上げられたらここから供給に戻す。
+    let mut parked_ticket: Option<GameTicket> = None;
+    while completed < target_games && !shutdown.load(Ordering::Relaxed) {
+        if last_control_poll.is_none_or(|t| t.elapsed() >= CONTROL_POLL_INTERVAL) {
+            last_control_poll = Some(Instant::now());
+            // 送信済み game_id は無効化できない (per-worker checkpoint と resume 検証が
+            // game_id ≤ games を前提とする) ため、target の下限は送信済み範囲。
+            let min_target = max_dispatched_id.max(completed_games.max_id().unwrap_or(0));
+            apply_control(
+                &control_path,
+                &control_history_path,
+                control_baseline,
+                &mut stale_control_warned,
+                &mut effective_concurrency,
+                cli.concurrency,
+                &mut target_games,
+                min_target,
+                completed,
+            );
+            if reconcile_pending_ticket(&mut next_ticket, &mut parked_ticket, target_games) {
+                // target 引き上げ直後は供給を再開する。
+                next_ticket = next_incomplete_ticket(
+                    &mut next_game_idx,
+                    &mut rng,
+                    &mut shuffled_startpos,
+                    &completed_games,
+                    target_games,
+                );
             }
-            Some(t) => {
+        }
+        let in_flight = dispatched.saturating_sub(session_completed) as usize;
+        match next_ticket.take() {
+            Some(t) if in_flight < effective_concurrency => {
                 chan::select! {
                     send(ticket_tx, Some(t.clone())) -> res => {
                         if res.is_ok() {
+                            dispatched += 1;
+                            max_dispatched_id = max_dispatched_id.max(t.game_idx + 1);
                             next_ticket = next_incomplete_ticket(
                                 &mut next_game_idx,
                                 &mut rng,
                                 &mut shuffled_startpos,
                                 &completed_games,
+                                target_games,
                             );
                         }
                     }
@@ -4799,9 +5062,31 @@ fn main() -> Result<()> {
                         // Put the ticket back since we received a result instead of sending
                         next_ticket = Some(t);
                         if let Ok(result) = result {
-                            handle_result(result, &mut completed_games, &mut black_wins, &mut white_wins, &mut draws, &mut completed)?;
+                            session_completed += 1;
+                            handle_result(result, &mut completed_games, &mut black_wins, &mut white_wins, &mut draws, &mut completed, target_games)?;
                         }
                     }
+                }
+            }
+            // 供給するものが無い、または in-flight が制御値まで達している。
+            // control.json の引き上げを取りこぼさないよう timeout 付きで結果を待つ。
+            other => {
+                next_ticket = other;
+                match result_rx.recv_timeout(CONTROL_POLL_INTERVAL) {
+                    Ok(result) => {
+                        session_completed += 1;
+                        handle_result(
+                            result,
+                            &mut completed_games,
+                            &mut black_wins,
+                            &mut white_wins,
+                            &mut draws,
+                            &mut completed,
+                            target_games,
+                        )?;
+                    }
+                    Err(chan::RecvTimeoutError::Timeout) => {}
+                    Err(chan::RecvTimeoutError::Disconnected) => break,
                 }
             }
         }
@@ -4824,6 +5109,7 @@ fn main() -> Result<()> {
             &mut white_wins,
             &mut draws,
             &mut completed,
+            target_games,
         )?;
     }
 
@@ -4849,7 +5135,8 @@ fn main() -> Result<()> {
                 cli.emit_metrics.then(|| temp_metrics_paths[worker_id].as_path()),
                 training_format,
                 worker_id,
-                cli.games,
+                // 実行中に target を引き上げた場合は cli.games を超える game_id が正当に存在する
+                cli.games.max(target_games),
             )?;
         }
     } else if !worker_errors.is_empty() {
@@ -4863,7 +5150,7 @@ fn main() -> Result<()> {
                 cli.emit_metrics.then(|| temp_metrics_paths[worker_id].as_path()),
                 training_format,
                 worker_id,
-                cli.games,
+                cli.games.max(target_games),
             )?;
         }
     }
@@ -4988,6 +5275,14 @@ fn main() -> Result<()> {
         println!();
         println!("--- Training Data ---");
         println!("Positions written in this invocation: {}", training_stats.total_written);
+        if target_games != cli.games {
+            println!(
+                "target_games (final, via control.json): {} (--games {}; resume には {} 以上を指定)",
+                target_games,
+                cli.games,
+                target_games.max(cli.games)
+            );
+        }
         println!(
             "Skipped (initial ply 1-{}): {}",
             cli.skip_initial_ply, training_stats.skipped_initial
@@ -6084,6 +6379,227 @@ mod tests {
             }
         }
         assert!(saw_gap);
+    }
+
+    #[test]
+    fn apply_control_clamps_to_max_and_ignores_invalid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = dir.path().join("control.json");
+        let history = dir.path().join("control_history.jsonl");
+        let mut effective = 8usize;
+        let mut target = 1000u32;
+        let mut warned = false;
+
+        // ファイル不在は無視
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            8,
+            &mut target,
+            0,
+            0,
+        );
+        assert_eq!(effective, 8);
+
+        std::fs::write(&control, r#"{"concurrency":3}"#).unwrap();
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            8,
+            &mut target,
+            0,
+            10,
+        );
+        assert_eq!(effective, 3);
+
+        // 上限超過は --concurrency に clamp
+        std::fs::write(&control, r#"{"concurrency":100}"#).unwrap();
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            8,
+            &mut target,
+            0,
+            20,
+        );
+        assert_eq!(effective, 8);
+
+        // 0 とパース不能は無視して現状維持
+        std::fs::write(&control, r#"{"concurrency":0}"#).unwrap();
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            8,
+            &mut target,
+            0,
+            30,
+        );
+        assert_eq!(effective, 8);
+        std::fs::write(&control, "not json").unwrap();
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            8,
+            &mut target,
+            0,
+            40,
+        );
+        assert_eq!(effective, 8);
+        assert_eq!(target, 1000);
+
+        // 変更 2 回分だけ履歴が残る
+        let lines = std::fs::read_to_string(&history).unwrap();
+        assert_eq!(lines.lines().count(), 2);
+    }
+
+    #[test]
+    fn apply_control_target_games_clamps_to_issued_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = dir.path().join("control.json");
+        let history = dir.path().join("control_history.jsonl");
+        let mut effective = 4usize;
+        let mut target = 1000u32;
+        let mut warned = false;
+
+        // 引き上げは無制限
+        std::fs::write(&control, r#"{"target_games":2000}"#).unwrap();
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            4,
+            &mut target,
+            50,
+            40,
+        );
+        assert_eq!(target, 2000);
+
+        // 発行済み範囲より下へは clamp (= drain)
+        std::fs::write(&control, r#"{"target_games":0}"#).unwrap();
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            4,
+            &mut target,
+            50,
+            45,
+        );
+        assert_eq!(target, 50);
+        assert_eq!(effective, 4);
+
+        // 同時指定も反映される
+        std::fs::write(&control, r#"{"concurrency":2,"target_games":60}"#).unwrap();
+        apply_control(
+            &control,
+            &history,
+            std::time::SystemTime::UNIX_EPOCH,
+            &mut warned,
+            &mut effective,
+            4,
+            &mut target,
+            50,
+            50,
+        );
+        assert_eq!(effective, 2);
+        assert_eq!(target, 60);
+
+        let lines = std::fs::read_to_string(&history).unwrap();
+        assert_eq!(lines.lines().count(), 3);
+    }
+
+    #[test]
+    fn apply_control_ignores_file_older_than_baseline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = dir.path().join("control.json");
+        let history = dir.path().join("control_history.jsonl");
+        let mut effective = 8usize;
+        let mut target = 1000u32;
+        let mut warned = false;
+
+        std::fs::write(&control, r#"{"concurrency":2,"target_games":0}"#).unwrap();
+        let baseline = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        apply_control(
+            &control,
+            &history,
+            baseline,
+            &mut warned,
+            &mut effective,
+            8,
+            &mut target,
+            0,
+            0,
+        );
+        assert_eq!(effective, 8);
+        assert_eq!(target, 1000);
+        assert!(warned);
+        assert!(!history.exists());
+    }
+
+    #[test]
+    fn model_fingerprint_omits_fv_scale_key_when_auto() {
+        let auto = build_model_fingerprint(
+            true,
+            Some("eval.bin".into()),
+            Some("evalsha".into()),
+            Some("progress.bin".into()),
+            Some("progsha".into()),
+            0,
+        );
+        assert!(auto.get("fv_scale").is_none());
+        // 同型 4 引数の位置対応を pin する (取り違えると既存 run の resume が全滅する)
+        assert_eq!(auto.get("eval_file").and_then(|v| v.as_str()), Some("eval.bin"));
+        assert_eq!(auto.get("eval_file_sha256").and_then(|v| v.as_str()), Some("evalsha"));
+        assert_eq!(auto.get("progress_file").and_then(|v| v.as_str()), Some("progress.bin"));
+        assert_eq!(auto.get("progress_file_sha256").and_then(|v| v.as_str()), Some("progsha"));
+        let overridden = build_model_fingerprint(true, None, None, None, None, 14);
+        assert_eq!(overridden.get("fv_scale").and_then(|v| v.as_i64()), Some(14));
+    }
+
+    #[test]
+    fn reconcile_pending_ticket_parks_and_restores_same_ticket() {
+        let ticket = GameTicket {
+            game_idx: 50,
+            startpos_idx: 7,
+        };
+        let mut next = Some(ticket.clone());
+        let mut parked = None;
+
+        // target 引き下げ (game_id 51 > 50) → park。戻り値 true で呼び出し側は新規生成を
+        // 試みるが、next_game_idx が target に達しているため None が返るだけ
+        assert!(reconcile_pending_ticket(&mut next, &mut parked, 50));
+        assert!(next.is_none());
+        assert_eq!(parked.as_ref().map(|t| t.game_idx), Some(50));
+
+        // target 据え置きの間は park されたまま
+        assert!(reconcile_pending_ticket(&mut next, &mut parked, 50));
+        assert!(parked.is_some());
+
+        // target 引き上げ → 同じ ticket (同じ startpos_idx) が供給に戻る
+        assert!(!reconcile_pending_ticket(&mut next, &mut parked, 51));
+        let restored = next.expect("restored");
+        assert_eq!(restored.game_idx, ticket.game_idx);
+        assert_eq!(restored.startpos_idx, ticket.startpos_idx);
+        assert!(parked.is_none());
     }
 
     #[test]

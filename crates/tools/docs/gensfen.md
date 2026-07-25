@@ -85,6 +85,11 @@ progress8kpabs 係数ファイルを指定する。未指定ならゼロ係数�
 native LayerStacks 実行時は stderr に `LayerStacks num_buckets=N` と、ワーカー終了時の
 `progress bucket distribution: [...] (used X/N)` を出力するため、短時間ランでも bucket 使用状況を確認できる。
 
+FV_SCALE は arch 文字列の `fv_scale` トークンから自動判定される。実際の学習スケールと
+食い違うネット（例: nnue2score を変えた学習で arch 文字列が旧値のままのもの）では
+`--fv-scale N` で上書きする。指定値は meta 行の `settings.fv_scale` と fingerprint に
+記録され、resume 時に同一指定を要求する。
+
 USI モードを使う場合は `--native=false --engine-path /path/to/usi-engine` を指定する。
 このとき `--engine-path-black/white` で先後を別エンジンにすることも可能。
 USI モードでは `--progress-file` は使わず、必要な場合は `--usi-option LS_PROGRESS_COEFF=/path/to/progress.bin`
@@ -126,6 +131,7 @@ TT/履歴が共有されるため棋力評価には不向きだが、教師局�
 | `--native[=BOOL]` | true | NativeBackend を使用（`--eval-file` 必須） |
 | `--eval-file PATH` | (native 時必須) | NNUE 評価関数ファイル |
 | `--progress-file PATH` | (LS native 時必須) | native LayerStacks 用 progress8kpabs 係数ファイル |
+| `--fv-scale N` | 0（自動判定） | FV_SCALE オーバーライド（NativeBackend 専用）。arch 文字列の fv_scale が実際の学習スケールと食い違うネットで指定する。USI モードでは `--usi-option FV_SCALE=N` を使う |
 | `--keep-tt[=BOOL]` | false | TT を対局間で保持（実験用） |
 | `--engine-path PATH` | (USI 時必須) | エンジンバイナリパス |
 | `--engine-path-black/white PATH` | — | 先後別エンジン |
@@ -593,6 +599,36 @@ NVMe/ext4 上へ出力し、fault 無効で各 5 回測定した。判定あり�
 - Ctrl-C を 2 回押すと強制終了する（進行中の対局は破棄される）
 - 同一 seed の通し実行と resume は完了 `game_id` 集合と各 game_id の開始局面・乱択列を一致させる。
   並列 scheduling と resume 時に空へ戻る共有 dedup table のため、成果物全体の bit 一致は保証しない
+
+## 実行中の動的制御（control.json）
+
+`<out-dir>/control.json` を書き換えると、再起動せず対局境界で同時対局数と目標対局数を
+変更できる（500ms 間隔でポーリング。フィールドは任意で、存在するものだけ反映）:
+
+```bash
+echo '{"concurrency":8}' > <out-dir>/control.json          # 並列度を絞る
+echo '{"target_games":2000000}' > <out-dir>/control.json   # 目標対局数を引き上げ
+echo '{"target_games":0}' > <out-dir>/control.json         # 安全な drain（下記）
+```
+
+- `concurrency` の上限は起動時の `--concurrency`（worker スレッド数と per-worker checkpoint
+  数は固定で、超過指定は上限へ clamp）。絞られた worker は ticket 待ちでブロックし CPU を
+  消費しない。`0` は無視
+- `target_games` の引き上げは無制限。引き下げは送信済み game_id を取り消せないため
+  送信済み game_id の最大値へ clamp する。つまり現在値未満（`0` 等）を書くと **安全な drain**
+  になる: 新規対局の供給を止め、in-flight を完走させ、通常どおり finalize して終了する
+  （単発 Ctrl-C も同じ finalize 経路を通るが、進行中の対局を放棄する点が異なる。drain は
+  in-flight を完走させる）
+- drain 後も `--resume` で続きを生成できる。ただし `target_games` を CLI の `--games` より
+  引き上げていた run の resume は、**引き上げ後の値以上を `--games` に指定する**こと
+  （resume 時の checkpoint 検証は `--games` を game_id 上限として使うため）。最終的な有効
+  target は終了サマリーと `control_history.jsonl` に出力される
+- パース不能な内容は無視して現状維持。変更は `<out-dir>/control_history.jsonl` に追記される
+- **プロセス開始より古い mtime の control.json は無視される**（drain 後の `--resume` が
+  前回の指定を拾って即終了しないため）。判定は秒粒度で、開始と同一秒の書き込みは
+  有効として扱う。restart 後にも反映したい指定は書き直す
+- resume 時の fingerprint 照合対象は CLI の `--concurrency` のみ（`--games` は従来どおり対象外）。
+  restart 後に絞りたい場合は同じ `--concurrency` で resume し、control.json で下げる
 
 ## 使用例
 
