@@ -557,6 +557,10 @@ checkpoint の新規作成後は親 directory も fsync するため、通常の
 検出できない。既定の ext4 `data=ordered` では想定しない前提であり、異なる filesystem/mount option では
 耐障害性を別途確認する。
 
+Windows には directory fsync に相当する API が無いため親 directory の fsync はスキップされる。
+ファイル内容の `sync_all` は同一だが、電源断ではディレクトリエントリの変更 (新規作成・rename・削除)
+が失われ得る (プロセス crash のみなら影響しない)。
+
 `--flush-each-move` は、その時点までの result buffer と `--log-info` の info 行を OS buffer へ flush
 する。対局中の教師局面は勝敗確定までメモリ上にあるため、このフラグは進行中対局の教師データを保護せず、
 fsync も行わない。対局完了の耐久性は `--fsync-interval-games` が制御する。
