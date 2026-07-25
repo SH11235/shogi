@@ -710,12 +710,11 @@ pub fn run() -> Result<()> {
 
     // progress8kpabs bucket ベンチマーク (net 由来の num_buckets で駆動)
     if let Some(weights) = progress_weights.as_deref() {
-        let num_buckets = if network.is_layer_stacks() {
-            network.as_layer_stacks().num_buckets()
-        } else {
-            // 非 LayerStack net: 微小ベンチに net 由来 N が無いので default
-            DEFAULT_NUM_BUCKETS
-        };
+        // `as_layer_stacks()` は runtime-dimensions ビルドで DynamicLayerStacks として
+        // load された net に対して panic する (`is_layer_stacks()` は Dynamic でも true)。
+        // 両 variant を扱う `layer_stack_num_buckets()` で取得する。
+        // 非 LayerStack net: 微小ベンチに net 由来 N が無いので default
+        let num_buckets = network.layer_stack_num_buckets().unwrap_or(DEFAULT_NUM_BUCKETS);
         bench_progress_bucket(&positions, weights, num_buckets, cli.warmup, cli.iterations);
     }
     println!("Architecture: {arch_name}");
