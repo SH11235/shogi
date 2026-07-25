@@ -6,6 +6,7 @@ use anyhow::Result;
 use rshogi_core::movegen::{MoveList, generate_legal_all};
 use rshogi_core::position::Position;
 use rshogi_core::types::{Color, Move};
+use rshogi_csa::SpecialMove;
 
 /// 索引フェーズで構築する、対局1件分のメタ情報（局面・指し手は含まない）。
 ///
@@ -207,6 +208,11 @@ pub struct GameRecord {
     /// 表示するか。PSV は `skip_initial_ply` で先頭手が落ちうるので true。JSONL の
     /// 定跡開始局面（例: 24手目から）は正当な開始で欠落ではないため false。
     pub leading_gap_is_drop: bool,
+    /// 終局の特殊手（CSA の `%TORYO` / `%KACHI` 等）の生値。`GameOutcomeView` が
+    /// Win/Draw へ縮約するのに対し、終局理由そのものを必要とするツール
+    /// （例: `nyugyoku_metrics` の宣言勝ち限定フィルタ）向けに保持する。
+    /// 終局特殊手を持たない出典（PSV / JSONL、中断・未完の CSA）は `None`。
+    pub termination: Option<SpecialMove>,
 }
 
 #[derive(Debug, Clone)]

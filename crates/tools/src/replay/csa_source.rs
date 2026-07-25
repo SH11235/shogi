@@ -248,9 +248,17 @@ impl GameSource for CsaSource {
             }
         }
 
+        // 終局特殊手の生値。`derive_outcome` と同じ「末尾から最初の Special」走査で拾う
+        // （勝敗への縮約はせず、`%KACHI` 等の終局理由をそのまま伝える）。
+        let termination = parsed.iter().rev().find_map(|m| match m {
+            ParsedMove::Special(sp) => Some(sp.clone()),
+            ParsedMove::Normal(_) => None,
+        });
+
         Ok(GameRecord {
             moves,
             leading_gap_is_drop: false,
+            termination,
         })
     }
 }
@@ -447,6 +455,24 @@ mod tests {
         write_csa(dir.path(), "a.csa", text);
         let index = CsaSource::new(dir.path()).build_index().expect("build_index");
         assert_eq!(index.entries[0].outcome, Some(GameOutcomeView::Win(Color::White)));
+    }
+
+    #[test]
+    fn termination_keeps_raw_special_move() {
+        // %KACHI は Win、%TORYO は Resign、終局手なしは None として生値を保持する。
+        let cases: [(&str, Option<SpecialMove>); 3] = [
+            ("V2.2\nN+S\nN-G\nPI\n+7776FU\nT1\n%KACHI\n", Some(SpecialMove::Win)),
+            (RESIGN_GAME, Some(SpecialMove::Resign)),
+            ("V2.2\nN+S\nN-G\nPI\n+7776FU\nT1\n", None),
+        ];
+        for (text, expected) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_csa(dir.path(), "a.csa", text);
+            let source = CsaSource::new(dir.path());
+            let index = source.build_index().expect("build_index");
+            let game = source.load_game(&index, &index.entries[0]).expect("load_game");
+            assert_eq!(game.termination, expected);
+        }
     }
 
     #[test]

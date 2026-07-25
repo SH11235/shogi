@@ -27,6 +27,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `eval_sfens` | SFEN 局面を LayerStacks NNUE で静的評価（`score` は歩=90 の内部スケール、`score_cp` は cp） |
 | `nnue_saturation` | LayerStacks NNUE の活性飽和率（u8 127 張り付き）を実局面で計測（[詳細](nnue_saturation.md)） |
 | `ek_testset` | held-out CSA から入玉評価テストセットを構築し、native NNUE 評価で DT/OC 指標を採点（[詳細](ek_testset.md)） |
+| `nyugyoku_metrics` | `%KACHI` 終局 CSA から宣言ルール距離ペアを抽出し、native NNUE 静的評価の順序一致率を条件別 + 対局クラスタ bootstrap CI で採点（[詳細](nyugyoku_metrics.md)） |
 | `compare_eval_nnue` | 教師 NNUE と生徒 NNUE の評価値一致度を検証（MAE・相関係数・スコア帯別誤差） |
 | `dump_effect_bucket_golden` | 形式一致 golden 用に effect bucket active index を config 別に dump（[詳細](dump_effect_bucket_golden.md)） |
 | `compare_nodes` | 2つの USI エンジン間で探索ノード数を深度別に比較。エンジン別の任意ノード上限を併用可能。alignment 調査用（[詳細](compare_nodes.md)） |

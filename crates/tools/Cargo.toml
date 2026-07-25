@@ -101,6 +101,12 @@ name = "ek_testset"
 path = "src/bin/ek_testset.rs"
 required-features = ["csa-replay"]
 
+# nyugyoku_metrics は CSA replay に依存する（TUI は不要）ため csa-replay に gate する。
+[[bin]]
+name = "nyugyoku_metrics"
+path = "src/bin/nyugyoku_metrics.rs"
+required-features = ["csa-replay"]
+
 [dependencies]
 # Workspace dependencies
 anyhow.workspace = true
@@ -137,6 +143,7 @@ rustix = { version = "1.1", features = ["fs"] }
 indicatif = "0.18"
 rand = "0.9.3"
 rand_chacha = "0.9"
+rand_distr = "0.5"
 byteorder = "1.5"
 tempfile = "3.20"
 glob = "0.3"
