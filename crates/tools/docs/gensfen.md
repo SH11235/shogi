@@ -625,7 +625,8 @@ echo '{"target_games":0}' > <out-dir>/control.json         # 安全な drain（�
   target は終了サマリーと `control_history.jsonl` に出力される
 - パース不能な内容は無視して現状維持。変更は `<out-dir>/control_history.jsonl` に追記される
 - **プロセス開始より古い mtime の control.json は無視される**（drain 後の `--resume` が
-  前回の指定を拾って即終了しないため）。restart 後にも反映したい指定は書き直す
+  前回の指定を拾って即終了しないため）。判定は秒粒度で、開始と同一秒の書き込みは
+  有効として扱う。restart 後にも反映したい指定は書き直す
 - resume 時の fingerprint 照合対象は CLI の `--concurrency` のみ（`--games` は従来どおり対象外）。
   restart 後に絞りたい場合は同じ `--concurrency` で resume し、control.json で下げる
 

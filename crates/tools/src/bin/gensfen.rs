@@ -2932,8 +2932,8 @@ fn apply_control(
     // 前回 run の drain 指定などが残った control.json を resume が拾って即終了しないよう、
     // 本プロセス開始より古い mtime のファイルは無視する (反映したければ書き直す)。
     match std::fs::metadata(control_path).and_then(|m| m.modified()) {
-        // >= : mtime が秒粒度の FS でプロセス開始と同一秒に書かれた指定を握り潰さない
-        // (前回 run 由来の stale ファイルは分単位で古いため誤適用にはならない)
+        // >= : baseline は秒に切り捨て済みなので、mtime が秒粒度でもプロセス開始と
+        // 同一秒に書かれた指定を握り潰さない
         Ok(mtime) if mtime >= control_baseline => {}
         Ok(_) => {
             if !*stale_control_warned {
@@ -4106,7 +4106,16 @@ fn append_file_to_stage(
 fn main() -> Result<()> {
     // control.json の鮮度判定の基準点。NNUE ロードや resume 解析より前 (= プロセス開始
     // 直後) に取らないと、初期化中にオペレータが書いた指定が「古い」と誤判定される。
-    let control_baseline = std::time::SystemTime::now();
+    // 秒粒度 mtime の FS では書き込み時刻が秒に切り捨てられるため、基準点も秒に切り捨てて
+    // 「開始と同一秒の書き込みを無視しない」側に倒す (stale ファイルは分単位で古いので
+    // 1 秒未満の窓で誤適用する実害はない)。
+    let control_baseline = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
     let mut cli = Cli::parse();
     validate_cli(&cli)?;
     let _ = fault_spec();
