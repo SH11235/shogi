@@ -46,7 +46,8 @@ cargo run -p tools --release --bin nyugyoku_metrics -- build-pairs \
 ```
 
 CSA（1 ファイル = 1 対局）をファイル名ソートの決定的順序でストリーミング走査します
-（ピークメモリは対局数に非依存）。`%KACHI` を含まないファイルは parse せずスキップします。
+（ピークメモリは対局数に非依存）。各ファイルを一度だけ parse し、`%KACHI` 以外の終局を
+スキップします。
 
 `%KACHI` 終局でも、以下の対局は警告して除外します（除外数は `meta.json` に計上）:
 
@@ -61,7 +62,7 @@ CSA（1 ファイル = 1 対局）をファイル名ソートの決定的順序�
 
 | ファイル | 内容 |
 |---|---|
-| `pairs.jsonl` | 1 行 1 pair。`source_csa`, `date_key`（ファイル名由来 `YYYYMMDDHHMMSS`、無ければ null）, `black_engine`/`white_engine`（CSA `N+`/`N-` の生値。将来の時期×エンジン group split 用）, `winner` (`b`/`w`), `ply_before`, `ply_after`, `sfen_before`, `sfen_after`, `conditions`, `points_before/after`, `zone_before/after`, `king_in_before/after`, `check_before/after` |
+| `pairs.jsonl` | 1 行 1 pair。`source_csa`, `winner` (`b`/`w`), `ply_before`, `ply_after`, `sfen_before`, `sfen_after`, `conditions`, `points_before/after`, `zone_before/after`, `king_in_before/after`, `check_before/after` |
 | `meta.json` | 入力、走査対局数、`%KACHI` 対局数、除外数（上記 3 分類）、総 pair 数、条件別の pair 数と対局数（クラスタ数） |
 
 ## eval-pairs
@@ -90,7 +91,9 @@ pair ごとに `sfen_before` / `sfen_after` を NNUE 静的評価（cp）し、�
   同 seed・同入力で結果は bit 一致します（`--bootstrap 0` で CI を省略）。条件ごとの
   クラスタ集合は「その条件の pair を 1 件以上持つ対局」です。実効クラスタ数（`n_games`）
   を必ず併記するので、クラスタが少ない層の CI は幅ではなく `n_games` を見て判断して
-  ください。
+  ください。`pairs.jsonl` は対局数の事前集計と評価の2回、順次走査します。bootstrapの
+  復元抽出回数を対局ごとに逐次生成するため、完了済み対局の集計はメモリに保持せず、
+  ピークメモリは対局数ではなく `--bootstrap` に比例します。
 - **fv_scale への非依存**: FV_SCALE は評価値の定数倍（狭義単調変換）にしか効かないため、
   順序一致率には影響しません（tie 潰れの量子化は測定対象の一部として残ります）。
 - `--dump-pairs <path>` で pair ごとの `eval_before` / `eval_after` / `agreement` を

@@ -8,15 +8,16 @@
 //! ルール特徴は `Position::entering_king_point_info` / `Position::in_check` のみを使い、
 //! 評価値を母集団選別に使わない（循環の回避）。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use rand_distr::{Binomial, Distribution};
 use rshogi_core::nnue::{
     AccumulatorStackVariant, LayerStackBucketMode, LayerStacksAccCache, evaluate_dispatch,
     get_network, init_nnue, load_progress_coeff_kpabs, set_layer_stack_bucket_mode,
@@ -150,13 +151,6 @@ impl Condition {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct PairRecord {
     source_csa: String,
-    /// 対局日時キー（ファイル名由来の `YYYYMMDDHHMMSS`）。将来の時期別 group split 用。
-    /// ファイル名に日時を持たない出典は `None`。
-    date_key: Option<u64>,
-    /// 先手プレイヤー名（CSA `N+` の生値）。将来のエンジン別 group split 用。
-    black_engine: String,
-    /// 後手プレイヤー名（CSA `N-` の生値）。
-    white_engine: String,
     /// 勝者（宣言側）。'b' / 'w'。
     winner: char,
     ply_before: u32,
@@ -273,26 +267,6 @@ fn run_build(args: &BuildArgs) -> Result<()> {
     for path in csa_paths(&args.input)? {
         let path = path?;
         games_scanned += 1;
-
-        // 高速化: `%KACHI` を含まないファイルは宣言終局ではあり得ないので parse せず skip
-        // する。実測 (floodgate 混合 9,952 局、kachi 率 9.1%、Windows NVMe): プレフィルタ
-        // あり 1.58 秒 / なし 8.0 秒で約 5 倍差 (非宣言局の parse 回避が、宣言局の
-        // 二重読みのコストを大きく上回る)。
-        let text = match fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!(
-                    "warning: {}: 読み込みに失敗したため読み飛ばしました（{e}）",
-                    path.display()
-                );
-                continue;
-            }
-        };
-        // parser は手番付き `%+KACHI` / `%-KACHI` も `SpecialMove::Win` に受理するため、
-        // プレフィルタは接頭辞なしの部分文字列で判定する（偽陽性は後段の parse が落とす）。
-        if !text.contains("KACHI") {
-            continue;
-        }
 
         let source = CsaSource::new(&path);
         let index = source.build_index()?;
@@ -547,9 +521,6 @@ fn build_pairs_for_game(
         }
         out.push(PairRecord {
             source_csa: prov.source_csa.clone(),
-            date_key: prov.date_key,
-            black_engine: prov.black_engine.clone(),
-            white_engine: prov.white_engine.clone(),
             winner: color_label(winner),
             ply_before: moves[i].ply,
             ply_after: moves[j].ply,
@@ -569,16 +540,10 @@ fn build_pairs_for_game(
     Ok(out)
 }
 
-/// pair 出力へ複製する対局単位の出典情報（将来の時期×エンジン group split 用の生値）。
+/// pair 出力へ記録する対局単位の出典情報。
 #[derive(Debug, Clone)]
 struct PairProvenance {
     source_csa: String,
-    /// ファイル名から抽出した対局日時キー（`YYYYMMDDHHMMSS`）。無い出典は `None`。
-    date_key: Option<u64>,
-    /// CSA `N+` のプレイヤー名。
-    black_engine: String,
-    /// CSA `N-` のプレイヤー名。
-    white_engine: String,
 }
 
 fn pair_provenance(index: &GameIndex, entry: &GameIndexEntry) -> Result<PairProvenance> {
@@ -590,9 +555,6 @@ fn pair_provenance(index: &GameIndex, entry: &GameIndexEntry) -> Result<PairProv
         .ok_or_else(|| anyhow!("file_idx {file_idx} が index にありません"))?;
     Ok(PairProvenance {
         source_csa: meta.path.display().to_string(),
-        date_key: meta.date_key,
-        black_engine: meta.black_label.clone(),
-        white_engine: meta.white_label.clone(),
     })
 }
 
@@ -625,75 +587,169 @@ struct GameAgg {
     count: u64,
 }
 
-/// pair を対局クラスタ単位で集計する。
+#[derive(Debug, Clone, Copy)]
+struct BootstrapReplicate {
+    sum: f64,
+    count: u64,
+    remaining_draws: u64,
+}
+
+/// 対局クラスタ bootstrap を対局単位で逐次更新する。
 ///
-/// per-game 集計（`HashMap` + `Vec`）を常駐させるのは意図的な設計判断:
-/// 対局クラスタ bootstrap には per-cluster（= 対局単位）の集計保持が本質的に必要で、
-/// ピークメモリは pair 数ではなくクラスタ数 = 対局数に比例する。全 floodgate 規模
-/// （約 7 万局）でも数 MB に収まり、streaming 規約が禁じる「入力件数線形の load-all」
-/// には当たらない（pair 自体はストリーミングで読み捨てる）。
-#[derive(Default)]
+/// 各 replicate の復元抽出回数は multinomial 分布に従う。現在の対局の抽出回数を
+/// `Binomial(remaining_draws, 1 / remaining_games)` で条件付き生成すると、全対局の
+/// 集計を保持せずに通常の n-out-of-n cluster bootstrap と同じ分布を得られる。
+/// メモリ使用量は replicate 数にのみ比例し、対局数には依存しない。
+struct StreamingBootstrap {
+    rng: ChaCha8Rng,
+    remaining_games: u64,
+    replicates: Vec<BootstrapReplicate>,
+}
+
+impl StreamingBootstrap {
+    fn new(n_games: usize, replicates: u32, seed: u64) -> Self {
+        let replicate_count = if n_games == 0 { 0 } else { replicates as usize };
+        Self {
+            rng: ChaCha8Rng::seed_from_u64(seed),
+            remaining_games: n_games as u64,
+            replicates: vec![
+                BootstrapReplicate {
+                    sum: 0.0,
+                    count: 0,
+                    remaining_draws: n_games as u64,
+                };
+                replicate_count
+            ],
+        }
+    }
+
+    fn push(&mut self, game: GameAgg) -> Result<()> {
+        if game.count == 0 {
+            bail!("bootstrap に pair 数 0 の対局が渡されました");
+        }
+        if self.remaining_games == 0 {
+            bail!("事前走査より多い対局が bootstrap に渡されました");
+        }
+
+        let probability = 1.0 / self.remaining_games as f64;
+        for replicate in &mut self.replicates {
+            let weight = if self.remaining_games == 1 {
+                replicate.remaining_draws
+            } else {
+                Binomial::new(replicate.remaining_draws, probability)
+                    .map_err(|e| anyhow!("bootstrap の二項分布を作れません: {e}"))?
+                    .sample(&mut self.rng)
+            };
+            replicate.sum += game.sum * weight as f64;
+            replicate.count += game.count * weight;
+            replicate.remaining_draws -= weight;
+        }
+        self.remaining_games -= 1;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Option<(f64, f64)>> {
+        if self.remaining_games != 0 {
+            bail!(
+                "bootstrap の対局数が事前走査と一致しません（未処理 {} 対局）",
+                self.remaining_games
+            );
+        }
+        if self.replicates.is_empty() {
+            return Ok(None);
+        }
+
+        let mut stats = Vec::with_capacity(self.replicates.len());
+        for replicate in self.replicates {
+            if replicate.remaining_draws != 0 || replicate.count == 0 {
+                bail!("bootstrap replicate の復元抽出が完了していません");
+            }
+            stats.push(replicate.sum / replicate.count as f64);
+        }
+        stats.sort_by(f64::total_cmp);
+        Ok(Some((percentile_sorted(&stats, 0.025), percentile_sorted(&stats, 0.975))))
+    }
+}
+
+struct SliceAggregator {
+    sum: f64,
+    count: u64,
+    n_games: usize,
+    bootstrap: StreamingBootstrap,
+}
+
+impl SliceAggregator {
+    fn new(n_games: usize, replicates: u32, seed: u64) -> Self {
+        Self {
+            sum: 0.0,
+            count: 0,
+            n_games: 0,
+            bootstrap: StreamingBootstrap::new(n_games, replicates, seed),
+        }
+    }
+
+    fn push(&mut self, game: GameAgg) -> Result<()> {
+        self.sum += game.sum;
+        self.count += game.count;
+        self.n_games += 1;
+        self.bootstrap.push(game)
+    }
+
+    fn finish(self) -> Result<SliceMetrics> {
+        let ci = self.bootstrap.finish()?;
+        Ok(SliceMetrics {
+            agreement: (self.count > 0).then(|| self.sum / self.count as f64),
+            n_pairs: self.count,
+            n_games: self.n_games,
+            ci95_lo: ci.map(|(lo, _)| lo),
+            ci95_hi: ci.map(|(_, hi)| hi),
+        })
+    }
+}
+
+/// pair を対局クラスタ単位で集計する。保持するのは現在処理中の対局と bootstrap
+/// replicate の状態だけで、完了済み対局の集計は保持しない。
 struct PairAggregator {
-    /// source_csa → 対局 index（初出順で採番。入力順が固定なら決定的）。
-    game_index: HashMap<String, usize>,
-    /// 対局ごとの [全体, 条件別...] 集計。
-    games: Vec<[GameAgg; SLOTS]>,
+    slots: [SliceAggregator; SLOTS],
 }
 
 impl PairAggregator {
-    fn push(&mut self, source_csa: &str, conditions: &[Condition], agreement: f64) {
-        let idx = match self.game_index.get(source_csa) {
-            Some(&idx) => idx,
-            None => {
-                let idx = self.games.len();
-                self.game_index.insert(source_csa.to_string(), idx);
-                self.games.push([GameAgg::default(); SLOTS]);
-                idx
+    fn new(n_games: [usize; SLOTS], replicates: u32, seed: u64) -> Self {
+        Self {
+            slots: std::array::from_fn(|slot| {
+                SliceAggregator::new(n_games[slot], replicates, slot_seed(seed, slot))
+            }),
+        }
+    }
+
+    fn push_game(&mut self, game: [GameAgg; SLOTS]) -> Result<()> {
+        for (slot, aggregate) in game.into_iter().enumerate() {
+            if aggregate.count > 0 {
+                self.slots[slot].push(aggregate)?;
             }
-        };
-        let slots = &mut self.games[idx];
-        slots[0].sum += agreement;
-        slots[0].count += 1;
-        for cond in conditions {
-            let slot = &mut slots[cond.index() + 1];
-            slot.sum += agreement;
-            slot.count += 1;
         }
+        Ok(())
     }
 
-    /// スロットごとに agreement 率と対局クラスタ bootstrap の 95% CI を確定する。
-    ///
-    /// bootstrap の seed はスロットごとに `slot_seed` で導出する（スロット間で
-    /// 独立な決定的ストリーム）。
-    fn finish(&self, bootstrap: u32, seed: u64) -> (SliceMetrics, BTreeMap<String, SliceMetrics>) {
-        let overall = self.slice_metrics(0, bootstrap, slot_seed(seed, 0));
-        let conditions = Condition::ALL
-            .into_iter()
-            .map(|cond| {
-                let slot = cond.index() + 1;
-                (
-                    cond.as_str().to_string(),
-                    self.slice_metrics(slot, bootstrap, slot_seed(seed, slot)),
-                )
-            })
-            .collect();
-        (overall, conditions)
-    }
-
-    fn slice_metrics(&self, slot: usize, bootstrap: u32, seed: u64) -> SliceMetrics {
-        // pair を 1 件以上持つ対局だけをこのスライスのクラスタ集合とする（対局 index 順）。
-        let per_game: Vec<GameAgg> =
-            self.games.iter().map(|g| g[slot]).filter(|g| g.count > 0).collect();
-        let n_pairs: u64 = per_game.iter().map(|g| g.count).sum();
-        let sum: f64 = per_game.iter().map(|g| g.sum).sum();
-        let ci = bootstrap_ci95(&per_game, bootstrap, seed);
-        SliceMetrics {
-            agreement: (n_pairs > 0).then(|| sum / n_pairs as f64),
-            n_pairs,
-            n_games: per_game.len(),
-            ci95_lo: ci.map(|(lo, _)| lo),
-            ci95_hi: ci.map(|(_, hi)| hi),
-        }
+    fn finish(self) -> Result<(SliceMetrics, BTreeMap<String, SliceMetrics>)> {
+        let [
+            overall,
+            point_gain,
+            zone_piece_gain,
+            king_entry,
+            check_resolved,
+        ] = self.slots;
+        let overall = overall.finish()?;
+        let conditions = [
+            (Condition::PointGain, point_gain),
+            (Condition::ZonePieceGain, zone_piece_gain),
+            (Condition::KingEntry, king_entry),
+            (Condition::CheckResolved, check_resolved),
+        ]
+        .into_iter()
+        .map(|(condition, aggregate)| Ok((condition.as_str().to_string(), aggregate.finish()?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+        Ok((overall, conditions))
     }
 }
 
@@ -714,34 +770,6 @@ fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-/// 対局クラスタ bootstrap による agreement 率の 95% CI
-/// （replicate 統計量の `percentile_sorted` による q=0.025 / 0.975 分位点）。
-///
-/// 各 replicate で `per_game` から同数の対局を復元抽出し、pair 重み付きの agreement 率を
-/// 計算する。`per_game` の各対局は pair を 1 件以上持つ前提（分母 0 は起きない）。
-/// seed 固定 + 入力順固定で結果は bit 一致する。対局が 0 件、または `replicates == 0`
-/// のときは `None`。
-fn bootstrap_ci95(per_game: &[GameAgg], replicates: u32, seed: u64) -> Option<(f64, f64)> {
-    if per_game.is_empty() || replicates == 0 {
-        return None;
-    }
-    let n = per_game.len();
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let mut stats = Vec::with_capacity(replicates as usize);
-    for _ in 0..replicates {
-        let mut sum = 0.0f64;
-        let mut count = 0u64;
-        for _ in 0..n {
-            let g = &per_game[rng.random_range(0..n)];
-            sum += g.sum;
-            count += g.count;
-        }
-        stats.push(sum / count as f64);
-    }
-    stats.sort_by(f64::total_cmp);
-    Some((percentile_sorted(&stats, 0.025), percentile_sorted(&stats, 0.975)))
-}
-
 /// 順序一致スコア。後局面（距離小）を前局面より高く評価すれば 1、tie は 0.5。
 fn agreement_score(eval_before: i32, eval_after: i32) -> f64 {
     match eval_after.cmp(&eval_before) {
@@ -751,7 +779,65 @@ fn agreement_score(eval_before: i32, eval_after: i32) -> f64 {
     }
 }
 
+fn visit_pair_records(
+    path: &Path,
+    mut visit: impl FnMut(PairRecord, usize) -> Result<()>,
+) -> Result<()> {
+    let file =
+        File::open(path).with_context(|| format!("pairs を開けません: {}", path.display()))?;
+    for (line_no, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let line_no = line_no + 1;
+        let pair: PairRecord = serde_json::from_str(&line)
+            .with_context(|| format!("{}:{line_no}: JSON を読めません", path.display()))?;
+        visit(pair, line_no)?;
+    }
+    Ok(())
+}
+
+/// `build-pairs` が出す source_csa 順の並びを一度走査し、全体・条件別の対局数を数える。
+/// 二度目の走査ではこの件数を使い、完了済み対局を保持せず bootstrap を逐次更新する。
+fn count_game_clusters(path: &Path) -> Result<[usize; SLOTS]> {
+    let mut counts = [0usize; SLOTS];
+    let mut current_source: Option<String> = None;
+    let mut has_slot = [false; SLOTS];
+
+    visit_pair_records(path, |pair, line_no| {
+        if current_source.as_deref() != Some(pair.source_csa.as_str()) {
+            if let Some(previous) = &current_source {
+                if pair.source_csa < *previous {
+                    bail!(
+                        "{}:{line_no}: source_csa は昇順かつ対局単位で連続している必要があります",
+                        path.display()
+                    );
+                }
+                for (slot, present) in has_slot.into_iter().enumerate() {
+                    counts[slot] += usize::from(present);
+                }
+            }
+            current_source = Some(pair.source_csa.clone());
+            has_slot = [false; SLOTS];
+        }
+        has_slot[0] = true;
+        for condition in &pair.conditions {
+            has_slot[condition.index() + 1] = true;
+        }
+        Ok(())
+    })?;
+
+    if current_source.is_some() {
+        for (slot, present) in has_slot.into_iter().enumerate() {
+            counts[slot] += usize::from(present);
+        }
+    }
+    Ok(counts)
+}
+
 fn run_eval(args: &EvalArgs) -> Result<()> {
+    let cluster_counts = count_game_clusters(&args.pairs)?;
     match args.bucket_mode {
         BucketModeArg::Progress8kpabs => {
             let progress_file = args.progress_file.as_ref().ok_or_else(|| {
@@ -796,17 +882,21 @@ fn run_eval(args: &EvalArgs) -> Result<()> {
         })
         .transpose()?;
 
-    let mut agg = PairAggregator::default();
-    let file = File::open(&args.pairs)
-        .with_context(|| format!("pairs を開けません: {}", args.pairs.display()))?;
-    for (line_no, line) in BufReader::new(file).lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
+    let mut agg = PairAggregator::new(cluster_counts, args.bootstrap, args.seed);
+    let mut current_source: Option<String> = None;
+    let mut current_game = [GameAgg::default(); SLOTS];
+    visit_pair_records(&args.pairs, |pair, line_no| {
+        let at = || format!("{}:{line_no}", args.pairs.display());
+        if current_source.as_deref() != Some(pair.source_csa.as_str()) {
+            if let Some(previous) = &current_source {
+                if pair.source_csa < *previous {
+                    bail!("{}: source_csa は昇順かつ対局単位で連続している必要があります", at());
+                }
+                agg.push_game(current_game)?;
+            }
+            current_source = Some(pair.source_csa.clone());
+            current_game = [GameAgg::default(); SLOTS];
         }
-        let at = || format!("{}:{}", args.pairs.display(), line_no + 1);
-        let pair: PairRecord =
-            serde_json::from_str(&line).with_context(|| format!("{}: JSON を読めません", at()))?;
         let winner = color_from_label(pair.winner).with_context(at)?;
 
         let mut eval_at = |sfen: &str| -> Result<i32> {
@@ -823,7 +913,13 @@ fn run_eval(args: &EvalArgs) -> Result<()> {
         let eval_before = eval_at(&pair.sfen_before)?;
         let eval_after = eval_at(&pair.sfen_after)?;
         let agreement = agreement_score(eval_before, eval_after);
-        agg.push(&pair.source_csa, &pair.conditions, agreement);
+        current_game[0].sum += agreement;
+        current_game[0].count += 1;
+        for condition in &pair.conditions {
+            let aggregate = &mut current_game[condition.index() + 1];
+            aggregate.sum += agreement;
+            aggregate.count += 1;
+        }
 
         if let Some(dump) = &mut dump {
             let record = DumpRecord {
@@ -838,12 +934,16 @@ fn run_eval(args: &EvalArgs) -> Result<()> {
             serde_json::to_writer(&mut *dump, &record)?;
             writeln!(dump)?;
         }
+        Ok(())
+    })?;
+    if current_source.is_some() {
+        agg.push_game(current_game)?;
     }
     if let Some(mut dump) = dump {
         dump.flush()?;
     }
 
-    let (overall, conditions) = agg.finish(args.bootstrap, args.seed);
+    let (overall, conditions) = agg.finish()?;
     let out = EvalPairsMetrics {
         pairs: args.pairs.display().to_string(),
         eval_file: args.eval_file.display().to_string(),
@@ -891,9 +991,6 @@ mod tests {
     fn test_prov(name: &str) -> PairProvenance {
         PairProvenance {
             source_csa: name.to_string(),
-            date_key: None,
-            black_engine: "B".to_string(),
-            white_engine: "W".to_string(),
         }
     }
 
@@ -985,17 +1082,17 @@ mod tests {
         let pairs = build_pairs_for_game(&moves, winner, &test_prov("game.csa")).expect("pairs");
         assert_eq!(pairs.len(), 2);
 
-        let p1 = &pairs[0];
-        assert_eq!((p1.ply_before, p1.ply_after), (1, 3));
-        assert_eq!(p1.conditions, vec![Condition::CheckResolved]);
-        assert!(p1.check_before && !p1.check_after);
-        assert_eq!((p1.points_before, p1.points_after), (27, 27));
+        let first_pair = &pairs[0];
+        assert_eq!((first_pair.ply_before, first_pair.ply_after), (1, 3));
+        assert_eq!(first_pair.conditions, vec![Condition::CheckResolved]);
+        assert!(first_pair.check_before && !first_pair.check_after);
+        assert_eq!((first_pair.points_before, first_pair.points_after), (27, 27));
 
-        let p2 = &pairs[1];
-        assert_eq!((p2.ply_before, p2.ply_after), (3, 5));
-        assert_eq!(p2.conditions, vec![Condition::PointGain, Condition::ZonePieceGain]);
-        assert_eq!((p2.points_before, p2.points_after), (27, 28));
-        assert_eq!((p2.zone_before, p2.zone_after), (9, 10));
+        let second_pair = &pairs[1];
+        assert_eq!((second_pair.ply_before, second_pair.ply_after), (3, 5));
+        assert_eq!(second_pair.conditions, vec![Condition::PointGain, Condition::ZonePieceGain]);
+        assert_eq!((second_pair.points_before, second_pair.points_after), (27, 28));
+        assert_eq!((second_pair.zone_before, second_pair.zone_after), (9, 10));
     }
 
     #[test]
@@ -1091,8 +1188,7 @@ mod tests {
     #[test]
     fn run_build_writes_pairs_and_meta() {
         let in_dir = tempfile::tempdir().expect("tempdir");
-        // 先頭の gains は csa_client 日時形式のファイル名にして date_key の伝播も確かめる。
-        write_csa(in_dir.path(), "20260101_000000_gains.csa", KACHI_GAINS_CSA);
+        write_csa(in_dir.path(), "a_gains.csa", KACHI_GAINS_CSA);
         write_csa(in_dir.path(), "b_entry.csa", KACHI_ENTRY_CSA);
         write_csa(in_dir.path(), "c_toryo.csa", TORYO_CSA);
         write_csa(in_dir.path(), "d_broken.csa", KACHI_BROKEN_CSA);
@@ -1114,12 +1210,6 @@ mod tests {
         assert_eq!(pairs.len(), 3);
         assert!(pairs.iter().all(|p| p.winner == 'b'));
         assert!(pairs.iter().all(|p| !p.conditions.is_empty()));
-        // 出典情報（date_key / 両エンジン名）の生値が各 pair に載る。
-        assert!(pairs.iter().all(|p| p.black_engine == "B" && p.white_engine == "W"));
-        assert_eq!(pairs[0].date_key, Some(20260101000000), "日時付きファイル名から抽出");
-        assert_eq!(pairs[1].date_key, Some(20260101000000));
-        assert_eq!(pairs[2].date_key, None, "日時なしファイル名は null");
-
         let meta: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(out_dir.path().join("meta.json")).unwrap())
                 .expect("meta json");
@@ -1150,11 +1240,18 @@ mod tests {
 
     #[test]
     fn aggregator_computes_rates_per_condition() {
-        let mut agg = PairAggregator::default();
-        agg.push("g1.csa", &[Condition::PointGain], 1.0);
-        agg.push("g1.csa", &[Condition::PointGain, Condition::KingEntry], 0.0);
-        agg.push("g2.csa", &[Condition::CheckResolved], 1.0);
-        let (overall, conditions) = agg.finish(0, DEFAULT_SEED);
+        let mut agg = PairAggregator::new([2, 1, 0, 1, 1], 0, DEFAULT_SEED);
+        let mut first_game = [GameAgg::default(); SLOTS];
+        first_game[0] = GameAgg { sum: 1.0, count: 2 };
+        first_game[Condition::PointGain.index() + 1] = GameAgg { sum: 1.0, count: 2 };
+        first_game[Condition::KingEntry.index() + 1] = GameAgg { sum: 0.0, count: 1 };
+        agg.push_game(first_game).unwrap();
+
+        let mut second_game = [GameAgg::default(); SLOTS];
+        second_game[0] = GameAgg { sum: 1.0, count: 1 };
+        second_game[Condition::CheckResolved.index() + 1] = GameAgg { sum: 1.0, count: 1 };
+        agg.push_game(second_game).unwrap();
+        let (overall, conditions) = agg.finish().unwrap();
 
         assert_eq!(overall.n_pairs, 3);
         assert_eq!(overall.n_games, 2);
@@ -1170,6 +1267,14 @@ mod tests {
         let zp = &conditions["zone_piece_gain"];
         assert_eq!((zp.n_pairs, zp.n_games), (0, 0));
         assert_eq!(zp.agreement, None);
+    }
+
+    fn streaming_ci(per_game: &[GameAgg], replicates: u32, seed: u64) -> Option<(f64, f64)> {
+        let mut bootstrap = StreamingBootstrap::new(per_game.len(), replicates, seed);
+        for game in per_game {
+            bootstrap.push(*game).unwrap();
+        }
+        bootstrap.finish().unwrap()
     }
 
     #[test]
@@ -1214,8 +1319,8 @@ mod tests {
             GameAgg { sum: 0.5, count: 1 },
             GameAgg { sum: 5.0, count: 6 },
         ];
-        let a = bootstrap_ci95(&per_game, 1000, DEFAULT_SEED).expect("ci");
-        let b = bootstrap_ci95(&per_game, 1000, DEFAULT_SEED).expect("ci");
+        let a = streaming_ci(&per_game, 1000, DEFAULT_SEED).expect("ci");
+        let b = streaming_ci(&per_game, 1000, DEFAULT_SEED).expect("ci");
         assert_eq!(a, b, "同 seed 同入力で CI は bit 一致する");
         assert!(a.0 <= a.1);
         assert!((0.0..=1.0).contains(&a.0) && (0.0..=1.0).contains(&a.1));
@@ -1224,7 +1329,7 @@ mod tests {
     #[test]
     fn bootstrap_single_game_collapses_to_point() {
         let per_game = vec![GameAgg { sum: 3.0, count: 4 }];
-        let (lo, hi) = bootstrap_ci95(&per_game, 100, DEFAULT_SEED).expect("ci");
+        let (lo, hi) = streaming_ci(&per_game, 100, DEFAULT_SEED).expect("ci");
         assert_eq!(lo, 0.75);
         assert_eq!(hi, 0.75);
     }
@@ -1232,11 +1337,20 @@ mod tests {
     #[test]
     fn aggregator_ci_is_deterministic_end_to_end() {
         let build = || {
-            let mut agg = PairAggregator::default();
-            agg.push("g1.csa", &[Condition::PointGain], 1.0);
-            agg.push("g2.csa", &[Condition::PointGain], 0.0);
-            agg.push("g3.csa", &[Condition::PointGain], 0.5);
-            agg.finish(500, DEFAULT_SEED)
+            let mut agg = PairAggregator::new([3, 3, 0, 0, 0], 500, DEFAULT_SEED);
+            for agreement in [1.0, 0.0, 0.5] {
+                let mut game = [GameAgg::default(); SLOTS];
+                game[0] = GameAgg {
+                    sum: agreement,
+                    count: 1,
+                };
+                game[Condition::PointGain.index() + 1] = GameAgg {
+                    sum: agreement,
+                    count: 1,
+                };
+                agg.push_game(game).unwrap();
+            }
+            agg.finish().unwrap()
         };
         let (o1, c1) = build();
         let (o2, c2) = build();
