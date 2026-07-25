@@ -204,6 +204,12 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     log_info: bool,
 
+    /// result 行の diversions 配列を省き、件数のみ記録する (jsonl を大幅削減)。
+    /// relabel_psv --deblunder は diversions の ply 位置を必要とするため、
+    /// deblunder を掛ける可能性のある run では使わないこと
+    #[arg(long, default_value_t = false)]
+    omit_diversions: bool,
+
     /// Flush game log on every move (safer, but slower)
     #[arg(long, default_value_t = false)]
     flush_each_move: bool,
@@ -422,6 +428,9 @@ struct MetaSettings {
     /// FV_SCALE オーバーライド（未指定 = arch 文字列から自動判定）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fv_scale: Option<i32>,
+    /// result 行の diversions 配列を省略したか（未指定 = 全量記録）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    omit_diversions: Option<bool>,
 }
 
 fn default_skip_in_check() -> bool {
@@ -476,7 +485,16 @@ struct ResultLog<'a> {
     king_in_enemy_white: bool,
     enemy_zone_pieces_black: u32,
     enemy_zone_pieces_white: u32,
-    diversions: &'a [DiversionLog],
+    /// 乱択来歴。--omit-diversions 時は None (キー自体を省く)。relabel_psv --deblunder が
+    /// ply 境界として消費するため、省略の有無は run 内で一貫している必要がある
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diversions: Option<&'a [DiversionLog]>,
+    /// --omit-diversions 時のみ: 省いた multipv 乱択の件数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    multipv_diversions: Option<u64>,
+    /// --omit-diversions 時のみ: 省いたランダムムーブの件数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    random_moves: Option<u64>,
     /// この result より先にコミット済みの worker 教師ファイル長。
     training_bytes: u64,
     /// この result より先にコミット済みの worker sidecar 長。
@@ -1884,6 +1902,7 @@ struct WorkerConfig {
     /// 直近 interval で既に警告済みかを示すフラグ（全ワーカー共有）。
     /// 同一タイミングで複数ワーカーが重複警告を出すのを抑制する。
     dedup_warn_emitted: Arc<AtomicBool>,
+    omit_diversions: bool,
 }
 
 fn worker_main(
@@ -2391,7 +2410,13 @@ fn worker_main(
                 king_in_enemy_white: final_meta.white.king_in_enemy,
                 enemy_zone_pieces_black: final_meta.black.enemy_zone_pieces,
                 enemy_zone_pieces_white: final_meta.white.enemy_zone_pieces,
-                diversions: &diversions,
+                diversions: (!cfg.omit_diversions).then_some(diversions.as_slice()),
+                multipv_diversions: cfg
+                    .omit_diversions
+                    .then(|| diversions.iter().filter(|d| d.kind == "multipv").count() as u64),
+                random_moves: cfg
+                    .omit_diversions
+                    .then(|| diversions.iter().filter(|d| d.kind == "random").count() as u64),
                 training_bytes: 0,
                 sidecar_bytes: None,
                 info_bytes: None,
@@ -4510,7 +4535,7 @@ fn main() -> Result<()> {
         native_progress_file_sha256.clone(),
         cli.fv_scale,
     );
-    let generation_fingerprint = serde_json::json!({
+    let mut generation_fingerprint = serde_json::json!({
         "schema": 2,
         "model": model_fingerprint,
         "engine": serde_json::json!({
@@ -4577,6 +4602,11 @@ fn main() -> Result<()> {
             "move_max_ply": cli.random_move_max_ply,
         }),
     });
+    if cli.omit_diversions {
+        // 未指定時はキーを出さない (既存 run の fingerprint 互換)。full/slim の混在は
+        // relabel_psv --deblunder の境界判定を silent に壊すため resume で拒否する。
+        generation_fingerprint["auxiliary_outputs"]["omit_diversions"] = serde_json::json!(true);
+    }
     if let Some(state) = &resume_state {
         validate_resume_fingerprint(state.fingerprint.as_ref(), &generation_fingerprint)?;
     }
@@ -4642,6 +4672,7 @@ fn main() -> Result<()> {
                 progress_file: cli.progress_file.as_ref().map(|p| p.display().to_string()),
                 progress_file_sha256: native_progress_file_sha256.clone(),
                 fv_scale: (cli.fv_scale > 0).then_some(cli.fv_scale),
+                omit_diversions: cli.omit_diversions.then_some(true),
             },
             engine_cmd: EngineCommandMeta {
                 path_black: engine_paths.black.path.display().to_string(),
@@ -4878,6 +4909,7 @@ fn main() -> Result<()> {
                     .max(1),
                 dedup_warn_rate: cli.dedup_warn_rate,
                 dedup_warn_emitted: Arc::clone(&dedup_warn_emitted),
+                omit_diversions: cli.omit_diversions,
             };
             let rx = ticket_rx.clone();
             let tx = result_tx.clone();
@@ -6959,7 +6991,9 @@ mod tests {
             king_in_enemy_white: false,
             enemy_zone_pieces_black: 0,
             enemy_zone_pieces_white: 0,
-            diversions: &[],
+            diversions: Some(&[]),
+            multipv_diversions: None,
+            random_moves: None,
             training_bytes: 0,
             sidecar_bytes: None,
             info_bytes: None,
@@ -6990,7 +7024,9 @@ mod tests {
             king_in_enemy_white: false,
             enemy_zone_pieces_black: 0,
             enemy_zone_pieces_white: 0,
-            diversions: &[],
+            diversions: Some(&[]),
+            multipv_diversions: None,
+            random_moves: None,
             training_bytes: 0,
             sidecar_bytes: None,
             info_bytes: None,
@@ -7002,6 +7038,43 @@ mod tests {
         assert_eq!(value["diversions"], serde_json::json!([]));
         assert_eq!(value["adopted"], true);
         assert_eq!(value["reason"], "max_moves");
+        // 全量記録モードでは件数フィールドを出さない
+        assert!(value.get("multipv_diversions").is_none());
+        assert!(value.get("random_moves").is_none());
+    }
+
+    #[test]
+    fn result_log_omits_diversions_and_keeps_counts() {
+        let result = ResultLog {
+            kind: "result",
+            worker_id: 0,
+            game_id: 1,
+            start_pos_index: 1,
+            start_sfen: "lnsgkgsnl/1r5b1/p1ppppppp/9/1p7/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL b - 1",
+            outcome: "draw",
+            reason: OutcomeReason::MaxMoves,
+            adopted: true,
+            plies: 1,
+            final_points_black: 0,
+            final_points_white: 0,
+            king_in_enemy_black: false,
+            king_in_enemy_white: false,
+            enemy_zone_pieces_black: 0,
+            enemy_zone_pieces_white: 0,
+            diversions: None,
+            multipv_diversions: Some(12),
+            random_moves: Some(4),
+            training_bytes: 0,
+            sidecar_bytes: None,
+            info_bytes: None,
+            eval_bytes: None,
+            metrics_bytes: None,
+            fsync_boundary: false,
+        };
+        let value = serde_json::to_value(result).unwrap();
+        assert!(value.get("diversions").is_none());
+        assert_eq!(value["multipv_diversions"], 12);
+        assert_eq!(value["random_moves"], 4);
     }
 
     #[test]
