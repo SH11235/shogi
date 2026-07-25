@@ -258,7 +258,9 @@ fn process_file(
         // 健全な行として通ってしまうため trim_end() は使わない。
         let line = line.strip_suffix('\n').unwrap_or(line);
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if line.trim().is_empty() {
+        // 空行のみ黙って読み飛ばす。空白だけが残った行は破損の疑いがあるので
+        // パースに回し、失敗すれば Corrupt lines に計上する。
+        if line.is_empty() {
             continue;
         }
 
@@ -555,6 +557,34 @@ mod tests {
         assert_eq!(stats.corrupt_lines, 0);
         assert_eq!(stats.games_written, 1);
         assert_eq!(stats.positions_written, 1);
+    }
+
+    /// 空白だけが残った行は「空行」として黙殺せず破損行に計上する。
+    #[test]
+    fn counts_whitespace_only_line_as_corrupt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("game.jsonl");
+        let output = dir.path().join("out.psv");
+        std::fs::write(
+            &input,
+            concat!(
+                "\n",         // 純粋な空行は黙って読み飛ばす
+                "\u{00a0}\n", // NBSP のみ
+                " \t\n",      // 半角空白とタブのみ
+                "{\"type\":\"result\",\"game_id\":1,\"outcome\":\"black_win\"}\n",
+            ),
+        )
+        .expect("write input");
+
+        let mut writer = BufWriter::new(File::create(&output).expect("create output"));
+        let mut games_written = 0;
+        let stats =
+            process_file(&input, &mut writer, MissingScoreMode::Skip, 0, &mut games_written)
+                .expect("process file");
+        writer.flush().expect("flush");
+
+        assert_eq!(stats.corrupt_lines, 2);
+        assert_eq!(stats.truncated_tail_lines, 0);
     }
 
     /// 全損した行が改行なしでファイル末尾にあっても「書き込み途中」ではなく破損行。
