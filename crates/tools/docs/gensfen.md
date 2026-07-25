@@ -61,7 +61,7 @@ KIF が必要な場合は `tournament` バイナリで対局を回し、その�
 | `king_in_enemy_black` / `king_in_enemy_white` | 自玉が敵陣三段内にいるか |
 | `enemy_zone_pieces_black` / `enemy_zone_pieces_white` | 敵陣三段内の自駒数（玉除く） |
 | `adopted` | 終局理由が教師データ採用対象か。異常終局では `false`。`true` でも dedup や出力形式の制約により書き出し局面数が 0 の場合がある |
-| `diversions` | `--random-multi-pv` / `--random-move-count` で PV1 以外を選んだ来歴配列 |
+| `diversions` | `--random-multi-pv` / `--random-move-count` で PV1 以外を選んだ来歴配列。`--omit-diversions` 時はこのキー自体が省かれ、代わりに件数 (`multipv_diversions` / `random_moves` / `diversions_total`) が出る |
 
 `diversions` の各要素は次の形:
 
@@ -191,6 +191,7 @@ position sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1
 | オプション | デフォルト | 説明 |
 |-----------|-----------|------|
 | `--log-info` | false | エンジンの info 出力を `gensfen.info.jsonl` に記録 |
+| `--omit-diversions` | false | result 行の `diversions` 配列を省き件数のみ記録（実測: multipv 8-100 + random 4 / depth 9 のレシピで 5.0KB/局 → 0.7KB/局）。**`relabel_psv --deblunder` は diversions の ply 位置を必要とするため、deblunder を掛ける可能性のある run では使わない**。fingerprint 対象で、resume での全量/省略の混在は拒否される |
 | `--emit-eval-file` | false | 評価値推移を `gensfen.eval.txt` に出力 |
 | `--emit-metrics` | false | 対局メトリクス JSONL を出力 |
 | `--flush-each-move` | false | 毎手フラッシュ（安全だが低速） |
