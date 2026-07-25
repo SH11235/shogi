@@ -201,6 +201,21 @@ cargo run -p tools --release --bin jsonl_to_psv -- \
 | `--missing-score` | `eval` 欠損局面の扱い。`skip` または `zero` | `skip` |
 | `--max-games` | 変換する最大対局数（0=全件） | `0` |
 
+#### 破損ログの扱い
+
+対局中にプロセスが落ちたログは、最終行が改行なしで途中まで書かれていたり、
+行が NUL 埋め / 不正 UTF-8 になっていることがある。これらは変換を中断させず、
+該当行だけを破棄して健全な行から局面を取り出す。件数は Summary に出る:
+
+- `Truncated tail lines` — 改行なしで切れた最終行。検出時点でそのファイルの読み込みを終える
+- `Corrupt lines` — 不正 UTF-8 または JSON として解釈できない行。警告はファイルごと先頭 5 件まで
+- `Parse errors` — JSON としては妥当だが `move` / `result` として読めない行
+  （必須フィールドの欠落や型不一致。未知の `type` は無視され、ここには入らない）
+
+`result` 行を失った対局は `Orphan games` として局面ごと破棄される（勝敗が確定
+できないため）。破損が想定外に多い場合は Summary の件数で気付けるので、変換後に
+必ず確認すること。
+
 ### expand_psv_from_policy
 
 dlshogi 系 ONNX モデルのポリシー出力を使い、各局面の合法手のうち選択確率が閾値を超える手の
