@@ -70,6 +70,43 @@ user-invocable: true
 はモデルごとに必要なものが異なる。デフォルト 1 つに固執せず、対象モデルから判断 +
 不明なら確認。
 
+## 永続出力先 gate（起動前に必ず実行）
+
+対局 JSONL は後で教師データに使う可能性があるため、出力先はユーザー相談で変える項目ではない。
+**本体 checkout の絶対パス `rshogi/runs/selfplay/` に固定**し、linked worktree には出さない。
+
+- 「本体 checkout」は branch 名では決めない。`main` branch 用でも `rshogi-main` 等は
+  disposable worktree であり、保存先として禁止。
+- `git worktree list --porcelain` の先頭 record（primary worktree）を canonical root とし、
+  directory 名が厳密に `rshogi` かつ実在する通常 directory であることを確認する。
+  条件を満たさなければ起動せず user に確認する。
+- run 名は実在日時の `YYYYMMDD-HHMMSS-PURPOSE`。`YYYYMMDD_HHMMSS` や不正日時は禁止。
+- `--out-dir` は必ず canonical root の直下
+  `<canonical-rshogi>/runs/selfplay/YYYYMMDD-HHMMSS-PURPOSE` を絶対パスで渡し、起動前には
+  run directory が存在しないことを確認する。
+- Windows の junction / symlink、Linux の symlink を永続 root に使わない。
+- engine の build は worktree でよいが、`xtask` が作る標準
+  `engines/rshogi-usi-<edition>` を使う。`sprt-runtime-*` 等の独自 runtime directory を作らない。
+- 起動 script では build repo と log root を同じ変数に畳み込まない。log root は上記 canonical
+  root からのみ組み立てる。
+
+出力 directory を作る前に OS に合う bundled checker を通す:
+
+```powershell
+# Windows native
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .claude/skills/selfplay/scripts/assert_output_root.ps1 `
+  -Repo $PWD -OutDir $OUT
+```
+
+```bash
+# Linux / WSL2
+bash .claude/skills/selfplay/scripts/assert_output_root.sh "$PWD" "$OUT"
+```
+
+checker が失敗したら **起動禁止**。起動後に違反へ気付いても user 承認なしに job を kill しない。
+状況を報告して指示を待つ。局数・並列数だけの変更は kill/restart せず `control.json` を使う。
+
 ## ビルドの注意 (pre-flight 必須 3 点)
 
 engine build / feature 構成 / format 互換性の詳細は
@@ -110,14 +147,18 @@ build / preset edition / feature 構成の詳細は
 
 ### 2. 出力ディレクトリの作成
 
-実験ごとに個別のディレクトリを作成し、ログファイルの混入を防ぐ。
+上記 gate で検証した絶対パスだけを作成し、実験ごとのログ混入を防ぐ。
 
-```
-mkdir -p runs/selfplay/{YYYYMMDD}-{HHMMSS}-{PURPOSE}
+```bash
+CANONICAL_RSHOGI=/absolute/path/to/rshogi
+OUT="$CANONICAL_RSHOGI/runs/selfplay/$(date +%Y%m%d-%H%M%S)-{PURPOSE}"
+mkdir -p "$CANONICAL_RSHOGI/runs/selfplay"
+bash .claude/skills/selfplay/scripts/assert_output_root.sh "$PWD" "$OUT"
+mkdir -p "$OUT"
 ```
 
 - `{PURPOSE}` はユーザーの実験目的を短く要約したもの（例: `tt-16bit`, `lmr-tuning`）
-- このディレクトリパスを以降の `--out-dir` オプションで使用する
+- 検証済みの絶対パス `$OUT` を以降の `--out-dir` オプションで使用する
 
 ### 3. tournament バイナリで総当たり自己対局を実行
 
@@ -130,7 +171,7 @@ cargo run -p tools --release --bin tournament -- \
   --games {GAMES} --byoyomi {BYOYOMI} --hash-mb {HASH} --threads {THREADS} \
   --concurrency {CONCURRENCY} \
   --usi-option {NNUE} \
-  --out-dir runs/selfplay/{DIR}
+  --out-dir "$OUT"
 ```
 
 - `--concurrency`: 並列対局数（デフォルト1）。CPUコア数に応じて調整。
@@ -158,7 +199,7 @@ cargo run -p tools --release --bin tournament -- \
 
 ```bash
 # <out-dir>/control.json （存在するフィールドだけ反映。両方任意）
-echo '{"target_games": 300, "concurrency": 8}' > runs/selfplay/{DIR}/control.json
+echo '{"target_games": 300, "concurrency": 8}' > "$OUT/control.json"
 ```
 
 - **`target_games`**: 各方向・各ペアあたりの目標対局数（CLI `--games` と同じ単位）。
@@ -189,7 +230,7 @@ cargo run -p tools --release --bin tournament -- \
   --engine-usi-option "1:EvalDir=/path/to/eval" \
   --engine-usi-option "1:BookFile=no_book" \
   --games 100 --byoyomi 3000 --concurrency 5 \
-  --out-dir runs/selfplay/{DIR}
+  --out-dir "$OUT"
 ```
 
 ### 4. 完了待ち・結果集計
@@ -198,7 +239,7 @@ Background task の完了を `TaskOutput` で検知する。
 完了後、`analyze_selfplay` ツールで対局ログを集計しサマリを生成する:
 
 ```
-cargo run -p tools --release --bin analyze_selfplay -- runs/selfplay/{DIR}/*.jsonl
+cargo run -p tools --release --bin analyze_selfplay -- "$OUT"/*.jsonl
 ```
 
 `analyze_selfplay` は JSONL ファイルを読み込み、勝率・Elo差・手数分布などを集計して標準出力に表示する。
@@ -235,7 +276,7 @@ cargo run -p tools --release --bin tournament -- \
   --base-label base \
   --sprt --sprt-base-label base --sprt-test-label test \
   --sprt-nelo0 0 --sprt-nelo1 5 --sprt-alpha 0.05 --sprt-beta 0.05 \
-  --out-dir runs/selfplay/$(date +%Y%m%d_%H%M%S)-sprt-base-vs-test
+  --out-dir "$OUT"
 ```
 
 ポイント:
@@ -277,7 +318,7 @@ final:       pairs=246, LLR=+3.002, decision=accept_h1
 
 ```
 cargo run -p tools --release --bin analyze_selfplay -- \
-  runs/selfplay/{DIR}/*.jsonl --sprt
+  "$OUT"/*.jsonl --sprt
 ```
 
 base/test のラベルは以下の順で自動推定され、推定時は根拠が stderr に表示される:
