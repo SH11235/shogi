@@ -7048,6 +7048,7 @@ mod tests {
         // 全量記録モードでは件数フィールドを出さない
         assert!(value.get("multipv_diversions").is_none());
         assert!(value.get("random_moves").is_none());
+        assert!(value.get("diversions_total").is_none());
     }
 
     #[test]
