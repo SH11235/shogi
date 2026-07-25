@@ -3607,9 +3607,17 @@ fn atomic_temp_path(path: &Path) -> PathBuf {
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
+    // Windows は CreateFile でディレクトリを開けず access denied になり、
+    // directory fsync に相当する安全な std API も無いためスキップする
+    // (電源断時のディレクトリエントリ永続化保証が Unix より弱くなるのみ)。
+    #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("failed to fsync parent dir of {}", path.display()))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
