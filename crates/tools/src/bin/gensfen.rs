@@ -2932,7 +2932,9 @@ fn apply_control(
     // 前回 run の drain 指定などが残った control.json を resume が拾って即終了しないよう、
     // 本プロセス開始より古い mtime のファイルは無視する (反映したければ書き直す)。
     match std::fs::metadata(control_path).and_then(|m| m.modified()) {
-        Ok(mtime) if mtime > control_baseline => {}
+        // >= : mtime が秒粒度の FS でプロセス開始と同一秒に書かれた指定を握り潰さない
+        // (前回 run 由来の stale ファイルは分単位で古いため誤適用にはならない)
+        Ok(mtime) if mtime >= control_baseline => {}
         Ok(_) => {
             if !*stale_control_warned {
                 *stale_control_warned = true;
@@ -4102,6 +4104,9 @@ fn append_file_to_stage(
 }
 
 fn main() -> Result<()> {
+    // control.json の鮮度判定の基準点。NNUE ロードや resume 解析より前 (= プロセス開始
+    // 直後) に取らないと、初期化中にオペレータが書いた指定が「古い」と誤判定される。
+    let control_baseline = std::time::SystemTime::now();
     let mut cli = Cli::parse();
     validate_cli(&cli)?;
     let _ = fault_spec();
@@ -4982,7 +4987,6 @@ fn main() -> Result<()> {
     let mut effective_concurrency = cli.concurrency;
     let mut target_games = cli.games;
     let mut last_control_poll: Option<Instant> = None;
-    let control_baseline = std::time::SystemTime::now();
     let mut stale_control_warned = false;
     println!(
         "[control] 実行中の動的制御: {} を {}ms 間隔でポーリング (例: echo '{{\"concurrency\":M,\"target_games\":N}}' > {}、concurrency 上限は --concurrency {}。target_games を発行済み対局数まで下げると安全に drain して finalize する)",
