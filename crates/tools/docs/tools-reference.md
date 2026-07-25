@@ -61,6 +61,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 | `filter_teacher_data` | 王手除外・スコアフィルタ・クリップなどの前処理を適用 |
 | `fix_scores` | preprocess で上書きされたスコアを元ファイルから復元 |
 | `psv_to_jsonl` | PSV 形式を JSONL 形式に変換 |
+| `jsonl_to_psv` | tournament / analyze_selfplay 互換の自己対局 JSONL を PSV に変換。書き手のクラッシュで壊れた行は破棄して継続し、件数を Summary に計上（[詳細](pack_tools.md#jsonl_to_psv)） |
 | `psv_to_hcpe3` | PSV を dlshogi 学習用 hcpe3 / hcpe に変換（通常手は cshogi と byte 一致、streaming、`move16=0` の有効な着手なしレコードを件数付きスキップ、`--evalfix-a` 対応） |
 | `migrate_psv_move16` | 旧リポジトリ形式 (B) の PSV move16 を実 YaneuraOu 形式 (A) へストリーミング移行（[詳細](migrate_psv_move16.md)） |
 | `pack_to_psv` | GenSfen .pack を PackedSfenValue (PSV) 形式に展開し、move16 を実 YaneuraOu 形式へ変換 |
