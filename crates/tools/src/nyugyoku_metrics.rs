@@ -1,4 +1,4 @@
-//! 宣言ルール距離ペア順序一致指標 (P1) の構築・採点ツール。
+//! 宣言ルール距離ペア順序一致指標の構築・採点ツール。
 //!
 //! `%KACHI`（入玉宣言勝ち）で終局した対局の勝者手番局面から、「宣言成立へのルール距離が
 //! 確定的に縮んだ」隣接局面 pair を抽出し（`build-pairs`）、NNUE 静的評価が後局面を
@@ -40,7 +40,7 @@ const DEFAULT_SEED: u64 = 20_260_726;
 #[command(
     name = "nyugyoku_metrics",
     version,
-    about = "宣言ルール距離ペア (P1) を CSA から抽出し、NNUE 静的評価の順序一致率を採点する"
+    about = "宣言ルール距離ペアを CSA から抽出し、NNUE 静的評価の順序一致率を採点する"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -102,7 +102,7 @@ enum BucketModeArg {
     Kingrank9,
 }
 
-/// pair の遷移条件（P1 の 4 条件、固定順）。
+/// pair の遷移条件（本指標の 4 条件、固定順）。
 ///
 /// いずれも「宣言成立へのルール距離が確定的に縮んだ」ことのルールベース判定で、
 /// 評価値には依存しない。
@@ -275,7 +275,9 @@ fn run_build(args: &BuildArgs) -> Result<()> {
         games_scanned += 1;
 
         // 高速化: `%KACHI` を含まないファイルは宣言終局ではあり得ないので parse せず skip
-        // する（宣言終局はコーパス中で希少なため、大半のファイルで parse を省ける）。
+        // する。実測 (floodgate 混合 9,952 局、kachi 率 9.1%、Windows NVMe): プレフィルタ
+        // あり 1.58 秒 / なし 8.0 秒で約 5 倍差 (非宣言局の parse 回避が、宣言局の
+        // 二重読みのコストを大きく上回る)。
         let text = match fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {

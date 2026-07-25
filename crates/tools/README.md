@@ -61,7 +61,7 @@
 | `label_bench_dl` | `label_bench` jsonl の各局面を DL水匠 (標準 dlshogi ONNX) で静的評価し `eval_dl` を追記（`dlshogi-onnx` feature、default 有効） |
 | `yardstick_label` / `yardstick_score` | ラベル品質「物差し」。held-out hcpe を labeler でラベル付け（stage 1）→ engine ごとに勝率較正して per-class WDL logloss / 参照天井 / リファレンス一致を採点（stage 2） |
 | `ek_testset` | held-out CSA から入玉評価テストセットを構築し、native NNUE 評価で DT/OC 指標を採点（[詳細](docs/ek_testset.md)） |
-| `nyugyoku_metrics` | `%KACHI` 終局 CSA から宣言ルール距離ペア (P1) を抽出し、native NNUE 静的評価の順序一致率を条件別に採点（[詳細](docs/nyugyoku_metrics.md)） |
+| `nyugyoku_metrics` | `%KACHI` 終局 CSA から宣言ルール距離ペアを抽出し、native NNUE 静的評価の順序一致率を条件別に採点（[詳細](docs/nyugyoku_metrics.md)） |
 | `nnue_saturation` | LayerStacks NNUE の活性飽和率（ClippedReLU 127 張り付き）を実局面で計測（[詳細](docs/nnue_saturation.md)） |
 
 ### NNUE 学習
@@ -109,7 +109,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 - [yardstick_label](docs/yardstick_label.md) - held-out hcpe を labeler の固定 depth 探索でラベル付け（物差し stage 1）
 - [yardstick_score](docs/yardstick_score.md) - labeler の WDL logloss / 参照天井 / リファレンス一致を採点（物差し stage 2）
 - [ek_testset](docs/ek_testset.md) - held-out CSA から入玉評価テストセットを構築し、native NNUE 評価で DT/OC 指標を採点
-- [nyugyoku_metrics](docs/nyugyoku_metrics.md) - `%KACHI` 終局 CSA から宣言ルール距離ペア (P1) を抽出し、NNUE 静的評価の順序一致率を採点
+- [nyugyoku_metrics](docs/nyugyoku_metrics.md) - `%KACHI` 終局 CSA から宣言ルール距離ペアを抽出し、NNUE 静的評価の順序一致率を採点
 - [nnue_saturation](docs/nnue_saturation.md) - LayerStacks NNUE の活性飽和率（u8 127 張り付き）を実局面で計測
 - [rescore_psv](docs/rescore_psv.md) - PSV 評価値の再スコアリング（推奨: dlshogi ONNX + TensorRT FP16。qsearch-leaf ラベル / policy 展開 / レジューム対応）
 - [relabel_psv](docs/relabel_psv.md) - PSV score の勝敗ラベル置換、宣言勝ち override、diversion 整合性 deblunder
