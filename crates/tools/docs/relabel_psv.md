@@ -34,6 +34,10 @@ cargo run -p tools --release --bin relabel_psv -- \
 
 ## diversions による deblunder
 
+> **注意**: `gensfen --omit-diversions` で生成した run の jsonl には `diversions` が
+> 無いため deblunder には使えない (明示エラーになる)。deblunder を掛ける可能性の
+> ある run は全量記録 (gensfen の既定) で生成すること。
+
 `gensfen --emit-game-id-sidecar` で作った sidecar と result JSONL を指定する。
 result JSONL の diversion `ply` は開始局面からの相対手数であり、`start_sfen` の開始手数を使って
 PSV の絶対 `game_ply` へ `start_ply + ply - 1` で変換する。PSV と sidecar は lockstep で読み、

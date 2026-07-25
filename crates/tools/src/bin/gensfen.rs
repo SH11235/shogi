@@ -495,6 +495,10 @@ struct ResultLog<'a> {
     /// --omit-diversions 時のみ: 省いたランダムムーブの件数
     #[serde(skip_serializing_if = "Option::is_none")]
     random_moves: Option<u64>,
+    /// --omit-diversions 時のみ: 省いた diversion の総数。kind 別件数の合計と
+    /// 突き合わせることで、将来 kind が増えた際の集計漏れを検知できる
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diversions_total: Option<u64>,
     /// この result より先にコミット済みの worker 教師ファイル長。
     training_bytes: u64,
     /// この result より先にコミット済みの worker sidecar 長。
@@ -2417,6 +2421,7 @@ fn worker_main(
                 random_moves: cfg
                     .omit_diversions
                     .then(|| diversions.iter().filter(|d| d.kind == "random").count() as u64),
+                diversions_total: cfg.omit_diversions.then_some(diversions.len() as u64),
                 training_bytes: 0,
                 sidecar_bytes: None,
                 info_bytes: None,
@@ -6994,6 +6999,7 @@ mod tests {
             diversions: Some(&[]),
             multipv_diversions: None,
             random_moves: None,
+            diversions_total: None,
             training_bytes: 0,
             sidecar_bytes: None,
             info_bytes: None,
@@ -7027,6 +7033,7 @@ mod tests {
             diversions: Some(&[]),
             multipv_diversions: None,
             random_moves: None,
+            diversions_total: None,
             training_bytes: 0,
             sidecar_bytes: None,
             info_bytes: None,
@@ -7064,6 +7071,7 @@ mod tests {
             diversions: None,
             multipv_diversions: Some(12),
             random_moves: Some(4),
+            diversions_total: Some(16),
             training_bytes: 0,
             sidecar_bytes: None,
             info_bytes: None,
@@ -7075,6 +7083,7 @@ mod tests {
         assert!(value.get("diversions").is_none());
         assert_eq!(value["multipv_diversions"], 12);
         assert_eq!(value["random_moves"], 4);
+        assert_eq!(value["diversions_total"], 16);
     }
 
     #[test]

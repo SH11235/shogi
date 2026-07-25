@@ -830,7 +830,12 @@ fn load_diversion_bounds(paths: &[PathBuf]) -> Result<HashMap<u32, DiversionBoun
             let start_ply = parse_start_ply(&value, path, line_index)?;
             let diversions =
                 value.get("diversions").and_then(Value::as_array).with_context(|| {
-                    format!("missing diversions in {} line {}", path.display(), line_index + 1)
+                    format!(
+                        "missing diversions in {} line {} (gensfen --omit-diversions で生成した \
+                     jsonl には diversions が無い。deblunder には全量記録の run が必要)",
+                        path.display(),
+                        line_index + 1
+                    )
                 })?;
             for diversion in diversions {
                 let relative_ply = parse_relative_ply(diversion, path, line_index)?;
@@ -879,7 +884,12 @@ fn load_game_info(paths: &[PathBuf]) -> Result<HashMap<u32, GameInfo>> {
                 _ => GameEndReason::Other,
             };
             let values = value.get("diversions").and_then(Value::as_array).with_context(|| {
-                format!("missing diversions in {} line {}", path.display(), line_index + 1)
+                format!(
+                    "missing diversions in {} line {} (gensfen --omit-diversions で生成した \
+                     jsonl には diversions が無い。deblunder には全量記録の run が必要)",
+                    path.display(),
+                    line_index + 1
+                )
             })?;
             let mut diversions = Vec::with_capacity(values.len());
             for diversion in values {
