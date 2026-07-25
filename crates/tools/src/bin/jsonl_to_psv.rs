@@ -123,6 +123,8 @@ struct Stats {
     skipped_error_game: u64,
     skipped_in_progress_game: u64,
     parse_errors: u64,
+    truncated_tail_lines: u64,
+    corrupt_lines: u64,
     move_errors: u64,
     orphan_games: u64,
 }
@@ -180,6 +182,8 @@ fn main() -> Result<()> {
     println!("Skipped in-progress:   {}", total.skipped_in_progress_game);
     println!("Move errors:           {}", total.move_errors);
     println!("Parse errors:          {}", total.parse_errors);
+    println!("Truncated tail lines:  {}", total.truncated_tail_lines);
+    println!("Corrupt lines:         {}", total.corrupt_lines);
     println!("Orphan games:          {}", total.orphan_games);
     println!("Output file:           {}", args.output.display());
     println!(
@@ -201,6 +205,8 @@ impl Stats {
         self.skipped_error_game += rhs.skipped_error_game;
         self.skipped_in_progress_game += rhs.skipped_in_progress_game;
         self.parse_errors += rhs.parse_errors;
+        self.truncated_tail_lines += rhs.truncated_tail_lines;
+        self.corrupt_lines += rhs.corrupt_lines;
         self.move_errors += rhs.move_errors;
         self.orphan_games += rhs.orphan_games;
     }
@@ -215,32 +221,74 @@ fn process_file(
 ) -> Result<Stats> {
     let file = File::open(path)
         .with_context(|| format!("入力ファイルを開けません: {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut pending: HashMap<u32, Vec<PendingRecord>> = HashMap::new();
     let mut stats = Stats {
         files: 1,
         ..Stats::default()
     };
 
-    for (line_idx, line) in reader.lines().enumerate() {
+    let mut raw = Vec::new();
+    let mut line_idx = 0usize;
+    loop {
         if max_games > 0 && *games_written >= max_games {
             break;
         }
 
-        let line = line.with_context(|| format!("{}行目の読み込みに失敗", line_idx + 1))?;
+        raw.clear();
+        let read = reader
+            .read_until(b'\n', &mut raw)
+            .with_context(|| format!("{}行目の読み込みに失敗", line_idx + 1))?;
+        if read == 0 {
+            break;
+        }
+        line_idx += 1;
+        // 書き手のプロセスが落ちると、最終行が改行なしで途中まで書かれた状態で残る。
+        let complete = raw.ends_with(b"\n");
+
+        let line = match std::str::from_utf8(&raw) {
+            Ok(line) => line,
+            Err(_) => {
+                stats.corrupt_lines += 1;
+                warn_corrupt_line(path, line_idx, "不正なUTF-8", stats.corrupt_lines);
+                continue;
+            }
+        };
+        // 行区切りのみ落とす。JSON 文法上不正な空白 (NBSP 等) を削ると破損行が
+        // 健全な行として通ってしまうため trim_end() は使わない。
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if line.trim().is_empty() {
             continue;
         }
 
-        let entry = match serde_json::from_str::<LogEntry>(&line) {
+        let entry = match serde_json::from_str::<LogEntry>(line) {
             Ok(entry) => entry,
-            Err(_) => match serde_json::from_str::<Value>(&line) {
+            Err(_) => match serde_json::from_str::<Value>(line) {
                 Ok(_) => {
                     stats.parse_errors += 1;
                     continue;
                 }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("{}行目のJSONが不正", line_idx + 1));
+                Err(_) => {
+                    // 書き込み途中で切れた行は record の先頭 `{` だけが残る。
+                    // 全損して NUL 等で埋まった行はこれに当たらず破損行として数える。
+                    if !complete && line.trim_start().starts_with('{') {
+                        stats.truncated_tail_lines += 1;
+                        eprintln!(
+                            "  警告: {} の最終行({}行目)が書き込み途中のため破棄します",
+                            path.display(),
+                            line_idx
+                        );
+                        break;
+                    }
+                    stats.corrupt_lines += 1;
+                    warn_corrupt_line(
+                        path,
+                        line_idx,
+                        "JSONとして解釈できない",
+                        stats.corrupt_lines,
+                    );
+                    continue;
                 }
             },
         };
@@ -260,7 +308,7 @@ fn process_file(
                     eprintln!(
                         "  move変換エラー {}:{} game_id={} ply={}: {e}",
                         path.display(),
-                        line_idx + 1,
+                        line_idx,
                         mv.game_id,
                         mv.ply
                     );
@@ -402,6 +450,18 @@ fn color_label(color: Color) -> char {
     if color == Color::Black { 'b' } else { 'w' }
 }
 
+/// 破損行の警告。1 ファイルにつき先頭 5 件までに絞る（全損ファイルで数百万行の
+/// 警告を出さないため）。総数は Summary の `Corrupt lines` に出る。
+fn warn_corrupt_line(path: &Path, line_idx: usize, reason: &str, corrupt_so_far: u64) {
+    const MAX_WARNINGS: u64 = 5;
+    if corrupt_so_far <= MAX_WARNINGS {
+        eprintln!("  警告: {} の{}行目が{}ため破棄します", path.display(), line_idx, reason);
+        if corrupt_so_far == MAX_WARNINGS {
+            eprintln!("  警告: {} の破損行の警告は以降省略します", path.display());
+        }
+    }
+}
+
 fn is_terminal_move(move_usi: &str) -> bool {
     matches!(move_usi, "resign" | "win" | "timeout" | "illegal" | "none")
 }
@@ -435,6 +495,130 @@ mod tests {
         assert_eq!(game_result_for_side(Outcome::BlackWin, Color::White), -1);
         assert_eq!(game_result_for_side(Outcome::WhiteWin, Color::Black), -1);
         assert_eq!(game_result_for_side(Outcome::Draw, Color::White), 0);
+    }
+
+    #[test]
+    fn drops_truncated_last_line_without_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("game.jsonl");
+        let output = dir.path().join("out.psv");
+        std::fs::write(
+            &input,
+            concat!(
+                "{\"type\":\"move\",\"game_id\":1,\"ply\":1,\"side_to_move\":\"b\",",
+                "\"sfen_before\":\"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1\",",
+                "\"move_usi\":\"7g7f\",\"eval\":{\"score_cp\":23}}\n",
+                "{\"type\":\"result\",\"game_id\":1,\"outcome\":\"black_win\"}\n",
+                // 書き手が落ちて改行なしで切れた行
+                "{\"type\":\"move\",\"game_id\":2,\"ply\":1,\"side_to_move\":\"b\",\"sfen_bef",
+            ),
+        )
+        .expect("write input");
+
+        let mut writer = BufWriter::new(File::create(&output).expect("create output"));
+        let mut games_written = 0;
+        let stats =
+            process_file(&input, &mut writer, MissingScoreMode::Skip, 0, &mut games_written)
+                .expect("truncated tail must not fail the conversion");
+        writer.flush().expect("flush");
+
+        assert_eq!(stats.truncated_tail_lines, 1);
+        assert_eq!(stats.games_written, 1);
+        assert_eq!(stats.positions_written, 1);
+    }
+
+    /// 改行で終わっていない最終行でも、JSON として完結していれば取りこぼさない。
+    #[test]
+    fn keeps_complete_last_line_without_trailing_newline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("game.jsonl");
+        let output = dir.path().join("out.psv");
+        std::fs::write(
+            &input,
+            concat!(
+                "{\"type\":\"move\",\"game_id\":1,\"ply\":1,\"side_to_move\":\"b\",",
+                "\"sfen_before\":\"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1\",",
+                "\"move_usi\":\"7g7f\",\"eval\":{\"score_cp\":23}}\n",
+                "{\"type\":\"result\",\"game_id\":1,\"outcome\":\"black_win\"}",
+            ),
+        )
+        .expect("write input");
+
+        let mut writer = BufWriter::new(File::create(&output).expect("create output"));
+        let mut games_written = 0;
+        let stats =
+            process_file(&input, &mut writer, MissingScoreMode::Skip, 0, &mut games_written)
+                .expect("process file");
+        writer.flush().expect("flush");
+
+        assert_eq!(stats.truncated_tail_lines, 0);
+        assert_eq!(stats.corrupt_lines, 0);
+        assert_eq!(stats.games_written, 1);
+        assert_eq!(stats.positions_written, 1);
+    }
+
+    /// 全損した行が改行なしでファイル末尾にあっても「書き込み途中」ではなく破損行。
+    #[test]
+    fn counts_garbage_tail_as_corrupt_not_truncated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("game.jsonl");
+        let output = dir.path().join("out.psv");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            concat!(
+                "{\"type\":\"move\",\"game_id\":1,\"ply\":1,\"side_to_move\":\"b\",",
+                "\"sfen_before\":\"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1\",",
+                "\"move_usi\":\"7g7f\",\"eval\":{\"score_cp\":23}}\n",
+                "{\"type\":\"result\",\"game_id\":1,\"outcome\":\"black_win\"}\n",
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&input, &bytes).expect("write input");
+
+        let mut writer = BufWriter::new(File::create(&output).expect("create output"));
+        let mut games_written = 0;
+        let stats =
+            process_file(&input, &mut writer, MissingScoreMode::Skip, 0, &mut games_written)
+                .expect("process file");
+        writer.flush().expect("flush");
+
+        assert_eq!(stats.truncated_tail_lines, 0);
+        assert_eq!(stats.corrupt_lines, 1);
+        assert_eq!(stats.games_written, 1);
+    }
+
+    /// 書き手のクラッシュで行の一部が NUL 埋め / 不正 UTF-8 になったログでも、
+    /// 健全な行から教師局面を取り出せること。
+    #[test]
+    fn skips_corrupt_lines_and_keeps_healthy_games() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = dir.path().join("game.jsonl");
+        let output = dir.path().join("out.psv");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x00\x00\x00\x00\x00\x00\n");
+        bytes.extend_from_slice(&[0xff, 0xfe, 0xff, b'\n']);
+        bytes.extend_from_slice(
+            concat!(
+                "{\"type\":\"move\",\"game_id\":1,\"ply\":1,\"side_to_move\":\"b\",",
+                "\"sfen_before\":\"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1\",",
+                "\"move_usi\":\"7g7f\",\"eval\":{\"score_cp\":23}}\n",
+                "{\"type\":\"result\",\"game_id\":1,\"outcome\":\"black_win\"}\n",
+            )
+            .as_bytes(),
+        );
+        std::fs::write(&input, &bytes).expect("write input");
+
+        let mut writer = BufWriter::new(File::create(&output).expect("create output"));
+        let mut games_written = 0;
+        let stats =
+            process_file(&input, &mut writer, MissingScoreMode::Skip, 0, &mut games_written)
+                .expect("corrupt lines must not fail the conversion");
+        writer.flush().expect("flush");
+
+        assert_eq!(stats.corrupt_lines, 2);
+        assert_eq!(stats.games_written, 1);
+        assert_eq!(stats.positions_written, 1);
     }
 
     #[test]
