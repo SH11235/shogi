@@ -177,6 +177,8 @@ impl GameSource for PsvSource {
         Ok(GameRecord {
             moves,
             leading_gap_is_drop: true,
+            // PSV は CSA 特殊手を持たないため終局理由は常に不明。
+            termination: None,
         })
     }
 }

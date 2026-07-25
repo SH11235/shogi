@@ -101,6 +101,12 @@ name = "ek_testset"
 path = "src/bin/ek_testset.rs"
 required-features = ["csa-replay"]
 
+# nyugyoku_metrics は CSA replay に依存する（TUI は不要）ため csa-replay に gate する。
+[[bin]]
+name = "nyugyoku_metrics"
+path = "src/bin/nyugyoku_metrics.rs"
+required-features = ["csa-replay"]
+
 [dependencies]
 # Workspace dependencies
 anyhow.workspace = true

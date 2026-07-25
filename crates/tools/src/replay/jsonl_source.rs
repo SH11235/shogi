@@ -128,6 +128,8 @@ impl GameSource for JsonlSource {
         Ok(GameRecord {
             moves,
             leading_gap_is_drop: false,
+            // JSONL は CSA 特殊手を持たないため終局理由は常に不明。
+            termination: None,
         })
     }
 }

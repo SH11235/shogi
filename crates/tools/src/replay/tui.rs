@@ -1844,6 +1844,7 @@ mod tests {
             Ok(GameRecord {
                 moves,
                 leading_gap_is_drop: false,
+                termination: None,
             })
         }
     }
@@ -2001,6 +2002,7 @@ mod tests {
                 mv(Color::Black, Some(-5), None),
             ],
             leading_gap_is_drop: false,
+            termination: None,
         };
         let points = eval_points(&game);
         assert_eq!(points.len(), 3);
@@ -2023,6 +2025,7 @@ mod tests {
                 mv_with_ply(5, Color::Black, Some(-20), None),
             ],
             leading_gap_is_drop: false,
+            termination: None,
         };
         let plotted: Vec<_> = eval_points(&game).into_iter().flatten().collect();
         assert_eq!(plotted.len(), 3, "評価値付きの 3 手が打点される（flat 隣接で 2 本の線）");
@@ -2095,6 +2098,7 @@ mod tests {
                 move_with_sfen(HIRATE_SFEN),
             ],
             leading_gap_is_drop: false,
+            termination: None,
         };
         // 手数が違っても盤面・手番・持駒が一致すればヒットする。
         assert!(game_contains_sfen(&game, &normalize_sfen("9/9/9/9/9/9/9/9/9 b - 1")));
@@ -2165,6 +2169,7 @@ mod tests {
             Ok(GameRecord {
                 moves,
                 leading_gap_is_drop: false,
+                termination: None,
             })
         }
     }
@@ -2514,6 +2519,7 @@ mod tests {
         GameRecord {
             moves,
             leading_gap_is_drop: false,
+            termination: None,
         }
     }
 
@@ -2548,6 +2554,7 @@ mod tests {
         let empty_game = GameRecord {
             moves: Vec::new(),
             leading_gap_is_drop: false,
+            termination: None,
         };
         assert_eq!(
             empty_state(Some(&error_entry), "", Some(&empty_game)),
@@ -2568,6 +2575,7 @@ mod tests {
         let game = GameRecord {
             moves: vec![mv(Color::Black, Some(0), None)],
             leading_gap_is_drop: false,
+            termination: None,
         };
         assert_eq!(empty_state(Some(&entry), "", Some(&game)), None);
     }
@@ -2589,6 +2597,7 @@ mod tests {
                 mv_with_ply(4, Color::White, None, None),
             ],
             leading_gap_is_drop: true,
+            termination: None,
         };
         assert_eq!(ply_gap_before(&game, 0), None, "先頭が ply=1 なら先頭欠番はない");
         assert_eq!(ply_gap_before(&game, 1), Some(2), "1 の次が 4 なら 2,3 の 2 手が欠落");
@@ -2604,6 +2613,7 @@ mod tests {
                 mv_with_ply(13, Color::White, None, None),
             ],
             leading_gap_is_drop: true,
+            termination: None,
         };
         assert_eq!(ply_gap_before(&game, 0), Some(11), "ply=12 開始なら 1〜11 の 11 手が欠落");
         assert_eq!(ply_gap_before(&game, 1), None, "12 の次が 13 なら欠番なし");
@@ -2618,6 +2628,7 @@ mod tests {
                 mv_with_ply(25, Color::White, None, None),
             ],
             leading_gap_is_drop: false,
+            termination: None,
         };
         assert_eq!(ply_gap_before(&game, 0), None, "定跡開始は先頭欠番扱いにしない");
         assert_eq!(ply_gap_before(&game, 1), None);
@@ -2663,6 +2674,7 @@ mod tests {
                 mv_with_ply(2, Color::White, None, None),
             ],
             leading_gap_is_drop: false,
+            termination: None,
         };
         assert_eq!(ply_gap_before(&game, 1), None);
     }
@@ -2679,6 +2691,7 @@ mod tests {
                 mv_with_ply(3, Color::Black, None, None),
             ],
             leading_gap_is_drop: false,
+            termination: None,
         };
         assert_eq!(ply_gap_before(&game, 1), None);
         assert_eq!(ply_gap_before(&game, 2), None);
