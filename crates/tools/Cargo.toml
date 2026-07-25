@@ -134,6 +134,7 @@ rshogi-csa-client = { path = "../rshogi-csa-client", default-features = false }
 sysinfo = "0.37"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "system-proxy"] }
 walkdir = "2.5"
+same-file = "1.0"
 url = "2.5"
 rayon = "1.10"
 crossbeam-channel = "0.5"
