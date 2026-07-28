@@ -3160,16 +3160,39 @@ fn validate_resume_fingerprint(meta: Option<&Value>, current: &Value) -> Result<
     let meta = meta.context(
         "--resume: meta has no generation fingerprint; move existing outputs aside and start a new run",
     )?;
-    if meta == current {
+    let mut saved = meta.clone();
+    let mut current = current.clone();
+    // hcpe3 policy のキーは psv / pack の fingerprint にも書かれるが、これらの形式では
+    // 生成物に影響しない。既定値を変えたときに無関係な差分で resume を拒否しないよう、
+    // hcpe3 以外では両側から対称に除外して比較する (片側だけだとキー欠落が差分になる)。
+    if current.pointer("/training/format").and_then(Value::as_str) != Some("hcpe3") {
+        remove_hcpe3_policy_fingerprint(&mut saved);
+        remove_hcpe3_policy_fingerprint(&mut current);
+    }
+    if saved == current {
         return Ok(());
     }
     let mut differences = Vec::new();
-    collect_json_differences("", meta, current, &mut differences);
+    collect_json_differences("", &saved, &current, &mut differences);
     differences.sort();
     bail!(
         "--resume: generation fingerprint mismatch in fields: {}",
         differences.join(", ")
     )
+}
+
+fn remove_hcpe3_policy_fingerprint(fingerprint: &mut Value) {
+    let Some(training) = fingerprint.get_mut("training").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for key in [
+        "hcpe3_policy_total",
+        "hcpe3_policy_temp",
+        "hcpe3_eval_drop_threshold",
+        "hcpe3_policy_algo",
+    ] {
+        training.remove(key);
+    }
 }
 
 fn add_hcpe3_policy_fingerprint(
@@ -7134,6 +7157,70 @@ mod tests {
             DEFAULT_HCPE3_EVAL_DROP_THRESHOLD
         );
         assert_eq!(hcpe3["training"]["hcpe3_policy_algo"], HCPE3_POLICY_ALGO_VERSION);
+    }
+
+    #[test]
+    fn psv_resume_ignores_legacy_hcpe3_policy_fields() {
+        let saved = serde_json::json!({
+            "training": {
+                "format": "psv",
+                "hcpe3_policy_total": 1000,
+                "hcpe3_policy_temp": 600.0,
+                "hcpe3_eval_drop_threshold": 300,
+                "hcpe3_policy_algo": 1
+            }
+        });
+        let current = serde_json::json!({
+            "training": {
+                "format": "psv",
+                "hcpe3_policy_total": 65535,
+                "hcpe3_policy_temp": 100.0
+            }
+        });
+
+        validate_resume_fingerprint(Some(&saved), &current).unwrap();
+    }
+
+    #[test]
+    fn hcpe3_resume_compares_policy_fields() {
+        let saved = serde_json::json!({
+            "training": {
+                "format": "hcpe3",
+                "hcpe3_policy_total": 1000,
+                "hcpe3_policy_temp": 100.0,
+                "hcpe3_eval_drop_threshold": 500,
+                "hcpe3_policy_algo": HCPE3_POLICY_ALGO_VERSION
+            }
+        });
+        let current = serde_json::json!({
+            "training": {
+                "format": "hcpe3",
+                "hcpe3_policy_total": 65535,
+                "hcpe3_policy_temp": 100.0,
+                "hcpe3_eval_drop_threshold": 500,
+                "hcpe3_policy_algo": HCPE3_POLICY_ALGO_VERSION
+            }
+        });
+
+        let error = validate_resume_fingerprint(Some(&saved), &current).unwrap_err().to_string();
+        assert!(error.contains("training.hcpe3_policy_total"));
+    }
+
+    #[test]
+    fn hcpe3_checkpoint_cannot_resume_as_psv() {
+        let saved = serde_json::json!({
+            "training": {
+                "format": "hcpe3",
+                "hcpe3_policy_total": 65535,
+                "hcpe3_policy_temp": 100.0,
+                "hcpe3_eval_drop_threshold": 500,
+                "hcpe3_policy_algo": HCPE3_POLICY_ALGO_VERSION
+            }
+        });
+        let current = serde_json::json!({"training": {"format": "psv"}});
+
+        let error = validate_resume_fingerprint(Some(&saved), &current).unwrap_err().to_string();
+        assert!(error.contains("training.format"));
     }
 
     #[test]
