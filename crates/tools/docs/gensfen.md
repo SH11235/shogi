@@ -168,8 +168,9 @@ position sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1
 | `--output-training-data PATH` | `<out-dir>/gensfen.psv` | 学習データ出力先 |
 | `--emit-game-id-sidecar PATH` | — | PSV 各レコードと 1:1・同順の `game_id` を u32 little-endian で出力（PSV 専用） |
 | `--training-data-format FORMAT` | psv | `psv`（40バイト固定）/ `pack`（32バイト + メタ）/ `hcpe3`（可変長棋譜 + policy） |
-| `--hcpe3-policy-total N` | 1000 | hcpe3 の policy 分布に割り当てる visit 総票数 |
-| `--hcpe3-policy-temp F` | 600.0 | hcpe3 の policy softmax 温度（centipawn 単位、大きいほど分布を均す） |
+| `--hcpe3-policy-total N` | 65535 | hcpe3 の policy 分布に割り当てる visit 総票数 |
+| `--hcpe3-policy-temp F` | 100.0 | hcpe3 の policy softmax 温度（centipawn 単位、大きいほど分布を均す。0 以下は最善候補へ全票） |
+| `--hcpe3-eval-drop-threshold N` | 500 | 最善候補から N cp を超えて劣る候補を除外（負値で無効、実着手は常に保持） |
 | `--skip-initial-ply N` | 0 | 序盤 1〜N 手目をスキップ（hcpe3 でも prefix 連続なので可） |
 | `--skip-in-check BOOL` | false | 王手局面をスキップ（**hcpe3 では不可** = 中間スキップが replay を壊す） |
 
@@ -399,8 +400,8 @@ selectedMove16 には実際に着手した手を記録するため、ランダ�
 |-----------|--------|------|
 | hcp | 32 | 開始局面 |
 | moveNum | 2 | 手数 |
-| result | 1 | 0=引き分け / 1=先手勝ち / 2=後手勝ち |
-| opponent | 1 | 予約（0） |
+| result | 1 | 下位2bit: 0=引き分け / 1=先手勝ち / 2=後手勝ち。bit2=千日手、bit3=入玉宣言、bit4=最大手数 |
+| gameInfo | 1 | bit0-1=opponent（自己対局は0）、bit2-3=max_moves code（256=1、320=2、512=3、その他=0） |
 | 以下を moveNum 回 | | |
 | selectedMove16 | 2 | 実着手（hcpe move16） |
 | eval | 2 | 手番側視点 cp。詰みは 32000-ply 符号化 |
@@ -409,9 +410,16 @@ selectedMove16 には実際に着手した手を記録するため、ランダ�
 | move16 | 2 | 候補手（hcpe move16） |
 | visitNum | 2 | softmax 量子化した票数 |
 
-policy の票数は各候補の eval を温度 `--hcpe3-policy-temp` の softmax で確率化し
-`--hcpe3-policy-total` 票へ量子化する（詰み候補は ±10000 にクリップ、PV1 は必ず 1 票以上）。
+policy 候補は量子化前に、最善候補から `--hcpe3-eval-drop-threshold` を超えて劣る候補を
+除外する（負値で無効）。実際に着手した手は閾値を超えていても保持する。残った全候補へ
+最低 1 票を与え、残りを各候補の eval と温度 `--hcpe3-policy-temp` の softmax で配分して
+`--hcpe3-policy-total` 票へ量子化する。総票数が候補数未満なら候補数まで引き上げる。
+詰み候補は eval と同じ `±(32000-ply)` を softmax にも使用する。
 `--random-multi-pv` 未指定（候補なし）のときは実着手の one-hot（visit=1）になる。
+
+gensfen が書く eval は rshogi の cp スケールである。一方、dlshogi の `score_to_value` は
+`sigmoid(score / 756.086)` 固定で、`train.py` は `--use_evalfix` を指定した場合だけデータから
+係数を推定して補正する。dlshogi で学習するときは `--use_evalfix` を指定すること。
 
 ## 中断・再開（Resume）
 
