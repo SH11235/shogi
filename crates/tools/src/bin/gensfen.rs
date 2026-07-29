@@ -36,6 +36,12 @@ use tools::selfplay::{
 };
 
 const DEFAULT_EVAL_HASH_SIZE_MB: usize = 64;
+const DEFAULT_HCPE3_EVAL_DROP_THRESHOLD: i32 = 500;
+const HCPE3_POLICY_ALGO_VERSION: u32 = 3;
+// 消費側の固定長 buffer と将棋の合法手数上限に合わせる。
+const MAX_HCPE3_POLICY_CANDIDATES: u32 = 593;
+#[cfg(test)]
+const TEST_HCPE3_MAX_MOVES_GAME_INFO_CODE_1: u32 = 256;
 
 /// NNUE 学習用の教師局面（PSV/pack）を生成する gensfen ツール。
 /// NativeBackend で `--eval-file` 指定の評価関数を使い、対局を回しながら
@@ -261,12 +267,16 @@ struct Cli {
     training_data_format: String,
 
     /// hcpe3 形式の policy 分布に割り当てる visit の総票数
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = 65535)]
     hcpe3_policy_total: u16,
 
     /// hcpe3 形式の policy softmax の温度（centipawn 単位、大きいほど分布を均す）
-    #[arg(long, default_value_t = 600.0)]
+    #[arg(long, default_value_t = 100.0)]
     hcpe3_policy_temp: f64,
+
+    /// hcpe3 policy から最善候補との差がこの値を超える候補を除外する（負値で無効）
+    #[arg(long, default_value_t = DEFAULT_HCPE3_EVAL_DROP_THRESHOLD)]
+    hcpe3_eval_drop_threshold: i32,
 
     /// Number of concurrent worker threads
     #[arg(long, default_value_t = 1)]
@@ -790,6 +800,15 @@ struct TrainingEntry {
     hcpe3: Option<Hcpe3EntryData>,
 }
 
+/// hcpe3 policy の生成設定。
+#[derive(Clone, Copy)]
+struct Hcpe3PolicyConfig {
+    total: u16,
+    temp: f64,
+    multi_pv: u32,
+    eval_drop_threshold: i32,
+}
+
 /// 学習データ収集器
 /// 対局中の局面データを収集し、対局終了後に勝敗を設定して書き出す
 struct TrainingDataCollector {
@@ -798,10 +817,10 @@ struct TrainingDataCollector {
     /// PSV と同じループで game_id を書く。PSV 以外では常に None。
     game_id_writer: Option<BufWriter<File>>,
     format: TrainingFormat,
-    /// hcpe3 policy 分布の visit 総票数（softmax 量子化に使用）
-    policy_total: u16,
-    /// hcpe3 policy softmax の温度
-    policy_temp: f64,
+    /// hcpe3 policy の生成設定
+    policy: Hcpe3PolicyConfig,
+    /// hcpe3 gameInfo に符号化する最大手数
+    max_moves: u32,
     skip_initial_ply: u32,
     skip_in_check: bool,
     total_written: u64,
@@ -834,8 +853,13 @@ impl TrainingDataCollector {
             skip_initial_ply,
             skip_in_check,
             format,
-            policy_total,
-            policy_temp,
+            Hcpe3PolicyConfig {
+                total: policy_total,
+                temp: policy_temp,
+                multi_pv: u32::MAX,
+                eval_drop_threshold: DEFAULT_HCPE3_EVAL_DROP_THRESHOLD,
+            },
+            TEST_HCPE3_MAX_MOVES_GAME_INFO_CODE_1,
             game_id_path,
             false,
         )
@@ -846,8 +870,8 @@ impl TrainingDataCollector {
         skip_initial_ply: u32,
         skip_in_check: bool,
         format: TrainingFormat,
-        policy_total: u16,
-        policy_temp: f64,
+        policy: Hcpe3PolicyConfig,
+        max_moves: u32,
         game_id_path: Option<&Path>,
         append: bool,
     ) -> Result<Self> {
@@ -878,8 +902,8 @@ impl TrainingDataCollector {
             writer: BufWriter::new(file),
             game_id_writer,
             format,
-            policy_total,
-            policy_temp,
+            policy,
+            max_moves,
             skip_initial_ply,
             skip_in_check,
             total_written: 0,
@@ -986,7 +1010,14 @@ impl TrainingDataCollector {
             let policy = if candidates.is_empty() {
                 vec![(selected_move16, 1u16)]
             } else {
-                multipv_to_policy(candidates, self.policy_total, self.policy_temp)
+                multipv_to_policy(
+                    candidates,
+                    played_move,
+                    self.policy.total,
+                    self.policy.temp,
+                    self.policy.multi_pv,
+                    self.policy.eval_drop_threshold,
+                )
             };
             Some(Hcpe3EntryData {
                 selected_move16,
@@ -1031,9 +1062,20 @@ impl TrainingDataCollector {
     }
 
     /// 対局終了時に勝敗を設定して書き出す
+    #[cfg(test)]
     fn finish_game(
         &mut self,
         outcome: GameOutcome,
+        disposition: TrainingDisposition,
+        game_id: u32,
+    ) -> Result<()> {
+        self.finish_game_with_reason(outcome, OutcomeReason::Mate, disposition, game_id)
+    }
+
+    fn finish_game_with_reason(
+        &mut self,
+        outcome: GameOutcome,
+        outcome_reason: OutcomeReason,
         disposition: TrainingDisposition,
         game_id: u32,
     ) -> Result<()> {
@@ -1059,7 +1101,7 @@ impl TrainingDataCollector {
         match self.format {
             TrainingFormat::Psv => self.finish_game_psv(outcome, game_id)?,
             TrainingFormat::Pack => self.finish_game_pack(outcome)?,
-            TrainingFormat::Hcpe3 => self.finish_game_hcpe3(outcome)?,
+            TrainingFormat::Hcpe3 => self.finish_game_hcpe3(outcome, outcome_reason)?,
         }
 
         self.entries.clear();
@@ -1149,27 +1191,27 @@ impl TrainingDataCollector {
     /// hcpe3 形式で書き出す（可変長対局棋譜 + 各手の policy 分布）。
     ///
     /// レイアウト:
-    ///   [hcp: 32byte][moveNum: u16 LE][result: u8][opponent: u8]
+    ///   [hcp: 32byte][moveNum: u16 LE][result: u8][gameInfo: u8]
     ///   moveNum 回: [selectedMove16: u16 LE][eval: i16 LE][candidateNum: u16 LE]
     ///               candidateNum 回: [move16: u16 LE][visitNum: u16 LE]
     /// result は 0=draw / 1=black_win / 2=white_win。move16 は hcpe 形式。
     /// 局面は hcp から selectedMove16 を順に辿って再構成するため手列が連続している必要がある。
-    fn finish_game_hcpe3(&mut self, outcome: GameOutcome) -> Result<()> {
+    fn finish_game_hcpe3(
+        &mut self,
+        outcome: GameOutcome,
+        outcome_reason: OutcomeReason,
+    ) -> Result<()> {
         let (hcp, _start_ply, _is_hirate) =
             self.start_hcp.ok_or_else(|| anyhow!("hcpe3 format: start_hcp not set"))?;
         let move_num: u16 = self.entries.len().try_into().map_err(|_| {
             anyhow!("hcpe3 format: too many moves in one game ({})", self.entries.len())
         })?;
-        let result: u8 = match outcome {
-            GameOutcome::BlackWin => 1,
-            GameOutcome::WhiteWin => 2,
-            GameOutcome::Draw => 0,
-            GameOutcome::InProgress => unreachable!(),
-        };
+        let result = hcpe3_result(outcome, outcome_reason);
+        let game_info = hcpe3_game_info(self.max_moves);
 
         self.writer.write_all(&hcp)?;
         self.writer.write_all(&move_num.to_le_bytes())?;
-        self.writer.write_all(&[result, 0u8])?;
+        self.writer.write_all(&[result, game_info])?;
 
         for entry in &self.entries {
             let h = entry
@@ -1233,6 +1275,31 @@ impl TrainingDataCollector {
             discarded_no_bestmove_games: self.discarded_no_bestmove_games,
             declaration_win_dedup_skipped_games: self.declaration_win_dedup_skipped_games,
         }
+    }
+}
+
+fn hcpe3_result(outcome: GameOutcome, outcome_reason: OutcomeReason) -> u8 {
+    let result = match outcome {
+        GameOutcome::BlackWin => 1,
+        GameOutcome::WhiteWin => 2,
+        GameOutcome::Draw => 0,
+        GameOutcome::InProgress => unreachable!(),
+    };
+    result
+        | match outcome_reason {
+            OutcomeReason::Sennichite | OutcomeReason::PerpetualCheck => 4,
+            OutcomeReason::Win => 8,
+            OutcomeReason::MaxMoves => 16,
+            _ => 0,
+        }
+}
+
+fn hcpe3_game_info(max_moves: u32) -> u8 {
+    match max_moves {
+        256 => 1 << 2,
+        320 => 2 << 2,
+        512 => 3 << 2,
+        _ => 0,
     }
 }
 
@@ -1427,8 +1494,8 @@ fn validate_hcpe3_opts(
     if policy_total == 0 {
         bail!("--hcpe3-policy-total must be >= 1");
     }
-    if !(policy_temp.is_finite() && policy_temp > 0.0) {
-        bail!("--hcpe3-policy-temp must be a finite value > 0");
+    if !policy_temp.is_finite() {
+        bail!("--hcpe3-policy-temp must be finite");
     }
     Ok(())
 }
@@ -1591,27 +1658,105 @@ fn mate_to_eval(score_mate: i32) -> i16 {
     }
 }
 
+fn candidate_eval(candidate: &MultiPvCandidate) -> i32 {
+    candidate.score_mate.map_or(candidate.score_cp, |mate| {
+        // native backend の mate_ply は負け詰みでも手数が非負になり得るため、
+        // 勝敗符号が残る score_cp も使って詰み評価値の符号を復元する。
+        let signed_mate = if mate < 0 || candidate.score_cp < 0 {
+            -mate.abs()
+        } else {
+            mate.abs()
+        };
+        i32::from(mate_to_eval(signed_mate))
+    })
+}
+
 /// MultiPV 候補を hcpe3 の policy 分布 `(move16, visit)` へ変換する。
 ///
-/// 各候補スコアを温度 `temp` の softmax で確率化し、largest-remainder 法で `total` 票へ
-/// 厳密配分する（`sum(visit) == total`）。詰みは `±10000` にクリップして softmax を安定
-/// させる。決定性のため multipv 昇順で安定ソートし、余り票も端数の大きい順（同点は multipv
-/// 昇順）で決定的に配る。PV1 は必ず 1 票以上残す（0 票の候補は落とす）。
-fn multipv_to_policy(candidates: &[MultiPvCandidate], total: u16, temp: f64) -> Vec<(u16, u16)> {
-    let mut sorted: Vec<&MultiPvCandidate> = candidates.iter().collect();
+/// 各候補に最低 1 票を与え、残りを温度 `temp` の softmax と largest-remainder 法で
+/// 厳密配分する。決定性のため候補と同端数の配分順は multipv 昇順にする。
+fn multipv_to_policy(
+    candidates: &[MultiPvCandidate],
+    played_move: Move,
+    total: u16,
+    temp: f64,
+    multi_pv: u32,
+    eval_drop_threshold: i32,
+) -> Vec<(u16, u16)> {
+    let mut sorted = candidates.to_vec();
     sorted.sort_by_key(|c| c.multipv);
 
-    // 符号付きの score_cp（詰みも大きな正/負の値で符号を持つ）を ±10000 にクリップして
-    // softmax 入力にする。score_mate は手数のみで勝敗符号を持たない経路があるため使わない。
-    let scalar = |c: &MultiPvCandidate| -> f64 { f64::from(c.score_cp.clamp(-10000, 10000)) };
-    let max_s = sorted.iter().map(|c| scalar(c)).fold(f64::NEG_INFINITY, f64::max);
-    let weights: Vec<f64> = sorted.iter().map(|c| ((scalar(c) - max_s) / temp).exp()).collect();
+    let mut seen_move16 = Vec::with_capacity(sorted.len());
+    sorted.retain(|c| {
+        let move16 = move_to_psv_move16(c.first_move);
+        if seen_move16.contains(&move16) {
+            false
+        } else {
+            seen_move16.push(move16);
+            true
+        }
+    });
+
+    let selected_move16 = move_to_psv_move16(played_move);
+    if !seen_move16.contains(&selected_move16) {
+        let (score_cp, score_mate) =
+            sorted.first().map_or((0, None), |c| (c.score_cp, c.score_mate));
+        sorted.insert(
+            0,
+            MultiPvCandidate {
+                // 通常の MultiPV は 1-indexed。0 なら合成候補を常に先頭に固定できる。
+                multipv: 0,
+                score_cp,
+                score_mate,
+                first_move: played_move,
+            },
+        );
+    }
+
+    // 合成候補は先頭に挿入済みなので、末尾を切っても実着手は必ず残る。
+    sorted.truncate(multi_pv.clamp(1, MAX_HCPE3_POLICY_CANDIDATES) as usize);
+
+    if eval_drop_threshold >= 0 && !sorted.is_empty() {
+        let best_score = sorted.iter().map(candidate_eval).max().unwrap_or(i32::MIN);
+        sorted.retain(|c| {
+            best_score.saturating_sub(candidate_eval(c)) <= eval_drop_threshold
+                || move_to_psv_move16(c.first_move) == selected_move16
+        });
+    }
+
+    let total = u32::from(total).max(sorted.len() as u32).min(u32::from(u16::MAX));
+    let mut visits = vec![1u32; sorted.len()];
+    let remaining = total - sorted.len() as u32;
+    if remaining == 0 {
+        return sorted.iter().map(|c| (move_to_psv_move16(c.first_move), 1)).collect();
+    }
+
+    if temp <= 0.0 {
+        let best_score = sorted.iter().map(candidate_eval).max().unwrap_or(i32::MIN);
+        let best = sorted.iter().position(|c| candidate_eval(c) == best_score).unwrap_or(0);
+        visits[best] += remaining;
+        return sorted
+            .iter()
+            .zip(visits)
+            .map(|(c, visit)| (move_to_psv_move16(c.first_move), visit as u16))
+            .collect();
+    }
+
+    let max_s = sorted
+        .iter()
+        .map(|c| f64::from(candidate_eval(c)))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let weights: Vec<f64> = sorted
+        .iter()
+        .map(|c| ((f64::from(candidate_eval(c)) - max_s) / temp).clamp(-700.0, 700.0).exp())
+        .collect();
     let sum: f64 = weights.iter().sum();
 
-    // 各候補の理想票と floor を取り、不足分を端数の大きい順に 1 票ずつ配る。
-    let ideals: Vec<f64> = weights.iter().map(|w| w / sum * total as f64).collect();
-    let mut visits: Vec<u32> = ideals.iter().map(|x| x.floor() as u32).collect();
-    let mut leftover = total as u32 - visits.iter().sum::<u32>();
+    let ideals: Vec<f64> = weights.iter().map(|w| w / sum * f64::from(remaining)).collect();
+    for (visit, ideal) in visits.iter_mut().zip(&ideals) {
+        *visit += ideal.floor() as u32;
+    }
+    let mut leftover = total - visits.iter().sum::<u32>();
     let mut order: Vec<usize> = (0..sorted.len()).collect();
     order.sort_by(|&a, &b| {
         let ra = ideals[a] - ideals[a].floor();
@@ -1626,23 +1771,11 @@ fn multipv_to_policy(candidates: &[MultiPvCandidate], total: u16, temp: f64) -> 
         leftover -= 1;
     }
 
-    // PV1 は最低 1 票。0 票なら最大票の候補から 1 票移す（総票数は不変）。
-    if let Some(pv1) = sorted.iter().position(|c| c.multipv == 1)
-        && visits[pv1] == 0
-        && let Some(donor) = (0..visits.len()).max_by_key(|&i| visits[i])
-        && visits[donor] > 0
-    {
-        visits[donor] -= 1;
-        visits[pv1] += 1;
-    }
-
-    let mut out: Vec<(u16, u16)> = Vec::with_capacity(sorted.len());
-    for (c, &v) in sorted.iter().zip(&visits) {
-        if v > 0 {
-            out.push((move_to_psv_move16(c.first_move), v as u16));
-        }
-    }
-    out
+    sorted
+        .iter()
+        .zip(visits)
+        .map(|(c, visit)| (move_to_psv_move16(c.first_move), visit as u16))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1884,6 +2017,7 @@ struct WorkerConfig {
     training_format: TrainingFormat,
     hcpe3_policy_total: u16,
     hcpe3_policy_temp: f64,
+    hcpe3_eval_drop_threshold: i32,
     // gensfen: NativeBackend モード
     native_mode: bool,
     /// USI 単一エンジン最適化（先後同一エンジン時に 1 プロセスで兼用）。
@@ -1995,8 +2129,13 @@ fn worker_main(
                 cfg.skip_initial_ply,
                 cfg.skip_in_check,
                 cfg.training_format,
-                cfg.hcpe3_policy_total,
-                cfg.hcpe3_policy_temp,
+                Hcpe3PolicyConfig {
+                    total: cfg.hcpe3_policy_total,
+                    temp: cfg.hcpe3_policy_temp,
+                    multi_pv: cfg.random_multi_pv,
+                    eval_drop_threshold: cfg.hcpe3_eval_drop_threshold,
+                },
+                cfg.max_moves,
                 cfg.game_id_sidecar_path.as_deref(),
                 cfg.append_checkpoints,
             )?)
@@ -2465,7 +2604,12 @@ fn worker_main(
             }
 
             if let Some(ref mut collector) = training_data_collector {
-                collector.finish_game(outcome, training_disposition, game_idx + 1)?;
+                collector.finish_game_with_reason(
+                    outcome,
+                    outcome_reason,
+                    training_disposition,
+                    game_idx + 1,
+                )?;
             }
             if training_disposition.is_adopted()
                 && let Some(dedup_hash) = dedup_hash.as_deref()
@@ -3054,16 +3198,53 @@ fn validate_resume_fingerprint(meta: Option<&Value>, current: &Value) -> Result<
     let meta = meta.context(
         "--resume: meta has no generation fingerprint; move existing outputs aside and start a new run",
     )?;
-    if meta == current {
+    let mut saved = meta.clone();
+    let mut current = current.clone();
+    // hcpe3 policy のキーは psv / pack の fingerprint にも書かれるが、これらの形式では
+    // 生成物に影響しない。既定値を変えたときに無関係な差分で resume を拒否しないよう、
+    // hcpe3 以外では両側から対称に除外して比較する (片側だけだとキー欠落が差分になる)。
+    if current.pointer("/training/format").and_then(Value::as_str) != Some("hcpe3") {
+        remove_hcpe3_policy_fingerprint(&mut saved);
+        remove_hcpe3_policy_fingerprint(&mut current);
+    }
+    if saved == current {
         return Ok(());
     }
     let mut differences = Vec::new();
-    collect_json_differences("", meta, current, &mut differences);
+    collect_json_differences("", &saved, &current, &mut differences);
     differences.sort();
     bail!(
         "--resume: generation fingerprint mismatch in fields: {}",
         differences.join(", ")
     )
+}
+
+fn remove_hcpe3_policy_fingerprint(fingerprint: &mut Value) {
+    let Some(training) = fingerprint.get_mut("training").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for key in [
+        "hcpe3_policy_total",
+        "hcpe3_policy_temp",
+        "hcpe3_eval_drop_threshold",
+        "hcpe3_policy_algo",
+    ] {
+        training.remove(key);
+    }
+}
+
+fn add_hcpe3_policy_fingerprint(
+    fingerprint: &mut Value,
+    format: TrainingFormat,
+    eval_drop_threshold: i32,
+) {
+    if format == TrainingFormat::Hcpe3 {
+        // psv / pack の既存 run を巻き込まず、hcpe3 の policy 生成規約が変わった
+        // checkpoint からの resume を拒否するため、hcpe3 のときだけ常に記録する。
+        fingerprint["training"]["hcpe3_eval_drop_threshold"] =
+            serde_json::json!(eval_drop_threshold);
+        fingerprint["training"]["hcpe3_policy_algo"] = serde_json::json!(HCPE3_POLICY_ALGO_VERSION);
+    }
 }
 
 fn collect_json_differences(prefix: &str, left: &Value, right: &Value, out: &mut Vec<String>) {
@@ -4620,6 +4801,11 @@ fn main() -> Result<()> {
         // relabel_psv --deblunder の境界判定を silent に壊すため resume で拒否する。
         generation_fingerprint["auxiliary_outputs"]["omit_diversions"] = serde_json::json!(true);
     }
+    add_hcpe3_policy_fingerprint(
+        &mut generation_fingerprint,
+        training_format,
+        cli.hcpe3_eval_drop_threshold,
+    );
     if let Some(state) = &resume_state {
         validate_resume_fingerprint(state.fingerprint.as_ref(), &generation_fingerprint)?;
     }
@@ -4907,6 +5093,7 @@ fn main() -> Result<()> {
                 training_format,
                 hcpe3_policy_total: cli.hcpe3_policy_total,
                 hcpe3_policy_temp: cli.hcpe3_policy_temp,
+                hcpe3_eval_drop_threshold: cli.hcpe3_eval_drop_threshold,
                 native_mode,
                 usi_single,
                 eval_hash_size_mb: DEFAULT_EVAL_HASH_SIZE_MB,
@@ -6987,6 +7174,94 @@ mod tests {
     }
 
     #[test]
+    fn hcpe3_policy_fingerprint_is_format_specific() {
+        let mut psv = serde_json::json!({"training": {}});
+        add_hcpe3_policy_fingerprint(
+            &mut psv,
+            TrainingFormat::Psv,
+            DEFAULT_HCPE3_EVAL_DROP_THRESHOLD,
+        );
+        assert!(psv["training"].get("hcpe3_eval_drop_threshold").is_none());
+        assert!(psv["training"].get("hcpe3_policy_algo").is_none());
+
+        let mut hcpe3 = serde_json::json!({"training": {}});
+        add_hcpe3_policy_fingerprint(
+            &mut hcpe3,
+            TrainingFormat::Hcpe3,
+            DEFAULT_HCPE3_EVAL_DROP_THRESHOLD,
+        );
+        assert_eq!(
+            hcpe3["training"]["hcpe3_eval_drop_threshold"],
+            DEFAULT_HCPE3_EVAL_DROP_THRESHOLD
+        );
+        assert_eq!(hcpe3["training"]["hcpe3_policy_algo"], HCPE3_POLICY_ALGO_VERSION);
+    }
+
+    #[test]
+    fn psv_resume_ignores_legacy_hcpe3_policy_fields() {
+        let saved = serde_json::json!({
+            "training": {
+                "format": "psv",
+                "hcpe3_policy_total": 1000,
+                "hcpe3_policy_temp": 600.0,
+                "hcpe3_eval_drop_threshold": 300,
+                "hcpe3_policy_algo": 1
+            }
+        });
+        let current = serde_json::json!({
+            "training": {
+                "format": "psv",
+                "hcpe3_policy_total": 65535,
+                "hcpe3_policy_temp": 100.0
+            }
+        });
+
+        validate_resume_fingerprint(Some(&saved), &current).unwrap();
+    }
+
+    #[test]
+    fn hcpe3_resume_compares_policy_fields() {
+        let saved = serde_json::json!({
+            "training": {
+                "format": "hcpe3",
+                "hcpe3_policy_total": 1000,
+                "hcpe3_policy_temp": 100.0,
+                "hcpe3_eval_drop_threshold": 500,
+                "hcpe3_policy_algo": HCPE3_POLICY_ALGO_VERSION
+            }
+        });
+        let current = serde_json::json!({
+            "training": {
+                "format": "hcpe3",
+                "hcpe3_policy_total": 65535,
+                "hcpe3_policy_temp": 100.0,
+                "hcpe3_eval_drop_threshold": 500,
+                "hcpe3_policy_algo": HCPE3_POLICY_ALGO_VERSION
+            }
+        });
+
+        let error = validate_resume_fingerprint(Some(&saved), &current).unwrap_err().to_string();
+        assert!(error.contains("training.hcpe3_policy_total"));
+    }
+
+    #[test]
+    fn hcpe3_checkpoint_cannot_resume_as_psv() {
+        let saved = serde_json::json!({
+            "training": {
+                "format": "hcpe3",
+                "hcpe3_policy_total": 65535,
+                "hcpe3_policy_temp": 100.0,
+                "hcpe3_eval_drop_threshold": 500,
+                "hcpe3_policy_algo": HCPE3_POLICY_ALGO_VERSION
+            }
+        });
+        let current = serde_json::json!({"training": {"format": "psv"}});
+
+        let error = validate_resume_fingerprint(Some(&saved), &current).unwrap_err().to_string();
+        assert!(error.contains("training.format"));
+    }
+
+    #[test]
     fn failed_training_commit_does_not_write_result() {
         let result = ResultLog {
             kind: "result",
@@ -7173,7 +7448,7 @@ mod tests {
                 first_move: m2,
             },
         ];
-        let policy = multipv_to_policy(&candidates, 1000, 600.0);
+        let policy = multipv_to_policy(&candidates, m1, 1000, 600.0, 3, -1);
         assert!(!policy.is_empty());
         // PV1 (m1) が先頭で 1 票以上
         assert_eq!(policy[0].0, move_to_psv_move16(m1));
@@ -7204,7 +7479,7 @@ mod tests {
                 first_move: m2,
             },
         ];
-        let policy = multipv_to_policy(&candidates, 1000, 600.0);
+        let policy = multipv_to_policy(&candidates, m1, 1000, 600.0, 2, -1);
         assert_eq!(policy.len(), 2);
         assert_eq!(policy[0].1, policy[1].1);
     }
@@ -7214,7 +7489,7 @@ mod tests {
         // hcpe3 は中間スキップ・不正 policy パラメータを拒否する
         assert!(validate_hcpe3_opts(TrainingFormat::Hcpe3, true, 1000, 600.0).is_err());
         assert!(validate_hcpe3_opts(TrainingFormat::Hcpe3, false, 0, 600.0).is_err());
-        assert!(validate_hcpe3_opts(TrainingFormat::Hcpe3, false, 1000, 0.0).is_err());
+        assert!(validate_hcpe3_opts(TrainingFormat::Hcpe3, false, 1000, 0.0).is_ok());
         assert!(validate_hcpe3_opts(TrainingFormat::Hcpe3, false, 1000, f64::NAN).is_err());
         assert!(validate_hcpe3_opts(TrainingFormat::Hcpe3, false, 1000, 600.0).is_ok());
         // 他形式には制約を課さない
@@ -7615,7 +7890,7 @@ mod tests {
         assert_eq!(bytes.len(), 46);
         assert_eq!(u16::from_le_bytes([bytes[32], bytes[33]]), 1); // moveNum
         assert_eq!(bytes[34], 1); // result = BLACK_WIN
-        assert_eq!(bytes[35], 0); // opponent(予約)
+        assert_eq!(bytes[35], 4); // gameInfo: max_moves=256
         assert_eq!(i16::from_le_bytes([bytes[38], bytes[39]]), 123); // eval
         assert_eq!(u16::from_le_bytes([bytes[40], bytes[41]]), 1); // candidateNum
         assert_eq!(bytes[36..38], bytes[42..44]); // selectedMove16 == 候補 move16
@@ -7707,12 +7982,168 @@ mod tests {
             legal_candidate(5, -120, "5g5f"),
         ];
         for total in [1u16, 7, 1000, 1001, 65535] {
-            let policy = multipv_to_policy(&candidates, total, 600.0);
+            let policy =
+                multipv_to_policy(&candidates, candidates[0].first_move, total, 600.0, 5, -1);
             let sum: u32 = policy.iter().map(|(_, v)| *v as u32).sum();
-            assert_eq!(sum, total as u32, "total={total}");
+            assert_eq!(sum, u32::from(total).max(candidates.len() as u32), "total={total}");
             assert_eq!(policy[0].0, move_to_psv_move16(candidates[0].first_move));
-            assert!(policy[0].1 >= 1);
+            assert!(policy.iter().all(|(_, visit)| *visit >= 1));
         }
+    }
+
+    #[test]
+    fn multipv_to_policy_filters_eval_drop_but_keeps_selected_move() {
+        use tools::packed_sfen::move_to_psv_move16;
+
+        let candidates = vec![
+            legal_candidate(1, 1000, "7g7f"),
+            legal_candidate(2, 499, "2g2f"),
+            legal_candidate(3, 498, "3g3f"),
+        ];
+        let selected_move = candidates[2].first_move;
+        let selected = move_to_psv_move16(selected_move);
+        let policy = multipv_to_policy(&candidates, selected_move, 100, 100.0, 3, 500);
+
+        assert_eq!(policy.len(), 2);
+        assert_eq!(policy[0].0, move_to_psv_move16(candidates[0].first_move));
+        assert_eq!(policy[1].0, selected);
+        assert_eq!(policy.iter().map(|(_, visit)| u32::from(*visit)).sum::<u32>(), 100);
+        assert!(policy.iter().all(|(_, visit)| *visit >= 1));
+    }
+
+    #[test]
+    fn multipv_to_policy_inserts_missing_played_move_first() {
+        use rshogi_core::types::Move;
+        use tools::packed_sfen::move_to_psv_move16;
+
+        let candidates = vec![
+            legal_candidate(2, 80, "2g2f"),
+            legal_candidate(1, 100, "7g7f"),
+        ];
+        let played = Move::from_usi("3g3f").unwrap();
+        let policy = multipv_to_policy(&candidates, played, 100, 100.0, 2, 0);
+
+        assert_eq!(policy.len(), 2);
+        assert_eq!(policy[0].0, move_to_psv_move16(played));
+        assert!(policy[0].1 >= 1);
+        assert_eq!(policy.iter().map(|(_, visit)| u32::from(*visit)).sum::<u32>(), 100);
+    }
+
+    #[test]
+    fn multipv_to_policy_trims_synthetic_candidate_to_multi_pv_width() {
+        use rshogi_core::types::Move;
+        use tools::packed_sfen::move_to_psv_move16;
+
+        let candidates = vec![
+            legal_candidate(1, 100, "7g7f"),
+            legal_candidate(2, 80, "2g2f"),
+            legal_candidate(3, 60, "3g3f"),
+        ];
+        let played = Move::from_usi("6g6f").unwrap();
+        let policy = multipv_to_policy(&candidates, played, 100, 100.0, 3, -1);
+
+        assert_eq!(policy.len(), 3);
+        assert_eq!(policy[0].0, move_to_psv_move16(played));
+        assert_eq!(policy[1].0, move_to_psv_move16(candidates[0].first_move));
+        assert_eq!(policy[2].0, move_to_psv_move16(candidates[1].first_move));
+        assert!(
+            !policy
+                .iter()
+                .any(|(move16, _)| *move16 == move_to_psv_move16(candidates[2].first_move))
+        );
+        assert_eq!(policy.iter().map(|(_, visit)| u32::from(*visit)).sum::<u32>(), 100);
+    }
+
+    #[test]
+    fn multipv_to_policy_keeps_all_candidates_when_played_move_is_within_exact_width() {
+        use tools::packed_sfen::move_to_psv_move16;
+
+        let candidates = vec![
+            legal_candidate(1, 100, "7g7f"),
+            legal_candidate(2, 80, "2g2f"),
+            legal_candidate(3, 60, "3g3f"),
+        ];
+        let played = candidates[1].first_move;
+        let policy = multipv_to_policy(&candidates, played, 100, 100.0, 3, -1);
+
+        assert_eq!(policy.len(), candidates.len());
+        assert_eq!(
+            policy.iter().map(|(move16, _)| *move16).collect::<Vec<_>>(),
+            candidates
+                .iter()
+                .map(|candidate| move_to_psv_move16(candidate.first_move))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(policy.iter().map(|(_, visit)| u32::from(*visit)).sum::<u32>(), 100);
+    }
+
+    #[test]
+    fn multipv_to_policy_caps_width_at_hcpe3_candidate_limit() {
+        use rshogi_core::types::{Move, Square};
+
+        let candidates = (0..=MAX_HCPE3_POLICY_CANDIDATES)
+            .map(|index| MultiPvCandidate {
+                multipv: index + 1,
+                score_cp: 0,
+                score_mate: None,
+                first_move: Move::new_move(
+                    Square::from_u8((index / 81) as u8).unwrap(),
+                    Square::from_u8((index % 81) as u8).unwrap(),
+                    false,
+                ),
+            })
+            .collect::<Vec<_>>();
+        let policy = multipv_to_policy(
+            &candidates,
+            candidates[0].first_move,
+            1000,
+            100.0,
+            MAX_HCPE3_POLICY_CANDIDATES + 1,
+            -1,
+        );
+
+        assert_eq!(policy.len(), MAX_HCPE3_POLICY_CANDIDATES as usize);
+    }
+
+    #[test]
+    fn multipv_to_policy_clamps_multi_pv_width_to_one() {
+        use rshogi_core::types::Move;
+        use tools::packed_sfen::move_to_psv_move16;
+
+        let candidates = vec![
+            legal_candidate(1, 100, "7g7f"),
+            legal_candidate(2, 80, "2g2f"),
+        ];
+        let played = Move::from_usi("3g3f").unwrap();
+
+        for multi_pv in [0, 1] {
+            let policy = multipv_to_policy(&candidates, played, 100, 100.0, multi_pv, -1);
+            assert_eq!(policy, vec![(move_to_psv_move16(played), 100)]);
+        }
+    }
+
+    #[test]
+    fn multipv_to_policy_deduplicates_move16_by_lowest_multipv() {
+        use tools::packed_sfen::move_to_psv_move16;
+
+        let candidates = vec![
+            legal_candidate(3, -500, "7g7f"),
+            legal_candidate(2, 50, "2g2f"),
+            legal_candidate(1, 100, "7g7f"),
+        ];
+        let policy = multipv_to_policy(&candidates, candidates[0].first_move, 100, 100.0, 3, -1);
+
+        assert_eq!(policy.len(), 2);
+        assert_eq!(policy[0].0, move_to_psv_move16(candidates[0].first_move));
+        assert_eq!(policy.iter().map(|(_, visit)| u32::from(*visit)).sum::<u32>(), 100);
+        assert_eq!(
+            policy
+                .iter()
+                .filter(|(move16, _)| { *move16 == move_to_psv_move16(candidates[0].first_move) })
+                .count(),
+            1
+        );
+        assert!(policy[0].1 > policy[1].1);
     }
 
     #[test]
@@ -7722,9 +8153,41 @@ mod tests {
             legal_candidate(1, 100, "7g7f"),
             legal_candidate(2, 63, "2g2f"),
         ];
-        let a = multipv_to_policy(&candidates, 1000, 600.0);
-        let b = multipv_to_policy(&candidates, 1000, 600.0);
+        let a = multipv_to_policy(&candidates, candidates[1].first_move, 1000, 600.0, 3, -1);
+        let b = multipv_to_policy(&candidates, candidates[1].first_move, 1000, 600.0, 3, -1);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn multipv_to_policy_greedy_selects_first_best_candidate() {
+        use tools::packed_sfen::move_to_psv_move16;
+
+        let candidates = vec![
+            legal_candidate(3, 50, "3g3f"),
+            legal_candidate(2, 100, "2g2f"),
+            legal_candidate(1, 100, "7g7f"),
+        ];
+
+        for temp in [0.0, -1.0] {
+            let policy = multipv_to_policy(&candidates, candidates[2].first_move, 100, temp, 3, -1);
+            assert_eq!(policy[0], (move_to_psv_move16(candidates[2].first_move), 98));
+            assert_eq!(policy[1], (move_to_psv_move16(candidates[1].first_move), 1));
+            assert_eq!(policy[2], (move_to_psv_move16(candidates[0].first_move), 1));
+        }
+    }
+
+    #[test]
+    fn hcpe3_game_info_and_result_flags_match_dlshogi_layout() {
+        assert_eq!(hcpe3_game_info(256), 4);
+        assert_eq!(hcpe3_game_info(320), 8);
+        assert_eq!(hcpe3_game_info(512), 12);
+        assert_eq!(hcpe3_game_info(400), 0);
+
+        assert_eq!(hcpe3_result(GameOutcome::Draw, OutcomeReason::Sennichite), 4);
+        assert_eq!(hcpe3_result(GameOutcome::WhiteWin, OutcomeReason::PerpetualCheck), 6);
+        assert_eq!(hcpe3_result(GameOutcome::BlackWin, OutcomeReason::Win), 9);
+        assert_eq!(hcpe3_result(GameOutcome::Draw, OutcomeReason::MaxMoves), 16);
+        assert_eq!(hcpe3_result(GameOutcome::BlackWin, OutcomeReason::Mate), 1);
     }
 
     #[test]
@@ -7735,7 +8198,7 @@ mod tests {
 
         let good = Move::from_usi("7g7f").unwrap();
         let losing = Move::from_usi("2g2f").unwrap();
-        // PV2 は負け詰み: score_mate は手数のみで正(5)、勝敗符号は score_cp(大きな負)に残る
+        // PV2 は負け詰み
         let candidates = vec![
             MultiPvCandidate {
                 multipv: 1,
@@ -7750,7 +8213,8 @@ mod tests {
                 first_move: losing,
             },
         ];
-        let policy = multipv_to_policy(&candidates, 1000, 600.0);
+        assert_eq!(candidate_eval(&candidates[1]), -31995);
+        let policy = multipv_to_policy(&candidates, good, 1000, 600.0, 2, -1);
         let good_v = policy
             .iter()
             .find(|(m, _)| *m == move_to_psv_move16(good))
@@ -7761,6 +8225,24 @@ mod tests {
             .map_or(0, |(_, v)| *v);
         // 符号付き score_cp で負け詰みは大きく減点され、PV1 を上回らない
         assert!(good_v > losing_v);
+    }
+
+    #[test]
+    fn candidate_eval_handles_signed_usi_mate_and_cp_fallback() {
+        use rshogi_core::types::Move;
+        use tools::selfplay::MultiPvCandidate;
+
+        let candidate = |score_cp, score_mate| MultiPvCandidate {
+            multipv: 1,
+            score_cp,
+            score_mate,
+            first_move: Move::from_usi("7g7f").unwrap(),
+        };
+
+        assert_eq!(candidate_eval(&candidate(30000, Some(-5))), -31995);
+        assert_eq!(candidate_eval(&candidate(30000, Some(5))), 31995);
+        assert_eq!(candidate_eval(&candidate(30000, None)), 30000);
+        assert_eq!(candidate_eval(&candidate(-30000, None)), -30000);
     }
 
     #[test]
@@ -7798,8 +8280,10 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        // selectedMove16(36..38) は実着手、候補 move16(42..44) は PV1 = 最善手。両者は異なる
-        assert_ne!(bytes[36..38], bytes[42..44]);
+        // 実着手が MultiPV に無くても合成候補として先頭に入り、policy に 1 票以上を持つ
+        assert_eq!(u16::from_le_bytes([bytes[40], bytes[41]]), 2);
+        assert_eq!(bytes[36..38], bytes[42..44]);
+        assert!(u16::from_le_bytes([bytes[44], bytes[45]]) >= 1);
     }
 
     #[test]
