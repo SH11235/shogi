@@ -393,6 +393,7 @@ NativeBackend でこの指定を検出した場合は stderr に警告する。�
 `--random-multi-pv N`（N>1）を指定したときに収集される。`--random-multi-pv-diff 0` を併用すると
 着手を PV1 と同評価の候補に限定できる（同評価が PV1 だけなら実着手は PV1 になる）。なお
 selectedMove16 には実際に着手した手を記録するため、ランダム着手を使っても replay は崩れない。
+dlshogi の hcpe3 読み込み側は `moveNum <= 513` を前提とするため、`--max-moves` は 513 以下にすること。
 
 レコード（局面は開始局面 hcp から `selectedMove16` を辿って復元する = 手列が連続している必要）:
 
@@ -411,7 +412,8 @@ selectedMove16 には実際に着手した手を記録するため、ランダ�
 | visitNum | 2 | softmax 量子化した票数 |
 
 policy 候補は量子化前に、最善候補から `--hcpe3-eval-drop-threshold` を超えて劣る候補を
-除外する（負値で無効）。実際に着手した手は閾値を超えていても保持する。残った全候補へ
+除外する（負値で無効）。実際に着手した手は閾値を超えていても保持する。
+policy 候補数は `--random-multi-pv` の MultiPV 幅を超えない。残った全候補へ
 最低 1 票を与え、残りを各候補の eval と温度 `--hcpe3-policy-temp` の softmax で配分して
 `--hcpe3-policy-total` 票へ量子化する。総票数が候補数未満なら候補数まで引き上げる。
 詰み候補は eval と同じ `±(32000-ply)` を softmax にも使用する。
@@ -420,6 +422,11 @@ policy 候補は量子化前に、最善候補から `--hcpe3-eval-drop-threshol
 gensfen が書く eval は rshogi の cp スケールである。一方、dlshogi の `score_to_value` は
 `sigmoid(score / 756.086)` 固定で、`train.py` は `--use_evalfix` を指定した場合だけデータから
 係数を推定して補正する。dlshogi で学習するときは `--use_evalfix` を指定すること。
+
+参照実装との差異として、`MoveInfo.eval` の非詰み cp は psv 出力と共有する経路の規約を
+踏襲して ±10000 に clip する（参照実装は ±32767）。この経路を変えると psv 出力も変わる一方、
+`sigmoid(score / 756.086)` は 10000cp でほぼ飽和するため、学習への影響は小さい。
+また、`MoveInfo.eval` には実着手のスコアではなく PV1 の評価値を書く。
 
 ## 中断・再開（Resume）
 
