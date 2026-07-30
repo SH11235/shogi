@@ -10,7 +10,7 @@ NNUE学習用の PackedSfenValue 形式データを処理するツール群。
 |------------|--------|------|
 | sfen | 32 | PackedSfen（局面） |
 | score | 2 | 評価値（i16） |
-| move | 2 | 最善手（Move16形式） |
+| move | 2 | Move16 形式。gensfen が直接出力する PSV では最善手ラベル、`pack_to_psv` で pack から展開した PSV では実着手ラベル |
 | game_ply | 2 | 手数（u16） |
 | game_result | 1 | 勝敗（1=勝ち, 0=引分, -1=負け） |
 | padding | 1 | パディング |

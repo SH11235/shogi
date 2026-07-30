@@ -642,6 +642,7 @@ struct TrainingStats {
     skipped_initial: u64,
     skipped_in_check: u64,
     discarded_positions: u64,
+    discarded_gap_positions: u64,
     discarded_timeout_games: u64,
     discarded_illegal_move_games: u64,
     discarded_no_bestmove_games: u64,
@@ -654,6 +655,7 @@ impl TrainingStats {
         self.skipped_initial += other.skipped_initial;
         self.skipped_in_check += other.skipped_in_check;
         self.discarded_positions += other.discarded_positions;
+        self.discarded_gap_positions += other.discarded_gap_positions;
         self.discarded_timeout_games += other.discarded_timeout_games;
         self.discarded_illegal_move_games += other.discarded_illegal_move_games;
         self.discarded_no_bestmove_games += other.discarded_no_bestmove_games;
@@ -790,7 +792,7 @@ struct TrainingEntry {
     sfen: [u8; 32],
     /// 探索スコア（手番側から見た評価値）
     score: i16,
-    /// 最善手 (Move16形式)
+    /// 出力形式に応じた手ラベル（PSV は最善手、Pack は実着手）
     move16: u16,
     /// 手数
     game_ply: u16,
@@ -827,6 +829,7 @@ struct TrainingDataCollector {
     skipped_initial: u64,
     skipped_in_check: u64,
     discarded_positions: u64,
+    discarded_gap_positions: u64,
     discarded_timeout_games: u64,
     discarded_illegal_move_games: u64,
     discarded_no_bestmove_games: u64,
@@ -910,6 +913,7 @@ impl TrainingDataCollector {
             skipped_initial: 0,
             skipped_in_check: 0,
             discarded_positions: 0,
+            discarded_gap_positions: 0,
             discarded_timeout_games: 0,
             discarded_illegal_move_games: 0,
             discarded_no_bestmove_games: 0,
@@ -934,10 +938,11 @@ impl TrainingDataCollector {
         self.declaration_win_dedup_skipped_games += 1;
     }
 
-    /// 記録局面が 1 手飛んだとき、replay が必要な hcpe3 形式では蓄積中のセグメントを
-    /// 破棄して次の記録局面から取り直す（Psv/Pack は各局面が独立なので影響を受けない）。
+    /// 記録局面が 1 手飛んだとき、replay が必要な形式では蓄積中のセグメントを
+    /// 破棄して次の記録局面から取り直す（PSV は各局面が独立なので影響を受けない）。
     fn discard_segment_on_gap(&mut self) {
-        if self.format == TrainingFormat::Hcpe3 {
+        if matches!(self.format, TrainingFormat::Pack | TrainingFormat::Hcpe3) {
+            self.discarded_gap_positions += self.entries.len() as u64;
             self.entries.clear();
             self.start_hcp = None;
         }
@@ -981,14 +986,18 @@ impl TrainingDataCollector {
             // 通常のセンチポーンスコア
             cp.clamp(-10000, 10000) as i16
         } else {
-            // スコアがない場合は記録しない。hcpe3 は手列を連続させて replay するため、
+            // スコアがない場合は記録しない。Pack/hcpe3 は手列を連続させて replay するため、
             // 蓄積途中で 1 手飛ぶと復元不能になる。途中のセグメントを破棄して取り直す。
             self.discard_segment_on_gap();
             return;
         };
 
-        // 最善手をMove16形式に変換
-        let move16 = best_move.map_or(0, move_to_psv_move16);
+        // PSV と hcpe3 の move16 は最善手ラベル、Pack は replay 用の実着手を記録する。
+        // hcpe3 の replay 手は下の Hcpe3EntryData に別途保持する。
+        let move16 = match self.format {
+            TrainingFormat::Pack => move_to_psv_move16(played_move),
+            TrainingFormat::Psv | TrainingFormat::Hcpe3 => best_move.map_or(0, move_to_psv_move16),
+        };
 
         // PackedSfenを生成
         let packed_sfen = pack_position(pos);
@@ -997,7 +1006,8 @@ impl TrainingDataCollector {
         if matches!(self.format, TrainingFormat::Pack | TrainingFormat::Hcpe3)
             && self.start_hcp.is_none()
         {
-            let is_hirate = packed_sfen == self.hirate_packed_sfen;
+            // 1 byte の平手ヘッダは、配置だけでなく replay 開始手数も初期値のときに限る。
+            let is_hirate = packed_sfen == self.hirate_packed_sfen && current_ply == 1;
             let hcp = pack_position_hcp(pos);
             let ply = current_ply.clamp(0, u16::MAX as i32) as u16;
             self.start_hcp = Some((hcp, ply, is_hirate));
@@ -1270,6 +1280,7 @@ impl TrainingDataCollector {
             skipped_initial: self.skipped_initial,
             skipped_in_check: self.skipped_in_check,
             discarded_positions: self.discarded_positions,
+            discarded_gap_positions: self.discarded_gap_positions,
             discarded_timeout_games: self.discarded_timeout_games,
             discarded_illegal_move_games: self.discarded_illegal_move_games,
             discarded_no_bestmove_games: self.discarded_no_bestmove_games,
@@ -1472,24 +1483,24 @@ impl ShuffledStartpos {
     }
 }
 
-/// hcpe3 形式に固有の制約を検証する。
+/// replay 形式と hcpe3 policy に固有の制約を検証する。
 ///
-/// hcpe3 は hcp から各手を replay して局面を再構成するため手列が連続している必要がある。
+/// Pack/hcpe3 は hcp から各手を replay して局面を再構成するため手列が連続している必要がある。
 /// 中間局面を間引く `--skip-in-check` は replay を壊すので拒否する（序盤 prefix の
-/// `--skip-initial-ply` は連続性を保つため許可）。policy のパラメータも検証する。
-fn validate_hcpe3_opts(
+/// `--skip-initial-ply` は連続性を保つため許可）。hcpe3 では policy のパラメータも検証する。
+fn validate_training_format_opts(
     format: TrainingFormat,
     skip_in_check: bool,
     policy_total: u16,
     policy_temp: f64,
 ) -> Result<()> {
+    if matches!(format, TrainingFormat::Pack | TrainingFormat::Hcpe3) && skip_in_check {
+        bail!(
+            "pack and hcpe3 formats do not support --skip-in-check (skipping mid-game positions breaks move replay)"
+        );
+    }
     if format != TrainingFormat::Hcpe3 {
         return Ok(());
-    }
-    if skip_in_check {
-        bail!(
-            "hcpe3 format does not support --skip-in-check (skipping mid-game positions breaks move replay)"
-        );
     }
     if policy_total == 0 {
         bail!("--hcpe3-policy-total must be >= 1");
@@ -2443,8 +2454,8 @@ fn worker_main(
                                         mv
                                     };
 
-                                    // Psv/Pack は最善手 PV1 を、hcpe3 は replay 整合のため実着手
-                                    // played_mv を selectedMove16 に記録する（policy は MultiPV 候補）。
+                                    // PSV は最善手 PV1 をラベルにする。Pack/hcpe3 は replay 整合のため
+                                    // played_mv を実着手として記録する（hcpe3 policy は MultiPV 候補）。
                                     if !skip_record
                                         && let Some(ref mut collector) = training_data_collector
                                     {
@@ -4412,7 +4423,7 @@ fn main() -> Result<()> {
     if cli.emit_game_id_sidecar.is_some() && training_format != TrainingFormat::Psv {
         bail!("--emit-game-id-sidecar requires --training-data-format psv");
     }
-    validate_hcpe3_opts(
+    validate_training_format_opts(
         training_format,
         cli.skip_in_check,
         cli.hcpe3_policy_total,
@@ -5532,6 +5543,12 @@ fn main() -> Result<()> {
                 training_stats.discarded_illegal_move_games,
                 training_stats.discarded_no_bestmove_games,
                 training_stats.discarded_positions
+            );
+        }
+        if training_stats.discarded_gap_positions > 0 {
+            println!(
+                "Discarded positions at replay gaps: {}",
+                training_stats.discarded_gap_positions
             );
         }
         if training_stats.declaration_win_dedup_skipped_games > 0 {
@@ -7485,15 +7502,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_hcpe3_opts_enforces_constraints() {
-        // hcpe3 は中間スキップ・不正 policy パラメータを拒否する
-        assert!(validate_hcpe3_opts(TrainingFormat::Hcpe3, true, 1000, 600.0).is_err());
-        assert!(validate_hcpe3_opts(TrainingFormat::Hcpe3, false, 0, 600.0).is_err());
-        assert!(validate_hcpe3_opts(TrainingFormat::Hcpe3, false, 1000, 0.0).is_ok());
-        assert!(validate_hcpe3_opts(TrainingFormat::Hcpe3, false, 1000, f64::NAN).is_err());
-        assert!(validate_hcpe3_opts(TrainingFormat::Hcpe3, false, 1000, 600.0).is_ok());
-        // 他形式には制約を課さない
-        assert!(validate_hcpe3_opts(TrainingFormat::Pack, true, 0, 0.0).is_ok());
+    fn validate_training_format_opts_enforces_constraints() {
+        // replay 形式は中間スキップを拒否する
+        assert!(validate_training_format_opts(TrainingFormat::Pack, true, 0, 0.0).is_err());
+        assert!(validate_training_format_opts(TrainingFormat::Hcpe3, true, 1000, 600.0).is_err());
+        // hcpe3 は不正 policy パラメータも拒否する
+        assert!(validate_training_format_opts(TrainingFormat::Hcpe3, false, 0, 600.0).is_err());
+        assert!(validate_training_format_opts(TrainingFormat::Hcpe3, false, 1000, 0.0).is_ok());
+        assert!(
+            validate_training_format_opts(TrainingFormat::Hcpe3, false, 1000, f64::NAN).is_err()
+        );
+        assert!(validate_training_format_opts(TrainingFormat::Hcpe3, false, 1000, 600.0).is_ok());
+        // PSV には replay/policy の制約を課さない
+        assert!(validate_training_format_opts(TrainingFormat::Psv, true, 0, f64::NAN).is_ok());
     }
 
     #[test]
@@ -8287,6 +8308,64 @@ mod tests {
     }
 
     #[test]
+    fn pack_records_played_move_but_psv_keeps_best_move_label() {
+        use tools::packed_sfen::{move_to_psv_move16, psv_move16_to_hcpe};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut pos = Position::new();
+        pos.set_hirate();
+        let best = Move::from_usi("7g7f").unwrap();
+        let played = Move::from_usi("2g2f").unwrap();
+
+        let pack_path = dir.path().join("played.pack");
+        {
+            let mut collector = TrainingDataCollector::new(
+                &pack_path,
+                0,
+                false,
+                TrainingFormat::Pack,
+                1000,
+                600.0,
+                None,
+            )
+            .unwrap();
+            collector.record_position(&pos, Some(100), None, Some(best), played, &[]);
+            collector
+                .finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 1)
+                .unwrap();
+            collector.flush().unwrap();
+        }
+        let pack = std::fs::read(pack_path).unwrap();
+        assert_eq!(pack[0], 1); // 平手開始
+        assert_eq!(
+            u16::from_le_bytes([pack[1], pack[2]]),
+            psv_move16_to_hcpe(move_to_psv_move16(played))
+        );
+
+        let psv_path = dir.path().join("best.psv");
+        {
+            let mut collector = TrainingDataCollector::new(
+                &psv_path,
+                0,
+                false,
+                TrainingFormat::Psv,
+                1000,
+                600.0,
+                None,
+            )
+            .unwrap();
+            collector.record_position(&pos, Some(100), None, Some(best), played, &[]);
+            collector
+                .finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 1)
+                .unwrap();
+            collector.flush().unwrap();
+        }
+        let psv = std::fs::read(psv_path).unwrap();
+        let record = PackedSfenValue::from_bytes(&psv).unwrap();
+        assert_eq!(record.move16, move_to_psv_move16(best));
+    }
+
+    #[test]
     fn finish_game_hcpe3_one_hot_without_candidates() {
         use rshogi_core::position::Position;
         use rshogi_core::types::Move;
@@ -8426,6 +8505,7 @@ mod tests {
                 m2,
                 &[legal_candidate(1, 40, "3c3d")],
             );
+            assert_eq!(col.stats().discarded_gap_positions, 1);
             col.finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 1).unwrap();
             col.flush().unwrap();
         }
@@ -8435,6 +8515,84 @@ mod tests {
         // 破棄により書き出されるのは欠落後の 1 手だけで、起点 HCP は局面C（取り直し局面）
         assert_eq!(u16::from_le_bytes([bytes[32], bytes[33]]), 1);
         assert_eq!(&bytes[0..32], &expected_hcp);
+    }
+
+    #[test]
+    fn pack_no_score_discards_partial_segment_and_restarts_replay() {
+        use tools::packed_sfen::{move_to_psv_move16, pack_position_hcp, psv_move16_to_hcpe};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gap.pack");
+        let mut pos = Position::new();
+        pos.set_hirate();
+        let first = Move::from_usi("7g7f").unwrap();
+        let gives_check = pos.gives_check(first);
+        let mut after = pos.clone();
+        after.do_move(first, gives_check);
+        let second = Move::from_usi("3c3d").unwrap();
+        let expected_hcp = pack_position_hcp(&after);
+
+        {
+            let mut collector = TrainingDataCollector::new(
+                &path,
+                0,
+                false,
+                TrainingFormat::Pack,
+                1000,
+                600.0,
+                None,
+            )
+            .unwrap();
+            collector.record_position(&pos, Some(50), None, Some(first), first, &[]);
+            collector.record_position(&pos, None, None, Some(first), first, &[]);
+            collector.record_position(&after, Some(40), None, Some(second), second, &[]);
+            assert_eq!(collector.stats().discarded_gap_positions, 1);
+            collector
+                .finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 1)
+                .unwrap();
+            collector.flush().unwrap();
+        }
+
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes[0], 0); // 欠落後の局面は平手開始ではない
+        assert_eq!(&bytes[1..33], &expected_hcp);
+        assert_eq!(
+            u16::from_le_bytes([bytes[35], bytes[36]]),
+            psv_move16_to_hcpe(move_to_psv_move16(second))
+        );
+        assert_eq!(bytes.len(), 42); // 任意局面 header + 1手 + 終局 marker/reason
+    }
+
+    #[test]
+    fn pack_hirate_position_with_non_initial_ply_writes_explicit_start_ply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hirate_non_initial_ply.pack");
+        let mut pos = Position::new();
+        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 5")
+            .unwrap();
+        let mv = Move::from_usi("7g7f").unwrap();
+
+        {
+            let mut collector = TrainingDataCollector::new(
+                &path,
+                0,
+                false,
+                TrainingFormat::Pack,
+                1000,
+                600.0,
+                None,
+            )
+            .unwrap();
+            collector.record_position(&pos, Some(50), None, Some(mv), mv, &[]);
+            collector
+                .finish_game(GameOutcome::BlackWin, TrainingDisposition::Adopt, 1)
+                .unwrap();
+            collector.flush().unwrap();
+        }
+
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes[0], 0);
+        assert_eq!(u16::from_le_bytes([bytes[33], bytes[34]]), 5);
     }
 
     #[test]
