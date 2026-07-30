@@ -42,7 +42,7 @@
 | `jsonl_to_psv` | 自己対局 JSONL → PSV 変換（破損行は破棄して継続、件数を Summary に計上。[詳細](docs/pack_tools.md#jsonl_to_psv)） |
 | `psv_to_hcpe3` | PSV → dlshogi 学習用 hcpe3 / hcpe 変換（cshogi 互換、streaming、`move16=0` の有効な着手なしレコードを件数付きスキップ、`--evalfix-a` 対応） |
 | `migrate_psv_move16` | 旧リポジトリ形式 (B) の PSV move16 を実 YaneuraOu 形式 (A) へ移行（[詳細](docs/migrate_psv_move16.md)） |
-| `pack_to_psv` | GenSfen .pack → PSV 変換（move16 は実 YaneuraOu 形式） |
+| `pack_to_psv` | GenSfen .pack → PSV 変換（move16 は実着手ラベルの実 YaneuraOu 形式） |
 | `fix_scores` | スコアの補正 |
 | `psv_dedup` / `psv_dedup_bloom` / `psv_dedup_partition` | PSV 局面の重複除去（3 方式。使い分けは [pack_tools.md](docs/pack_tools.md#重複除去ツールの選び方)） |
 | `prep_hcpe` | hcpe 教師プールの汚染除去・重複除去・決定的 shuffle・分割（[詳細](docs/prep_hcpe.md)） |

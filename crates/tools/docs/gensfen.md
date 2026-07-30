@@ -172,7 +172,7 @@ position sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1
 | `--hcpe3-policy-temp F` | 100.0 | hcpe3 の policy softmax 温度（centipawn 単位、大きいほど分布を均す。0 以下は最善候補へ全票） |
 | `--hcpe3-eval-drop-threshold N` | 500 | 最善候補から N cp を超えて劣る候補を除外（負値で無効、実着手は常に保持） |
 | `--skip-initial-ply N` | 0 | 序盤 1〜N 手目をスキップ（hcpe3 でも prefix 連続なので可） |
-| `--skip-in-check BOOL` | false | 王手局面をスキップ（**hcpe3 では不可** = 中間スキップが replay を壊す） |
+| `--skip-in-check BOOL` | false | 王手局面をスキップ（**pack/hcpe3 では不可** = 中間スキップが replay を壊す） |
 
 ### 重複回避（gensfen 固有）
 
@@ -319,7 +319,7 @@ PackedSfenValue 形式（40バイト/局面）で、Nodchip learner 互換。
 |-----------|--------|-----------|
 | 0 | 32 | PackedSfen（局面データ） |
 | 32 | 2 | score（探索評価値、手番視点、cp） |
-| 34 | 2 | move16（最善手） |
+| 34 | 2 | move16（gensfen が直接出力する PSV では最善手） |
 | 36 | 2 | game_ply（手数） |
 | 38 | 1 | game_result（1=勝ち, 0=引き分け, -1=負け、手番視点） |
 | 39 | 1 | padding |
@@ -384,7 +384,23 @@ NativeBackend でこの指定を検出した場合は stderr に警告する。�
 ### pack 形式
 
 `--training-data-format pack` は 1 対局を可変長で書く（開始局面 hcp + 各手の move16/score
-+ 終局マーカー）。局面は開始局面から指し手を辿って復元する。
++ 終局マーカー）。局面は開始局面から指し手を replay して復元するため、手列は連続している
+必要がある。中間局面を間引く `--skip-in-check` は使用できない。pack の move16 は実際に
+着手した手を記録する。pack は 1 つの move16 フィールドで replay とラベルを兼ねるため、
+replay に必要な実着手と最善手ラベルを同時には保持できない。したがって `pack_to_psv` で
+展開した PSV の move16 も実着手ラベルとなり、gensfen が直接出力する PSV の最善手ラベルとは
+意味が異なる。
+
+### replay ギャップによるセグメント破棄（pack / hcpe3 共通）
+
+pack と hcpe3 は手列を replay して局面を復元するため、途中の 1 手が欠けると以降を復元できない。
+USI エンジンが `score cp` と `score mate` のどちらも返さない手があると、その局面は記録できない。
+このとき**その対局でそれまでに収集したセグメント全体を破棄し、次の有効な局面を新しい開始局面と
+して再開する**。破棄せずに継ぎ足すと、1 手飛んだ手列がそのまま書き出されて replay が壊れる。
+
+破棄した局面数はサマリの `Discarded positions at replay gaps` に出る（0 のときは表示しない）。
+教師局面数が想定より少ないときは、この値と対局単位の破棄件数を切り分けて確認する。
+native backend は評価値を必ず返すためこの経路には入らない。
 
 ### hcpe3 形式
 
