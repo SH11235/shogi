@@ -72,7 +72,7 @@ Output disk:          same filesystem as temp (/fast/ssd). 追加 headroom ...
 
 チェック内容:
 
-- **メモリ**: `Phase1 mem` と `Phase2 peak mem` のうち大きい方が `MemAvailable × 80%` を超えたら Err
+- **メモリ**: `Phase1 mem` と `Phase2 peak mem` のうち大きい方が OS の利用可能メモリ × 80% を超えたら Err。利用可能メモリを取得できない場合も `--force` なしでは停止
 - **temp ディスク**: 入力合計 × 1.05 が `--temp-dir` の空きを超えたら Err
 - **output ディスク**: 出力上限 = 入力合計（dedup しない最悪ケース）× 1.05 が出力親ディレクトリの空きを超えたら Err。temp と同一ファイルシステムの場合もチェックは省略しない。`--keep-temp` なしでは「処理中の最大 input partition」ぶんの追加 headroom、`--keep-temp` ありでは output 全量ぶんの追加空き容量を要求する
 - 不足時は停止。`--force` を付けると Warning を出して続行する（swap 多用・途中失敗のリスクを許容する場合のみ）

@@ -3,5 +3,6 @@
 pub mod dedup;
 pub mod floodgate;
 pub mod io;
+pub mod memory;
 pub mod sfen;
 pub mod sfen_ops;

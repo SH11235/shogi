@@ -56,8 +56,9 @@ use std::{
 use clap::Parser;
 use tools::common::dedup::{
     PSV_SIZE, SFEN_SIZE, check_output_not_in_inputs, collect_input_paths, format_gib,
-    get_disk_available, get_mem_available, hash_packed_sfen, same_filesystem, sum_file_sizes,
+    get_disk_available, hash_packed_sfen, same_filesystem, sum_file_sizes,
 };
+use tools::common::memory::available_memory_bytes;
 
 const INPUT_SUBDIR: &str = "input";
 const REF_SUBDIR: &str = "ref";
@@ -149,7 +150,7 @@ const HASH_VARIANCE_FACTOR: f64 = 1.2;
 /// ディスクチェックの安全マージン (5%)。
 const DISK_SAFETY_FACTOR: f64 = 1.05;
 
-/// メモリ不足判定のしきい値 (MemAvailable の 80%)。
+/// メモリ不足判定のしきい値（利用可能メモリの 80%）。
 const MEM_THRESHOLD_FACTOR: f64 = 0.8;
 
 struct ResourceEstimate {
@@ -236,6 +237,26 @@ fn preflight_check(
     keep_temp: bool,
     force: bool,
 ) -> io::Result<()> {
+    preflight_check_with_available_memory(
+        estimate,
+        temp_dir,
+        output_path,
+        skip_temp_check,
+        keep_temp,
+        force,
+        available_memory_bytes(),
+    )
+}
+
+fn preflight_check_with_available_memory(
+    estimate: &ResourceEstimate,
+    temp_dir: &Path,
+    output_path: Option<&Path>,
+    skip_temp_check: bool,
+    keep_temp: bool,
+    force: bool,
+    available_memory: Option<u64>,
+) -> io::Result<()> {
     eprintln!("=== Resource Estimate ===");
     eprintln!(
         "Total input records:  {} ({} bytes / {})",
@@ -260,7 +281,7 @@ fn preflight_check(
     let peak_mem = estimate.phase1_memory_bytes.max(estimate.phase2_peak_memory_bytes);
 
     // --- メモリチェック ---
-    if let Some(avail) = get_mem_available() {
+    if let Some(avail) = available_memory {
         let threshold = (avail as f64 * MEM_THRESHOLD_FACTOR) as u64;
         eprintln!(
             "Memory available:     {} (threshold {:.0}% = {})",
@@ -283,8 +304,15 @@ fn preflight_check(
                 return Err(io::Error::other(msg));
             }
         }
+    } else if force {
+        eprintln!(
+            "Warning (--force): 利用可能メモリを取得できないため、メモリチェックをスキップします"
+        );
     } else {
-        eprintln!("Memory available:     (取得不可、メモリチェックをスキップ)");
+        return Err(io::Error::other(
+            "利用可能メモリを取得できません。安全のため処理を停止します。\n\
+             続行する場合は --force を指定してください",
+        ));
     }
 
     // --- ディスクチェック ---
@@ -1354,6 +1382,24 @@ mod tests {
 
         assert_eq!(output_disk_required_bytes(&estimate, true, true, false), 1_260);
         assert_eq!(output_disk_required_bytes(&estimate, false, true, false), 4_200);
+    }
+
+    #[test]
+    fn dedup_only_preflight_succeeds_when_memory_is_available() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("output.bin");
+        let estimate = estimate_resources(0, 0, 1, 0);
+
+        preflight_check_with_available_memory(
+            &estimate,
+            dir.path(),
+            Some(&output),
+            true,
+            false,
+            false,
+            Some(u64::MAX),
+        )
+        .unwrap();
     }
 
     #[test]

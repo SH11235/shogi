@@ -31,6 +31,7 @@ use std::{
 
 use clap::Parser;
 use tools::common::dedup::{PSV_SIZE, SFEN_SIZE, check_output_not_in_inputs, collect_input_paths};
+use tools::common::memory::available_memory_bytes;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -179,20 +180,6 @@ fn hash_pair(sfen: &[u8; SFEN_SIZE]) -> (u64, u64) {
     (h1, h2 | 1)
 }
 
-/// /proc/meminfo から MemAvailable をバイト単位で取得する。
-/// 取得できない環境（非 Linux）では None を返す。
-fn get_mem_available() -> Option<u64> {
-    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb_str = rest.trim().strip_suffix("kB")?.trim();
-            let kb: u64 = kb_str.parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
-}
-
 fn format_gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
@@ -307,7 +294,7 @@ fn main() -> io::Result<()> {
     );
 
     // メモリ充足チェック
-    if let Some(mem_available) = get_mem_available() {
+    if let Some(mem_available) = available_memory_bytes() {
         let threshold = (mem_available as f64 * 0.8) as u64;
         eprintln!(
             "  required: {} / available: {} (80% threshold: {})",
@@ -330,11 +317,16 @@ fn main() -> io::Result<()> {
                 )));
             }
         }
-    } else {
+    } else if args.force {
         eprintln!(
-            "  required: {} (MemAvailable の取得不可、メモリチェックをスキップ)",
+            "  required: {} (利用可能メモリの取得不可、--force によりチェックをスキップ)",
             format_gib(params.size_bytes),
         );
+    } else {
+        return Err(io::Error::other(
+            "利用可能メモリを取得できません。安全のため処理を停止します。\n\
+             続行する場合は --force を指定してください",
+        ));
     }
 
     // ブルームフィルタ確保
