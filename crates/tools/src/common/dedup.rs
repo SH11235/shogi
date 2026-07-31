@@ -216,20 +216,6 @@ pub fn sum_file_sizes(paths: &[PathBuf]) -> io::Result<u64> {
     Ok(total)
 }
 
-/// /proc/meminfo から MemAvailable をバイト単位で取得する。
-/// 取得できない環境では None を返す。
-pub fn get_mem_available() -> Option<u64> {
-    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb_str = rest.trim().strip_suffix("kB")?.trim();
-            let kb: u64 = kb_str.parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
-}
-
 fn disk_probe_path(path: &Path) -> Option<PathBuf> {
     let probe = if path.exists() {
         path

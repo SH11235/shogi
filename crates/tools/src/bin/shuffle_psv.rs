@@ -30,6 +30,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use tools::common::memory::available_memory_bytes;
 use tools::packed_sfen::PackedSfenValue;
 
 const RECORD_SIZE: usize = PackedSfenValue::SIZE;
@@ -70,19 +71,6 @@ struct Cli {
 /// 処理中にCtrl-Cが押されたかを追跡
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-/// /proc/meminfo から MemAvailable をバイト単位で取得する。
-fn get_mem_available() -> Option<u64> {
-    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb_str = rest.trim().strip_suffix("kB")?.trim();
-            let kb: u64 = kb_str.parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
-}
-
 /// バイト数を人間が読みやすい形式にフォーマットする。
 fn format_size(bytes: usize) -> String {
     const GIB: usize = 1024 * 1024 * 1024;
@@ -99,9 +87,25 @@ fn format_size(bytes: usize) -> String {
 ///
 /// 80% 閾値は、OS・他プロセス・バッファキャッシュ等に 20% の余裕を確保するため。
 const MEMORY_VALIDATION_RATIO: f64 = 0.8;
+/// Pass 2 で使用できる利用可能メモリの割合。
+const MEMORY_BUDGET_RATIO: f64 = 0.7;
+
+fn batch_size_for_memory(
+    num_threads: usize,
+    max_chunk_bytes: usize,
+    available_memory: Option<u64>,
+) -> (usize, usize) {
+    let by_memory = available_memory
+        .map(|bytes| {
+            let usable = (bytes as f64 * MEMORY_BUDGET_RATIO) as usize;
+            (usable / max_chunk_bytes).max(1)
+        })
+        .unwrap_or(1);
+    (num_threads.min(by_memory), by_memory)
+}
 
 fn check_memory(required_bytes: usize, force: bool) -> Result<()> {
-    if let Some(mem_available) = get_mem_available() {
+    if let Some(mem_available) = available_memory_bytes() {
         let threshold = (mem_available as f64 * MEMORY_VALIDATION_RATIO) as usize;
         info!(
             "  required: {} / available: {} ({:.0}% threshold: {})",
@@ -124,8 +128,18 @@ fn check_memory(required_bytes: usize, force: bool) -> Result<()> {
                 );
             }
         }
+        return Ok(());
     }
-    Ok(())
+
+    if force {
+        warn!("利用可能メモリを取得できないため、--force によりメモリチェックをスキップします");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "利用可能メモリを取得できません。安全のため処理を停止します。\n\
+             続行する場合は --force を指定してください"
+        )
+    }
 }
 
 fn main() -> Result<()> {
@@ -400,21 +414,21 @@ fn shuffle_chunked(
     let max_chunk_bytes = chunk_size * RECORD_SIZE;
     // OS・他プロセス・バッファキャッシュ等のための余裕を 30% 確保し、
     // 利用可能メモリの 70% を上限とする。
-    const MEMORY_BUDGET_RATIO: f64 = 0.7;
     let batch_size = {
         let num_threads = rayon::current_num_threads();
-        // 非 Linux 環境では MemAvailable を取得できないため、制限なし（スレッド数で決定）
-        let mem_limit = get_mem_available().unwrap_or(u64::MAX);
-        let usable = (mem_limit as f64 * MEMORY_BUDGET_RATIO) as usize;
-        let by_memory = (usable / max_chunk_bytes).max(1);
-        let batch = num_threads.min(by_memory);
+        let available_memory = available_memory_bytes();
+        if available_memory.is_none() {
+            warn!("利用可能メモリを取得できないため、batch_size を 1 に制限します");
+        }
+        let (batch, by_memory) =
+            batch_size_for_memory(num_threads, max_chunk_bytes, available_memory);
         info!(
             "  batch_size: {} (threads: {}, memory allows: {} chunks × {} = {})",
             batch,
             num_threads,
             by_memory,
             format_size(max_chunk_bytes),
-            format_size(by_memory * max_chunk_bytes),
+            format_size(by_memory.saturating_mul(max_chunk_bytes)),
         );
         batch
     };
@@ -466,4 +480,20 @@ fn shuffle_chunked(
 
     info!("Shuffling complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_memory_limits_batch_to_one() {
+        assert_eq!(batch_size_for_memory(32, 40_000_000_000, None), (1, 1));
+    }
+
+    #[test]
+    fn batch_size_is_limited_by_memory_and_threads() {
+        assert_eq!(batch_size_for_memory(16, 100, Some(1_000)), (7, 7));
+        assert_eq!(batch_size_for_memory(4, 100, Some(1_000)), (4, 7));
+    }
 }
