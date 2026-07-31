@@ -487,10 +487,16 @@ mod tests {
         let paths = collect_merge_input_paths(dir.path(), "train_*.bin", true).unwrap();
         let names: Vec<_> = paths
             .iter()
-            .map(|path| path.strip_prefix(dir.path()).unwrap().to_string_lossy().into_owned())
+            .map(|path| path.strip_prefix(dir.path()).unwrap().to_path_buf())
             .collect();
 
-        assert_eq!(names, vec!["train_000.bin", "archive/train_001.bin"]);
+        assert_eq!(
+            names,
+            vec![
+                PathBuf::from("train_000.bin"),
+                PathBuf::from("archive").join("train_001.bin")
+            ]
+        );
     }
 
     #[test]
@@ -516,16 +522,16 @@ mod tests {
         let paths = collect_merge_input_paths(dir.path(), "train_*.bin", true).unwrap();
         let names: Vec<_> = paths
             .iter()
-            .map(|path| path.strip_prefix(dir.path()).unwrap().to_string_lossy().into_owned())
+            .map(|path| path.strip_prefix(dir.path()).unwrap().to_path_buf())
             .collect();
 
         assert_eq!(
             names,
             vec![
-                "a/train_000.bin",
-                "b/train_001.bin",
-                "a/train_002.bin",
-                "b/train_003.bin"
+                PathBuf::from("a").join("train_000.bin"),
+                PathBuf::from("b").join("train_001.bin"),
+                PathBuf::from("a").join("train_002.bin"),
+                PathBuf::from("b").join("train_003.bin")
             ]
         );
     }
