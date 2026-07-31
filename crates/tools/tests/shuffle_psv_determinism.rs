@@ -47,8 +47,8 @@ fn chunked_output_is_independent_of_threads_and_batch_size() {
     let single_log = run_shuffle(&input, &single_output, 1);
     let multi_log = run_shuffle(&input, &multi_output, 4);
 
-    assert!(single_log.contains("batch_size: 1 (threads: 1"));
-    assert!(multi_log.contains("batch_size: 4 (threads: 4"));
+    assert!(single_log.contains("Pass 2 batching (threads: 1,"));
+    assert!(multi_log.contains("Pass 2 batching (threads: 4,"));
     assert_eq!(
         fs::read(single_output).expect("単一スレッド出力を読めること"),
         fs::read(multi_output).expect("複数スレッド出力を読めること"),

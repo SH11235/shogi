@@ -90,18 +90,32 @@ const MEMORY_VALIDATION_RATIO: f64 = 0.8;
 /// Pass 2 で使用できる利用可能メモリの割合。
 const MEMORY_BUDGET_RATIO: f64 = 0.7;
 
-fn batch_size_for_memory(
+fn memory_budget(available_memory: Option<u64>) -> Option<u64> {
+    available_memory.map(|bytes| (bytes as f64 * MEMORY_BUDGET_RATIO) as u64)
+}
+
+fn batch_end_for_memory(
+    chunk_sizes: &[u64],
+    batch_start: usize,
     num_threads: usize,
-    max_chunk_bytes: usize,
-    available_memory: Option<u64>,
-) -> (usize, usize) {
-    let by_memory = available_memory
-        .map(|bytes| {
-            let usable = (bytes as f64 * MEMORY_BUDGET_RATIO) as usize;
-            (usable / max_chunk_bytes).max(1)
-        })
-        .unwrap_or(1);
-    (num_threads.min(by_memory), by_memory)
+    memory_budget: Option<u64>,
+) -> usize {
+    let max_end = (batch_start + num_threads).min(chunk_sizes.len());
+    let Some(memory_budget) = memory_budget else {
+        return (batch_start + 1).min(max_end);
+    };
+
+    let mut batch_bytes = 0u64;
+    let mut batch_end = batch_start;
+    while batch_end < max_end {
+        let next_bytes = batch_bytes.saturating_add(chunk_sizes[batch_end]);
+        if batch_end > batch_start && next_bytes > memory_budget {
+            break;
+        }
+        batch_bytes = next_bytes;
+        batch_end += 1;
+    }
+    batch_end
 }
 
 fn check_memory(required_bytes: usize, force: bool) -> Result<()> {
@@ -408,37 +422,43 @@ fn shuffle_chunked(
         .with_context(|| format!("Failed to create {}", output_path.display()))?;
     let mut writer = BufWriter::with_capacity(BUF_SIZE, out_file);
 
-    // バッチサイズをメモリ上限で制限する。
-    // 各チャンクは最大 chunk_size * RECORD_SIZE バイトをメモリに展開するため、
-    // 同時にロードするチャンク数 × チャンクサイズが利用可能メモリを超えないようにする。
-    let max_chunk_bytes = chunk_size * RECORD_SIZE;
+    let chunk_sizes = chunk_paths
+        .iter()
+        .map(|path| {
+            std::fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .with_context(|| format!("Failed to read chunk metadata: {}", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let num_threads = rayon::current_num_threads();
     // OS・他プロセス・バッファキャッシュ等のための余裕を 30% 確保し、
     // 利用可能メモリの 70% を上限とする。
-    let batch_size = {
-        let num_threads = rayon::current_num_threads();
-        let available_memory = available_memory_bytes();
-        if available_memory.is_none() {
-            warn!("利用可能メモリを取得できないため、batch_size を 1 に制限します");
-        }
-        let (batch, by_memory) =
-            batch_size_for_memory(num_threads, max_chunk_bytes, available_memory);
-        info!(
-            "  batch_size: {} (threads: {}, memory allows: {} chunks × {} = {})",
-            batch,
-            num_threads,
-            by_memory,
-            format_size(max_chunk_bytes),
-            format_size(by_memory.saturating_mul(max_chunk_bytes)),
-        );
-        batch
-    };
-    for batch_start in (0..num_chunks).step_by(batch_size) {
+    let memory_budget = memory_budget(available_memory_bytes());
+    if memory_budget.is_none() {
+        warn!("利用可能メモリを取得できないため、各バッチを 1 チャンクに制限します");
+    }
+    info!(
+        "  Pass 2 batching (threads: {}, memory budget: {})",
+        num_threads,
+        memory_budget.map_or_else(|| "unknown".to_string(), |bytes| format_size(bytes as usize)),
+    );
+
+    let mut batch_start = 0;
+    while batch_start < num_chunks {
         if INTERRUPTED.load(Ordering::SeqCst) {
             progress.abandon_with_message("Interrupted");
             return Ok(());
         }
 
-        let batch_end = (batch_start + batch_size).min(num_chunks);
+        let batch_end = batch_end_for_memory(&chunk_sizes, batch_start, num_threads, memory_budget);
+        if memory_budget.is_some_and(|budget| chunk_sizes[batch_start] > budget) {
+            warn!(
+                "chunk {} ({}) exceeds the Pass 2 memory budget ({}); loading it alone",
+                batch_start,
+                format_size(chunk_sizes[batch_start] as usize),
+                format_size(memory_budget.unwrap_or_default() as usize),
+            );
+        }
         let batch_paths = &chunk_paths[batch_start..batch_end];
         let batch_seeds = &chunk_seeds[batch_start..batch_end];
 
@@ -473,6 +493,8 @@ fn shuffle_chunked(
             }
             progress.inc(1);
         }
+        // バッチ構成によらずチャンク index 順に書き出すため、出力の決定性は変わらない。
+        batch_start = batch_end;
     }
 
     writer.flush()?;
@@ -488,12 +510,19 @@ mod tests {
 
     #[test]
     fn unavailable_memory_limits_batch_to_one() {
-        assert_eq!(batch_size_for_memory(32, 40_000_000_000, None), (1, 1));
+        assert_eq!(batch_end_for_memory(&[100, 100], 0, 32, None), 1);
     }
 
     #[test]
-    fn batch_size_is_limited_by_memory_and_threads() {
-        assert_eq!(batch_size_for_memory(16, 100, Some(1_000)), (7, 7));
-        assert_eq!(batch_size_for_memory(4, 100, Some(1_000)), (4, 7));
+    fn batch_is_limited_by_actual_size_memory_and_threads() {
+        let sizes = [100, 200, 300, 400];
+        assert_eq!(batch_end_for_memory(&sizes, 0, 16, Some(550)), 2);
+        assert_eq!(batch_end_for_memory(&sizes, 0, 2, Some(1_000)), 2);
+        assert_eq!(batch_end_for_memory(&sizes, 2, 16, Some(1_000)), 4);
+    }
+
+    #[test]
+    fn oversized_chunk_is_loaded_alone() {
+        assert_eq!(batch_end_for_memory(&[600, 100], 0, 16, Some(550)), 1);
     }
 }
