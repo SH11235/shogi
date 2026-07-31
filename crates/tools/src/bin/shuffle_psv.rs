@@ -94,6 +94,15 @@ fn memory_budget(available_memory: Option<u64>) -> Option<u64> {
     available_memory.map(|bytes| (bytes as f64 * MEMORY_BUDGET_RATIO) as u64)
 }
 
+fn chunk_memory_bytes(chunk_file_bytes: u64) -> u64 {
+    chunk_file_bytes.saturating_add(BUF_SIZE as u64)
+}
+
+fn pass1_buffer_bytes(num_chunks: usize) -> usize {
+    let per_chunk_writer = BUF_SIZE / num_chunks.clamp(1, 64);
+    BUF_SIZE.saturating_add(per_chunk_writer.saturating_mul(num_chunks))
+}
+
 fn batch_end_for_memory(
     chunk_sizes: &[u64],
     batch_start: usize,
@@ -108,7 +117,7 @@ fn batch_end_for_memory(
     let mut batch_bytes = 0u64;
     let mut batch_end = batch_start;
     while batch_end < max_end {
-        let next_bytes = batch_bytes.saturating_add(chunk_sizes[batch_end]);
+        let next_bytes = batch_bytes.saturating_add(chunk_memory_bytes(chunk_sizes[batch_end]));
         if batch_end > batch_start && next_bytes > memory_budget {
             break;
         }
@@ -119,7 +128,15 @@ fn batch_end_for_memory(
 }
 
 fn check_memory(required_bytes: usize, force: bool) -> Result<()> {
-    if let Some(mem_available) = available_memory_bytes() {
+    check_memory_with_available(required_bytes, force, available_memory_bytes())
+}
+
+fn check_memory_with_available(
+    required_bytes: usize,
+    force: bool,
+    available_memory: Option<u64>,
+) -> Result<()> {
+    if let Some(mem_available) = available_memory {
         let threshold = (mem_available as f64 * MEMORY_VALIDATION_RATIO) as usize;
         info!(
             "  required: {} / available: {} ({:.0}% threshold: {})",
@@ -349,16 +366,20 @@ fn shuffle_chunked(
         );
     }
 
-    // ランダム振り分け後の期待チャンクサイズで見積もる。
+    // ランダム振り分け後の期待チャンクサイズで事前見積もりする。
     // chunk_size そのものではなく record_count / num_chunks を使うことで、
     // record_count が chunk_size をわずかに超える場合の過大見積もりを防ぐ。
     let expected_chunk_records = (record_count as usize).div_ceil(num_chunks);
     let expected_chunk_bytes = expected_chunk_records * RECORD_SIZE;
+    let expected_chunk_memory = expected_chunk_bytes.saturating_add(BUF_SIZE);
+    let pass1_buffers = pass1_buffer_bytes(num_chunks);
+    let preflight_memory = expected_chunk_memory.max(pass1_buffers);
     info!(
-        "Creating {num_chunks} temporary chunks (expected max chunk: {})",
-        format_size(expected_chunk_bytes),
+        "Creating {num_chunks} temporary chunks (expected chunk memory: {}, Pass 1 buffers: {})",
+        format_size(expected_chunk_memory),
+        format_size(pass1_buffers),
     );
-    check_memory(expected_chunk_bytes, force)?;
+    check_memory(preflight_memory, force)?;
 
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
 
@@ -399,6 +420,7 @@ fn shuffle_chunked(
         chunk_writers[chunk_idx].write_all(&buffer)?;
         progress.inc(1);
     }
+    drop(reader);
 
     for writer in &mut chunk_writers {
         writer.flush()?;
@@ -418,10 +440,6 @@ fn shuffle_chunked(
         .map(|i| temp_dir.path().join(format!("chunk_{i}.tmp")))
         .collect();
 
-    let out_file = File::create(output_path)
-        .with_context(|| format!("Failed to create {}", output_path.display()))?;
-    let mut writer = BufWriter::with_capacity(BUF_SIZE, out_file);
-
     let chunk_sizes = chunk_paths
         .iter()
         .map(|path| {
@@ -430,10 +448,24 @@ fn shuffle_chunked(
                 .with_context(|| format!("Failed to read chunk metadata: {}", path.display()))
         })
         .collect::<Result<Vec<_>>>()?;
+    let max_chunk_memory =
+        chunk_sizes.iter().copied().map(chunk_memory_bytes).max().unwrap_or_default();
+    let max_chunk_memory = usize::try_from(max_chunk_memory)
+        .context("Largest chunk does not fit in this platform's address space")?;
+    let available_memory = available_memory_bytes();
+    // Pass 1 のランダム分配では期待値を超えるチャンクが生じ得るため、
+    // 実サイズが判明した時点で再検査する。失敗時に既存出力を truncate しないよう、
+    // 出力ファイルを開く前に行う。
+    check_memory_with_available(max_chunk_memory, force, available_memory)?;
+
+    let out_file = File::create(output_path)
+        .with_context(|| format!("Failed to create {}", output_path.display()))?;
+    let mut writer = BufWriter::with_capacity(BUF_SIZE, out_file);
+
     let num_threads = rayon::current_num_threads();
     // OS・他プロセス・バッファキャッシュ等のための余裕を 30% 確保し、
     // 利用可能メモリの 70% を上限とする。
-    let memory_budget = memory_budget(available_memory_bytes());
+    let memory_budget = memory_budget(available_memory);
     if memory_budget.is_none() {
         warn!("利用可能メモリを取得できないため、各バッチを 1 チャンクに制限します");
     }
@@ -451,11 +483,12 @@ fn shuffle_chunked(
         }
 
         let batch_end = batch_end_for_memory(&chunk_sizes, batch_start, num_threads, memory_budget);
-        if memory_budget.is_some_and(|budget| chunk_sizes[batch_start] > budget) {
+        let first_chunk_memory = chunk_memory_bytes(chunk_sizes[batch_start]);
+        if memory_budget.is_some_and(|budget| first_chunk_memory > budget) {
             warn!(
-                "chunk {} ({}) exceeds the Pass 2 memory budget ({}); loading it alone",
+                "chunk {} estimated memory ({}) exceeds the Pass 2 memory budget ({}); loading it alone",
                 batch_start,
-                format_size(chunk_sizes[batch_start] as usize),
+                format_size(first_chunk_memory as usize),
                 format_size(memory_budget.unwrap_or_default() as usize),
             );
         }
@@ -516,13 +549,32 @@ mod tests {
     #[test]
     fn batch_is_limited_by_actual_size_memory_and_threads() {
         let sizes = [100, 200, 300, 400];
-        assert_eq!(batch_end_for_memory(&sizes, 0, 16, Some(550)), 2);
-        assert_eq!(batch_end_for_memory(&sizes, 0, 2, Some(1_000)), 2);
-        assert_eq!(batch_end_for_memory(&sizes, 2, 16, Some(1_000)), 4);
+        assert_eq!(batch_end_for_memory(&sizes, 0, 16, Some(2 * BUF_SIZE as u64 + 550)), 2);
+        assert_eq!(batch_end_for_memory(&sizes, 0, 2, Some(4 * BUF_SIZE as u64 + 1_000)), 2);
+        assert_eq!(batch_end_for_memory(&sizes, 2, 16, Some(2 * BUF_SIZE as u64 + 1_000)), 4);
     }
 
     #[test]
     fn oversized_chunk_is_loaded_alone() {
-        assert_eq!(batch_end_for_memory(&[600, 100], 0, 16, Some(550)), 1);
+        assert_eq!(batch_end_for_memory(&[600, 100], 0, 16, Some(BUF_SIZE as u64 + 550)), 1);
+    }
+
+    #[test]
+    fn batch_budget_includes_per_chunk_reader_buffers() {
+        assert_eq!(batch_end_for_memory(&[0, 0], 0, 2, Some(BUF_SIZE as u64)), 1);
+    }
+
+    #[test]
+    fn preflight_counts_all_pass1_buffers() {
+        assert_eq!(pass1_buffer_bytes(1), 2 * BUF_SIZE);
+        assert_eq!(pass1_buffer_bytes(64), 2 * BUF_SIZE);
+        assert_eq!(pass1_buffer_bytes(1_000), BUF_SIZE + 1_000 * (BUF_SIZE / 64));
+    }
+
+    #[test]
+    fn actual_chunk_over_validation_threshold_requires_force() {
+        assert!(check_memory_with_available(801, false, Some(1_000)).is_err());
+        assert!(check_memory_with_available(801, true, Some(1_000)).is_ok());
+        assert!(check_memory_with_available(800, false, Some(1_000)).is_ok());
     }
 }
