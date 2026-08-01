@@ -142,3 +142,6 @@ best-effort 検出用で、暗号学的 digest ではない）。resume 時は�
 参照 CSA 内容の累積 SHA-256 を照合し、checkpoint より後の一時データは記録済み byte 位置へ
 切り戻してから再処理する。公開は `out.work/` から同一 filesystem 内の rename
 （Linux では `RENAME_NOREPLACE`）で行う。
+Windows でも動作し、ファイル本体の flush・sync は同様に行うが、ディレクトリ
+エントリの fsync は Unix 専用で Windows では no-op（rename・作成の crash 耐久性は
+NTFS のメタデータジャーナリングに委ねる）。
