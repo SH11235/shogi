@@ -664,7 +664,9 @@ fn validate_output_checkpoint(path: &Path, expected_len: u64, expected_hash: u64
 
 fn publish_staged_file(staged: &Path, final_path: &Path) -> Result<()> {
     if staged.exists() {
-        File::open(staged)?.sync_all()?;
+        // Windows の FlushFileBuffers は書き込みアクセスを要求するため、
+        // 読み取り専用ハンドルでは ERROR_ACCESS_DENIED になる。
+        OpenOptions::new().write(true).open(staged)?.sync_all()?;
         fs::rename(staged, final_path)?;
     } else {
         ensure!(final_path.is_file(), "missing staged output: {}", staged.display());
