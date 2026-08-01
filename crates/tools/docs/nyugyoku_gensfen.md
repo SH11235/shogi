@@ -143,5 +143,5 @@ best-effort 検出用で、暗号学的 digest ではない）。resume 時は�
 切り戻してから再処理する。公開は `out.work/` から同一 filesystem 内の rename
 （Linux では `RENAME_NOREPLACE`）で行う。
 Windows でも動作し、ファイル本体の flush・sync は同様に行うが、ディレクトリ
-エントリの fsync は Unix 専用で Windows では no-op（rename・作成の crash 耐久性は
-NTFS のメタデータジャーナリングに委ねる）。
+エントリの fsync は Unix 専用で Windows では no-op。Windows では rename・ファイル
+作成の crash 耐久性を本ツールでは保証せず、OS・filesystem の挙動に依存する。
