@@ -664,7 +664,13 @@ fn validate_output_checkpoint(path: &Path, expected_len: u64, expected_hash: u64
 
 fn publish_staged_file(staged: &Path, final_path: &Path) -> Result<()> {
     if staged.exists() {
+        // Windows の FlushFileBuffers は書き込みアクセスを要求するため書き込み
+        // ハンドルで開く。Unix は read-only な staged ファイルも同期できる
+        // 読み取りハンドルを維持する。
+        #[cfg(unix)]
         File::open(staged)?.sync_all()?;
+        #[cfg(not(unix))]
+        OpenOptions::new().write(true).open(staged)?.sync_all()?;
         fs::rename(staged, final_path)?;
     } else {
         ensure!(final_path.is_file(), "missing staged output: {}", staged.display());
@@ -1473,6 +1479,22 @@ mod tests {
         assert!(rename_noreplace(&source, &destination).is_err());
         assert!(source.is_dir());
         assert!(destination.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_syncs_read_only_staged_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("startpos.txt.tmp");
+        fs::write(&staged, "position sfen x\n").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o444)).unwrap();
+        let final_path = dir.path().join("startpos.txt");
+
+        publish_staged_file(&staged, &final_path).unwrap();
+        assert!(final_path.is_file());
+        assert!(!staged.exists());
     }
 
     #[cfg(unix)]
