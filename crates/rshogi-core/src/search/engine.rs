@@ -1402,9 +1402,9 @@ where
 {
     let is_main = main_state.is_some();
 
-    // YO の反復深化開始時の stack 全体ゼロ初期化に合わせ、毎 go 全スロットをクリアする。
-    // 孫スロットをクリアする経路に穴があっても go をまたぐ寿命比例の蓄積と i32 overflow を
-    // 防ぎ、go 内の蓄積は YO 同様に保持する。
+    // 毎 go の開始時に全スロットの cutoff_cnt をクリアする。孫スロット方式のクリア経路に
+    // 穴があっても go をまたぐ寿命比例の蓄積と i32 overflow を起こさないための防御で、
+    // go 内の蓄積は保持される。
     for stack in &mut worker.state.stack {
         stack.cutoff_cnt = 0;
     }
