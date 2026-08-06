@@ -81,7 +81,8 @@ env_logger = { workspace = true, optional = true }
 # version は workspace 上 (ctrlc 経由) で既に解決されている `0.31` 系に揃え、
 # Cargo.lock の dup を回避する。
 # NOTE: この target 固有セクションは必ずファイル末尾に置くこと。汎用
-# [dependencies] より上に置くと、後続の依存 (tungstenite 等) がこの
-# セクションに吸われて unix 限定になり、Windows build が壊れる (#673 の regression)。
+# [dependencies] の途中 (後続の依存定義より上) に置くと、それ以降の依存
+# (tungstenite 等) がこのセクションに吸われて unix 限定になり、
+# Windows build が壊れる (#673 の regression)。
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal"] }
