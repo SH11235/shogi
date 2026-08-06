@@ -13,6 +13,12 @@ use super::accumulator_layer_stacks::{
 use super::bona_piece::BonaPiece;
 #[cfg(feature = "nnue-psqt")]
 use super::constants::MAX_LAYER_STACK_BUCKETS;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    not(target_feature = "avx512bw")
+))]
+use super::constants::NNUE_PYTORCH_L1;
 use super::features::{Feature, FeatureSet};
 use super::leb128::read_compressed_tensor_i16_all;
 use super::ls_feature_spec::LsFeatureSpec;
@@ -1162,8 +1168,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
             &self.biases.0,
             accumulation,
             idx_fn,
-            |acc, idx| self.add_weights(acc, idx),
-            |acc, idx| self.sub_weights(acc, idx),
+            |acc, removed, added| self.apply_weight_changes_tiled(acc, removed, added),
         );
     }
 
@@ -1318,6 +1323,86 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         stack.current_mut().accumulator.computed_accumulation = true;
         stack.current_mut().accumulator.computed_score = false;
         true
+    }
+
+    /// 複数featureの差分をaccumulatorのtile単位でまとめて適用する。
+    #[inline]
+    fn apply_weight_changes_tiled(
+        &self,
+        accumulation: &mut [i16; L1],
+        removed: &IndexList<{ PieceNumber::NB }>,
+        added: &IndexList<{ PieceNumber::NB }>,
+    ) {
+        if removed.is_empty() && added.is_empty() {
+            return;
+        }
+
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512bw")
+        ))]
+        {
+            const VALUES_PER_REG: usize = 16;
+            const TILE_REGS: usize = 16;
+            const TILE_VALUES: usize = VALUES_PER_REG * TILE_REGS;
+
+            if L1 == NNUE_PYTORCH_L1 {
+                // SAFETY:
+                // - accumulationとweight rowは64-byte alignedで、tile offsetは512-byte単位。
+                // - NNUE_PYTORCH_L1はTILE_VALUESの倍数なので、各load/storeは配列内に収まる。
+                // - weight_rowが各feature indexとrow長L1の境界を検証する。
+                unsafe {
+                    use std::arch::x86_64::*;
+
+                    let acc_ptr = accumulation.as_mut_ptr();
+                    for tile_offset in (0..L1).step_by(TILE_VALUES) {
+                        let mut tile = [_mm256_setzero_si256(); TILE_REGS];
+                        for (k, value) in tile.iter_mut().enumerate() {
+                            *value = _mm256_load_si256(
+                                acc_ptr.add(tile_offset + k * VALUES_PER_REG) as *const __m256i,
+                            );
+                        }
+
+                        for index in removed.iter() {
+                            let weights = self.weight_row(index);
+                            let weight_ptr = weights.as_ptr().add(tile_offset);
+                            for (k, value) in tile.iter_mut().enumerate() {
+                                let weight = _mm256_load_si256(
+                                    weight_ptr.add(k * VALUES_PER_REG) as *const __m256i
+                                );
+                                *value = _mm256_sub_epi16(*value, weight);
+                            }
+                        }
+                        for index in added.iter() {
+                            let weights = self.weight_row(index);
+                            let weight_ptr = weights.as_ptr().add(tile_offset);
+                            for (k, value) in tile.iter_mut().enumerate() {
+                                let weight = _mm256_load_si256(
+                                    weight_ptr.add(k * VALUES_PER_REG) as *const __m256i
+                                );
+                                *value = _mm256_add_epi16(*value, weight);
+                            }
+                        }
+
+                        for (k, &value) in tile.iter().enumerate() {
+                            _mm256_store_si256(
+                                acc_ptr.add(tile_offset + k * VALUES_PER_REG) as *mut __m256i,
+                                value,
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        for index in removed.iter() {
+            self.sub_weights(accumulation, index);
+        }
+        for index in added.iter() {
+            self.add_weights(accumulation, index);
+        }
     }
 
     /// 重みを累積値に加算（SIMD最適化版）
@@ -1989,6 +2074,42 @@ mod tests {
         for index in added.iter() {
             ft.add_weights(accumulation, index);
         }
+    }
+
+    #[cfg(not(feature = "nnue-effect-bucket"))]
+    #[test]
+    fn test_apply_weight_changes_tiled_matches_sequential_with_wrapping() {
+        let mut ft = make_test_transformer();
+        for (index, seed) in [0usize, 1, 2, 3].into_iter().zip([31i16, -47, 83, -109]) {
+            fill_weight_row(&mut ft, index, seed);
+        }
+
+        let mut removed = IndexList::<{ PieceNumber::NB }>::new();
+        let mut added = IndexList::<{ PieceNumber::NB }>::new();
+        assert!(removed.push(0));
+        assert!(removed.push(1));
+        assert!(added.push(2));
+        assert!(added.push(3));
+
+        let mut sequential = Aligned([0i16; TEST_L1]);
+        for (i, value) in sequential.0.iter_mut().enumerate() {
+            *value = if i % 2 == 0 {
+                i16::MAX.wrapping_sub((i % 97) as i16)
+            } else {
+                i16::MIN.wrapping_add((i % 89) as i16)
+            };
+        }
+        let mut tiled = Aligned(sequential.0);
+
+        for index in removed.iter() {
+            ft.sub_weights(&mut sequential.0, index);
+        }
+        for index in added.iter() {
+            ft.add_weights(&mut sequential.0, index);
+        }
+        ft.apply_weight_changes_tiled(&mut tiled.0, &removed, &added);
+
+        assert_eq!(sequential.0, tiled.0);
     }
 
     // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
