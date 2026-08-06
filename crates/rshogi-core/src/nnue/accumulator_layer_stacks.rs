@@ -176,24 +176,13 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
         }
     }
 
-    /// キャッシュからの差分で refresh を実行（Stockfish 風 piece_list 差分方式）
+    /// キャッシュ差分のfeature indexをまとめて適用するrefresh。
     ///
-    /// キャッシュが有効な場合、現在の `PieceList` と cache の `PieceList` を
-    /// slot-wise に比較し、変化した slot のみ `idx_fn` で feature index を
-    /// 算出して add/sub を適用する。
-    /// キャッシュが無効な場合は biases から full refresh し、cache を更新する。
-    ///
-    /// # 引数
-    ///
-    /// - `king_sq`: この視点の玉位置（cache key）
-    /// - `perspective`: 視点（cache key）
-    /// - `piece_list`: 現在の perspective 固有 `PieceList`（`piece_list_fb` / `piece_list_fw`）
-    /// - `biases`: Feature Transformer のバイアス
-    /// - `accumulation`: 更新先のアキュムレータ値
-    /// - `idx_fn`: BonaPiece (非 ZERO) → feature index の変換
-    /// - `add_fn`: 重み加算関数
-    /// - `sub_fn`: 重み減算関数
-    pub(crate) fn refresh_or_cache<FI, FA, FS>(
+    /// add/subを1件ずつ呼ぶ代わりに、全indexを固定長listへ集めて`apply_fn`へ渡す。
+    /// Feature Transformer側はこのlistを使い、accumulatorをtileごとに1回だけ
+    /// load/storeできる。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn refresh_or_cache<FI, FApply>(
         &mut self,
         king_sq: Square,
         perspective: Color,
@@ -201,48 +190,48 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
         biases: &[i16; L1],
         accumulation: &mut [i16; L1],
         idx_fn: FI,
-        add_fn: FA,
-        sub_fn: FS,
+        apply_fn: FApply,
     ) where
         FI: Fn(BonaPiece) -> usize,
-        FA: Fn(&mut [i16; L1], usize),
-        FS: Fn(&mut [i16; L1], usize),
+        FApply:
+            Fn(&mut [i16; L1], &IndexList<{ PieceNumber::NB }>, &IndexList<{ PieceNumber::NB }>),
     {
         let entry = &mut self.entries[king_sq.raw() as usize][perspective as usize];
+        // 各駒slotはremoved/addedへ最大1件ずつ入るため、容量40を超えない。
+        let mut removed = IndexList::<{ PieceNumber::NB }>::new();
+        let mut added = IndexList::<{ PieceNumber::NB }>::new();
 
         if entry.valid {
             crate::nnue::stats::count_cache_hit!();
-            // キャッシュのアキュムレータ値をコピー
             accumulation.copy_from_slice(&entry.accumulation);
 
-            // 40 slot 比較して変化した slot のみ差分適用
-            let mut diff_count = 0usize;
             for (cached_bp, &current_bp) in entry.piece_list.iter().copied().zip(piece_list.iter())
             {
                 if cached_bp != current_bp {
                     if cached_bp != BonaPiece::ZERO {
-                        sub_fn(accumulation, idx_fn(cached_bp));
-                        diff_count += 1;
+                        let pushed = removed.push(idx_fn(cached_bp));
+                        debug_assert!(pushed);
                     }
                     if current_bp != BonaPiece::ZERO {
-                        add_fn(accumulation, idx_fn(current_bp));
-                        diff_count += 1;
+                        let pushed = added.push(idx_fn(current_bp));
+                        debug_assert!(pushed);
                     }
                 }
             }
-            crate::nnue::stats::count_refresh_diff!(diff_count);
+            crate::nnue::stats::count_refresh_diff!(removed.len() + added.len());
         } else {
             crate::nnue::stats::count_cache_miss!();
-            // キャッシュ無効 → バイアスから full refresh
             accumulation.copy_from_slice(biases);
             for &bp in piece_list.iter() {
                 if bp != BonaPiece::ZERO {
-                    add_fn(accumulation, idx_fn(bp));
+                    let pushed = added.push(idx_fn(bp));
+                    debug_assert!(pushed);
                 }
             }
         }
 
-        // キャッシュを更新
+        apply_fn(accumulation, &removed, &added);
+
         entry.accumulation.copy_from_slice(accumulation);
         entry.piece_list.copy_from_slice(piece_list);
         entry.valid = true;
@@ -887,6 +876,19 @@ mod tests {
     /// テスト用の具体的な L1 サイズ
     const TEST_L1: usize = NNUE_PYTORCH_L1; // 1536
 
+    fn apply_test_changes(
+        acc: &mut [i16; TEST_L1],
+        removed: &IndexList<{ PieceNumber::NB }>,
+        added: &IndexList<{ PieceNumber::NB }>,
+    ) {
+        for idx in removed.iter() {
+            acc[0] = acc[0].wrapping_sub(idx as i16);
+        }
+        for idx in added.iter() {
+            acc[0] = acc[0].wrapping_add(idx as i16);
+        }
+    }
+
     #[test]
     fn test_accumulator_new() {
         let acc = AccumulatorLayerStacks::<TEST_L1>::new();
@@ -960,8 +962,7 @@ mod tests {
             &biases,
             &mut accumulation,
             |bp| bp.0 as usize,
-            |acc, idx| acc[0] = acc[0].wrapping_add(idx as i16),
-            |acc, idx| acc[0] = acc[0].wrapping_sub(idx as i16),
+            apply_test_changes,
         );
 
         // biases[0] + 5 + 10 + 15 = 130
@@ -996,8 +997,7 @@ mod tests {
             &biases,
             &mut acc1,
             |bp| bp.0 as usize,
-            |acc, idx| acc[0] = acc[0].wrapping_add(idx as i16),
-            |acc, idx| acc[0] = acc[0].wrapping_sub(idx as i16),
+            apply_test_changes,
         );
         assert_eq!(acc1[0], 30);
 
@@ -1012,8 +1012,7 @@ mod tests {
             &biases,
             &mut acc2,
             |bp| bp.0 as usize,
-            |acc, idx| acc[0] = acc[0].wrapping_add(idx as i16),
-            |acc, idx| acc[0] = acc[0].wrapping_sub(idx as i16),
+            apply_test_changes,
         );
         // hit: 30 - 15 + 20 = 35
         assert_eq!(acc2[0], 35);
@@ -1038,8 +1037,7 @@ mod tests {
             &biases,
             &mut acc1,
             |bp| bp.0 as usize,
-            |acc, idx| acc[0] = acc[0].wrapping_add(idx as i16),
-            |acc, idx| acc[0] = acc[0].wrapping_sub(idx as i16),
+            apply_test_changes,
         );
         assert_eq!(acc1[0], 15);
 
@@ -1054,8 +1052,7 @@ mod tests {
             &biases,
             &mut acc2,
             |bp| bp.0 as usize,
-            |acc, idx| acc[0] = acc[0].wrapping_add(idx as i16),
-            |acc, idx| acc[0] = acc[0].wrapping_sub(idx as i16),
+            apply_test_changes,
         );
         // hit: 15 - 10 = 5
         assert_eq!(acc2[0], 5);
