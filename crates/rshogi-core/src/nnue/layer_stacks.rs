@@ -363,7 +363,48 @@ fn l1_sqr_clipped_relu_activation<const LS_L1_OUT: usize, const LS_L2_IN: usize>
 ) {
     let main_dim = LS_L1_OUT - 1;
     debug_assert_eq!(LS_L2_IN, main_dim * 2);
-    // LayerStacks の main_dim は現状 7 / 15 / 31 で、SIMD 化のメリットが小さい。
+
+    // 16入力を一度だけpackし、sqr/clipの両方を生成するAVX2変換。16個目はskip出力なので、
+    // sqr側の余剰byteをclip側の先頭storeで上書きし、clip側の余剰byteはpadded inputに書く。
+    // i32 -> i16は32767超を32767、-32768未満を-32768へ飽和する。前者はsqr/clipとも
+    // 127、後者はsqrが127、clipが0になるためscalarと一致する。
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if LS_L1_OUT == 16 && LS_L2_IN == 30 && l2_input.len() >= 31 {
+        // SAFETY:
+        // - LS_L1_OUT == 16 なので l1_out から i32 を 16 個 load できる。
+        // - l2_input.len() >= 31 なので [0,16) と [15,31) の store は範囲内。
+        // - load/store は unaligned 版を使うため追加の alignment 要件はない。
+        unsafe {
+            use std::arch::x86_64::*;
+
+            let input = l1_out.as_ptr() as *const __m256i;
+            let mut words =
+                _mm256_packs_epi32(_mm256_loadu_si256(input), _mm256_loadu_si256(input.add(1)));
+            words = _mm256_permute4x64_epi64(words, 0b1101_1000);
+
+            // mulhi gives square >> 16; another 3 bits produce square >> 19.
+            let sq_words = _mm256_srli_epi16(_mm256_mulhi_epi16(words, words), 3);
+            let sq_bytes = _mm_packs_epi16(
+                _mm256_castsi256_si128(sq_words),
+                _mm256_extracti128_si256(sq_words, 1),
+            );
+
+            let clip_words = _mm256_srli_epi16(_mm256_max_epi16(words, _mm256_setzero_si256()), 6);
+            let clip_bytes = _mm_packs_epi16(
+                _mm256_castsi256_si128(clip_words),
+                _mm256_extracti128_si256(clip_words, 1),
+            );
+
+            let output = l2_input.as_mut_ptr();
+            _mm_storeu_si128(output as *mut __m128i, sq_bytes);
+            _mm_storeu_si128(output.add(main_dim) as *mut __m128i, clip_bytes);
+            // clip store の16個目は skip 出力であり、有効入力の直後へ書かれる。
+            // padding weight が非zeroのnetでも従来値を保つため0へ戻す。
+            *output.add(LS_L2_IN) = 0;
+        }
+        return;
+    }
+
     // 注意: 二乗は i64 で計算する必要がある。
     // i32 乗算は |val| > ~46340 (sqrt(i32::MAX)) でオーバーフローし、
     // 中盤局面の L1 出力は数万〜数十万に達するため i64 が必須。
@@ -953,18 +994,32 @@ mod tests {
                 -1, 1, 63, 127, 128, 255, 256, 4096, 8191, 8192, 16384, 24576, 32768, 40000, 65535,
                 70000,
             ],
+            [
+                i32::MIN,
+                i32::MIN + 1,
+                -65536,
+                -32769,
+                -32768,
+                -32767,
+                -8192,
+                -64,
+                0,
+                64,
+                8192,
+                32767,
+                32768,
+                65536,
+                i32::MAX - 1,
+                i32::MAX,
+            ],
         ];
 
         for l1_out in cases {
-            let mut l1_relu = [0u8; TEST_LS_L1_OUT];
             let mut l2_input_opt = Aligned([0u8; TEST_LS_L2_PADDED_INPUT]);
-            let mut l2_sqr = [0u8; TEST_LS_L1_OUT];
-
-            ClippedReLU::<TEST_LS_L1_OUT>::propagate(&l1_out, &mut l1_relu);
-            sqr_clipped_relu_explicit::<TEST_LS_L1_OUT>(&l1_out, &mut l2_sqr);
-            l2_input_opt.0[..TEST_LS_L1_OUT].copy_from_slice(&l2_sqr);
-            l2_input_opt.0[TEST_MAIN_DIM..TEST_MAIN_DIM + TEST_MAIN_DIM]
-                .copy_from_slice(&l1_relu[..TEST_MAIN_DIM]);
+            l1_sqr_clipped_relu_activation::<TEST_LS_L1_OUT, TEST_LS_L2_IN>(
+                &l1_out,
+                &mut l2_input_opt.0,
+            );
 
             let mut l2_input_ref = Aligned([0u8; TEST_LS_L2_PADDED_INPUT]);
             for (i, &val) in l1_out.iter().enumerate().take(TEST_MAIN_DIM) {
