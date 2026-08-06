@@ -62,14 +62,6 @@ rshogi-csa-server = { path = "../rshogi-csa-server", default-features = false }
 # コード側のため feature gate せず常時必須。
 libc = "0.2"
 
-# `nix` は engine 死亡時の process group 単位 kill (`killpg`) を unsafe を
-# 使わず safe wrapper 経由で呼ぶために unix 限定で依存。`signal` feature だけ
-# あれば `killpg` / `Signal::SIGKILL` / `Pid::from_raw` が揃う。
-# version は workspace 上 (ctrlc 経由) で既に解決されている `0.31` 系に揃え、
-# Cargo.lock の dup を回避する。
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["signal"] }
-
 # CSA-over-WebSocket 用の sync ハンドシェイク + フレーミング。
 # rustls + webpki ルートで TLS を実装し、native-tls 経由の OpenSSL 依存を避ける。
 tungstenite = { version = "0.27", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"], optional = true }
@@ -82,3 +74,14 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 clap = { workspace = true, optional = true }
 ctrlc = { version = "3.4", optional = true }
 env_logger = { workspace = true, optional = true }
+
+# `nix` は engine 死亡時の process group 単位 kill (`killpg`) を unsafe を
+# 使わず safe wrapper 経由で呼ぶために unix 限定で依存。`signal` feature だけ
+# あれば `killpg` / `Signal::SIGKILL` / `Pid::from_raw` が揃う。
+# version は workspace 上 (ctrlc 経由) で既に解決されている `0.31` 系に揃え、
+# Cargo.lock の dup を回避する。
+# NOTE: この target 固有セクションは必ずファイル末尾に置くこと。汎用
+# [dependencies] より上に置くと、後続の依存 (tungstenite 等) がこの
+# セクションに吸われて unix 限定になり、Windows build が壊れる (#673 の regression)。
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["signal"] }
