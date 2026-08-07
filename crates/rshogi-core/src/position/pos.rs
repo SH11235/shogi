@@ -122,7 +122,8 @@ impl Position {
     fn cur_state(&self) -> &StateInfo {
         debug_assert!(self.state_idx < self.state_stack.len());
         // SAFETY: state_idx は push_state で設定され、常に state_stack.len() 未満。
-        //         state_stack は do_move で push / undo_move で pop され、不変条件を維持する。
+        //         state_stack は push_state で伸長するのみで縮小されず、undo 系は
+        //         state_idx を戻すだけなので不変条件が維持される。
         unsafe { self.state_stack.get_unchecked(self.state_idx) }
     }
 
@@ -1561,8 +1562,8 @@ impl Position {
         };
 
         // push_state() は常に current_idx + 1 へ保存するため、同一局面履歴上の
-        // n手前は state_stack[current_idx - n] にある。previous を二段ずつ
-        // たどる代わりに直接index化する。
+        // n手前は state_stack[current_idx - n] にある。
+        debug_assert!(current_idx == 0 || self.cur_state().previous == current_idx - 1);
         let max_back = plies_from_null.min(16).min(current_idx as i32);
         let mut repetition = 0;
         let mut repetition_times = 0;
@@ -1574,7 +1575,8 @@ impl Position {
             while dist <= max_back {
                 let st_idx = current_idx - dist as usize;
                 debug_assert!(st_idx < self.state_stack.len());
-                // SAFETY: dist <= max_back <= current_idx なので範囲内。
+                // SAFETY: dist <= max_back <= current_idx、かつ cur_state の不変条件より
+                //         current_idx < state_stack.len() なので範囲内。
                 let stp = unsafe { self.state_stack.get_unchecked(st_idx) };
                 if stp.board_key == board_key {
                     let prev_hand = stp.hand_snapshot[side.index()];
@@ -2165,17 +2167,58 @@ mod tests {
         }
         assert_eq!(pos.repetition_state(0), RepetitionState::Draw);
 
-        // 直前cycleをundoして同じdepthへ指し直し、古いstate slotを上書きしても
-        // 4回目の繰り返し情報が同じになることを確認する。
+        // 直前cycleをundoし、別手順で古いstate slotを異なる内容に上書きしてから
+        // 同じdepthへ指し直しても繰り返し情報が変わらないことを確認する。
         for mv in cycle.into_iter().rev() {
             pos.undo_move(mv);
         }
         assert_eq!(pos.cur_state().repetition_times, 2);
+        let alt_line = [
+            Move::new_move(
+                Square::new(File::File4, Rank::Rank9),
+                Square::new(File::File4, Rank::Rank8),
+                false,
+            ),
+            Move::new_move(
+                Square::new(File::File4, Rank::Rank1),
+                Square::new(File::File4, Rank::Rank2),
+                false,
+            ),
+            Move::new_move(
+                Square::new(File::File4, Rank::Rank8),
+                Square::new(File::File4, Rank::Rank9),
+                false,
+            ),
+            Move::new_move(
+                Square::new(File::File4, Rank::Rank2),
+                Square::new(File::File4, Rank::Rank1),
+                false,
+            ),
+        ];
+        for mv in alt_line {
+            assert!(pos.is_legal(mv));
+            let gives_check = pos.gives_check(mv);
+            assert!(!gives_check);
+            pos.do_move(mv, gives_check);
+        }
+        for mv in alt_line.into_iter().rev() {
+            pos.undo_move(mv);
+        }
         for mv in cycle {
             let gives_check = pos.gives_check(mv);
             pos.do_move(mv, gives_check);
         }
         assert_eq!(pos.cur_state().repetition_times, 3);
+        assert_eq!(pos.cur_state().repetition, -4);
+        assert_eq!(pos.cur_state().repetition_type, RepetitionState::Draw);
+
+        // さらに1周指し、上書き再利用したslotが繰り返し走査の比較対象に入る
+        // 深さでも正しく数えられることを確認する。
+        for mv in cycle {
+            let gives_check = pos.gives_check(mv);
+            pos.do_move(mv, gives_check);
+        }
+        assert_eq!(pos.cur_state().repetition_times, 4);
         assert_eq!(pos.cur_state().repetition, -4);
         assert_eq!(pos.cur_state().repetition_type, RepetitionState::Draw);
     }
