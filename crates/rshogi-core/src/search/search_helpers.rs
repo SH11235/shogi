@@ -15,6 +15,7 @@ use crate::search::PieceToHistory;
 use crate::types::{Move, Piece, Square, Value};
 
 use super::alpha_beta::{SearchContext, SearchState};
+use super::history::CorrectionPieceToHistory;
 use super::types::{ContHistKey, STACK_SIZE};
 use super::{LimitsType, TimeManagement};
 
@@ -251,13 +252,19 @@ pub(super) fn set_cont_history_for_move(
     let in_check_idx = in_check as usize;
     let capture_idx = capture as usize;
     // SAFETY: 単一スレッド内で使用、可変参照と同時保持しない
-    let table = {
+    let (table, correction_table) = {
         let h = unsafe { ctx.history.as_ref_unchecked() };
-        NonNull::from(h.continuation_history[in_check_idx][capture_idx].get_table(piece, to))
+        (
+            NonNull::from(h.continuation_history[in_check_idx][capture_idx].get_table(piece, to)),
+            NonNull::<CorrectionPieceToHistory>::from(
+                h.correction_history.continuation_table(piece, to),
+            ),
+        )
     };
     // SAFETY: ply < MAX_PLY < STACK_SIZE は上の debug_assert で検証済み。
     let ss = unsafe { st.stack.get_unchecked_mut(ply as usize) };
     ss.cont_history_ptr = table;
+    ss.cont_correction_ptr = correction_table;
     ss.cont_hist_key = Some(ContHistKey::new(in_check, capture, piece, to));
 }
 
@@ -267,9 +274,15 @@ pub(super) fn set_cont_history_for_move(
 /// sentinel keyを設定してYOと同じsentinelテーブルへの読み書きが行われるようにする。
 #[inline]
 pub(super) fn clear_cont_history_for_null(st: &mut SearchState, ctx: &SearchContext<'_>, ply: i32) {
+    let correction_sentinel = {
+        // SAFETY: 単一スレッド内で使用、可変参照と同時保持しない。
+        let h = unsafe { ctx.history.as_ref_unchecked() };
+        NonNull::from(h.correction_history.continuation_table(Piece::NONE, Square::SQ_11))
+    };
     // SAFETY: ply < MAX_PLY < STACK_SIZE。
     let ss = unsafe { st.stack.get_unchecked_mut(ply as usize) };
     ss.cont_history_ptr = ctx.cont_history_sentinel;
+    ss.cont_correction_ptr = correction_sentinel;
     ss.cont_hist_key = Some(ContHistKey::null_sentinel());
 }
 

@@ -446,6 +446,7 @@ fn test_sentinel_initialization() {
 
     // sentinelポインタがdanglingではなく、実際のテーブルを指していることを確認
     let sentinel = worker.cont_history_sentinel;
+    let correction_sentinel = worker.cont_correction_sentinel;
     // NonNullはnullにならないことが保証されているので、
     // 代わりにsafeにderefできることを確認（ポインタが有効なメモリを指していること）
     let sentinel_ref = unsafe { sentinel.as_ref() };
@@ -455,6 +456,17 @@ fn test_sentinel_initialization() {
         crate::search::history::CONTINUATION_HISTORY_INIT,
         "sentinel table should be initialized with YO-standard value"
     );
+    // correction historyのsentinelはYOと同じ初期値8を持つ。
+    assert_eq!(
+        unsafe {
+            crate::search::history::CorrectionHistory::continuation_value_from_table(
+                correction_sentinel,
+                crate::types::Piece::B_PAWN,
+                crate::types::Square::SQ_11,
+            )
+        },
+        8
+    );
 
     // 全てのスタックエントリがsentinelで初期化されていることを確認
     for (i, stack) in worker.state.stack.iter().enumerate() {
@@ -462,5 +474,31 @@ fn test_sentinel_initialization() {
             stack.cont_history_ptr, sentinel,
             "stack[{i}].cont_history_ptr should be initialized to sentinel"
         );
+        assert_eq!(
+            stack.cont_correction_ptr, correction_sentinel,
+            "stack[{i}].cont_correction_ptr should be initialized to sentinel"
+        );
     }
+
+    // 未使用だったusize slotをpointerへ置き換えるため、hot Stackのfootprintは増やさない。
+    assert_eq!(std::mem::size_of::<crate::search::Stack>(), 56);
+}
+
+#[test]
+fn test_cont_correction_pointer_tracks_move_and_null() {
+    let tt = Arc::new(TranspositionTable::new(16));
+    let eval_hash = Arc::new(EvalHash::new(1));
+    let mut worker = SearchWorker::new(tt, eval_hash, 0, 0, SearchTuneParams::default());
+    let piece = crate::types::Piece::B_SILVER;
+    let to = crate::types::Square::SQ_55;
+
+    worker.set_cont_history_for_move(3, false, false, piece, to);
+    let expected = {
+        let history = unsafe { worker.history.as_ref_unchecked() };
+        std::ptr::NonNull::from(history.correction_history.continuation_table(piece, to))
+    };
+    assert_eq!(worker.state.stack[3].cont_correction_ptr, expected);
+
+    worker.clear_cont_history_for_null(3);
+    assert_eq!(worker.state.stack[3].cont_correction_ptr, worker.cont_correction_sentinel);
 }
