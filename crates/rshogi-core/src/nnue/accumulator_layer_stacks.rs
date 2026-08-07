@@ -108,6 +108,10 @@ impl<const L1: usize> Default for AccumulatorLayerStacks<L1> {
 #[repr(C, align(64))]
 struct AccCacheEntry<const L1: usize> {
     /// キャッシュされたアキュムレータ値
+    ///
+    /// `refresh_or_cache` がこの field を aligned SIMD load/store を使う
+    /// add/sub weight 関数へ直接渡すため、struct の `align(64)` と field 先頭
+    /// 配置 (offset 0) が 64-byte アライメントの前提として load-bearing。
     accumulation: [i16; L1],
     /// キャッシュされた PSQT アキュムレータ値
     ///
@@ -197,14 +201,24 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
             Fn(&mut [i16; L1], &IndexList<{ PieceNumber::NB }>, &IndexList<{ PieceNumber::NB }>),
     {
         let entry = &mut self.entries[king_sq.raw() as usize][perspective as usize];
+        // apply_fn (tiled SIMD) は aligned load/store を使うため、entry.accumulation を
+        // 直接渡すには AccCacheEntry の align(64) + field 先頭配置が必須。
+        debug_assert_eq!(entry.accumulation.as_ptr() as usize % 64, 0);
         // 各駒slotはremoved/addedへ最大1件ずつ入るため、容量40を超えない。
         let mut removed = IndexList::<{ PieceNumber::NB }>::new();
         let mut added = IndexList::<{ PieceNumber::NB }>::new();
 
-        if entry.valid {
-            crate::nnue::stats::count_cache_hit!();
-            accumulation.copy_from_slice(&entry.accumulation);
+        let was_valid = entry.valid;
+        // entry.accumulation を作業領域として直接更新するため、差分適用の途中で
+        // unwind すると entry が不整合になる。valid を先に落とし、全 field の
+        // 書き戻し完了後に立て直すことで半更新 entry の再利用を防ぐ。
+        entry.valid = false;
 
+        if was_valid {
+            crate::nnue::stats::count_cache_hit!();
+            // entry を作業領域にすることで、cache hit 時の L1 要素全量コピーを
+            // 最後の entry→accumulation 1回だけにする。差分indexはlistへ集めて
+            // 後段の apply_fn でtile一括適用する。
             for (cached_bp, &current_bp) in entry.piece_list.iter().copied().zip(piece_list.iter())
             {
                 if cached_bp != current_bp {
@@ -221,7 +235,8 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
             crate::nnue::stats::count_refresh_diff!(removed.len() + added.len());
         } else {
             crate::nnue::stats::count_cache_miss!();
-            accumulation.copy_from_slice(biases);
+            // キャッシュ無効 → バイアスから full refresh
+            entry.accumulation.copy_from_slice(biases);
             for &bp in piece_list.iter() {
                 if bp != BonaPiece::ZERO {
                     let pushed = added.push(idx_fn(bp));
@@ -230,9 +245,10 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
             }
         }
 
-        apply_fn(accumulation, &removed, &added);
+        apply_fn(&mut entry.accumulation, &removed, &added);
 
-        entry.accumulation.copy_from_slice(accumulation);
+        // 更新済みcache entryを探索stack側へ公開する。
+        accumulation.copy_from_slice(&entry.accumulation);
         entry.piece_list.copy_from_slice(piece_list);
         entry.valid = true;
     }
@@ -1016,6 +1032,48 @@ mod tests {
         );
         // hit: 30 - 15 + 20 = 35
         assert_eq!(acc2[0], 35);
+
+        // 3回目: 同じpiece listなら、2回目に更新したcache entryをそのまま返す。
+        let mut acc3 = [0i16; TEST_L1];
+        cache.refresh_or_cache(
+            king_sq,
+            perspective,
+            &pl2,
+            &biases,
+            &mut acc3,
+            |bp| bp.0 as usize,
+            apply_test_changes,
+        );
+        assert_eq!(acc3[0], 35);
+
+        // 4回目: in-place 更新済み entry へさらに非ゼロ差分を適用 (hit→mutate→hit chain)
+        let mut pl3 = pl2;
+        pl3[0] = BonaPiece(7);
+        let mut acc4 = [0i16; TEST_L1];
+        cache.refresh_or_cache(
+            king_sq,
+            perspective,
+            &pl3,
+            &biases,
+            &mut acc4,
+            |bp| bp.0 as usize,
+            apply_test_changes,
+        );
+        // hit: 35 - 5 + 7 = 37
+        assert_eq!(acc4[0], 37);
+
+        // 5回目: pl3 のまま再読。piece_list の書き戻しが stale なら差分が重複適用される。
+        let mut acc5 = [0i16; TEST_L1];
+        cache.refresh_or_cache(
+            king_sq,
+            perspective,
+            &pl3,
+            &biases,
+            &mut acc5,
+            |bp| bp.0 as usize,
+            apply_test_changes,
+        );
+        assert_eq!(acc5[0], 37);
     }
 
     /// refresh_or_cache: slot 消滅 (capture)
