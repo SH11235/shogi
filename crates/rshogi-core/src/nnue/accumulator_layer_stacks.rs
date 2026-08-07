@@ -212,20 +212,19 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
 
         if entry.valid {
             crate::nnue::stats::count_cache_hit!();
-            // キャッシュのアキュムレータ値をコピー
-            accumulation.copy_from_slice(&entry.accumulation);
-
-            // 40 slot 比較して変化した slot のみ差分適用
+            // cache entryを直接更新する。従来はentry→accumulationへコピーして差分を適用し、
+            // 最後にaccumulation→entryへ戻していた。entryを作業領域にすれば、cache hit時の
+            // L1要素全量コピーを最後のentry→accumulation 1回だけにできる。
             let mut diff_count = 0usize;
             for (cached_bp, &current_bp) in entry.piece_list.iter().copied().zip(piece_list.iter())
             {
                 if cached_bp != current_bp {
                     if cached_bp != BonaPiece::ZERO {
-                        sub_fn(accumulation, idx_fn(cached_bp));
+                        sub_fn(&mut entry.accumulation, idx_fn(cached_bp));
                         diff_count += 1;
                     }
                     if current_bp != BonaPiece::ZERO {
-                        add_fn(accumulation, idx_fn(current_bp));
+                        add_fn(&mut entry.accumulation, idx_fn(current_bp));
                         diff_count += 1;
                     }
                 }
@@ -234,16 +233,16 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
         } else {
             crate::nnue::stats::count_cache_miss!();
             // キャッシュ無効 → バイアスから full refresh
-            accumulation.copy_from_slice(biases);
+            entry.accumulation.copy_from_slice(biases);
             for &bp in piece_list.iter() {
                 if bp != BonaPiece::ZERO {
-                    add_fn(accumulation, idx_fn(bp));
+                    add_fn(&mut entry.accumulation, idx_fn(bp));
                 }
             }
         }
 
-        // キャッシュを更新
-        entry.accumulation.copy_from_slice(accumulation);
+        // 更新済みcache entryを探索stack側へ公開する。
+        accumulation.copy_from_slice(&entry.accumulation);
         entry.piece_list.copy_from_slice(piece_list);
         entry.valid = true;
     }
@@ -1017,6 +1016,20 @@ mod tests {
         );
         // hit: 30 - 15 + 20 = 35
         assert_eq!(acc2[0], 35);
+
+        // 3回目: 同じpiece listなら、2回目に更新したcache entryをそのまま返す。
+        let mut acc3 = [0i16; TEST_L1];
+        cache.refresh_or_cache(
+            king_sq,
+            perspective,
+            &pl2,
+            &biases,
+            &mut acc3,
+            |bp| bp.0 as usize,
+            |acc, idx| acc[0] = acc[0].wrapping_add(idx as i16),
+            |acc, idx| acc[0] = acc[0].wrapping_sub(idx as i16),
+        );
+        assert_eq!(acc3[0], 35);
     }
 
     /// refresh_or_cache: slot 消滅 (capture)
