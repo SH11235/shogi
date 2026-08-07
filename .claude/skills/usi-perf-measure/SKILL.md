@@ -52,13 +52,19 @@ Precise と同じ帰属規則）。**Hyper-V / VBS 有効のままで動く**（
     もの（`CacheMisses`, `DcacheMisses`, `BranchMispredictions` 等を追加可能、最大 8 個）
   - `--cpus`（shard 並列）は未対応（指定するとエラー）。`--cpu N` は
     `SetProcessAffinityMask` で論理 CPU 1 個に pin + `HIGH_PRIORITY_CLASS`
-- 計測区間は `go` 送信直前〜`bestmove` 受信直後の QPC 区間で gating し、
-  `bestmove` 後に ETW バッファを flush して遅延到着イベントを 500ms 待ってから閉じる
-- JSON レポートは Linux 版とスキーマ互換。source 名は
+- 計測区間は `position`+`go` 送信直前〜`bestmove` 受信直後の QPC 区間で gating する。
+  区間 close 後に ETW バッファを flush して 500ms 待ち、遅延到着した区間内イベントを
+  取り込んでから集計を確定する
+- JSON レポートは Linux 版と `samples` / `summary` がスキーマ互換（`cli` ブロックのみ
+  `perf_events` / `pmc_sources` のフィールド名差あり）。source 名は
   `TotalCycles→cycles` / `InstructionRetired→instructions` /
   `BranchInstructions→branches` / `BranchMispredictions→branch_misses` /
   `CacheMisses→cache_misses` / `DcacheMisses→l1_dcache_load_misses` にマップされ、
-  未知の source は `perf.extra.<source名>` に入る。既存の jq 集計レシピはそのまま動く
+  未知の source は `perf.extra.<source名>` に入る。既存の jq 集計レシピはそのまま動く。
+  ただし `DcacheMisses` は **load+store 合算**で、Linux の `L1-dcache-load-misses`
+  （load のみ）とはセマンティクスが異なる。この欄に限らず counter の意味は OS 間で
+  完全一致しないため、**cross-OS で数値を直接比較しない**こと（比較は同一 OS 内の
+  A/B 差分で行う）
 
 実行例（管理者 PowerShell / Git Bash）:
 
@@ -77,8 +83,17 @@ Precise と同じ帰属規則）。**Hyper-V / VBS 有効のままで動く**（
   いると **stop してから** 開始する。計測中に xperf 等を並走させないこと
 - counter 差分にはエンジンスレッド実行中の割り込み・DPC 時間が含まれる（CPU Usage
   Precise と同じ）。cycles/node の A/B 比較では両側に同様に乗るため通常は無視できる
-- プロセス起動直後の Thread Start イベント到着前の極短区間は帰属から漏れうるが、
-  計測区間は `isready` 完了後の `go` からなので実害はない
+- ETW は per-CPU バッファ単位で配送され **timestamp 順の保証がない**。Thread Start
+  イベントの到着前にその TID の CSwitch が処理されると帰属から漏れる。対象 PID は
+  spawn 直後に登録するが、**計測中（`go` 以降）に lazy spawn されるスレッド**は最初の
+  数スライスが漏れうる。`isready` までに全スレッドを起動するエンジンなら影響しない
+- 計測区間 close 境界を跨ぐ実行スライス（終端 CSwitch が close 後）は全額除外される。
+  `--threads 1` では bestmove 出力直後にエンジンスレッドが block して switch out する
+  ため実質欠落しないが、`--threads > 1` では最終スライス欠落による僅かな系統誤差が
+  ありうる
+- ETW イベントロス（`EventsLost` / `RealTimeBuffersLost` の増分）を run ごとに検査し、
+  検出したらその run はエラーで破棄する（静かに壊れた計測値を出さない）。頻発する
+  場合はシステム負荷を下げる
 
 ## 前提確認
 
