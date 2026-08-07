@@ -245,11 +245,7 @@ pub fn check_move_mate(pos: &Position, us: Color) -> Option<Move> {
     }
 
     // GOLD相当（Gold/ProPawn/ProLance/ProKnight/ProSilver）
-    let gold_like = pos.pieces(us, PieceType::Gold)
-        | pos.pieces(us, PieceType::ProPawn)
-        | pos.pieces(us, PieceType::ProLance)
-        | pos.pieces(us, PieceType::ProKnight)
-        | pos.pieces(us, PieceType::ProSilver);
+    let gold_like = pos.golds_c(us);
     let mut bb = check_cand_bb(us, PieceTypeCheck::Gold, sq_king) & gold_like;
     while bb.is_not_empty() {
         let from = bb.pop();
