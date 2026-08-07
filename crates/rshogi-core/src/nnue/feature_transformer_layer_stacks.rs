@@ -2219,8 +2219,8 @@ mod tests {
                 _ => (i as i16).wrapping_mul(97),
             };
         }
-        let mut generic = source.clone();
-        let mut fast = source.clone();
+        let mut generic = source;
+        let mut fast = source;
         let mut from_source = Aligned([123i16; TEST_L1]);
         apply_generic(&ft, &mut generic.0, &dirty_piece, Color::Black, king_sq);
         assert!(ft.try_apply_dirty_piece_fast(&mut fast.0, &dirty_piece, Color::Black, king_sq));
@@ -2298,8 +2298,8 @@ mod tests {
                 _ => (i as i16).wrapping_mul(-113),
             };
         }
-        let mut generic = source.clone();
-        let mut fast = source.clone();
+        let mut generic = source;
+        let mut fast = source;
         let mut from_source = Aligned([-321i16; TEST_L1]);
         apply_generic(&ft, &mut generic.0, &dirty_piece, Color::Black, king_sq);
         assert!(ft.try_apply_dirty_piece_fast(&mut fast.0, &dirty_piece, Color::Black, king_sq));
