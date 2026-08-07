@@ -159,3 +159,14 @@ ndarray = { version = "0.16", optional = true }
 # 棋譜プレイヤー TUI (optional, behind "kifu-player" feature)
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.28", optional = true }
+
+# search_only_ab の Windows 実装 (ETW NT Kernel Logger の PMC counting) 用。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }

@@ -16,7 +16,9 @@ rshogi USI バイナリの **探索区間のみ** の HW カウンタを計測�
 
 ## ツール
 
-**本命**: `crates/tools/src/bin/search_only_ab.rs`
+**本命**: `crates/tools/src/bin/search_only_ab.rs`（Linux = perf、Windows = ETW PMC。Windows は「Windows での計測」節を参照）
+
+Linux 実装:
 
 - `perf stat --control fd:20,21 -D -1` で perf を disable 状態で起動
 - Engine を perf の子プロセスとして spawn、fd 20/21 を pre_exec で dup2
@@ -34,6 +36,66 @@ cargo build --release -p tools --bin search_only_ab
 ```
 
 `target/release/search_only_ab` に出る。wrapper 自体は計測対象 feature に依存しないので **release build 1 回で全ケースに使える**。計測対象の USI バイナリ側を各 feature で build 分けする。
+
+## Windows での計測（ETW PMC counting）
+
+Windows では perf の代わりに **OS 標準の ETW PMC counting** を使う（NT Kernel Logger
+セッションで CSwitch イベントに PMC カウンタを添付し、エンジンスレッドが switch out
+されるたびに per-CPU counter 差分をそのスレッドへ帰属させる。xperf の CPU Usage
+Precise と同じ帰属規則）。**Hyper-V / VBS 有効のままで動く**（AMD uProf は Hyper-V
+非対応なので使わない）。
+
+- **要管理者権限**。非管理者だと `ERROR_ACCESS_DENIED` で明確にエラーになる
+- CLI は Linux 版と同一互換。差分は以下のみ:
+  - `--perf-events` の代わりに `--pmc-sources`（カンマ区切り、default
+    `TotalCycles,InstructionRetired`）。source 名は `wpr -pmcsources` で列挙される
+    もの（`CacheMisses`, `DcacheMisses`, `BranchMispredictions` 等を追加可能、最大 8 個）
+  - `--cpus`（shard 並列）は未対応（指定するとエラー）。`--cpu N` は
+    `SetProcessAffinityMask` で論理 CPU 1 個に pin + `HIGH_PRIORITY_CLASS`
+- 計測区間は `position`+`go` 送信直前〜`bestmove` 受信直後の QPC 区間で gating する。
+  区間 close 後に ETW バッファを flush して 500ms 待ち、遅延到着した区間内イベントを
+  取り込んでから集計を確定する
+- JSON レポートは Linux 版と `samples` / `summary` がスキーマ互換（`cli` ブロックのみ
+  `perf_events` / `pmc_sources` のフィールド名差あり）。source 名は
+  `TotalCycles→cycles` / `InstructionRetired→instructions` /
+  `BranchInstructions→branches` / `BranchMispredictions→branch_misses` /
+  `CacheMisses→cache_misses` / `DcacheMisses→l1_dcache_load_misses` にマップされ、
+  未知の source は `perf.extra.<source名>` に入る。既存の jq 集計レシピはそのまま動く。
+  ただし `DcacheMisses` は **load+store 合算**で、Linux の `L1-dcache-load-misses`
+  （load のみ）とはセマンティクスが異なる。この欄に限らず counter の意味は OS 間で
+  完全一致しないため、**cross-OS で数値を直接比較しない**こと（比較は同一 OS 内の
+  A/B 差分で行う）
+
+実行例（管理者 PowerShell / Git Bash）:
+
+```powershell
+.\target\release\search_only_ab.exe `
+  --baseline <BASELINE_EXE> --candidate <CANDIDATE_EXE> `
+  --positions <POSITIONS_TXT> --movetime-ms 10000 --pattern abba --rounds 2 `
+  --threads 1 --hash-mb 256 --cpu 2 --eval-file <MODEL_PATH> `
+  --pmc-sources TotalCycles,InstructionRetired,CacheMisses `
+  --json-out <RESULT_JSON>
+```
+
+注意:
+
+- 既存の NT Kernel Logger セッション（xperf / wpr のカーネルトレース等）が生きて
+  いると **stop してから** 開始する。計測中に xperf 等を並走させないこと
+- counter 差分にはエンジンスレッド実行中の割り込み・DPC 時間が含まれる（CPU Usage
+  Precise と同じ）。cycles/node の A/B 比較では両側に同様に乗るため通常は無視できる
+- ETW は per-CPU バッファ単位で配送され **timestamp 順の保証がない**。Thread Start
+  イベントの到着前にその TID の CSwitch が処理されると帰属から漏れる。対象 PID は
+  spawn 直後に登録するが、**計測中（`go` 以降）に lazy spawn されるスレッド**は最初の
+  数スライスが漏れうる。`isready` までに全スレッドを起動するエンジンなら影響しない
+- 実行スライス（CSwitch 間）が計測 window の境界を跨ぐ場合、counter 差分は window
+  との**重なり比で線形按分**される（counter がスライス内で一様に増える近似）。pin
+  された idle CPU ではエンジンスレッドが数百 ms〜秒オーダーで switch せずスライスが
+  極端に粗くなり、全額計上/全額除外だと A/A で cycles/node ±1% 級の量子化誤差が
+  実測された（帰属カバレッジ 86〜97% の揺れ）ための措置。`--threads > 1` でも按分で
+  緩和されるが、一様増加近似の誤差と割り込み・DPC 混入は残る
+- ETW イベントロス（`EventsLost` / `RealTimeBuffersLost` の増分）を run ごとに検査し、
+  検出したらその run はエラーで破棄する（静かに壊れた計測値を出さない）。頻発する
+  場合はシステム負荷を下げる
 
 ## 前提確認
 

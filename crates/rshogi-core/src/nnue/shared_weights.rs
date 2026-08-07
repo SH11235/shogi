@@ -25,6 +25,8 @@
 use super::accumulator::AlignedBox;
 
 /// キルスイッチ環境変数。`0` / `off` / `false` で共有を無効化する。
+/// 参照は Linux 実装のみのため、他ターゲットでは dead_code になる（cfg で除外）。
+#[cfg(target_os = "linux")]
 const ENV_KILL_SWITCH: &str = "RSHOGI_NNUE_SHARED_WEIGHTS";
 
 /// 重み blob を共有メモリへ移行する。
