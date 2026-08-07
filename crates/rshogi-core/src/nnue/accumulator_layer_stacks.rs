@@ -1042,6 +1042,37 @@ mod tests {
             |acc, idx| acc[0] = acc[0].wrapping_sub(idx as i16),
         );
         assert_eq!(acc3[0], 35);
+
+        // 4回目: in-place 更新済み entry へさらに非ゼロ差分を適用 (hit→mutate→hit chain)
+        let mut pl3 = pl2;
+        pl3[0] = BonaPiece(7);
+        let mut acc4 = [0i16; TEST_L1];
+        cache.refresh_or_cache(
+            king_sq,
+            perspective,
+            &pl3,
+            &biases,
+            &mut acc4,
+            |bp| bp.0 as usize,
+            |acc, idx| acc[0] = acc[0].wrapping_add(idx as i16),
+            |acc, idx| acc[0] = acc[0].wrapping_sub(idx as i16),
+        );
+        // hit: 35 - 5 + 7 = 37
+        assert_eq!(acc4[0], 37);
+
+        // 5回目: pl3 のまま再読。piece_list の書き戻しが stale なら差分が重複適用される。
+        let mut acc5 = [0i16; TEST_L1];
+        cache.refresh_or_cache(
+            king_sq,
+            perspective,
+            &pl3,
+            &biases,
+            &mut acc5,
+            |bp| bp.0 as usize,
+            |acc, idx| acc[0] = acc[0].wrapping_add(idx as i16),
+            |acc, idx| acc[0] = acc[0].wrapping_sub(idx as i16),
+        );
+        assert_eq!(acc5[0], 37);
     }
 
     /// refresh_or_cache: slot 消滅 (capture)
