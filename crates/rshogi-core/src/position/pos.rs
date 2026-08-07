@@ -168,13 +168,11 @@ impl Position {
         // StateInfoの全フィールドを網羅し、追加時にコピー/再構築の分類漏れを
         // コンパイルエラーとして検出する。`_`のフィールドはdo_move内で再構築する。
         let &StateInfo {
-            material_key,
             pawn_key,
             minor_piece_key,
             non_pawn_key,
             plies_from_null,
             continuous_check,
-            game_ply,
             pass_rights,
             board_key,
             hand_key,
@@ -192,13 +190,11 @@ impl Position {
             last_move: _,
         } = previous;
 
-        next.material_key = material_key;
         next.pawn_key = pawn_key;
         next.minor_piece_key = minor_piece_key;
         next.non_pawn_key = non_pawn_key;
         next.plies_from_null = plies_from_null;
         next.continuous_check = continuous_check;
-        next.game_ply = game_ply;
         next.pass_rights = pass_rights;
         next.board_key = board_key;
         next.hand_key = hand_key;
