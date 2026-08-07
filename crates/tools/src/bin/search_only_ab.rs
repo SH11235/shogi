@@ -1515,6 +1515,8 @@ mod windows_main {
             totals: [u64; MAX_PMC_SOURCES],
             /// 集計に入った CSwitch 数（診断用）
             attributed_switches: u64,
+            /// 区間内なのにカウンタ巻き戻りで skip した CSwitch 数（診断用）
+            regressed_switches: u64,
         }
 
         impl PmcAccumulator {
@@ -1527,6 +1529,7 @@ mod windows_main {
                     window_end: None,
                     totals: [0; MAX_PMC_SOURCES],
                     attributed_switches: 0,
+                    regressed_switches: 0,
                 }
             }
 
@@ -1580,16 +1583,21 @@ mod windows_main {
                     // カウンタ巻き戻り（セッション再構成等）は差分にできないのでスキップ
                     let monotonic =
                         prev.counters[..n].iter().zip(&sample.counters[..n]).all(|(p, c)| c >= p);
-                    if fraction > 0.0 && monotonic {
-                        for (total, (prev_v, now)) in self
-                            .totals
-                            .iter_mut()
-                            .zip(prev.counters[..n].iter().zip(&sample.counters[..n]))
-                        {
-                            // 一様増加近似での線形按分。最近接丸め
-                            *total += (((now - prev_v) as f64) * fraction).round() as u64;
+                    if fraction > 0.0 {
+                        if monotonic {
+                            for (total, (prev_v, now)) in self
+                                .totals
+                                .iter_mut()
+                                .zip(prev.counters[..n].iter().zip(&sample.counters[..n]))
+                            {
+                                // 一様増加近似での線形按分。最近接丸め
+                                *total += (((now - prev_v) as f64) * fraction).round() as u64;
+                            }
+                            self.attributed_switches += 1;
+                        } else {
+                            // 帰属すべきだった差分を捨てた回数。0 でない run は要注意
+                            self.regressed_switches += 1;
                         }
-                        self.attributed_switches += 1;
                     }
                 }
                 self.per_cpu_last.insert(
@@ -1648,11 +1656,16 @@ mod windows_main {
                 }
             }
 
-            /// 積算結果 (counter 合計, 帰属 CSwitch 数) を取り出し、積算器を破棄する。
-            pub fn take_totals(&mut self) -> Option<(Vec<u64>, u64)> {
-                self.acc
-                    .take()
-                    .map(|acc| (acc.totals[..acc.n_counters].to_vec(), acc.attributed_switches))
+            /// 積算結果 (counter 合計, 帰属 CSwitch 数, 巻き戻り skip 数) を取り出し、
+            /// 積算器を破棄する。
+            pub fn take_totals(&mut self) -> Option<(Vec<u64>, u64, u64)> {
+                self.acc.take().map(|acc| {
+                    (
+                        acc.totals[..acc.n_counters].to_vec(),
+                        acc.attributed_switches,
+                        acc.regressed_switches,
+                    )
+                })
             }
         }
 
@@ -1688,7 +1701,7 @@ mod windows_main {
                 let mut state = state_with_target();
                 state.on_cswitch(&cswitch(0, 10, 999, &[1000, 2000]));
                 state.on_cswitch(&cswitch(0, 20, TID, &[1500, 2600]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![500, 600]);
                 assert_eq!(switches, 1);
             }
@@ -1698,7 +1711,7 @@ mod windows_main {
                 let mut state = state_with_target();
                 // 前回値が無い CPU では差分を計算できない
                 state.on_cswitch(&cswitch(0, 10, TID, &[1000, 2000]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![0, 0]);
                 assert_eq!(switches, 0);
             }
@@ -1710,7 +1723,7 @@ mod windows_main {
                 state.on_cswitch(&cswitch(0, 20, 999, &[1500, 2600]));
                 // 直後に target が switch out: 基準値は 999 の切り替え時点まで進んでいる
                 state.on_cswitch(&cswitch(0, 30, TID, &[1600, 2700]));
-                let (totals, _) = state.take_totals().expect("accumulator installed");
+                let (totals, _, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![100, 100]);
             }
 
@@ -1722,7 +1735,7 @@ mod windows_main {
                 // window 未オープンの間は一切集計しない（基準値の更新のみ）
                 state.on_cswitch(&cswitch(0, 10, 999, &[1000, 2000]));
                 state.on_cswitch(&cswitch(0, 20, TID, &[1500, 2600]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![0, 0]);
                 assert_eq!(switches, 0);
             }
@@ -1736,7 +1749,7 @@ mod windows_main {
                 state.on_cswitch(&cswitch(0, 60, 999, &[1000, 2000]));
                 // スライス [60,140] のうち window [100,∞) と重なるのは後半 40/80 = 50%
                 state.on_cswitch(&cswitch(0, 140, TID, &[1500, 2600]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![250, 300]);
                 assert_eq!(switches, 1);
             }
@@ -1748,7 +1761,7 @@ mod windows_main {
                 state.close_window(20);
                 // スライス [10,30] のうち window [0,20] と重なるのは前半 10/20 = 50%
                 state.on_cswitch(&cswitch(0, 30, TID, &[1500, 2600]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![250, 300]);
                 assert_eq!(switches, 1);
             }
@@ -1763,7 +1776,7 @@ mod windows_main {
                 state.on_cswitch(&cswitch(0, 50, 999, &[1000, 1000]));
                 // スライス [50,250] が window [100,200] を両側に跨ぐ → 100/200 = 50%
                 state.on_cswitch(&cswitch(0, 250, TID, &[1400, 1600]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![200, 300]);
                 assert_eq!(switches, 1);
             }
@@ -1781,7 +1794,7 @@ mod windows_main {
                 // open 前に始まり open 前に終わるスライス（別 CPU）
                 state.on_cswitch(&cswitch(1, 10, 999, &[3000, 3000]));
                 state.on_cswitch(&cswitch(1, 90, TID, &[3500, 3500]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![0, 0]);
                 assert_eq!(switches, 0);
             }
@@ -1794,7 +1807,7 @@ mod windows_main {
                 // スライス [5,20] のうち window [0,10] との重なりは 5/15 = 1/3。
                 // 差分 [10,20] → [3.33..,6.66..] → 最近接丸めで [3,7]
                 state.on_cswitch(&cswitch(0, 20, TID, &[1010, 1020]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![3, 7]);
                 assert_eq!(switches, 1);
             }
@@ -1805,7 +1818,7 @@ mod windows_main {
                 state.on_cswitch(&cswitch(0, 10, 999, &[1000, 1000]));
                 // 長さ 0 のスライスは終端が window 内なら全額
                 state.on_cswitch(&cswitch(0, 10, TID, &[1005, 1006]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![5, 6]);
                 assert_eq!(switches, 1);
             }
@@ -1817,20 +1830,22 @@ mod windows_main {
                 // 区間を閉じた後に、区間内タイムスタンプのイベントが遅延到着するケース
                 state.close_window(100);
                 state.on_cswitch(&cswitch(0, 50, TID, &[1200, 2300]));
-                let (totals, _) = state.take_totals().expect("accumulator installed");
+                let (totals, _, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![200, 300]);
             }
 
             #[test]
-            fn counter_regression_is_skipped() {
+            fn counter_regression_is_skipped_and_counted() {
                 let mut state = state_with_target();
                 state.on_cswitch(&cswitch(0, 10, 999, &[1000, 2000]));
-                // 巻き戻った値は差分にしない（基準値は更新される）
+                // 巻き戻った値は差分にしない（基準値は更新され、診断カウンタに乗る）
                 state.on_cswitch(&cswitch(0, 20, TID, &[500, 2600]));
                 state.on_cswitch(&cswitch(0, 30, TID, &[600, 2700]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, regressed) =
+                    state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![100, 100]);
                 assert_eq!(switches, 1);
+                assert_eq!(regressed, 1);
             }
 
             #[test]
@@ -1840,7 +1855,7 @@ mod windows_main {
                 state.on_cswitch(&cswitch(1, 11, 999, &[500, 500]));
                 state.on_cswitch(&cswitch(0, 20, TID, &[1100, 1200]));
                 state.on_cswitch(&cswitch(1, 21, TID, &[530, 540]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![130, 240]);
                 assert_eq!(switches, 2);
             }
@@ -1851,7 +1866,7 @@ mod windows_main {
                 state.on_cswitch(&cswitch(0, 10, 999, &[1000, 2000]));
                 state.on_thread_end(PID, TID);
                 state.on_cswitch(&cswitch(0, 20, TID, &[1500, 2600]));
-                let (totals, _) = state.take_totals().expect("accumulator installed");
+                let (totals, _, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![0, 0]);
             }
 
@@ -1864,7 +1879,7 @@ mod windows_main {
                 state.open_window(0);
                 // per-CPU 基準値もリセットされるため、最初の CSwitch は基準値記録のみ
                 state.on_cswitch(&cswitch(0, 30, TID, &[9999, 9999]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![0, 0]);
                 assert_eq!(switches, 0);
             }
@@ -1876,7 +1891,7 @@ mod windows_main {
                 // counter 数が不足するイベントは基準値も更新しない
                 state.on_cswitch(&cswitch(0, 15, TID, &[9999]));
                 state.on_cswitch(&cswitch(0, 20, TID, &[1500, 2600]));
-                let (totals, _) = state.take_totals().expect("accumulator installed");
+                let (totals, _, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![500, 600]);
             }
 
@@ -1892,7 +1907,7 @@ mod windows_main {
                 state.on_cswitch(&cswitch(0, 100, TID, &[1200, 1200]));
                 // スライス [100,200] は window に完全内包 → 全額
                 state.on_cswitch(&cswitch(0, 200, TID, &[1500, 1500]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![300, 300]);
                 assert_eq!(switches, 1);
             }
@@ -1903,7 +1918,7 @@ mod windows_main {
                 // 設定 (n=2) より多い counter が届いた場合は先頭 n 個だけを使う
                 state.on_cswitch(&cswitch(0, 10, 999, &[1000, 2000, 111]));
                 state.on_cswitch(&cswitch(0, 20, TID, &[1500, 2600, 999]));
-                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                let (totals, switches, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![500, 600]);
                 assert_eq!(switches, 1);
             }
@@ -1912,7 +1927,7 @@ mod windows_main {
             fn install_clamps_counter_count_to_max() {
                 let mut state = PmcEngineState::default();
                 state.install(PID, MAX_PMC_SOURCES + 5);
-                let (totals, _) = state.take_totals().expect("accumulator installed");
+                let (totals, _, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals.len(), MAX_PMC_SOURCES);
             }
         }
@@ -2832,7 +2847,7 @@ mod windows_main {
             );
         }
 
-        let (totals, attributed_switches) = lock_state(shared)?
+        let (totals, attributed_switches, regressed_switches) = lock_state(shared)?
             .take_totals()
             .ok_or_else(|| anyhow!("{}: PMC accumulator not installed", engine.label))?;
         if attributed_switches == 0 {
@@ -2842,7 +2857,9 @@ mod windows_main {
                 engine.label
             );
         }
-        let perf = PerfCounters::from_totals(source_names, &totals);
+        let mut perf = PerfCounters::from_totals(source_names, &totals);
+        // 巻き戻り skip の診断値。0 でない run は帰属差分を取りこぼしている
+        perf.extra.insert("regressed_switches".to_string(), regressed_switches);
         if perf.cycles.is_none() {
             bail!("PMC totals do not contain TotalCycles");
         }
@@ -2923,13 +2940,14 @@ mod windows_main {
                         )
                     })?;
                     println!(
-                        "[shard 1] depth={} nodes={} time={}ms nps={} cycles/node={:.1} instructions/node={:.1}",
+                        "[shard 1] depth={} nodes={} time={}ms nps={} cycles/node={:.1} instructions/node={:.1} regressed_switches={}",
                         sample.info.depth,
                         sample.info.nodes,
                         sample.info.time_ms,
                         sample.info.nps,
                         sample.perf.cycles_per_node(sample.info.nodes).unwrap_or(0.0),
                         sample.perf.instructions_per_node(sample.info.nodes).unwrap_or(0.0),
+                        sample.perf.extra.get("regressed_switches").copied().unwrap_or(0),
                     );
                     samples.push(sample);
                 }
