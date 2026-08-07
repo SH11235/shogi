@@ -5,12 +5,12 @@
 #[cfg(not(feature = "search-no-pass-rules"))]
 use crate::eval::evaluate_pass_rights;
 use crate::position::Position;
-use crate::types::{Bound, Color, DEPTH_UNSEARCHED, Depth, MAX_PLY, Move, Value};
+use crate::types::{Bound, Color, DEPTH_UNSEARCHED, Depth, MAX_PLY, Move, Piece, Square, Value};
 
 use super::alpha_beta::{
     EvalContext, ProbeOutcome, SearchContext, SearchState, TTContext, to_corrected_static_eval,
 };
-use super::history::CORRECTION_HISTORY_SIZE;
+use super::history::{CORRECTION_HISTORY_SIZE, CorrectionHistory};
 #[cfg(feature = "use-lazy-evaluate")]
 use super::search_helpers::ensure_nnue_accumulator;
 use super::search_helpers::nnue_evaluate;
@@ -28,7 +28,9 @@ use super::types::{ContHistKey, NodeType, value_from_tt};
 // =============================================================================
 
 /// 補正履歴から静的評価の補正値を算出
-#[inline]
+// production baselineと同じout-of-line形を保ち、簡略化した大規模history参照が
+// qsearchの特殊化ごとに複製されるのを防ぐ。
+#[inline(never)]
 pub(super) fn correction_value(
     st: &SearchState,
     ctx: &SearchContext<'_>,
@@ -51,38 +53,6 @@ pub(super) fn correction_value(
     };
     let move_ok = prev_move.is_normal();
 
-    // continuation correction 用キー: (ss-2) と (ss-4) の2段階
-    // cont_hist_key が未設定(None)でも sentinel にフォールバックして参照する。
-    let sentinel_key = ContHistKey::null_sentinel();
-    let cont_key_2 = if move_ok {
-        if ply >= 2 {
-            debug_assert!(((ply - 2) as usize) < st.stack.len());
-            // SAFETY: ply >= 2 かつ ply <= MAX_PLY なので (ply-2) は StackArray の範囲内。
-            match unsafe { st.stack.get_unchecked((ply - 2) as usize) }.cont_hist_key {
-                Some(key) => key,
-                None => sentinel_key,
-            }
-        } else {
-            sentinel_key
-        }
-    } else {
-        sentinel_key
-    };
-    let cont_key_4 = if move_ok {
-        if ply >= 4 {
-            debug_assert!(((ply - 4) as usize) < st.stack.len());
-            // SAFETY: ply >= 4 かつ ply <= MAX_PLY なので (ply-4) は StackArray の範囲内。
-            match unsafe { st.stack.get_unchecked((ply - 4) as usize) }.cont_hist_key {
-                Some(key) => key,
-                None => sentinel_key,
-            }
-        } else {
-            sentinel_key
-        }
-    } else {
-        sentinel_key
-    };
-
     // SAFETY: 単一スレッド内で使用、可変参照と同時保持しない
     let h = unsafe { ctx.history.as_ref_unchecked() };
     let pcv = h.correction_history.pawn_value(pawn_idx, us) as i32;
@@ -92,19 +62,32 @@ pub(super) fn correction_value(
 
     // move無効の場合はcntcv全体が8（個別デフォルトの合計ではない）
     let cntcv = if move_ok {
+        let sentinel = std::ptr::NonNull::from(
+            h.correction_history.continuation_table(Piece::NONE, Square::SQ_11),
+        );
+        let table_2 = if ply >= 2 {
+            debug_assert!(((ply - 2) as usize) < st.stack.len());
+            // SAFETY: ply >= 2 かつ ply <= MAX_PLY なので (ply-2) はStackArrayの範囲内。
+            unsafe { st.stack.get_unchecked((ply - 2) as usize) }.cont_correction_ptr
+        } else {
+            sentinel
+        };
+        let table_4 = if ply >= 4 {
+            debug_assert!(((ply - 4) as usize) < st.stack.len());
+            // SAFETY: ply >= 4 かつ ply <= MAX_PLY なので (ply-4) はStackArrayの範囲内。
+            unsafe { st.stack.get_unchecked((ply - 4) as usize) }.cont_correction_ptr
+        } else {
+            sentinel
+        };
         let pc = pos.piece_on(prev_move.to());
-        let cv2 = h.correction_history.continuation_value(
-            cont_key_2.piece,
-            cont_key_2.to,
-            pc,
-            prev_move.to(),
-        ) as i32;
-        let cv4 = h.correction_history.continuation_value(
-            cont_key_4.piece,
-            cont_key_4.to,
-            pc,
-            prev_move.to(),
-        ) as i32;
+        // SAFETY: Stack上のpointerはHistoryCell内のtableまたはsentinelを指し、探索中は有効。
+        let cv2 = unsafe {
+            CorrectionHistory::continuation_value_from_table(table_2, pc, prev_move.to())
+        } as i32;
+        // SAFETY: 同上。
+        let cv4 = unsafe {
+            CorrectionHistory::continuation_value_from_table(table_4, pc, prev_move.to())
+        } as i32;
         cv2 + cv4
     } else {
         8
