@@ -1953,15 +1953,15 @@ mod windows_main {
         use windows_sys::Win32::System::Diagnostics::Etw::{
             CLASSIC_EVENT_ID, CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW,
             EVENT_HEADER_EXT_TYPE_PMC_COUNTERS, EVENT_HEADER_FLAG_PROCESSOR_INDEX, EVENT_RECORD,
-            EVENT_TRACE_CONTROL_FLUSH,
-            EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_CSWITCH,
-            EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW, EVENT_TRACE_LOGFILEW_0,
-            EVENT_TRACE_LOGFILEW_1, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
-            KERNEL_LOGGER_NAMEW, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
-            PROCESS_TRACE_MODE_RAW_TIMESTAMP, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
-            PROFILE_SOURCE_INFO, ProcessTrace, StartTraceW, SystemTraceControlGuid,
-            TracePmcCounterListInfo, TracePmcEventListInfo, TraceProfileSourceListInfo,
-            TraceQueryInformation, TraceSetInformation, WNODE_FLAG_TRACED_GUID,
+            EVENT_TRACE_CONTROL_FLUSH, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP,
+            EVENT_TRACE_FLAG_CSWITCH, EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW,
+            EVENT_TRACE_LOGFILEW_0, EVENT_TRACE_LOGFILEW_1, EVENT_TRACE_PROPERTIES,
+            EVENT_TRACE_REAL_TIME_MODE, KERNEL_LOGGER_NAMEW, OpenTraceW,
+            PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_RAW_TIMESTAMP,
+            PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, PROFILE_SOURCE_INFO, ProcessTrace,
+            StartTraceW, SystemTraceControlGuid, TracePmcCounterListInfo, TracePmcEventListInfo,
+            TraceProfileSourceListInfo, TraceQueryInformation, TraceSetInformation,
+            WNODE_FLAG_TRACED_GUID,
         };
 
         use super::pmc::{CSwitchSample, MAX_PMC_SOURCES, PmcEngineState};
@@ -2679,9 +2679,15 @@ mod windows_main {
         }
 
         fn recv_line(&self, timeout: Duration) -> Result<String> {
-            self.stdout_rx.recv_timeout(timeout).map_err(|_| {
-                anyhow!("{}: timeout waiting for engine output after {:?}", self.label, timeout)
-            })
+            match self.stdout_rx.recv_timeout(timeout) {
+                Ok(line) => Ok(line),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    bail!("{}: timeout waiting for engine output after {:?}", self.label, timeout)
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("{}: engine died (stdout closed) while waiting for output", self.label)
+                }
+            }
         }
 
         fn set_option_if_available(&mut self, name: &str, value: &str) -> Result<()> {
@@ -2847,9 +2853,10 @@ mod windows_main {
             );
         }
 
-        let (totals, attributed_switches, regressed_switches) = lock_state(shared)?
-            .take_totals()
-            .ok_or_else(|| anyhow!("{}: PMC accumulator not installed", engine.label))?;
+        let (totals, attributed_switches, regressed_switches) =
+            lock_state(shared)?
+                .take_totals()
+                .ok_or_else(|| anyhow!("{}: PMC accumulator not installed", engine.label))?;
         if attributed_switches == 0 {
             bail!(
                 "{}: 計測区間内にエンジンスレッドへ帰属する PMC 付き CSwitch を観測できません\n\
