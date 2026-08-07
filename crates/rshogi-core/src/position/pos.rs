@@ -710,7 +710,7 @@ impl Position {
         let mut result = Bitboard::EMPTY;
         for pinner_sq in pinners.iter() {
             let between = crate::bitboard::between_bb(ksq, pinner_sq) & pieces_without_avoid;
-            if !between.is_empty() && !between.more_than_one() {
+            if !between.more_than_one() {
                 result |= between & self.pieces_c(them);
             }
         }
