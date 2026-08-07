@@ -1402,11 +1402,12 @@ where
 {
     let is_main = main_state.is_some();
 
-    // cutoff_cnt は各ノードが孫スロット stack[ply+2] をクリアする方式のため、担当ノード
-    // (ply-2) が存在しない stack[0]/stack[1] だけは go をまたいで蓄積してしまう。YO の
-    // 反復深化開始時 stack ゼロ初期化に合わせ毎 go クリアする (go 内の蓄積は YO 同様保持)。
-    worker.state.stack[0].cutoff_cnt = 0;
-    worker.state.stack[1].cutoff_cnt = 0;
+    // 毎 go の開始時に全スロットの cutoff_cnt をクリアする。孫スロット方式のクリア経路に
+    // 穴があっても go をまたぐ寿命比例の蓄積と i32 overflow を起こさないための防御で、
+    // go 内の蓄積は保持される。
+    for stack in &mut worker.state.stack {
+        stack.cutoff_cnt = 0;
+    }
 
     // ルート手を初期化
     worker.state.root_moves = super::RootMoves::from_legal_moves(pos, &limits.search_moves);
