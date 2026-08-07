@@ -1220,6 +1220,10 @@ mod tests {
 
         assert_eq!(optimized_inline, reference);
         assert_eq!(optimized, reference);
+
+        // hot path と診断 path は別実装のため、非自明入力での bit 一致をここで固定する
+        let mut counts = LsSaturationCounts::default();
+        assert_eq!(bucket.propagate_counting_saturation(&input.0, &mut counts), reference);
     }
 
     /// l1_out の値が大きい場合（i32 乗算でオーバーフローするケース）の回帰テスト。
