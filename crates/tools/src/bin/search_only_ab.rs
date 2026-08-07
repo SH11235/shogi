@@ -1937,7 +1937,8 @@ mod windows_main {
         use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
         use windows_sys::Win32::System::Diagnostics::Etw::{
             CLASSIC_EVENT_ID, CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW,
-            EVENT_HEADER_EXT_TYPE_PMC_COUNTERS, EVENT_RECORD, EVENT_TRACE_CONTROL_FLUSH,
+            EVENT_HEADER_EXT_TYPE_PMC_COUNTERS, EVENT_HEADER_FLAG_PROCESSOR_INDEX, EVENT_RECORD,
+            EVENT_TRACE_CONTROL_FLUSH,
             EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_CSWITCH,
             EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW, EVENT_TRACE_LOGFILEW_0,
             EVENT_TRACE_LOGFILEW_1, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
@@ -2452,9 +2453,17 @@ mod windows_main {
                 return;
             }
 
-            // SAFETY: ETW_BUFFER_CONTEXT の union はどのメンバも同じ 2 byte を指す。
-            // 論理 CPU 番号を u16 (ProcessorIndex) として読む。
-            let cpu = unsafe { record.BufferContext.Anonymous.ProcessorIndex };
+            // EVENT_HEADER_FLAG_PROCESSOR_INDEX が立っていれば union は u16 の
+            // ProcessorIndex として書かれている。立っていなければ従来レイアウト
+            // (ProcessorNumber: u8 + Alignment) なので下位 byte だけを読む。
+            let flags = u32::from(record.EventHeader.Flags);
+            let cpu = if flags & EVENT_HEADER_FLAG_PROCESSOR_INDEX != 0 {
+                // SAFETY: flag 設定時は ProcessorIndex (u16) が有効メンバ。
+                unsafe { record.BufferContext.Anonymous.ProcessorIndex }
+            } else {
+                // SAFETY: flag 未設定時は ProcessorNumber (u8) が有効メンバ。
+                u16::from(unsafe { record.BufferContext.Anonymous.Anonymous.ProcessorNumber })
+            };
             let sample = CSwitchSample {
                 cpu,
                 // ClientContext=1 + PROCESS_TRACE_MODE_RAW_TIMESTAMP により生の QPC 値
