@@ -108,6 +108,10 @@ impl<const L1: usize> Default for AccumulatorLayerStacks<L1> {
 #[repr(C, align(64))]
 struct AccCacheEntry<const L1: usize> {
     /// キャッシュされたアキュムレータ値
+    ///
+    /// `refresh_or_cache` がこの field を aligned SIMD load/store を使う
+    /// add/sub weight 関数へ直接渡すため、struct の `align(64)` と field 先頭
+    /// 配置 (offset 0) が 64-byte アライメントの前提として load-bearing。
     accumulation: [i16; L1],
     /// キャッシュされた PSQT アキュムレータ値
     ///
@@ -209,12 +213,20 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
         FS: Fn(&mut [i16; L1], usize),
     {
         let entry = &mut self.entries[king_sq.raw() as usize][perspective as usize];
+        // add_fn/sub_fn は aligned SIMD load/store を使うため、entry.accumulation を
+        // 直接渡すには AccCacheEntry の align(64) + field 先頭配置が必須。
+        debug_assert_eq!(entry.accumulation.as_ptr() as usize % 64, 0);
 
-        if entry.valid {
+        let was_valid = entry.valid;
+        // entry.accumulation を作業領域として直接更新するため、差分適用の途中で
+        // unwind すると entry が不整合になる。valid を先に落とし、全 field の
+        // 書き戻し完了後に立て直すことで半更新 entry の再利用を防ぐ。
+        entry.valid = false;
+
+        if was_valid {
             crate::nnue::stats::count_cache_hit!();
-            // cache entryを直接更新する。従来はentry→accumulationへコピーして差分を適用し、
-            // 最後にaccumulation→entryへ戻していた。entryを作業領域にすれば、cache hit時の
-            // L1要素全量コピーを最後のentry→accumulation 1回だけにできる。
+            // entry を作業領域にすることで、cache hit 時の L1 要素全量コピーを
+            // 最後の entry→accumulation 1回だけにする。
             let mut diff_count = 0usize;
             for (cached_bp, &current_bp) in entry.piece_list.iter().copied().zip(piece_list.iter())
             {
