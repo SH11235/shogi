@@ -13,12 +13,6 @@ use super::accumulator_layer_stacks::{
 use super::bona_piece::BonaPiece;
 #[cfg(feature = "nnue-psqt")]
 use super::constants::MAX_LAYER_STACK_BUCKETS;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    not(target_feature = "avx512bw")
-))]
-use super::constants::NNUE_PYTORCH_L1;
 use super::features::{Feature, FeatureSet};
 use super::leb128::read_compressed_tensor_i16_all;
 use super::ls_feature_spec::LsFeatureSpec;
@@ -1347,10 +1341,10 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
             const TILE_REGS: usize = 16;
             const TILE_VALUES: usize = VALUES_PER_REG * TILE_REGS;
 
-            if L1 == NNUE_PYTORCH_L1 {
+            if L1.is_multiple_of(TILE_VALUES) {
                 // SAFETY:
                 // - accumulationとweight rowは64-byte alignedで、tile offsetは512-byte単位。
-                // - NNUE_PYTORCH_L1はTILE_VALUESの倍数なので、各load/storeは配列内に収まる。
+                // - L1がTILE_VALUESの倍数のときだけ入るため、各load/storeは配列内に収まる。
                 // - weight_rowが各feature indexとrow長L1の境界を検証する。
                 unsafe {
                     use std::arch::x86_64::*;
