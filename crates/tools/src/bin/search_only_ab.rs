@@ -1523,6 +1523,17 @@ mod windows_main {
                 }
             }
 
+            /// 区間判定の仕様（境界規則）:
+            ///
+            /// - 判定は実行スライスの終端（CSwitch イベントの timestamp）基準。
+            ///   スライスの開始点（同一 CPU の前回 CSwitch）は見ない
+            /// - 両端 inclusive（`timestamp == start` / `timestamp == end` は区間内）
+            /// - したがって open 境界を跨ぐスライス（開始 < start <= 終端）は全額計上、
+            ///   close 境界を跨ぐスライス（開始 <= end < 終端）は全額除外、という
+            ///   非対称を仕様とする。open 側はエンジンスレッドが `go` を読むまで
+            ///   block しているため過大計上は実質ゼロ。close 側は `--threads 1` なら
+            ///   bestmove 出力直後に block して switch out するため欠落も実質ゼロだが、
+            ///   `--threads > 1` では最終スライス欠落による僅かな系統誤差がありうる
             fn in_window(&self, timestamp: i64) -> bool {
                 let Some(start) = self.window_start else {
                     return false;
@@ -1588,7 +1599,7 @@ mod windows_main {
                 self.acc = Some(PmcAccumulator::new(target_pid, n_counters));
             }
 
-            /// 計測区間を開く（`go` 送信直前の QPC）。
+            /// 計測区間を開く（`position` + `go` 送信直前の QPC）。
             pub fn open_window(&mut self, qpc: i64) {
                 if let Some(acc) = &mut self.acc {
                     acc.window_start = Some(qpc);
@@ -1765,6 +1776,41 @@ mod windows_main {
                 let (totals, _) = state.take_totals().expect("accumulator installed");
                 assert_eq!(totals, vec![500, 600]);
             }
+
+            #[test]
+            fn window_boundaries_are_inclusive() {
+                let mut state = PmcEngineState::default();
+                state.on_thread_start(PID, TID);
+                state.install(PID, 2);
+                state.open_window(100);
+                state.close_window(200);
+                state.on_cswitch(&cswitch(0, 50, 999, &[1000, 1000]));
+                // timestamp == start / == end はどちらも区間内 (両端 inclusive)
+                state.on_cswitch(&cswitch(0, 100, TID, &[1100, 1100]));
+                state.on_cswitch(&cswitch(0, 200, TID, &[1400, 1400]));
+                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                assert_eq!(totals, vec![400, 400]);
+                assert_eq!(switches, 2);
+            }
+
+            #[test]
+            fn extra_counters_beyond_configured_are_ignored() {
+                let mut state = state_with_target();
+                // 設定 (n=2) より多い counter が届いた場合は先頭 n 個だけを使う
+                state.on_cswitch(&cswitch(0, 10, 999, &[1000, 2000, 111]));
+                state.on_cswitch(&cswitch(0, 20, TID, &[1500, 2600, 999]));
+                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                assert_eq!(totals, vec![500, 600]);
+                assert_eq!(switches, 1);
+            }
+
+            #[test]
+            fn install_clamps_counter_count_to_max() {
+                let mut state = PmcEngineState::default();
+                state.install(PID, MAX_PMC_SOURCES + 5);
+                let (totals, _) = state.take_totals().expect("accumulator installed");
+                assert_eq!(totals.len(), MAX_PMC_SOURCES);
+            }
         }
     }
 
@@ -1775,6 +1821,7 @@ mod windows_main {
     mod etw {
         use std::ffi::c_void;
         use std::ptr::null;
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, Mutex};
         use std::thread::{self, JoinHandle};
 
@@ -1783,10 +1830,11 @@ mod windows_main {
             ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER,
             ERROR_MORE_DATA, ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND,
         };
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
         use windows_sys::Win32::System::Diagnostics::Etw::{
             CLASSIC_EVENT_ID, CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW,
             EVENT_HEADER_EXT_TYPE_PMC_COUNTERS, EVENT_RECORD, EVENT_TRACE_CONTROL_FLUSH,
-            EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_CSWITCH, EVENT_TRACE_FLAG_PROCESS,
+            EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_CSWITCH,
             EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW, EVENT_TRACE_LOGFILEW_0,
             EVENT_TRACE_LOGFILEW_1, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
             KERNEL_LOGGER_NAMEW, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
@@ -1873,6 +1921,14 @@ mod windows_main {
 
                 // ここから先のエラーでも Self の Drop でセッションが stop される
                 let session = Self { handle };
+
+                // Ctrl+C 等でプロセスが即死するとセッションが OS に残るため、
+                // 終了前に stop を試みるハンドラを登録する
+                CTRL_SESSION_HANDLE.store(handle.Value, Ordering::SeqCst);
+                // SAFETY: console_ctrl_handler は 'static な関数ポインタ。登録に失敗しても
+                // 計測自体は続行できるため戻り値は無視する。
+                let _ = unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), 1) };
+
                 session.set_pmc_counter_list(pmc_source_indices)?;
                 session.set_pmc_event_list()?;
                 Ok(session)
@@ -1925,6 +1981,30 @@ mod windows_main {
                 Ok(())
             }
 
+            /// セッション統計からイベントロス数 (EventsLost, RealTimeBuffersLost の累計)
+            /// を取得する。run 前後の増分検査に使う。
+            pub fn query_lost_counts(&self) -> Result<LostCounts> {
+                let mut props = PropsBuf::new();
+                // SAFETY: handle は有効なセッションハンドル。props は有効なバッファで、
+                // ControlTraceW(query) が統計を書き込む。
+                let status = unsafe {
+                    ControlTraceW(
+                        self.handle,
+                        null(),
+                        props.as_mut_ptr(),
+                        EVENT_TRACE_CONTROL_QUERY,
+                    )
+                };
+                if status != ERROR_SUCCESS {
+                    bail!("ControlTraceW(query) が失敗しました (code {status})");
+                }
+                let p = props.props_mut();
+                Ok(LostCounts {
+                    events_lost: p.EventsLost,
+                    realtime_buffers_lost: p.RealTimeBuffersLost,
+                })
+            }
+
             /// バッファを強制 flush し、real-time consumer への配送を促す。
             pub fn flush(&self) -> Result<()> {
                 let mut props = PropsBuf::new();
@@ -1946,6 +2026,10 @@ mod windows_main {
 
         impl Drop for KernelSession {
             fn drop(&mut self) {
+                // 正常経路で stop するため、Ctrl ハンドラからの二重 stop を解除する
+                CTRL_SESSION_HANDLE.store(0, Ordering::SeqCst);
+                // SAFETY: console_ctrl_handler は登録時と同じ 'static な関数ポインタ。
+                let _ = unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), 0) };
                 let mut props = PropsBuf::new();
                 // SAFETY: handle は有効なセッションハンドル。props は有効なバッファ。
                 // drop 中なのでエラーは無視する。
@@ -1953,6 +2037,38 @@ mod windows_main {
                     ControlTraceW(self.handle, null(), props.as_mut_ptr(), EVENT_TRACE_CONTROL_STOP)
                 };
             }
+        }
+
+        /// ETW セッション統計のイベントロス数 (累計値)。
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct LostCounts {
+            pub events_lost: u32,
+            pub realtime_buffers_lost: u32,
+        }
+
+        /// Ctrl+C 等での強制終了時に stop すべきセッションハンドル (0 = なし)。
+        static CTRL_SESSION_HANDLE: AtomicU64 = AtomicU64::new(0);
+
+        /// コンソール制御イベント (Ctrl+C / Ctrl+Break / close) のハンドラ。
+        ///
+        /// プロセスが即死すると NT Kernel Logger セッションが OS に残るため、終了前に
+        /// stop を試みる。FALSE を返して既定の終了処理 (プロセス終了) へ委ねる。
+        unsafe extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> windows_sys::core::BOOL {
+            let value = CTRL_SESSION_HANDLE.swap(0, Ordering::SeqCst);
+            if value != 0 {
+                let mut props = PropsBuf::new();
+                // SAFETY: value は KernelSession::start が登録した有効なセッションハンドル。
+                // swap により stop はここか Drop のどちらか一方でのみ実行される。
+                let _ = unsafe {
+                    ControlTraceW(
+                        CONTROLTRACE_HANDLE { Value: value },
+                        null(),
+                        props.as_mut_ptr(),
+                        EVENT_TRACE_CONTROL_STOP,
+                    )
+                };
+            }
+            0
         }
 
         fn start_trace_once(handle: &mut CONTROLTRACE_HANDLE) -> u32 {
@@ -1964,8 +2080,8 @@ mod windows_main {
                 p.MaximumBuffers = 256;
                 p.FlushTimer = 1; // 秒。real-time 配送の遅延上限を短くする
                 p.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-                p.EnableFlags =
-                    EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_THREAD | EVENT_TRACE_FLAG_CSWITCH;
+                // 消費するのは Thread Start/End (TID 追跡) と CSwitch (PMC 添付) のみ
+                p.EnableFlags = EVENT_TRACE_FLAG_THREAD | EVENT_TRACE_FLAG_CSWITCH;
             }
             // SAFETY:
             // - props は必要サイズを満たす有効なバッファで、呼び出しの間有効。
@@ -1975,6 +2091,10 @@ mod windows_main {
 
         /// 前回の異常終了等で残った NT Kernel Logger セッションを停止する。
         fn stop_existing_session() -> Result<()> {
+            eprintln!(
+                "既存の NT Kernel Logger セッションを検出したため停止して回収します \
+                 (前回の異常終了、または xperf/wpr 等の並行セッション)"
+            );
             let mut props = PropsBuf::new();
             // SAFETY: セッション名指定 (ハンドル 0) の stop。props は有効なバッファ。
             let status = unsafe {
@@ -2111,14 +2231,22 @@ mod windows_main {
                 let thread_handle = PROCESSTRACE_HANDLE {
                     Value: handle.Value,
                 };
-                let thread = thread::Builder::new()
-                    .name("etw-consumer".to_string())
-                    .spawn(move || {
+                let spawned =
+                    thread::Builder::new().name("etw-consumer".to_string()).spawn(move || {
                         // SAFETY: handle は OpenTraceW が返した有効な処理ハンドル。
                         // ProcessTrace はセッション停止か CloseTrace まで block する。
                         let _ = unsafe { ProcessTrace(&thread_handle, 1, null(), null()) };
-                    })
-                    .context("ETW consumer スレッドの起動に失敗しました")?;
+                    });
+                let thread = match spawned {
+                    Ok(thread) => thread,
+                    Err(err) => {
+                        // spawn 失敗時に trace handle をリークさせない
+                        // SAFETY: handle は OpenTraceW で得た有効なハンドルで、ProcessTrace
+                        // は未開始のため close してよい。
+                        let _ = unsafe { CloseTrace(handle) };
+                        return Err(err).context("ETW consumer スレッドの起動に失敗しました");
+                    }
+                };
 
                 Ok(Self {
                     handle,
@@ -2246,6 +2374,76 @@ mod windows_main {
             let tid =
                 unsafe { (record.UserData as *const u8).add(4).cast::<u32>().read_unaligned() };
             Some((pid, tid))
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            /// PROFILE_SOURCE_INFO 1 エントリ分の合成バイト列。
+            /// `next_offset != 0` なら次エントリ開始位置まで 0 で pad する。
+            fn entry_bytes(next_offset: u32, source: u32, name: &str) -> Vec<u8> {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&next_offset.to_le_bytes());
+                bytes.extend_from_slice(&source.to_le_bytes());
+                bytes.extend_from_slice(&[0u8; 16]); // MinInterval + MaxInterval + Reserved
+                for unit in name.encode_utf16() {
+                    bytes.extend_from_slice(&unit.to_le_bytes());
+                }
+                bytes.extend_from_slice(&[0, 0]); // NUL 終端
+                if next_offset != 0 {
+                    assert!(bytes.len() <= next_offset as usize, "next_offset too small");
+                    bytes.resize(next_offset as usize, 0);
+                }
+                bytes
+            }
+
+            /// バイト列を parse_profile_source_list の入力形式 (u64 word 列) にする。
+            fn to_words(bytes: &[u8]) -> Vec<u64> {
+                let mut padded = bytes.to_vec();
+                while !padded.len().is_multiple_of(size_of::<u64>()) {
+                    padded.push(0);
+                }
+                padded
+                    .chunks_exact(size_of::<u64>())
+                    .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
+                    .collect()
+            }
+
+            #[test]
+            fn parse_profile_source_list_reads_chained_entries() {
+                let mut bytes = entry_bytes(64, 0, "TotalCycles");
+                bytes.extend_from_slice(&entry_bytes(0, 2, "InstructionRetired"));
+                let words = to_words(&bytes);
+                let parsed = parse_profile_source_list(&words, bytes.len());
+                assert_eq!(
+                    parsed,
+                    vec![
+                        ("TotalCycles".to_string(), 0),
+                        ("InstructionRetired".to_string(), 2)
+                    ]
+                );
+            }
+
+            #[test]
+            fn parse_profile_source_list_stops_at_zero_next_offset() {
+                let bytes = entry_bytes(0, 5, "CacheMisses");
+                let words = to_words(&bytes);
+                let parsed = parse_profile_source_list(&words, bytes.len());
+                assert_eq!(parsed, vec![("CacheMisses".to_string(), 5)]);
+            }
+
+            #[test]
+            fn parse_profile_source_list_tolerates_truncated_buffer() {
+                let mut bytes = entry_bytes(64, 0, "TotalCycles");
+                bytes.extend_from_slice(&entry_bytes(0, 2, "InstructionRetired"));
+                let words = to_words(&bytes);
+                // 2 エントリ目の固定部が入りきらない長さに切り詰める → 1 件だけ返す
+                let parsed = parse_profile_source_list(&words, 80);
+                assert_eq!(parsed, vec![("TotalCycles".to_string(), 0)]);
+                // 固定部すら入らない長さなら空
+                assert!(parse_profile_source_list(&words, 10).is_empty());
+            }
         }
     }
 
@@ -2444,11 +2642,15 @@ mod windows_main {
         sequence_index: usize,
     ) -> Result<RunSample> {
         let mut engine = UsiEngine::spawn(cli, variant, cli.cpu)?;
-        // spawn 直後（ETW の Thread Start イベントが consumer へ届く前）に対象 PID を
-        // 登録し、エンジンスレッドの TID を取りこぼさないようにする。
+        // spawn 直後に対象 PID を登録し、Thread Start の観測窓を最大化する。ただし
+        // ETW は per-CPU バッファ単位で配送され timestamp 順の保証がないため、
+        // Thread Start の到着前にその TID の CSwitch が処理される帰属漏れが理論上
+        // ありうる（計測中に lazy spawn されるスレッドが典型。既知限界は
+        // .claude/skills/usi-perf-measure/SKILL.md を参照）。
         lock_state(shared)?.install(engine.pid(), source_names.len());
         engine.initialize(cli, variant)?;
 
+        let lost_before = session.query_lost_counts()?;
         let start_qpc = qpc_now()?;
         lock_state(shared)?.open_window(start_qpc);
         engine.write_line(&position.position_cmd)?;
@@ -2487,6 +2689,8 @@ mod windows_main {
         })?;
 
         let end_qpc = qpc_now()?;
+        // close 境界を跨ぐ実行スライス（終端 CSwitch が end_qpc より後）は全額除外
+        // される（仕様と影響は pmc::PmcAccumulator::in_window のコメントを参照）。
         lock_state(shared)?.close_window(end_qpc);
         engine.write_line("quit")?;
         let status = wait_child(&mut engine.child, QUIT_TIMEOUT)?;
@@ -2497,6 +2701,20 @@ mod windows_main {
         // 遅延到着イベントを取り込む: バッファを flush してから配送を待つ
         session.flush()?;
         thread::sleep(FLUSH_WAIT);
+
+        // イベントロスがあった run は計測値が静かに欠けるため、集計せず破棄する
+        let lost_after = session.query_lost_counts()?;
+        if lost_after != lost_before {
+            bail!(
+                "{}: ETW イベントロスを検出しました (events_lost +{}, \
+                 realtime_buffers_lost +{})。この run の計測値は信頼できないため破棄\
+                 します。システム負荷を下げるか、バッファ設定 (BufferSize / \
+                 MaximumBuffers) の拡大を検討してください。",
+                engine.label,
+                lost_after.events_lost.wrapping_sub(lost_before.events_lost),
+                lost_after.realtime_buffers_lost.wrapping_sub(lost_before.realtime_buffers_lost),
+            );
+        }
 
         let (totals, attributed_switches) = lock_state(shared)?
             .take_totals()
