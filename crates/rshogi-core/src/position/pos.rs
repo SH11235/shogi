@@ -107,7 +107,7 @@ pub struct EnteringKingPointInfo {
 impl Position {
     /// 部分ハッシュを更新（XOR）
     #[inline]
-    fn xor_partial_keys(&self, st: &mut StateInfo, pc: Piece, sq: Square) {
+    fn xor_partial_keys(st: &mut StateInfo, pc: Piece, sq: Square) {
         if pc.piece_type() == PieceType::Pawn {
             st.pawn_key ^= zobrist_psq(pc, sq);
         } else {
@@ -144,6 +144,63 @@ impl Position {
         } else {
             self.state_stack.push(st);
         }
+        self.state_idx = next_idx;
+    }
+
+    /// 現局面から引き継ぐフィールドだけを次のStateInfoへ直接コピーし、現在位置を進める。
+    ///
+    /// 通常手では残りのフィールドをdo_move_with_prefetch()内で必ず上書きする。
+    /// ローカルStateInfoを完成させてからstack slotへ丸ごとmoveする二重コピーを避ける。
+    #[inline]
+    fn push_partial_state_in_place(&mut self) {
+        let previous_idx = self.state_idx;
+        let next_idx = previous_idx + 1;
+        if self.state_stack.len() <= next_idx {
+            self.state_stack.push(StateInfo::new());
+        }
+
+        // SAFETY: next_idx == previous_idx + 1かつlen > next_idxなので、
+        // split_at_mut後のpreviousとnextは別要素であり、両方とも範囲内。
+        let (previous_states, next_states) = self.state_stack.split_at_mut(next_idx);
+        let previous = unsafe { previous_states.get_unchecked(previous_idx) };
+        let next = unsafe { next_states.get_unchecked_mut(0) };
+
+        // StateInfoの全フィールドを網羅し、追加時にコピー/再構築の分類漏れを
+        // コンパイルエラーとして検出する。`_`のフィールドはdo_move内で再構築する。
+        let &StateInfo {
+            pawn_key,
+            minor_piece_key,
+            non_pawn_key,
+            plies_from_null,
+            continuous_check,
+            pass_rights,
+            board_key,
+            hand_key,
+            hand_snapshot: _,
+            previous: _,
+            checkers: _,
+            blockers_for_king: _,
+            pinners: _,
+            check_squares: _,
+            captured_piece: _,
+            repetition: _,
+            repetition_times: _,
+            repetition_type: _,
+            material_value,
+            last_move: _,
+        } = previous;
+
+        next.pawn_key = pawn_key;
+        next.minor_piece_key = minor_piece_key;
+        next.non_pawn_key = non_pawn_key;
+        next.plies_from_null = plies_from_null;
+        next.continuous_check = continuous_check;
+        next.pass_rights = pass_rights;
+        next.board_key = board_key;
+        next.hand_key = hand_key;
+        next.material_value = material_value;
+        next.previous = previous_idx;
+
         self.state_idx = next_idx;
     }
 
@@ -931,24 +988,40 @@ impl Position {
         let prev_blockers = self.cur_state().blockers_for_king;
         let prev_pinners = self.cur_state().pinners;
         let prev_king_sq = self.king_square;
+        let prev_check_square = if gives_check {
+            let moved_pt = if m.is_drop() {
+                m.drop_piece_type()
+            } else {
+                let pt = self.piece_on(m.from()).piece_type();
+                if m.is_promote() {
+                    pt.promote().expect("promote move on unpromotable piece")
+                } else {
+                    pt
+                }
+            };
+            check_sq_index(moved_pt)
+                .map(|idx| unsafe { *self.cur_state().check_squares.get_unchecked(idx) })
+                .unwrap_or(Bitboard::EMPTY)
+        } else {
+            Bitboard::EMPTY
+        };
 
-        // 1. 新しいStateInfoを作成（NNUE関連はAccumulatorStackで管理）
-        let mut new_state = self.cur_state().partial_clone();
+        // 1. 次のStateInfo slotへ、引き継ぐフィールドだけを直接コピーする。
+        self.push_partial_state_in_place();
         // NNUE用のDirtyPieceはローカルで構築して返す
         let mut dirty_piece = DirtyPiece::new();
-        let mut material_value = new_state.material_value.raw();
+        let mut material_value = self.cur_state().material_value.raw();
 
         // 2. 局面情報の更新
         self.game_ply += 1;
-        new_state.plies_from_null += 1;
+        self.cur_state_mut().plies_from_null += 1;
 
         // 3. 手番の変更とハッシュ更新
-        new_state.board_key ^= zobrist_side();
+        self.cur_state_mut().board_key ^= zobrist_side();
 
         // 4. 駒の移動
         let mut moved_from: Option<Square> = None;
         let moved_to: Square;
-        let moved_pt: PieceType;
 
         if update_board_effects {
             self.ensure_board_effects();
@@ -961,7 +1034,6 @@ impl Position {
             let to = m.to();
             let pc = Piece::new(us, pt);
             moved_to = to;
-            moved_pt = pt;
 
             if update_board_effects {
                 let occupied_before = self.occupied();
@@ -981,12 +1053,14 @@ impl Position {
 
             // 手駒から減らす
             self.hand[us.index()] = self.hand[us.index()].sub(pt);
-            new_state.hand_key = new_state.hand_key.wrapping_sub(zobrist_hand(us, pt));
+            let st = self.cur_state_mut();
+            st.hand_key = st.hand_key.wrapping_sub(zobrist_hand(us, pt));
 
             // 盤上に配置
             self.put_piece_internal(pc, to);
-            new_state.board_key ^= zobrist_psq(pc, to);
-            self.xor_partial_keys(&mut new_state, pc, to);
+            let st = self.cur_state_mut();
+            st.board_key ^= zobrist_psq(pc, to);
+            Self::xor_partial_keys(st, pc, to);
 
             let new_bp = ExtBonaPiece::from_board(pc, to);
             self.piece_list.put_piece_on_board(piece_no, new_bp, to);
@@ -998,7 +1072,7 @@ impl Position {
                 new_piece: new_bp,
             };
 
-            new_state.captured_piece = Piece::NONE;
+            self.cur_state_mut().captured_piece = Piece::NONE;
         } else {
             let from = m.from();
             let to = m.to();
@@ -1019,11 +1093,6 @@ impl Position {
                 m.is_promote()
             );
 
-            moved_pt = if m.is_promote() {
-                pc.piece_type().promote().unwrap()
-            } else {
-                pc.piece_type()
-            };
             let moved_after_pc = if m.is_promote() {
                 pc.promote().unwrap()
             } else {
@@ -1075,8 +1144,9 @@ impl Position {
                 let old_bp_cap = self.piece_list.bona_piece(piece_no_cap);
 
                 self.remove_piece_internal(to);
-                new_state.board_key ^= zobrist_psq(captured, to);
-                self.xor_partial_keys(&mut new_state, captured, to);
+                let st = self.cur_state_mut();
+                st.board_key ^= zobrist_psq(captured, to);
+                Self::xor_partial_keys(st, captured, to);
 
                 // material_value: 盤上から駒が消える
                 material_value -= signed_piece_value(captured);
@@ -1093,8 +1163,8 @@ impl Position {
                         | PieceType::Rook
                 ) {
                     self.hand[us.index()] = self.hand[us.index()].add(captured_pt);
-                    new_state.hand_key =
-                        new_state.hand_key.wrapping_add(zobrist_hand(us, captured_pt));
+                    let st = self.cur_state_mut();
+                    st.hand_key = st.hand_key.wrapping_add(zobrist_hand(us, captured_pt));
                     material_value += hand_piece_value(us, captured_pt);
                 }
 
@@ -1113,16 +1183,18 @@ impl Position {
             } else {
                 dirty_piece.dirty_num = 1;
             }
-            new_state.captured_piece = captured;
+            self.cur_state_mut().captured_piece = captured;
 
             // 駒を移動
             self.remove_piece_internal(from);
-            new_state.board_key ^= zobrist_psq(pc, from);
-            self.xor_partial_keys(&mut new_state, pc, from);
+            let st = self.cur_state_mut();
+            st.board_key ^= zobrist_psq(pc, from);
+            Self::xor_partial_keys(st, pc, from);
 
             self.put_piece_internal(moved_after_pc, to);
-            new_state.board_key ^= zobrist_psq(moved_after_pc, to);
-            self.xor_partial_keys(&mut new_state, moved_after_pc, to);
+            let st = self.cur_state_mut();
+            st.board_key ^= zobrist_psq(moved_after_pc, to);
+            Self::xor_partial_keys(st, moved_after_pc, to);
 
             // 成りによるmaterial差分
             if moved_after_pc != pc {
@@ -1148,27 +1220,23 @@ impl Position {
         }
 
         // do_move直後にTTをprefetch
-        prefetcher.prefetch(new_state.key(), them);
+        prefetcher.prefetch(self.cur_state().key(), them);
 
         // 6. 王手情報の更新（diffベース）
         let mut checkers = Bitboard::EMPTY;
         if gives_check {
             let ksq = self.king_square[them.index()];
-            // 直接王手: King 以外の駒が check_squares 上にいるかチェック。
-            // King の場合は直接王手はない（開き王手のみ）のでスキップ。
-            if let Some(cs_idx) = check_sq_index(moved_pt) {
-                // SAFETY: check_sq_index は 0..CHECK_SQUARES_SIZE-1 を返す。
-                checkers |= unsafe { *self.cur_state().check_squares.get_unchecked(cs_idx) }
-                    & Bitboard::from_square(moved_to);
-            }
+            // 直接王手: 手を進める前に退避したcheck_squaresを使う。
+            // Kingの場合はprev_check_squareがEMPTYなので直接王手はなく、開き王手だけを調べる。
+            checkers |= prev_check_square & Bitboard::from_square(moved_to);
 
             // 開き王手（動かした駒が遮断駒だった場合）
             // discovered(from, to, ksq, blockers) と同等の判定
             // - fromがblockersに含まれている
             // - from, to, ksq が同一直線上にない（aligned でない）場合のみ開き王手
             if let Some(from_sq) = moved_from {
-                let prev_blockers = self.cur_state().blockers_for_king[them.index()];
-                if prev_blockers.contains(from_sq)
+                let their_prev_blockers = prev_blockers[them.index()];
+                if their_prev_blockers.contains(from_sq)
                     && !crate::mate::aligned(from_sq, moved_to, ksq)
                     && let Some(dir) = crate::bitboard::direct_of(ksq, from_sq)
                 {
@@ -1201,26 +1269,26 @@ impl Position {
         let is_check = !checkers.is_empty();
         // 4. 連続王手カウンタの更新
         if is_check {
-            new_state.continuous_check[us.index()] = prev_continuous[us.index()] + 2;
+            self.cur_state_mut().continuous_check[us.index()] = prev_continuous[us.index()] + 2;
         } else {
-            new_state.continuous_check[us.index()] = 0;
+            self.cur_state_mut().continuous_check[us.index()] = 0;
         }
-        // 受け手側は前の値をそのまま引き継ぐ（memcpyで自動的にコピーされる）
-        // rshogi では partial_clone() で既にコピー済みなので、リセットしない
+        // 受け手側はpush_partial_state_in_place()で引き継いでいるため、リセットしない。
 
         // 5. 手番交代
         self.side_to_move = them;
 
         // 6. 王手情報の更新
-        new_state.checkers = checkers;
+        self.cur_state_mut().checkers = checkers;
 
         // 7. 千日手判定に使う手駒スナップショットを保存
-        new_state.hand_snapshot = self.hand;
-        new_state.material_value = Value::new(material_value);
+        let hand_snapshot = self.hand;
+        let st = self.cur_state_mut();
+        st.hand_snapshot = hand_snapshot;
+        st.material_value = Value::new(material_value);
 
-        // 8. StateInfoの付け替え（previous をぶら下げる）
-        new_state.last_move = m;
-        self.push_state(new_state);
+        // 8. StateInfoの残りを更新（previous/state_idxは手の実行前に設定済み）
+        self.cur_state_mut().last_move = m;
 
         // 9. 繰り返し情報の更新
         self.update_repetition_info();
@@ -1422,6 +1490,8 @@ impl Position {
     }
 
     pub(crate) fn do_null_move_with_prefetch<P: TtPrefetch>(&mut self, prefetcher: &P) {
+        // update_repetition_info を呼ばないため、repetition 系フィールドの初期化は
+        // partial_clone の zero クリアに依存している。in-place 化する場合は要注意。
         let mut new_state = self.cur_state().partial_clone();
 
         new_state.board_key ^= zobrist_side();
