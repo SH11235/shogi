@@ -998,7 +998,7 @@ impl Position {
             } else {
                 let pt = self.piece_on(m.from()).piece_type();
                 if m.is_promote() {
-                    pt.promote().unwrap_or(pt)
+                    pt.promote().expect("promote move on unpromotable piece")
                 } else {
                     pt
                 }
@@ -1494,6 +1494,8 @@ impl Position {
     }
 
     pub(crate) fn do_null_move_with_prefetch<P: TtPrefetch>(&mut self, prefetcher: &P) {
+        // update_repetition_info を呼ばないため、repetition 系フィールドの初期化は
+        // partial_clone の zero クリアに依存している。in-place 化する場合は要注意。
         let mut new_state = self.cur_state().partial_clone();
 
         new_state.board_key ^= zobrist_side();
