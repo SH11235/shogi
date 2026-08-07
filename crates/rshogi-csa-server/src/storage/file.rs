@@ -183,7 +183,11 @@ mod tests {
         let store = FileKifuStorage::new(&dir);
         let game_id = GameId::new("20260417120000");
         let key = store.save(&game_id, "V2.2\nN+alice\n").await.unwrap();
-        assert_eq!(key.as_str(), "2026/04/17/20260417120000.csa");
+        // StorageKey は OS のパス区切りを含むため、PathBuf 比較で OS 非依存にする。
+        assert_eq!(
+            PathBuf::from(key.as_str()),
+            PathBuf::from("2026").join("04").join("17").join("20260417120000.csa")
+        );
         let abs = dir.join(key.as_str());
         let body = fs::read_to_string(&abs).await.unwrap();
         assert_eq!(body, "V2.2\nN+alice\n");
@@ -217,7 +221,7 @@ mod tests {
         let store = FileKifuStorage::new(&dir);
         let game_id = GameId::new("buoy-123");
         let key = store.save(&game_id, "V2.2\n").await.unwrap();
-        assert_eq!(key.as_str(), "unknown/buoy-123.csa");
+        assert_eq!(PathBuf::from(key.as_str()), PathBuf::from("unknown").join("buoy-123.csa"));
         let _ = fs::remove_dir_all(&dir).await;
     }
 
@@ -228,7 +232,7 @@ mod tests {
         let store = FileKifuStorage::new(&dir);
         let game_id = GameId::new("20261340abcd");
         let key = store.save(&game_id, "V2.2\n").await.unwrap();
-        assert_eq!(key.as_str(), "unknown/20261340abcd.csa");
+        assert_eq!(PathBuf::from(key.as_str()), PathBuf::from("unknown").join("20261340abcd.csa"));
         let _ = fs::remove_dir_all(&dir).await;
     }
 

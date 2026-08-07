@@ -14,6 +14,7 @@
 
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 use crate::types::{Color, Move, Piece, PieceType, Square};
@@ -693,6 +694,10 @@ impl Default for CounterMoveHistory {
 // CorrectionHistory
 // =============================================================================
 
+/// Continuation correction historyの1 context分: [piece][to] -> correction。
+pub type CorrectionPieceToHistory =
+    [[StatsEntry<CORRECTION_HISTORY_LIMIT>; Square::NUM]; Piece::NUM];
+
 /// CorrectionHistory ()
 ///
 /// - Pawn/Minor: [key_index][color] -> correction
@@ -705,8 +710,7 @@ pub struct CorrectionHistory {
     minor: [[StatsEntry<CORRECTION_HISTORY_LIMIT>; Color::NUM]; CORRECTION_HISTORY_SIZE],
     non_pawn:
         [[[StatsEntry<CORRECTION_HISTORY_LIMIT>; Color::NUM]; Color::NUM]; CORRECTION_HISTORY_SIZE],
-    continuation: [[[[StatsEntry<CORRECTION_HISTORY_LIMIT>; Square::NUM]; Piece::NUM]; Square::NUM];
-        Piece::NUM],
+    continuation: [[CorrectionPieceToHistory; Square::NUM]; Piece::NUM],
 }
 
 impl CorrectionHistory {
@@ -841,6 +845,28 @@ impl CorrectionHistory {
                 .get_unchecked(to.index())
                 .get()
         }
+    }
+
+    /// 指定した直前手contextの[piece][to]テーブルを返す。
+    #[inline]
+    pub fn continuation_table(&self, prev_pc: Piece, prev_to: Square) -> &CorrectionPieceToHistory {
+        // SAFETY: Piece::index() < Piece::NUM=31、Square::index() < Square::NUM=81。
+        unsafe { self.continuation.get_unchecked(prev_pc.index()).get_unchecked(prev_to.index()) }
+    }
+
+    /// 事前に選択済みのcontinuation correction tableから値を取得する。
+    ///
+    /// # Safety
+    ///
+    /// `table`は生存中の`CorrectionHistory::continuation_table()`を指していなければならない。
+    #[inline]
+    pub unsafe fn continuation_value_from_table(
+        table: NonNull<CorrectionPieceToHistory>,
+        pc: Piece,
+        to: Square,
+    ) -> i16 {
+        // SAFETY: 呼出側がtableの生存期間を保証し、Piece/Square indexは各NUM未満。
+        unsafe { table.as_ref().get_unchecked(pc.index()).get_unchecked(to.index()).get() }
     }
 
     #[inline]

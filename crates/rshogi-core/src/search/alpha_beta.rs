@@ -25,9 +25,9 @@ use crate::types::{
 };
 
 use super::history::{
-    CORRECTION_HISTORY_LIMIT, HistoryCell, HistoryTables, LOW_PLY_HISTORY_SIZE,
-    continuation_history_bonus_with_offset, continuation_history_weight, low_ply_history_bonus,
-    pawn_history_bonus, stat_bonus, stat_malus,
+    CORRECTION_HISTORY_LIMIT, CorrectionPieceToHistory, HistoryCell, HistoryTables,
+    LOW_PLY_HISTORY_SIZE, continuation_history_bonus_with_offset, continuation_history_weight,
+    low_ply_history_bonus, pawn_history_bonus, stat_bonus, stat_malus,
 };
 use super::movepicker::piece_value;
 use super::types::{
@@ -672,6 +672,9 @@ pub struct SearchWorker {
     /// ContinuationHistoryのsentinel
     pub cont_history_sentinel: NonNull<PieceToHistory>,
 
+    /// ContinuationCorrectionHistoryのsentinel
+    pub cont_correction_sentinel: NonNull<CorrectionPieceToHistory>,
+
     /// 全合法手生成フラグ
     pub generate_all_legal_moves: bool,
 
@@ -746,9 +749,12 @@ impl SearchWorker {
         let history = HistoryCell::new_boxed();
         // HistoryCell経由でsentinelポインタを取得
         // SAFETY: 初期化時のみ使用、他の参照と同時保持しない
-        let cont_history_sentinel = {
+        let (cont_history_sentinel, cont_correction_sentinel) = {
             let h = unsafe { history.as_ref_unchecked() };
-            NonNull::from(h.continuation_history[0][0].get_table(Piece::NONE, Square::SQ_11))
+            (
+                NonNull::from(h.continuation_history[0][0].get_table(Piece::NONE, Square::SQ_11)),
+                NonNull::from(h.correction_history.continuation_table(Piece::NONE, Square::SQ_11)),
+            )
         };
 
         let reductions = build_reductions(search_tune_params.lmr_table_coeff);
@@ -757,6 +763,7 @@ impl SearchWorker {
             eval_hash,
             history,
             cont_history_sentinel,
+            cont_correction_sentinel,
             generate_all_legal_moves: false,
             max_moves_to_draw,
             thread_id,
@@ -879,8 +886,10 @@ impl SearchWorker {
 
     fn reset_cont_history_ptrs(&mut self) {
         let sentinel = self.cont_history_sentinel;
+        let correction_sentinel = self.cont_correction_sentinel;
         for stack in self.state.stack.iter_mut() {
             stack.cont_history_ptr = sentinel;
+            stack.cont_correction_ptr = correction_sentinel;
         }
     }
 
@@ -897,11 +906,17 @@ impl SearchWorker {
         let in_check_idx = in_check as usize;
         let capture_idx = capture as usize;
         // SAFETY: 単一スレッド内で使用、可変参照と同時保持しない
-        let table = {
+        let (table, correction_table) = {
             let h = unsafe { self.history.as_ref_unchecked() };
-            NonNull::from(h.continuation_history[in_check_idx][capture_idx].get_table(piece, to))
+            (
+                NonNull::from(
+                    h.continuation_history[in_check_idx][capture_idx].get_table(piece, to),
+                ),
+                NonNull::from(h.correction_history.continuation_table(piece, to)),
+            )
         };
         self.state.stack[ply as usize].cont_history_ptr = table;
+        self.state.stack[ply as usize].cont_correction_ptr = correction_table;
         self.state.stack[ply as usize].cont_hist_key =
             Some(ContHistKey::new(in_check, capture, piece, to));
     }
@@ -909,6 +924,7 @@ impl SearchWorker {
     #[inline]
     pub(super) fn clear_cont_history_for_null(&mut self, ply: i32) {
         self.state.stack[ply as usize].cont_history_ptr = self.cont_history_sentinel;
+        self.state.stack[ply as usize].cont_correction_ptr = self.cont_correction_sentinel;
         self.state.stack[ply as usize].cont_hist_key = Some(ContHistKey::null_sentinel());
     }
 
@@ -1158,6 +1174,7 @@ impl SearchWorker {
         self.state.set_previous_pv(&self.state.root_moves[0].pv.clone());
         self.state.set_root_follow_pv();
         self.state.stack[0].cont_history_ptr = self.cont_history_sentinel;
+        self.state.stack[0].cont_correction_ptr = self.cont_correction_sentinel;
         self.state.stack[0].cont_hist_key = None;
         // ss->statScore = 0
         self.state.stack[0].stat_score = 0;
@@ -1882,6 +1899,7 @@ impl SearchWorker {
         self.state.set_previous_pv(&previous_pv);
         self.state.set_root_follow_pv();
         self.state.stack[0].cont_history_ptr = self.cont_history_sentinel;
+        self.state.stack[0].cont_correction_ptr = self.cont_correction_sentinel;
         self.state.stack[0].cont_hist_key = None;
         // root探索開始時の初期化
         self.state.stack[0].stat_score = 0;
@@ -3963,10 +3981,10 @@ impl SearchWorker {
 
 // SAFETY: SearchWorkerは単一スレッドで使用される前提。
 //
-// 1. `cont_history_ptr: NonNull<PieceToHistory>`（StackArray内の各Stack）:
-//    `self.history.continuation_history` 内のテーブルへの参照である。
-//    SearchWorkerがスレッド間でmoveされても、history フィールドも一緒にmoveされるため、
-//    ポインタの参照先は常に有効であり、データ競合も発生しない。
+// 1. `cont_history_ptr` / `cont_correction_ptr`（StackArray内の各Stack）:
+//    `self.history`が所有するcontinuation history / correction history内のテーブルへの参照である。
+//    HistoryCell本体はBox allocation内にあり、SearchWorkerがスレッド間でmoveされても再配置されない。
+//    ワーカーは移動先の単一スレッドだけで使用するため、データ競合も発生しない。
 //
 // 2. `network_ptr: *const NNUENetwork`（SearchState、layerstack-arch feature時のみ）:
 //    グローバル NETWORK (RwLock<Option<Arc<NNUENetwork>>>) 内の Arc が指す

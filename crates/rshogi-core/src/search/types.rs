@@ -12,7 +12,7 @@ use crate::movegen::{MoveList, generate_legal_with_pass};
 use crate::position::Position;
 use crate::types::{MAX_PLY, Move, Piece, RepetitionState, Square, Value};
 
-use super::history::PieceToHistory;
+use super::history::{CorrectionPieceToHistory, PieceToHistory};
 use std::ptr::NonNull;
 
 // =============================================================================
@@ -166,8 +166,16 @@ pub struct Stack {
     /// tree-changing な探索改善でのみ参照する。
     pub follow_pv: bool,
 
-    /// ContinuationHistoryへの参照インデックス（旧方式、互換性のため残す）
-    pub cont_history_idx: usize,
+    /// ContinuationCorrectionHistoryへの参照（YaneuraOu方式）
+    ///
+    /// # Safety
+    ///
+    /// このポインタは以下の不変条件を満たす：
+    /// - 常に有効な`CorrectionPieceToHistory`テーブルを指す（`dangling()`は初期値のみ）
+    /// - `SearchWorker::reset_cont_history_ptrs()`でsentinelに初期化される
+    /// - 指し手実行時に`CorrectionHistory`内の対応テーブルへ更新される
+    /// - 参照先を所有する`HistoryCell`は`SearchWorker`の生存期間中に再配置されない
+    pub cont_correction_ptr: NonNull<CorrectionPieceToHistory>,
 
     /// ContinuationHistoryへの参照（YaneuraOu方式、MovePicker直結）
     ///
@@ -224,7 +232,7 @@ impl Default for Stack {
     fn default() -> Self {
         Self {
             follow_pv: false,
-            cont_history_idx: 0,
+            cont_correction_ptr: NonNull::dangling(),
             cont_history_ptr: NonNull::dangling(),
             cont_hist_key: None,
             ply: 0,

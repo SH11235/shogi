@@ -760,8 +760,8 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
                 let mut added = IndexList::new();
                 let prev = prev_acc.get(p);
                 let curr = acc.get_mut(p);
-                curr.copy_from_slice(prev);
-                let fast_applied = self.try_apply_dirty_piece_fast(
+                let fast_applied = self.try_apply_dirty_piece_fast_from_source(
+                    prev,
                     curr,
                     dirty_piece,
                     perspective,
@@ -779,6 +779,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
                     );
                 }
                 if !fast_applied {
+                    curr.copy_from_slice(prev);
                     for index in removed.iter() {
                         self.sub_weights(curr, index);
                     }
@@ -919,8 +920,8 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
                 let mut added = IndexList::new();
                 let prev = prev_acc.get(p);
                 let curr = acc.get_mut(p);
-                curr.copy_from_slice(prev);
-                let fast_applied = self.try_apply_dirty_piece_fast(
+                let fast_applied = self.try_apply_dirty_piece_fast_from_source(
+                    prev,
                     curr,
                     dirty_piece,
                     perspective,
@@ -938,6 +939,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
                     );
                 }
                 if !fast_applied {
+                    curr.copy_from_slice(prev);
                     for index in removed.iter() {
                         self.sub_weights(curr, index);
                     }
@@ -1162,8 +1164,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
             &self.biases.0,
             accumulation,
             idx_fn,
-            |acc, idx| self.add_weights(acc, idx),
-            |acc, idx| self.sub_weights(acc, idx),
+            |acc, removed, added| self.apply_weight_changes_tiled(acc, removed, added),
         );
     }
 
@@ -1320,6 +1321,86 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         true
     }
 
+    /// 複数featureの差分をaccumulatorのtile単位でまとめて適用する。
+    #[inline]
+    fn apply_weight_changes_tiled(
+        &self,
+        accumulation: &mut [i16; L1],
+        removed: &IndexList<{ PieceNumber::NB }>,
+        added: &IndexList<{ PieceNumber::NB }>,
+    ) {
+        if removed.is_empty() && added.is_empty() {
+            return;
+        }
+
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512bw")
+        ))]
+        {
+            const VALUES_PER_REG: usize = 16;
+            const TILE_REGS: usize = 16;
+            const TILE_VALUES: usize = VALUES_PER_REG * TILE_REGS;
+
+            if L1.is_multiple_of(TILE_VALUES) {
+                // SAFETY:
+                // - accumulationとweight rowは64-byte alignedで、tile offsetは512-byte単位。
+                // - L1がTILE_VALUESの倍数のときだけ入るため、各load/storeは配列内に収まる。
+                // - weight_rowが各feature indexとrow長L1の境界を検証する。
+                unsafe {
+                    use std::arch::x86_64::*;
+
+                    let acc_ptr = accumulation.as_mut_ptr();
+                    for tile_offset in (0..L1).step_by(TILE_VALUES) {
+                        let mut tile = [_mm256_setzero_si256(); TILE_REGS];
+                        for (k, value) in tile.iter_mut().enumerate() {
+                            *value = _mm256_load_si256(
+                                acc_ptr.add(tile_offset + k * VALUES_PER_REG) as *const __m256i,
+                            );
+                        }
+
+                        for index in removed.iter() {
+                            let weights = self.weight_row(index);
+                            let weight_ptr = weights.as_ptr().add(tile_offset);
+                            for (k, value) in tile.iter_mut().enumerate() {
+                                let weight = _mm256_load_si256(
+                                    weight_ptr.add(k * VALUES_PER_REG) as *const __m256i
+                                );
+                                *value = _mm256_sub_epi16(*value, weight);
+                            }
+                        }
+                        for index in added.iter() {
+                            let weights = self.weight_row(index);
+                            let weight_ptr = weights.as_ptr().add(tile_offset);
+                            for (k, value) in tile.iter_mut().enumerate() {
+                                let weight = _mm256_load_si256(
+                                    weight_ptr.add(k * VALUES_PER_REG) as *const __m256i
+                                );
+                                *value = _mm256_add_epi16(*value, weight);
+                            }
+                        }
+
+                        for (k, &value) in tile.iter().enumerate() {
+                            _mm256_store_si256(
+                                acc_ptr.add(tile_offset + k * VALUES_PER_REG) as *mut __m256i,
+                                value,
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        for index in removed.iter() {
+            self.sub_weights(accumulation, index);
+        }
+        for index in added.iter() {
+            self.add_weights(accumulation, index);
+        }
+    }
+
     /// 重みを累積値に加算（SIMD最適化版）
     ///
     /// L1 個の i16 要素を SIMD で加算。AVX512BW/AVX2/SSE2/WASM SIMD128 に対応。
@@ -1451,6 +1532,43 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         perspective: Color,
         king_sq: crate::types::Square,
     ) -> bool {
+        self.try_apply_dirty_piece_fast_impl::<false>(
+            None,
+            accumulation,
+            dirty_piece,
+            perspective,
+            king_sq,
+        )
+    }
+
+    /// `source` のコピーと通常差分更新を1回の走査で行う。
+    #[inline]
+    fn try_apply_dirty_piece_fast_from_source(
+        &self,
+        source: &[i16; L1],
+        accumulation: &mut [i16; L1],
+        dirty_piece: &DirtyPiece,
+        perspective: Color,
+        king_sq: crate::types::Square,
+    ) -> bool {
+        self.try_apply_dirty_piece_fast_impl::<true>(
+            Some(source),
+            accumulation,
+            dirty_piece,
+            perspective,
+            king_sq,
+        )
+    }
+
+    #[inline]
+    fn try_apply_dirty_piece_fast_impl<const FROM_SOURCE: bool>(
+        &self,
+        source: Option<&[i16; L1]>,
+        accumulation: &mut [i16; L1],
+        dirty_piece: &DirtyPiece,
+        perspective: Color,
+        king_sq: crate::types::Square,
+    ) -> bool {
         if cfg!(feature = "nnue-effect-bucket") {
             return false;
         }
@@ -1497,11 +1615,20 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
             1 => {
                 let (old_bp, new_bp) = old_new(0);
                 if old_bp != BonaPiece::ZERO && new_bp != BonaPiece::ZERO {
-                    self.apply_sub_add_fused(
-                        accumulation,
-                        feature_index_from_bona_piece::<FT>(old_bp, perspective, king_sq),
-                        feature_index_from_bona_piece::<FT>(new_bp, perspective, king_sq),
-                    );
+                    let sub_index =
+                        feature_index_from_bona_piece::<FT>(old_bp, perspective, king_sq);
+                    let add_index =
+                        feature_index_from_bona_piece::<FT>(new_bp, perspective, king_sq);
+                    if FROM_SOURCE {
+                        self.apply_sub_add_fused_from_source(
+                            source.expect("source is present when FROM_SOURCE is true"),
+                            accumulation,
+                            sub_index,
+                            add_index,
+                        );
+                    } else {
+                        self.apply_sub_add_fused(accumulation, sub_index, add_index);
+                    }
                     true
                 } else {
                     false
@@ -1515,19 +1642,147 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
                     && old_bp1 != BonaPiece::ZERO
                     && new_bp1 != BonaPiece::ZERO
                 {
-                    self.apply_double_sub_add_fused(
-                        accumulation,
-                        feature_index_from_bona_piece::<FT>(old_bp0, perspective, king_sq),
-                        feature_index_from_bona_piece::<FT>(new_bp0, perspective, king_sq),
-                        feature_index_from_bona_piece::<FT>(old_bp1, perspective, king_sq),
-                        feature_index_from_bona_piece::<FT>(new_bp1, perspective, king_sq),
-                    );
+                    let sub_index0 =
+                        feature_index_from_bona_piece::<FT>(old_bp0, perspective, king_sq);
+                    let add_index0 =
+                        feature_index_from_bona_piece::<FT>(new_bp0, perspective, king_sq);
+                    let sub_index1 =
+                        feature_index_from_bona_piece::<FT>(old_bp1, perspective, king_sq);
+                    let add_index1 =
+                        feature_index_from_bona_piece::<FT>(new_bp1, perspective, king_sq);
+                    if FROM_SOURCE {
+                        self.apply_double_sub_add_fused_from_source(
+                            source.expect("source is present when FROM_SOURCE is true"),
+                            accumulation,
+                            sub_index0,
+                            add_index0,
+                            sub_index1,
+                            add_index1,
+                        );
+                    } else {
+                        self.apply_double_sub_add_fused(
+                            accumulation,
+                            sub_index0,
+                            add_index0,
+                            sub_index1,
+                            add_index1,
+                        );
+                    }
                     true
                 } else {
                     false
                 }
             }
             _ => false,
+        }
+    }
+
+    #[inline]
+    fn apply_sub_add_fused_from_source(
+        &self,
+        source: &[i16; L1],
+        accumulation: &mut [i16; L1],
+        sub_index: usize,
+        add_index: usize,
+    ) {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512bw")
+        ))]
+        {
+            let sub_weights = self.weight_row(sub_index);
+            let add_weights = self.weight_row(add_index);
+
+            // SAFETY:
+            // - source / accumulation は別の AccumulatorLayerStacks 内
+            //   Aligned<[i16; L1]> で、ともに32バイトアライン。
+            // - weight rowも64バイトアラインかつ各行長L1は16の倍数。
+            // - L1要素を16要素ずつ完全に走査し、sourceとweightを読んでから
+            //   対応するaccumulation chunkへstoreする。
+            unsafe {
+                use std::arch::x86_64::*;
+                let source_ptr = source.as_ptr();
+                let acc_ptr = accumulation.as_mut_ptr();
+                let sub_ptr = sub_weights.as_ptr();
+                let add_ptr = add_weights.as_ptr();
+
+                for i in 0..(L1 / 16) {
+                    let source_vec = _mm256_load_si256(source_ptr.add(i * 16) as *const __m256i);
+                    let sub_vec = _mm256_load_si256(sub_ptr.add(i * 16) as *const __m256i);
+                    let add_vec = _mm256_load_si256(add_ptr.add(i * 16) as *const __m256i);
+                    let result = _mm256_add_epi16(_mm256_sub_epi16(source_vec, sub_vec), add_vec);
+                    _mm256_store_si256(acc_ptr.add(i * 16) as *mut __m256i, result);
+                }
+            }
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        {
+            accumulation.copy_from_slice(source);
+            self.apply_sub_add_fused(accumulation, sub_index, add_index);
+        }
+    }
+
+    #[inline]
+    fn apply_double_sub_add_fused_from_source(
+        &self,
+        source: &[i16; L1],
+        accumulation: &mut [i16; L1],
+        sub_index0: usize,
+        add_index0: usize,
+        sub_index1: usize,
+        add_index1: usize,
+    ) {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512bw")
+        ))]
+        {
+            let sub_weights0 = self.weight_row(sub_index0);
+            let add_weights0 = self.weight_row(add_index0);
+            let sub_weights1 = self.weight_row(sub_index1);
+            let add_weights1 = self.weight_row(add_index1);
+
+            // SAFETY: apply_sub_add_fused_from_sourceと同じ。4本のweight rowも
+            // すべてL1要素あり、16要素単位で完全に走査する。
+            unsafe {
+                use std::arch::x86_64::*;
+                let source_ptr = source.as_ptr();
+                let acc_ptr = accumulation.as_mut_ptr();
+                let sub_ptr0 = sub_weights0.as_ptr();
+                let add_ptr0 = add_weights0.as_ptr();
+                let sub_ptr1 = sub_weights1.as_ptr();
+                let add_ptr1 = add_weights1.as_ptr();
+
+                for i in 0..(L1 / 16) {
+                    let source_vec = _mm256_load_si256(source_ptr.add(i * 16) as *const __m256i);
+                    let sub_vec0 = _mm256_load_si256(sub_ptr0.add(i * 16) as *const __m256i);
+                    let add_vec0 = _mm256_load_si256(add_ptr0.add(i * 16) as *const __m256i);
+                    let sub_vec1 = _mm256_load_si256(sub_ptr1.add(i * 16) as *const __m256i);
+                    let add_vec1 = _mm256_load_si256(add_ptr1.add(i * 16) as *const __m256i);
+                    let result = _mm256_add_epi16(
+                        _mm256_add_epi16(_mm256_sub_epi16(source_vec, sub_vec0), add_vec0),
+                        _mm256_sub_epi16(add_vec1, sub_vec1),
+                    );
+                    _mm256_store_si256(acc_ptr.add(i * 16) as *mut __m256i, result);
+                }
+            }
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        {
+            accumulation.copy_from_slice(source);
+            self.apply_double_sub_add_fused(
+                accumulation,
+                sub_index0,
+                add_index0,
+                sub_index1,
+                add_index1,
+            );
         }
     }
 
@@ -1991,6 +2246,42 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "nnue-effect-bucket"))]
+    #[test]
+    fn test_apply_weight_changes_tiled_matches_sequential_with_wrapping() {
+        let mut ft = make_test_transformer();
+        for (index, seed) in [0usize, 1, 2, 3].into_iter().zip([31i16, -47, 83, -109]) {
+            fill_weight_row(&mut ft, index, seed);
+        }
+
+        let mut removed = IndexList::<{ PieceNumber::NB }>::new();
+        let mut added = IndexList::<{ PieceNumber::NB }>::new();
+        assert!(removed.push(0));
+        assert!(removed.push(1));
+        assert!(added.push(2));
+        assert!(added.push(3));
+
+        let mut sequential = Aligned([0i16; TEST_L1]);
+        for (i, value) in sequential.0.iter_mut().enumerate() {
+            *value = if i % 2 == 0 {
+                i16::MAX.wrapping_sub((i % 97) as i16)
+            } else {
+                i16::MIN.wrapping_add((i % 89) as i16)
+            };
+        }
+        let mut tiled = Aligned(sequential.0);
+
+        for index in removed.iter() {
+            ft.sub_weights(&mut sequential.0, index);
+        }
+        for index in added.iter() {
+            ft.add_weights(&mut sequential.0, index);
+        }
+        ft.apply_weight_changes_tiled(&mut tiled.0, &removed, &added);
+
+        assert_eq!(sequential.0, tiled.0);
+    }
+
     // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
     // feature transformer の寸法 test は対象外。
     #[cfg(not(feature = "nnue-effect-bucket"))]
@@ -2035,11 +2326,28 @@ mod tests {
         fill_weight_row(&mut ft, old_index, 11);
         fill_weight_row(&mut ft, new_index, 37);
 
-        let mut generic = Aligned([5i16; TEST_L1]);
-        let mut fast = Aligned([5i16; TEST_L1]);
+        let mut source = Aligned([0i16; TEST_L1]);
+        for (i, slot) in source.0.iter_mut().enumerate() {
+            *slot = match i % 3 {
+                0 => i16::MIN.wrapping_add(i as i16),
+                1 => i16::MAX.wrapping_sub(i as i16),
+                _ => (i as i16).wrapping_mul(97),
+            };
+        }
+        let mut generic = source;
+        let mut fast = source;
+        let mut from_source = Aligned([123i16; TEST_L1]);
         apply_generic(&ft, &mut generic.0, &dirty_piece, Color::Black, king_sq);
         assert!(ft.try_apply_dirty_piece_fast(&mut fast.0, &dirty_piece, Color::Black, king_sq));
+        assert!(ft.try_apply_dirty_piece_fast_from_source(
+            &source.0,
+            &mut from_source.0,
+            &dirty_piece,
+            Color::Black,
+            king_sq,
+        ));
         assert_eq!(generic.0, fast.0);
+        assert_eq!(generic.0, from_source.0);
     }
 
     // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
@@ -2097,11 +2405,28 @@ mod tests {
             fill_weight_row(&mut ft, index, *seed);
         }
 
-        let mut generic = Aligned([7i16; TEST_L1]);
-        let mut fast = Aligned([7i16; TEST_L1]);
+        let mut source = Aligned([0i16; TEST_L1]);
+        for (i, slot) in source.0.iter_mut().enumerate() {
+            *slot = match i % 3 {
+                0 => i16::MIN.wrapping_add((i * 3) as i16),
+                1 => i16::MAX.wrapping_sub((i * 5) as i16),
+                _ => (i as i16).wrapping_mul(-113),
+            };
+        }
+        let mut generic = source;
+        let mut fast = source;
+        let mut from_source = Aligned([-321i16; TEST_L1]);
         apply_generic(&ft, &mut generic.0, &dirty_piece, Color::Black, king_sq);
         assert!(ft.try_apply_dirty_piece_fast(&mut fast.0, &dirty_piece, Color::Black, king_sq));
+        assert!(ft.try_apply_dirty_piece_fast_from_source(
+            &source.0,
+            &mut from_source.0,
+            &dirty_piece,
+            Color::Black,
+            king_sq,
+        ));
         assert_eq!(generic.0, fast.0);
+        assert_eq!(generic.0, from_source.0);
     }
 
     // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket

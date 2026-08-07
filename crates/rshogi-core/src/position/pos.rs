@@ -107,7 +107,7 @@ pub struct EnteringKingPointInfo {
 impl Position {
     /// 部分ハッシュを更新（XOR）
     #[inline]
-    fn xor_partial_keys(&self, st: &mut StateInfo, pc: Piece, sq: Square) {
+    fn xor_partial_keys(st: &mut StateInfo, pc: Piece, sq: Square) {
         if pc.piece_type() == PieceType::Pawn {
             st.pawn_key ^= zobrist_psq(pc, sq);
         } else {
@@ -122,7 +122,8 @@ impl Position {
     fn cur_state(&self) -> &StateInfo {
         debug_assert!(self.state_idx < self.state_stack.len());
         // SAFETY: state_idx は push_state で設定され、常に state_stack.len() 未満。
-        //         state_stack は do_move で push / undo_move で pop され、不変条件を維持する。
+        //         state_stack は push_state で伸長するのみで縮小されず、undo 系は
+        //         state_idx を戻すだけなので不変条件が維持される。
         unsafe { self.state_stack.get_unchecked(self.state_idx) }
     }
 
@@ -144,6 +145,63 @@ impl Position {
         } else {
             self.state_stack.push(st);
         }
+        self.state_idx = next_idx;
+    }
+
+    /// 現局面から引き継ぐフィールドだけを次のStateInfoへ直接コピーし、現在位置を進める。
+    ///
+    /// 通常手では残りのフィールドをdo_move_with_prefetch()内で必ず上書きする。
+    /// ローカルStateInfoを完成させてからstack slotへ丸ごとmoveする二重コピーを避ける。
+    #[inline]
+    fn push_partial_state_in_place(&mut self) {
+        let previous_idx = self.state_idx;
+        let next_idx = previous_idx + 1;
+        if self.state_stack.len() <= next_idx {
+            self.state_stack.push(StateInfo::new());
+        }
+
+        // SAFETY: next_idx == previous_idx + 1かつlen > next_idxなので、
+        // split_at_mut後のpreviousとnextは別要素であり、両方とも範囲内。
+        let (previous_states, next_states) = self.state_stack.split_at_mut(next_idx);
+        let previous = unsafe { previous_states.get_unchecked(previous_idx) };
+        let next = unsafe { next_states.get_unchecked_mut(0) };
+
+        // StateInfoの全フィールドを網羅し、追加時にコピー/再構築の分類漏れを
+        // コンパイルエラーとして検出する。`_`のフィールドはdo_move内で再構築する。
+        let &StateInfo {
+            pawn_key,
+            minor_piece_key,
+            non_pawn_key,
+            plies_from_null,
+            continuous_check,
+            pass_rights,
+            board_key,
+            hand_key,
+            hand_snapshot: _,
+            previous: _,
+            checkers: _,
+            blockers_for_king: _,
+            pinners: _,
+            check_squares: _,
+            captured_piece: _,
+            repetition: _,
+            repetition_times: _,
+            repetition_type: _,
+            material_value,
+            last_move: _,
+        } = previous;
+
+        next.pawn_key = pawn_key;
+        next.minor_piece_key = minor_piece_key;
+        next.non_pawn_key = non_pawn_key;
+        next.plies_from_null = plies_from_null;
+        next.continuous_check = continuous_check;
+        next.pass_rights = pass_rights;
+        next.board_key = board_key;
+        next.hand_key = hand_key;
+        next.material_value = material_value;
+        next.previous = previous_idx;
+
         self.state_idx = next_idx;
     }
 
@@ -649,7 +707,7 @@ impl Position {
         let mut result = Bitboard::EMPTY;
         for pinner_sq in pinners.iter() {
             let between = crate::bitboard::between_bb(ksq, pinner_sq) & pieces_without_avoid;
-            if !between.is_empty() && !between.more_than_one() {
+            if !between.more_than_one() {
                 result |= between & self.pieces_c(them);
             }
         }
@@ -931,24 +989,40 @@ impl Position {
         let prev_blockers = self.cur_state().blockers_for_king;
         let prev_pinners = self.cur_state().pinners;
         let prev_king_sq = self.king_square;
+        let prev_check_square = if gives_check {
+            let moved_pt = if m.is_drop() {
+                m.drop_piece_type()
+            } else {
+                let pt = self.piece_on(m.from()).piece_type();
+                if m.is_promote() {
+                    pt.promote().expect("promote move on unpromotable piece")
+                } else {
+                    pt
+                }
+            };
+            check_sq_index(moved_pt)
+                .map(|idx| unsafe { *self.cur_state().check_squares.get_unchecked(idx) })
+                .unwrap_or(Bitboard::EMPTY)
+        } else {
+            Bitboard::EMPTY
+        };
 
-        // 1. 新しいStateInfoを作成（NNUE関連はAccumulatorStackで管理）
-        let mut new_state = self.cur_state().partial_clone();
+        // 1. 次のStateInfo slotへ、引き継ぐフィールドだけを直接コピーする。
+        self.push_partial_state_in_place();
         // NNUE用のDirtyPieceはローカルで構築して返す
         let mut dirty_piece = DirtyPiece::new();
-        let mut material_value = new_state.material_value.raw();
+        let mut material_value = self.cur_state().material_value.raw();
 
         // 2. 局面情報の更新
         self.game_ply += 1;
-        new_state.plies_from_null += 1;
+        self.cur_state_mut().plies_from_null += 1;
 
         // 3. 手番の変更とハッシュ更新
-        new_state.board_key ^= zobrist_side();
+        self.cur_state_mut().board_key ^= zobrist_side();
 
         // 4. 駒の移動
         let mut moved_from: Option<Square> = None;
         let moved_to: Square;
-        let moved_pt: PieceType;
 
         if update_board_effects {
             self.ensure_board_effects();
@@ -961,7 +1035,6 @@ impl Position {
             let to = m.to();
             let pc = Piece::new(us, pt);
             moved_to = to;
-            moved_pt = pt;
 
             if update_board_effects {
                 let occupied_before = self.occupied();
@@ -981,12 +1054,14 @@ impl Position {
 
             // 手駒から減らす
             self.hand[us.index()] = self.hand[us.index()].sub(pt);
-            new_state.hand_key = new_state.hand_key.wrapping_sub(zobrist_hand(us, pt));
+            let st = self.cur_state_mut();
+            st.hand_key = st.hand_key.wrapping_sub(zobrist_hand(us, pt));
 
             // 盤上に配置
             self.put_piece_internal(pc, to);
-            new_state.board_key ^= zobrist_psq(pc, to);
-            self.xor_partial_keys(&mut new_state, pc, to);
+            let st = self.cur_state_mut();
+            st.board_key ^= zobrist_psq(pc, to);
+            Self::xor_partial_keys(st, pc, to);
 
             let new_bp = ExtBonaPiece::from_board(pc, to);
             self.piece_list.put_piece_on_board(piece_no, new_bp, to);
@@ -998,7 +1073,7 @@ impl Position {
                 new_piece: new_bp,
             };
 
-            new_state.captured_piece = Piece::NONE;
+            self.cur_state_mut().captured_piece = Piece::NONE;
         } else {
             let from = m.from();
             let to = m.to();
@@ -1019,11 +1094,6 @@ impl Position {
                 m.is_promote()
             );
 
-            moved_pt = if m.is_promote() {
-                pc.piece_type().promote().unwrap()
-            } else {
-                pc.piece_type()
-            };
             let moved_after_pc = if m.is_promote() {
                 pc.promote().unwrap()
             } else {
@@ -1075,8 +1145,9 @@ impl Position {
                 let old_bp_cap = self.piece_list.bona_piece(piece_no_cap);
 
                 self.remove_piece_internal(to);
-                new_state.board_key ^= zobrist_psq(captured, to);
-                self.xor_partial_keys(&mut new_state, captured, to);
+                let st = self.cur_state_mut();
+                st.board_key ^= zobrist_psq(captured, to);
+                Self::xor_partial_keys(st, captured, to);
 
                 // material_value: 盤上から駒が消える
                 material_value -= signed_piece_value(captured);
@@ -1093,8 +1164,8 @@ impl Position {
                         | PieceType::Rook
                 ) {
                     self.hand[us.index()] = self.hand[us.index()].add(captured_pt);
-                    new_state.hand_key =
-                        new_state.hand_key.wrapping_add(zobrist_hand(us, captured_pt));
+                    let st = self.cur_state_mut();
+                    st.hand_key = st.hand_key.wrapping_add(zobrist_hand(us, captured_pt));
                     material_value += hand_piece_value(us, captured_pt);
                 }
 
@@ -1113,16 +1184,18 @@ impl Position {
             } else {
                 dirty_piece.dirty_num = 1;
             }
-            new_state.captured_piece = captured;
+            self.cur_state_mut().captured_piece = captured;
 
             // 駒を移動
             self.remove_piece_internal(from);
-            new_state.board_key ^= zobrist_psq(pc, from);
-            self.xor_partial_keys(&mut new_state, pc, from);
+            let st = self.cur_state_mut();
+            st.board_key ^= zobrist_psq(pc, from);
+            Self::xor_partial_keys(st, pc, from);
 
             self.put_piece_internal(moved_after_pc, to);
-            new_state.board_key ^= zobrist_psq(moved_after_pc, to);
-            self.xor_partial_keys(&mut new_state, moved_after_pc, to);
+            let st = self.cur_state_mut();
+            st.board_key ^= zobrist_psq(moved_after_pc, to);
+            Self::xor_partial_keys(st, moved_after_pc, to);
 
             // 成りによるmaterial差分
             if moved_after_pc != pc {
@@ -1148,27 +1221,23 @@ impl Position {
         }
 
         // do_move直後にTTをprefetch
-        prefetcher.prefetch(new_state.key(), them);
+        prefetcher.prefetch(self.cur_state().key(), them);
 
         // 6. 王手情報の更新（diffベース）
         let mut checkers = Bitboard::EMPTY;
         if gives_check {
             let ksq = self.king_square[them.index()];
-            // 直接王手: King 以外の駒が check_squares 上にいるかチェック。
-            // King の場合は直接王手はない（開き王手のみ）のでスキップ。
-            if let Some(cs_idx) = check_sq_index(moved_pt) {
-                // SAFETY: check_sq_index は 0..CHECK_SQUARES_SIZE-1 を返す。
-                checkers |= unsafe { *self.cur_state().check_squares.get_unchecked(cs_idx) }
-                    & Bitboard::from_square(moved_to);
-            }
+            // 直接王手: 手を進める前に退避したcheck_squaresを使う。
+            // Kingの場合はprev_check_squareがEMPTYなので直接王手はなく、開き王手だけを調べる。
+            checkers |= prev_check_square & Bitboard::from_square(moved_to);
 
             // 開き王手（動かした駒が遮断駒だった場合）
             // discovered(from, to, ksq, blockers) と同等の判定
             // - fromがblockersに含まれている
             // - from, to, ksq が同一直線上にない（aligned でない）場合のみ開き王手
             if let Some(from_sq) = moved_from {
-                let prev_blockers = self.cur_state().blockers_for_king[them.index()];
-                if prev_blockers.contains(from_sq)
+                let their_prev_blockers = prev_blockers[them.index()];
+                if their_prev_blockers.contains(from_sq)
                     && !crate::mate::aligned(from_sq, moved_to, ksq)
                     && let Some(dir) = crate::bitboard::direct_of(ksq, from_sq)
                 {
@@ -1201,26 +1270,26 @@ impl Position {
         let is_check = !checkers.is_empty();
         // 4. 連続王手カウンタの更新
         if is_check {
-            new_state.continuous_check[us.index()] = prev_continuous[us.index()] + 2;
+            self.cur_state_mut().continuous_check[us.index()] = prev_continuous[us.index()] + 2;
         } else {
-            new_state.continuous_check[us.index()] = 0;
+            self.cur_state_mut().continuous_check[us.index()] = 0;
         }
-        // 受け手側は前の値をそのまま引き継ぐ（memcpyで自動的にコピーされる）
-        // rshogi では partial_clone() で既にコピー済みなので、リセットしない
+        // 受け手側はpush_partial_state_in_place()で引き継いでいるため、リセットしない。
 
         // 5. 手番交代
         self.side_to_move = them;
 
         // 6. 王手情報の更新
-        new_state.checkers = checkers;
+        self.cur_state_mut().checkers = checkers;
 
         // 7. 千日手判定に使う手駒スナップショットを保存
-        new_state.hand_snapshot = self.hand;
-        new_state.material_value = Value::new(material_value);
+        let hand_snapshot = self.hand;
+        let st = self.cur_state_mut();
+        st.hand_snapshot = hand_snapshot;
+        st.material_value = Value::new(material_value);
 
-        // 8. StateInfoの付け替え（previous をぶら下げる）
-        new_state.last_move = m;
-        self.push_state(new_state);
+        // 8. StateInfoの残りを更新（previous/state_idxは手の実行前に設定済み）
+        self.cur_state_mut().last_move = m;
 
         // 9. 繰り返し情報の更新
         self.update_repetition_info();
@@ -1422,6 +1491,8 @@ impl Position {
     }
 
     pub(crate) fn do_null_move_with_prefetch<P: TtPrefetch>(&mut self, prefetcher: &P) {
+        // update_repetition_info を呼ばないため、repetition 系フィールドの初期化は
+        // partial_clone の zero クリアに依存している。in-place 化する場合は要注意。
         let mut new_state = self.cur_state().partial_clone();
 
         new_state.board_key ^= zobrist_side();
@@ -1548,42 +1619,34 @@ impl Position {
     fn update_repetition_info(&mut self) {
         // 初期化
         let side = self.side_to_move;
-        let (plies_from_null, board_key, hand_snapshot, prev_idx, cc_side, cc_opp) = {
+        let current_idx = self.state_idx;
+        let (plies_from_null, board_key, hand_snapshot, cc_side, cc_opp) = {
             let st = self.cur_state();
             (
                 st.plies_from_null,
                 st.board_key,
                 st.hand_snapshot,
-                st.previous,
                 st.continuous_check[side.index()],
                 st.continuous_check[(!side).index()],
             )
         };
 
-        let max_back = plies_from_null.min(16);
+        // push_state() は常に current_idx + 1 へ保存するため、同一局面履歴上の
+        // n手前は state_stack[current_idx - n] にある。
+        debug_assert!(current_idx == 0 || self.cur_state().previous == current_idx - 1);
+        let max_back = plies_from_null.min(16).min(current_idx as i32);
         let mut repetition = 0;
         let mut repetition_times = 0;
         let mut repetition_type = RepetitionState::None;
 
-        if max_back >= 4 && prev_idx != StateInfo::NO_PREVIOUS {
+        if max_back >= 4 {
             // 千日手は最短4手で成立するため4手前から比較開始
             let mut dist = 4;
-            let mut st_idx = prev_idx;
-            for _ in 0..3 {
+            while dist <= max_back {
+                let st_idx = current_idx - dist as usize;
                 debug_assert!(st_idx < self.state_stack.len());
-                // SAFETY: ループ不変条件: st_idx はループ先頭時点で常に有効なインデックス。
-                //   - 1回目: prev_idx は関数先頭で NO_PREVIOUS チェック済み。
-                //   - 2・3回目: 前の反復で NO_PREVIOUS なら break するため無効値では到達しない。
-                //   push_state で設定された .previous は常に有効なインデックスか NO_PREVIOUS。
-                st_idx = unsafe { self.state_stack.get_unchecked(st_idx) }.previous;
-                if st_idx == StateInfo::NO_PREVIOUS {
-                    break;
-                }
-            }
-
-            while dist <= max_back && st_idx != StateInfo::NO_PREVIOUS {
-                debug_assert!(st_idx < self.state_stack.len());
-                // SAFETY: 同上。
+                // SAFETY: dist <= max_back <= current_idx、かつ cur_state の不変条件より
+                //         current_idx < state_stack.len() なので範囲内。
                 let stp = unsafe { self.state_stack.get_unchecked(st_idx) };
                 if stp.board_key == board_key {
                     let prev_hand = stp.hand_snapshot[side.index()];
@@ -1623,13 +1686,6 @@ impl Position {
                     }
                 }
 
-                let prev_same_side = stp.previous;
-                if prev_same_side == StateInfo::NO_PREVIOUS {
-                    break;
-                }
-                debug_assert!(prev_same_side < self.state_stack.len());
-                // SAFETY: prev_same_side は .previous チェーンの有効なインデックス。
-                st_idx = unsafe { self.state_stack.get_unchecked(prev_same_side) }.previous;
                 dist += 2;
             }
         }
@@ -2138,6 +2194,103 @@ mod tests {
         assert_eq!(pos.piece_on(sq77), Piece::B_PAWN);
         assert_eq!(pos.piece_on(sq76), Piece::NONE);
         assert_eq!(pos.side_to_move(), Color::Black);
+    }
+
+    #[test]
+    fn test_repetition_info_survives_state_slot_reuse() {
+        let mut pos = Position::new();
+        pos.set_hirate();
+
+        let cycle = [
+            Move::new_move(
+                Square::new(File::File5, Rank::Rank9),
+                Square::new(File::File5, Rank::Rank8),
+                false,
+            ),
+            Move::new_move(
+                Square::new(File::File5, Rank::Rank1),
+                Square::new(File::File5, Rank::Rank2),
+                false,
+            ),
+            Move::new_move(
+                Square::new(File::File5, Rank::Rank8),
+                Square::new(File::File5, Rank::Rank9),
+                false,
+            ),
+            Move::new_move(
+                Square::new(File::File5, Rank::Rank2),
+                Square::new(File::File5, Rank::Rank1),
+                false,
+            ),
+        ];
+
+        for expected_times in 1..=3 {
+            for mv in cycle {
+                assert!(pos.is_legal(mv));
+                let gives_check = pos.gives_check(mv);
+                assert!(!gives_check);
+                pos.do_move(mv, gives_check);
+            }
+            assert_eq!(pos.cur_state().repetition_times, expected_times);
+            assert_eq!(pos.cur_state().repetition_type, RepetitionState::Draw);
+            assert_eq!(pos.cur_state().repetition, if expected_times >= 3 { -4 } else { 4 });
+        }
+        assert_eq!(pos.repetition_state(0), RepetitionState::Draw);
+
+        // 直前cycleをundoし、別手順で古いstate slotを異なる内容に上書きしてから
+        // 同じdepthへ指し直しても繰り返し情報が変わらないことを確認する。
+        for mv in cycle.into_iter().rev() {
+            pos.undo_move(mv);
+        }
+        assert_eq!(pos.cur_state().repetition_times, 2);
+        let alt_line = [
+            Move::new_move(
+                Square::new(File::File4, Rank::Rank9),
+                Square::new(File::File4, Rank::Rank8),
+                false,
+            ),
+            Move::new_move(
+                Square::new(File::File4, Rank::Rank1),
+                Square::new(File::File4, Rank::Rank2),
+                false,
+            ),
+            Move::new_move(
+                Square::new(File::File4, Rank::Rank8),
+                Square::new(File::File4, Rank::Rank9),
+                false,
+            ),
+            Move::new_move(
+                Square::new(File::File4, Rank::Rank2),
+                Square::new(File::File4, Rank::Rank1),
+                false,
+            ),
+        ];
+        for mv in alt_line {
+            assert!(pos.is_legal(mv));
+            let gives_check = pos.gives_check(mv);
+            assert!(!gives_check);
+            pos.do_move(mv, gives_check);
+        }
+        for mv in alt_line.into_iter().rev() {
+            pos.undo_move(mv);
+        }
+        for mv in cycle {
+            let gives_check = pos.gives_check(mv);
+            pos.do_move(mv, gives_check);
+        }
+        assert_eq!(pos.cur_state().repetition_times, 3);
+        assert_eq!(pos.cur_state().repetition, -4);
+        assert_eq!(pos.cur_state().repetition_type, RepetitionState::Draw);
+
+        // さらに1周指し、上書き再利用したslotが繰り返し走査の比較対象に入る
+        // 深さでも正しく数えられることを確認する。
+        for mv in cycle {
+            let gives_check = pos.gives_check(mv);
+            pos.do_move(mv, gives_check);
+        }
+        assert_eq!(pos.cur_state().repetition_times, 4);
+        assert_eq!(pos.cur_state().repetition, -4);
+        assert_eq!(pos.cur_state().repetition_type, RepetitionState::Draw);
     }
 
     #[test]
