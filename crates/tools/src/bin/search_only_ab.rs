@@ -1495,13 +1495,20 @@ mod windows_main {
             }
         }
 
+        /// CPU ごとの直前 CSwitch の観測値（実行スライスの始点）。
+        #[derive(Debug, Clone, Copy)]
+        struct CpuBaseline {
+            timestamp: i64,
+            counters: [u64; MAX_PMC_SOURCES],
+        }
+
         /// 1 run 分の PMC 差分積算器。
         #[derive(Debug)]
         struct PmcAccumulator {
             target_pid: u32,
             n_counters: usize,
-            /// CPU ごとの前回 CSwitch 時のカウンタ値
-            per_cpu_last: HashMap<u16, [u64; MAX_PMC_SOURCES]>,
+            /// CPU ごとの前回 CSwitch 時の (timestamp, カウンタ値)
+            per_cpu_last: HashMap<u16, CpuBaseline>,
             /// 計測区間 (QPC)。start 未設定の間は集計しない
             window_start: Option<i64>,
             window_end: Option<i64>,
@@ -1523,22 +1530,41 @@ mod windows_main {
                 }
             }
 
-            /// 区間判定の仕様（境界規則）:
+            /// 実行スライス `[slice_start, slice_end]` と計測 window の重なり比
+            /// (0.0..=1.0)。区間按分の仕様:
             ///
-            /// - 判定は実行スライスの終端（CSwitch イベントの timestamp）基準。
-            ///   スライスの開始点（同一 CPU の前回 CSwitch）は見ない
-            /// - 両端 inclusive（`timestamp == start` / `timestamp == end` は区間内）
-            /// - したがって open 境界を跨ぐスライス（開始 < start <= 終端）は全額計上、
-            ///   close 境界を跨ぐスライス（開始 <= end < 終端）は全額除外、という
-            ///   非対称を仕様とする。open 側はエンジンスレッドが `go` を読むまで
-            ///   block しているため過大計上は実質ゼロ。close 側は `--threads 1` なら
-            ///   bestmove 出力直後に block して switch out するため欠落も実質ゼロだが、
-            ///   `--threads > 1` では最終スライス欠落による僅かな系統誤差がありうる
-            fn in_window(&self, timestamp: i64) -> bool {
+            /// - 各 CSwitch は「同一 CPU の直前イベント timestamp から自身の timestamp
+            ///   まで」の実行スライスを表し、counter 差分はスライス内で一様に増えた
+            ///   と近似する
+            /// - window と重なる長さの比で差分を線形按分する（完全内包は全額、境界
+            ///   跨ぎは比例配分）。open 側・close 側とも同じ規則で対称
+            /// - 長さ 0 のスライスは終端が window 内（両端 inclusive）なら全額
+            /// - window 未 open（start 未設定）は常に 0
+            ///
+            /// pin された idle CPU ではエンジンスレッドが数百 ms〜秒オーダーで
+            /// switch せずスライスが極端に粗くなるため、境界スライスの全額計上 /
+            /// 全額除外では数 % 級の量子化誤差が出る（A/A 実測で cycles/node ±1%
+            /// 級の残差）。按分はこれを一桁以上圧縮する。一様増加近似の誤差と
+            /// 割り込み・DPC 混入は残る。
+            fn window_overlap_fraction(&self, slice_start: i64, slice_end: i64) -> f64 {
                 let Some(start) = self.window_start else {
-                    return false;
+                    return 0.0;
                 };
-                timestamp >= start && self.window_end.is_none_or(|end| timestamp <= end)
+                let end = self.window_end.unwrap_or(i64::MAX);
+                if slice_end <= slice_start {
+                    // 長さ 0（または時計異常で逆転）のスライスは終端の位置で全額判定
+                    return if slice_end >= start && slice_end <= end {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                }
+                let overlap_start = slice_start.max(start);
+                let overlap_end = slice_end.min(end);
+                if overlap_end <= overlap_start {
+                    return 0.0;
+                }
+                (overlap_end - overlap_start) as f64 / (slice_end - slice_start) as f64
             }
 
             fn record(&mut self, sample: &CSwitchSample, old_tid_is_target: bool) {
@@ -1548,23 +1574,31 @@ mod windows_main {
                     // 差分の対応が取れないため、基準値の更新もせず捨てる。
                     return;
                 }
-                if old_tid_is_target
-                    && self.in_window(sample.timestamp)
-                    && let Some(prev) = self.per_cpu_last.get(&sample.cpu)
+                if old_tid_is_target && let Some(prev) = self.per_cpu_last.get(&sample.cpu).copied()
                 {
+                    let fraction = self.window_overlap_fraction(prev.timestamp, sample.timestamp);
                     // カウンタ巻き戻り（セッション再構成等）は差分にできないのでスキップ
                     let monotonic =
-                        prev[..n].iter().zip(&sample.counters[..n]).all(|(p, c)| c >= p);
-                    if monotonic {
-                        for (total, (prev_v, now)) in
-                            self.totals.iter_mut().zip(prev[..n].iter().zip(&sample.counters[..n]))
+                        prev.counters[..n].iter().zip(&sample.counters[..n]).all(|(p, c)| c >= p);
+                    if fraction > 0.0 && monotonic {
+                        for (total, (prev_v, now)) in self
+                            .totals
+                            .iter_mut()
+                            .zip(prev.counters[..n].iter().zip(&sample.counters[..n]))
                         {
-                            *total += now - prev_v;
+                            // 一様増加近似での線形按分。最近接丸め
+                            *total += (((now - prev_v) as f64) * fraction).round() as u64;
                         }
                         self.attributed_switches += 1;
                     }
                 }
-                self.per_cpu_last.insert(sample.cpu, sample.counters);
+                self.per_cpu_last.insert(
+                    sample.cpu,
+                    CpuBaseline {
+                        timestamp: sample.timestamp,
+                        counters: sample.counters,
+                    },
+                );
             }
         }
 
@@ -1685,25 +1719,94 @@ mod windows_main {
                 let mut state = PmcEngineState::default();
                 state.on_thread_start(PID, TID);
                 state.install(PID, 2);
-                // window 未オープン
+                // window 未オープンの間は一切集計しない（基準値の更新のみ）
                 state.on_cswitch(&cswitch(0, 10, 999, &[1000, 2000]));
                 state.on_cswitch(&cswitch(0, 20, TID, &[1500, 2600]));
-                state.open_window(100);
-                state.on_cswitch(&cswitch(0, 110, TID, &[2000, 3000]));
-                let (totals, _) = state.take_totals().expect("accumulator installed");
-                assert_eq!(totals, vec![500, 400]);
+                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                assert_eq!(totals, vec![0, 0]);
+                assert_eq!(switches, 0);
             }
 
             #[test]
-            fn events_after_window_close_are_excluded() {
+            fn open_boundary_slice_is_prorated() {
+                let mut state = PmcEngineState::default();
+                state.on_thread_start(PID, TID);
+                state.install(PID, 2);
+                state.open_window(100);
+                state.on_cswitch(&cswitch(0, 60, 999, &[1000, 2000]));
+                // スライス [60,140] のうち window [100,∞) と重なるのは後半 40/80 = 50%
+                state.on_cswitch(&cswitch(0, 140, TID, &[1500, 2600]));
+                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                assert_eq!(totals, vec![250, 300]);
+                assert_eq!(switches, 1);
+            }
+
+            #[test]
+            fn close_boundary_slice_is_prorated() {
                 let mut state = state_with_target();
                 state.on_cswitch(&cswitch(0, 10, 999, &[1000, 2000]));
-                state.on_cswitch(&cswitch(0, 20, TID, &[1500, 2600]));
-                state.close_window(25);
-                // close 後のイベントは集計しない（基準値の更新は継続）
-                state.on_cswitch(&cswitch(0, 30, TID, &[9000, 9000]));
+                state.close_window(20);
+                // スライス [10,30] のうち window [0,20] と重なるのは前半 10/20 = 50%
+                state.on_cswitch(&cswitch(0, 30, TID, &[1500, 2600]));
                 let (totals, switches) = state.take_totals().expect("accumulator installed");
-                assert_eq!(totals, vec![500, 600]);
+                assert_eq!(totals, vec![250, 300]);
+                assert_eq!(switches, 1);
+            }
+
+            #[test]
+            fn slice_spanning_entire_window_is_prorated() {
+                let mut state = PmcEngineState::default();
+                state.on_thread_start(PID, TID);
+                state.install(PID, 2);
+                state.open_window(100);
+                state.close_window(200);
+                state.on_cswitch(&cswitch(0, 50, 999, &[1000, 1000]));
+                // スライス [50,250] が window [100,200] を両側に跨ぐ → 100/200 = 50%
+                state.on_cswitch(&cswitch(0, 250, TID, &[1400, 1600]));
+                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                assert_eq!(totals, vec![200, 300]);
+                assert_eq!(switches, 1);
+            }
+
+            #[test]
+            fn slice_entirely_outside_window_is_excluded() {
+                let mut state = PmcEngineState::default();
+                state.on_thread_start(PID, TID);
+                state.install(PID, 2);
+                state.open_window(100);
+                state.close_window(200);
+                // close 後に始まり close 後に終わるスライス
+                state.on_cswitch(&cswitch(0, 210, 999, &[1000, 1000]));
+                state.on_cswitch(&cswitch(0, 220, TID, &[1500, 1500]));
+                // open 前に始まり open 前に終わるスライス（別 CPU）
+                state.on_cswitch(&cswitch(1, 10, 999, &[3000, 3000]));
+                state.on_cswitch(&cswitch(1, 90, TID, &[3500, 3500]));
+                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                assert_eq!(totals, vec![0, 0]);
+                assert_eq!(switches, 0);
+            }
+
+            #[test]
+            fn proration_rounds_to_nearest() {
+                let mut state = state_with_target();
+                state.on_cswitch(&cswitch(0, 5, 999, &[1000, 1000]));
+                state.close_window(10);
+                // スライス [5,20] のうち window [0,10] との重なりは 5/15 = 1/3。
+                // 差分 [10,20] → [3.33..,6.66..] → 最近接丸めで [3,7]
+                state.on_cswitch(&cswitch(0, 20, TID, &[1010, 1020]));
+                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                assert_eq!(totals, vec![3, 7]);
+                assert_eq!(switches, 1);
+            }
+
+            #[test]
+            fn zero_length_slice_counts_fully_when_inside_window() {
+                let mut state = state_with_target();
+                state.on_cswitch(&cswitch(0, 10, 999, &[1000, 1000]));
+                // 長さ 0 のスライスは終端が window 内なら全額
+                state.on_cswitch(&cswitch(0, 10, TID, &[1005, 1006]));
+                let (totals, switches) = state.take_totals().expect("accumulator installed");
+                assert_eq!(totals, vec![5, 6]);
                 assert_eq!(switches, 1);
             }
 
@@ -1778,19 +1881,20 @@ mod windows_main {
             }
 
             #[test]
-            fn window_boundaries_are_inclusive() {
+            fn slice_touching_window_edge_has_zero_overlap() {
                 let mut state = PmcEngineState::default();
                 state.on_thread_start(PID, TID);
                 state.install(PID, 2);
                 state.open_window(100);
                 state.close_window(200);
-                state.on_cswitch(&cswitch(0, 50, 999, &[1000, 1000]));
-                // timestamp == start / == end はどちらも区間内 (両端 inclusive)
-                state.on_cswitch(&cswitch(0, 100, TID, &[1100, 1100]));
-                state.on_cswitch(&cswitch(0, 200, TID, &[1400, 1400]));
+                state.on_cswitch(&cswitch(0, 60, 999, &[1000, 1000]));
+                // スライス [60,100] は終端が open 境界ちょうど → 重なり長 0 → 除外
+                state.on_cswitch(&cswitch(0, 100, TID, &[1200, 1200]));
+                // スライス [100,200] は window に完全内包 → 全額
+                state.on_cswitch(&cswitch(0, 200, TID, &[1500, 1500]));
                 let (totals, switches) = state.take_totals().expect("accumulator installed");
-                assert_eq!(totals, vec![400, 400]);
-                assert_eq!(switches, 2);
+                assert_eq!(totals, vec![300, 300]);
+                assert_eq!(switches, 1);
             }
 
             #[test]
@@ -2692,8 +2796,8 @@ mod windows_main {
         })?;
 
         let end_qpc = qpc_now()?;
-        // close 境界を跨ぐ実行スライス（終端 CSwitch が end_qpc より後）は全額除外
-        // される（仕様と影響は pmc::PmcAccumulator::in_window のコメントを参照）。
+        // 計測 window の境界を跨ぐ実行スライスは重なり比で線形按分される
+        // （仕様は pmc::PmcAccumulator::window_overlap_fraction のコメントを参照）。
         lock_state(shared)?.close_window(end_qpc);
         engine.write_line("quit")?;
         let status = wait_child(&mut engine.child, QUIT_TIMEOUT)?;
