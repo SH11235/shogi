@@ -2058,7 +2058,8 @@ mod windows_main {
             if value != 0 {
                 let mut props = PropsBuf::new();
                 // SAFETY: value は KernelSession::start が登録した有効なセッションハンドル。
-                // swap により stop はここか Drop のどちらか一方でのみ実行される。
+                // swap により handler 側の stop は高々 1 回。Drop 側の stop とは重複
+                // しうるが、2 回目は ERROR_WMI_INSTANCE_NOT_FOUND になるだけで無害。
                 let _ = unsafe {
                     ControlTraceW(
                         CONTROLTRACE_HANDLE { Value: value },
@@ -2641,6 +2642,9 @@ mod windows_main {
         round: u32,
         sequence_index: usize,
     ) -> Result<RunSample> {
+        // spawn 前に基準を取ることで、spawn〜initialize 間の Thread Start ロスも
+        // lost 検査の窓に含める（この区間のロスは TID 追跡を静かに欠けさせるため）。
+        let lost_before = session.query_lost_counts()?;
         let mut engine = UsiEngine::spawn(cli, variant, cli.cpu)?;
         // spawn 直後に対象 PID を登録し、Thread Start の観測窓を最大化する。ただし
         // ETW は per-CPU バッファ単位で配送され timestamp 順の保証がないため、
@@ -2650,7 +2654,6 @@ mod windows_main {
         lock_state(shared)?.install(engine.pid(), source_names.len());
         engine.initialize(cli, variant)?;
 
-        let lost_before = session.query_lost_counts()?;
         let start_qpc = qpc_now()?;
         lock_state(shared)?.open_window(start_qpc);
         engine.write_line(&position.position_cmd)?;
