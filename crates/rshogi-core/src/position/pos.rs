@@ -1620,42 +1620,33 @@ impl Position {
     fn update_repetition_info(&mut self) {
         // 初期化
         let side = self.side_to_move;
-        let (plies_from_null, board_key, hand_snapshot, prev_idx, cc_side, cc_opp) = {
+        let current_idx = self.state_idx;
+        let (plies_from_null, board_key, hand_snapshot, cc_side, cc_opp) = {
             let st = self.cur_state();
             (
                 st.plies_from_null,
                 st.board_key,
                 st.hand_snapshot,
-                st.previous,
                 st.continuous_check[side.index()],
                 st.continuous_check[(!side).index()],
             )
         };
 
-        let max_back = plies_from_null.min(16);
+        // push_state() は常に current_idx + 1 へ保存するため、同一局面履歴上の
+        // n手前は state_stack[current_idx - n] にある。previous を二段ずつ
+        // たどる代わりに直接index化する。
+        let max_back = plies_from_null.min(16).min(current_idx as i32);
         let mut repetition = 0;
         let mut repetition_times = 0;
         let mut repetition_type = RepetitionState::None;
 
-        if max_back >= 4 && prev_idx != StateInfo::NO_PREVIOUS {
+        if max_back >= 4 {
             // 千日手は最短4手で成立するため4手前から比較開始
             let mut dist = 4;
-            let mut st_idx = prev_idx;
-            for _ in 0..3 {
+            while dist <= max_back {
+                let st_idx = current_idx - dist as usize;
                 debug_assert!(st_idx < self.state_stack.len());
-                // SAFETY: ループ不変条件: st_idx はループ先頭時点で常に有効なインデックス。
-                //   - 1回目: prev_idx は関数先頭で NO_PREVIOUS チェック済み。
-                //   - 2・3回目: 前の反復で NO_PREVIOUS なら break するため無効値では到達しない。
-                //   push_state で設定された .previous は常に有効なインデックスか NO_PREVIOUS。
-                st_idx = unsafe { self.state_stack.get_unchecked(st_idx) }.previous;
-                if st_idx == StateInfo::NO_PREVIOUS {
-                    break;
-                }
-            }
-
-            while dist <= max_back && st_idx != StateInfo::NO_PREVIOUS {
-                debug_assert!(st_idx < self.state_stack.len());
-                // SAFETY: 同上。
+                // SAFETY: dist <= max_back <= current_idx なので範囲内。
                 let stp = unsafe { self.state_stack.get_unchecked(st_idx) };
                 if stp.board_key == board_key {
                     let prev_hand = stp.hand_snapshot[side.index()];
@@ -1695,13 +1686,6 @@ impl Position {
                     }
                 }
 
-                let prev_same_side = stp.previous;
-                if prev_same_side == StateInfo::NO_PREVIOUS {
-                    break;
-                }
-                debug_assert!(prev_same_side < self.state_stack.len());
-                // SAFETY: prev_same_side は .previous チェーンの有効なインデックス。
-                st_idx = unsafe { self.state_stack.get_unchecked(prev_same_side) }.previous;
                 dist += 2;
             }
         }
@@ -2210,6 +2194,62 @@ mod tests {
         assert_eq!(pos.piece_on(sq77), Piece::B_PAWN);
         assert_eq!(pos.piece_on(sq76), Piece::NONE);
         assert_eq!(pos.side_to_move(), Color::Black);
+    }
+
+    #[test]
+    fn test_repetition_info_survives_state_slot_reuse() {
+        let mut pos = Position::new();
+        pos.set_hirate();
+
+        let cycle = [
+            Move::new_move(
+                Square::new(File::File5, Rank::Rank9),
+                Square::new(File::File5, Rank::Rank8),
+                false,
+            ),
+            Move::new_move(
+                Square::new(File::File5, Rank::Rank1),
+                Square::new(File::File5, Rank::Rank2),
+                false,
+            ),
+            Move::new_move(
+                Square::new(File::File5, Rank::Rank8),
+                Square::new(File::File5, Rank::Rank9),
+                false,
+            ),
+            Move::new_move(
+                Square::new(File::File5, Rank::Rank2),
+                Square::new(File::File5, Rank::Rank1),
+                false,
+            ),
+        ];
+
+        for expected_times in 1..=3 {
+            for mv in cycle {
+                assert!(pos.is_legal(mv));
+                let gives_check = pos.gives_check(mv);
+                assert!(!gives_check);
+                pos.do_move(mv, gives_check);
+            }
+            assert_eq!(pos.cur_state().repetition_times, expected_times);
+            assert_eq!(pos.cur_state().repetition_type, RepetitionState::Draw);
+            assert_eq!(pos.cur_state().repetition, if expected_times >= 3 { -4 } else { 4 });
+        }
+        assert_eq!(pos.repetition_state(0), RepetitionState::Draw);
+
+        // 直前cycleをundoして同じdepthへ指し直し、古いstate slotを上書きしても
+        // 4回目の繰り返し情報が同じになることを確認する。
+        for mv in cycle.into_iter().rev() {
+            pos.undo_move(mv);
+        }
+        assert_eq!(pos.cur_state().repetition_times, 2);
+        for mv in cycle {
+            let gives_check = pos.gives_check(mv);
+            pos.do_move(mv, gives_check);
+        }
+        assert_eq!(pos.cur_state().repetition_times, 3);
+        assert_eq!(pos.cur_state().repetition, -4);
+        assert_eq!(pos.cur_state().repetition_type, RepetitionState::Draw);
     }
 
     #[test]
