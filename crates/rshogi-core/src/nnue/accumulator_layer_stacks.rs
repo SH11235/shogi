@@ -203,8 +203,9 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
 
         if entry.valid {
             crate::nnue::stats::count_cache_hit!();
-            accumulation.copy_from_slice(&entry.accumulation);
-
+            // cache entryを直接更新する。従来はentry→accumulationへコピーして差分を適用し、
+            // 最後にaccumulation→entryへ戻していた。entryを作業領域にすれば、cache hit時の
+            // L1要素全量コピーを最後のentry→accumulation 1回だけにできる。
             for (cached_bp, &current_bp) in entry.piece_list.iter().copied().zip(piece_list.iter())
             {
                 if cached_bp != current_bp {
@@ -221,7 +222,8 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
             crate::nnue::stats::count_refresh_diff!(removed.len() + added.len());
         } else {
             crate::nnue::stats::count_cache_miss!();
-            accumulation.copy_from_slice(biases);
+            // キャッシュ無効 → バイアスから full refresh
+            entry.accumulation.copy_from_slice(biases);
             for &bp in piece_list.iter() {
                 if bp != BonaPiece::ZERO {
                     let pushed = added.push(idx_fn(bp));
@@ -230,9 +232,10 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
             }
         }
 
-        apply_fn(accumulation, &removed, &added);
+        apply_fn(&mut entry.accumulation, &removed, &added);
 
-        entry.accumulation.copy_from_slice(accumulation);
+        // 更新済みcache entryを探索stack側へ公開する。
+        accumulation.copy_from_slice(&entry.accumulation);
         entry.piece_list.copy_from_slice(piece_list);
         entry.valid = true;
     }
@@ -1016,6 +1019,19 @@ mod tests {
         );
         // hit: 30 - 15 + 20 = 35
         assert_eq!(acc2[0], 35);
+
+        // 3回目: 同じpiece listなら、2回目に更新したcache entryをそのまま返す。
+        let mut acc3 = [0i16; TEST_L1];
+        cache.refresh_or_cache(
+            king_sq,
+            perspective,
+            &pl2,
+            &biases,
+            &mut acc3,
+            |bp| bp.0 as usize,
+            apply_test_changes,
+        );
+        assert_eq!(acc3[0], 35);
     }
 
     /// refresh_or_cache: slot 消滅 (capture)
