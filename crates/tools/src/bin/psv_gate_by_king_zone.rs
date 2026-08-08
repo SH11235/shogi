@@ -414,6 +414,15 @@ mod tests {
     }
 
     #[test]
+    fn white_king_in_middle_zone_is_advancing() -> Result<()> {
+        // 後手玉が中央（rank 3..=5）へ進み、先手玉は自陣に残るケース。
+        let bytes = record("9/9/9/9/4k4/9/9/9/4K4 b - 1", 0)?;
+        let (tier, _) = classify_record(&bytes, 0)?;
+        assert_eq!(tier, 1);
+        Ok(())
+    }
+
+    #[test]
     fn mask_rejects_output_equal_to_input_without_truncating() -> Result<()> {
         let dir = tempdir()?;
         let input = dir.path().join("input.psv");

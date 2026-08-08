@@ -308,6 +308,8 @@ enum OnnxMarkerDecision {
     Skip,
     /// rescore + expand 出力を truncate して最初から処理
     TruncateAndProcess,
+    /// score sidecar の in-progress marker が一致。件数ベースで追記再開
+    ResumeSidecar,
     /// marker 不存在 + expand 無効 → 既存の record-count resume にフォールバック
     LegacyResume,
 }
@@ -491,6 +493,9 @@ fn onnx_marker_decide(
             };
 
         if marker.fingerprint == current && bodies_match {
+            if cli.out_scores {
+                remove_in_progress_marker(rescore_output_path)?;
+            }
             return Ok(OnnxMarkerDecision::Skip);
         }
 
@@ -567,10 +572,21 @@ fn onnx_marker_decide(
         // 6. marker 削除（最後）
         fs::remove_file(&marker_path)
             .with_context(|| format!("Failed to remove stale marker {}", marker_path.display()))?;
+        if cli.out_scores {
+            prepare_in_progress_marker(rescore_output_path, &current, true)?;
+        }
         return Ok(OnnxMarkerDecision::TruncateAndProcess);
     }
 
     // marker 不存在
+    if cli.out_scores {
+        let decision = prepare_in_progress_marker(rescore_output_path, &current, false)?
+            .context("out_scores=true did not create an in-progress marker")?;
+        return match decision {
+            SidecarStartDecision::Resume => Ok(OnnxMarkerDecision::ResumeSidecar),
+            SidecarStartDecision::Truncate => Ok(OnnxMarkerDecision::TruncateAndProcess),
+        };
+    }
     // leaf-label は marker 必須にする。record 数ベースの legacy resume では、旧通常 rescore の
     // marker 無し出力（レコード数だけ一致）を完了扱いし、葉ラベルを生成せず stale 出力を温存する。
     if expand_output_path.is_some() || replacement_output.is_some() || cli.qsearch_leaf_label {
@@ -637,6 +653,11 @@ fn main() -> Result<()> {
     let use_dlshogi_onnx = cli.dlshogi_onnx_model.is_some();
 
     if cli.out_scores {
+        if cli.limit > 0 {
+            anyhow::bail!(
+                "--out-scores cannot be combined with --limit because the score sidecar must cover every base PSV record"
+            );
+        }
         if cli.delete_input {
             anyhow::bail!(
                 "--out-scores cannot be combined with --delete-input because the base PSV is required to interpret the score sidecar"
@@ -1045,6 +1066,14 @@ fn main() -> Result<()> {
                         input_path.display()
                     );
                 }
+                OnnxMarkerDecision::ResumeSidecar => {
+                    eprintln!(
+                        "=== [{}/{}] Resuming (in-progress marker matches): {} ===",
+                        file_idx + 1,
+                        total_files,
+                        input_path.display()
+                    );
+                }
                 OnnxMarkerDecision::LegacyResume => {
                     use_legacy_resume_check = true;
                 }
@@ -1062,30 +1091,10 @@ fn main() -> Result<()> {
             }
             if output_path.exists() {
                 let out_size = fs::metadata(&output_path)?.len();
-                let output_record_size = if cli.out_scores {
-                    std::mem::size_of::<i16>() as u64
-                } else {
-                    PackedSfenValue::SIZE as u64
-                };
-                if cli.out_scores && out_size % output_record_size != 0 {
-                    anyhow::bail!(
-                        "Output size is not a multiple of {output_record_size}: {} ({out_size} bytes)",
-                        output_path.display()
-                    );
-                }
+                let output_record_size = PackedSfenValue::SIZE as u64;
                 let out_records = out_size / output_record_size;
-                if cli.out_scores && out_records > process_count {
-                    anyhow::bail!(
-                        "score sidecar has {out_records} records, exceeding expected {process_count}: {}",
-                        output_path.display()
-                    );
-                }
-                let complete = if cli.out_scores {
-                    out_records == process_count
-                } else {
-                    out_records >= input_record_count
-                        && out_size % PackedSfenValue::SIZE as u64 == 0
-                };
+                let complete = out_records >= input_record_count
+                    && out_size % PackedSfenValue::SIZE as u64 == 0;
                 if complete {
                     eprintln!(
                         "=== [{}/{}] Skipping (complete: {} records): {} ===",
@@ -2215,8 +2224,10 @@ fn prepare_resume_count(
     }
     if out_scores {
         anyhow::bail!(
-            "Output size is not a multiple of {output_record_size}: {} ({out_size} bytes)",
-            output_path.display()
+            "Output size is not a multiple of {output_record_size}: {} ({out_size} bytes). \
+             Delete the .in-progress marker {} so the next run truncates and regenerates the sidecar.",
+            output_path.display(),
+            in_progress_marker_path_for(output_path).display()
         );
     }
 
@@ -2325,6 +2336,9 @@ struct RunFingerprint {
     skip_in_check: bool,
     score_clip: i16,
     eval_scale_bits: u32,
+    // 旧 marker のキー欠落は unknown (`None`)。現行実行は常に `Some` を設定するため、
+    // CUDA / TensorRT のどちらとも一致せず一度だけ再生成される。
+    use_tensorrt: Option<bool>,
     onnx_draw_ply: i32,
     // 出力内容を変える要素: root 据え置き・葉ラベルモードと葉探索深さ。
     // モード差で resume / marker が誤って一致しないよう fingerprint に含める。
@@ -2372,6 +2386,14 @@ fn marker_path_for(rescore_output: &std::path::Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// `<rescore_output>.in-progress` を返す
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn in_progress_marker_path_for(rescore_output: &std::path::Path) -> PathBuf {
+    let mut s = rescore_output.as_os_str().to_owned();
+    s.push(".in-progress");
+    PathBuf::from(s)
+}
+
 /// ファイルの `(len, modified_unix_ns)` を取得
 #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn file_size_mtime_ns(path: &std::path::Path) -> Result<(u64, u128)> {
@@ -2405,6 +2427,9 @@ fn serialize_marker(marker: &DoneMarker) -> String {
     let _ = writeln!(out, "skip_in_check={}", f.skip_in_check);
     let _ = writeln!(out, "score_clip={}", f.score_clip);
     let _ = writeln!(out, "eval_scale_bits=0x{:08x}", f.eval_scale_bits);
+    if let Some(use_tensorrt) = f.use_tensorrt {
+        let _ = writeln!(out, "use_tensorrt={use_tensorrt}");
+    }
     let _ = writeln!(out, "onnx_draw_ply={}", f.onnx_draw_ply);
     let _ = writeln!(out, "qsearch_leaf_label={}", f.qsearch_leaf_label);
     if f.qsearch_leaf_label {
@@ -2557,6 +2582,9 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
         skip_in_check: parse_bool(get("skip_in_check")?)?,
         score_clip: get("score_clip")?.parse().context("invalid score_clip")?,
         eval_scale_bits: parse_hex_u32(get("eval_scale_bits")?)?,
+        // 旧 marker は実行 backend を追跡していなかった。欠落は unknown として保持し、
+        // 現行の CUDA / TensorRT のどちらとも fingerprint が一致しないようにする。
+        use_tensorrt: map.get("use_tensorrt").map(|v| parse_bool(v)).transpose()?,
         onnx_draw_ply: get("onnx_draw_ply")?.parse().context("invalid onnx_draw_ply")?,
         qsearch_leaf_label,
         qsearch_max_ply: if qsearch_leaf_label {
@@ -2635,13 +2663,19 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
 #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn write_marker_atomic(rescore_output: &std::path::Path, marker: &DoneMarker) -> Result<()> {
     let final_path = marker_path_for(rescore_output);
+    write_marker_atomic_at(&final_path, marker)
+}
+
+/// 指定したパスへマーカーを atomic に書き出す。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn write_marker_atomic_at(final_path: &std::path::Path, marker: &DoneMarker) -> Result<()> {
     let mut tmp_os = final_path.as_os_str().to_owned();
     tmp_os.push(".tmp");
     let tmp_path = PathBuf::from(tmp_os);
 
     // symlink 拒否: final / tmp どちらも symlink 経由の書き込みをブロック。
     // tmp に前回クラッシュの残骸 (通常ファイル) があれば事前削除する。
-    for p in [&final_path, &tmp_path] {
+    for p in [final_path, tmp_path.as_path()] {
         if let Ok(meta) = fs::symlink_metadata(p)
             && meta.file_type().is_symlink()
         {
@@ -2669,10 +2703,165 @@ fn write_marker_atomic(rescore_output: &std::path::Path, marker: &DoneMarker) ->
         f.write_all(body.as_bytes())?;
         f.sync_all()?;
     }
-    fs::rename(&tmp_path, &final_path).with_context(|| {
+    fs::rename(&tmp_path, final_path).with_context(|| {
         format!("Failed to rename marker {} → {}", tmp_path.display(), final_path.display())
     })?;
     Ok(())
+}
+
+/// score sidecar の run 開始時に選ぶ処理方法。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarStartDecision {
+    Resume,
+    Truncate,
+}
+
+/// in-progress marker が通常ファイルなら削除する。symlink は追跡せず拒否する。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn remove_in_progress_marker(rescore_output: &std::path::Path) -> Result<()> {
+    let path = in_progress_marker_path_for(rescore_output);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to stat in-progress marker {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "In-progress marker path is a symlink (refusing to remove): {}",
+            path.display()
+        );
+    }
+    fs::remove_file(&path)
+        .with_context(|| format!("Failed to remove in-progress marker {}", path.display()))
+}
+
+/// score sidecar の in-progress marker を書く。
+///
+/// 完了 marker と同じ key=value 形式を再利用し、output size は未完了を表す 0 とする。
+/// fingerprint だけを resume の根拠にし、変化する sidecar 自身の mtime は記録しない。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn write_in_progress_marker(
+    rescore_output: &std::path::Path,
+    fingerprint: &RunFingerprint,
+) -> Result<()> {
+    let marker = DoneMarker {
+        fingerprint: fingerprint.clone(),
+        output_sizes: OutputSizes {
+            rescore_output_size: 0,
+            expand_output_size: None,
+            replacement_output_size: None,
+        },
+    };
+    write_marker_atomic_at(&in_progress_marker_path_for(rescore_output), &marker)
+}
+
+/// score sidecar の安全な resume 条件を確認し、run 開始状態を用意する。
+///
+/// full PSV では何もせず、従来の marker / record-count 判定へ委ねる。sidecar では
+/// 出力と in-progress marker の両方が存在し fingerprint が一致するときだけ追記を許可する。
+/// それ以外は出力を truncate して現在 fingerprint の marker を書き直す。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn prepare_in_progress_marker(
+    rescore_output: &std::path::Path,
+    current: &RunFingerprint,
+    force_truncate: bool,
+) -> Result<Option<SidecarStartDecision>> {
+    if !current.out_scores {
+        return Ok(None);
+    }
+
+    let in_progress_path = in_progress_marker_path_for(rescore_output);
+    let marker_matches = if force_truncate || !rescore_output.exists() {
+        false
+    } else {
+        match fs::symlink_metadata(&in_progress_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "In-progress marker path is a symlink (refusing to resume): {}",
+                    in_progress_path.display()
+                );
+            }
+            Ok(_) => match parse_marker(&in_progress_path) {
+                Ok(marker) => marker.fingerprint == *current,
+                Err(error) => {
+                    eprintln!(
+                        "Warning: invalid in-progress marker {}, regenerating sidecar: {error:#}",
+                        in_progress_path.display()
+                    );
+                    false
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to stat in-progress marker {}", in_progress_path.display())
+                });
+            }
+        }
+    };
+
+    if marker_matches {
+        return Ok(Some(SidecarStartDecision::Resume));
+    }
+
+    if rescore_output.exists() {
+        File::options().write(true).open(rescore_output)?.set_len(0)?;
+    }
+    remove_in_progress_marker(rescore_output)?;
+    write_in_progress_marker(rescore_output, current)?;
+    Ok(Some(SidecarStartDecision::Truncate))
+}
+
+/// sidecar の正常完了を `.done` へ昇格し、その後 in-progress marker を削除する。
+/// この順序なら両操作の間で停止しても、次回は `.done` を正として回収できる。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn promote_score_sidecar_marker(
+    rescore_output: &std::path::Path,
+    marker: &DoneMarker,
+) -> Result<()> {
+    write_marker_atomic(rescore_output, marker)?;
+    remove_in_progress_marker(rescore_output)
+}
+
+/// sidecar run の開始時 fingerprint が現在も有効か確認する。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn ensure_sidecar_fingerprint_unchanged(
+    start: &RunFingerprint,
+    current: &RunFingerprint,
+    phase: &str,
+) -> Result<()> {
+    if start != current {
+        anyhow::bail!(
+            "score sidecar fingerprint changed {phase}; refusing to finalize mixed/stale output"
+        );
+    }
+    Ok(())
+}
+
+/// run 中の fingerprint 変更を検出した sidecar を、次回 resume 不能な状態へ戻す。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn reject_changed_sidecar_fingerprint(
+    rescore_output: &std::path::Path,
+    start: &RunFingerprint,
+    current: &RunFingerprint,
+    phase: &str,
+) -> Result<()> {
+    let error = match ensure_sidecar_fingerprint_unchanged(start, current, phase) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    // marker だけを残すと入力/model の mtime を元に戻した際に満杯の sidecar が再利用
+    // され得る。出力を空にしてから marker を削除し、次回を必ず先頭から始める。
+    if rescore_output.exists() {
+        File::options().write(true).open(rescore_output)?.set_len(0)?;
+    }
+    remove_in_progress_marker(rescore_output)?;
+    Err(error)
 }
 
 /// マーカーの `key=value\n` テキスト形式で安全に round-trip できないパスを拒否する。
@@ -2774,6 +2963,7 @@ fn build_run_fingerprint(config: &OnnxPipelineConfig<'_>) -> Result<RunFingerpri
         skip_in_check: config.skip_in_check,
         score_clip: config.score_clip,
         eval_scale_bits: config.eval_scale.to_bits(),
+        use_tensorrt: Some(config.use_tensorrt),
         onnx_draw_ply: config.onnx_draw_ply,
         qsearch_leaf_label: config.qsearch_leaf_label,
         qsearch_max_ply: config.qsearch_leaf_label.then_some(config.qsearch_max_ply),
@@ -2938,6 +3128,18 @@ where
         qsearch_nnue_path: _,
         replacement_output,
     } = *config;
+
+    // marker 判定から Session/load 開始までの間に入力・モデルが変わっていないことを確認し、
+    // この run の基準 fingerprint を固定する。完了時にも再検証し、run 中の差し替えを
+    // 新しい条件の .done として誤って確定しない。
+    let sidecar_start_fingerprint = if out_scores {
+        let marker = parse_marker(&in_progress_marker_path_for(output_path))?;
+        let current = build_run_fingerprint(config)?;
+        ensure_sidecar_fingerprint_unchanged(&marker.fingerprint, &current, "before processing")?;
+        Some(current)
+    } else {
+        None
+    };
     use ort::ep::ExecutionProvider;
     use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
     use ort::session::Session;
@@ -3160,6 +3362,16 @@ where
         PackedSfenValue::SIZE as u64
     };
     let resume_count = prepare_resume_count(output_path, output_record_size, out_scores)?;
+    anyhow::ensure!(
+        resume_count <= process_count,
+        "{} has {resume_count} records, exceeding expected {process_count}: {}",
+        if out_scores {
+            "score sidecar"
+        } else {
+            "output"
+        },
+        output_path.display()
+    );
 
     let out_file = File::options()
         .create(true)
@@ -3193,8 +3405,8 @@ where
         None
     };
 
-    // 既存レコード分の入力をスキップ（expand 無効 + marker 不存在の legacy
-    // resume パス。main 側で truncate(0) 済みなら resume_count == 0 になり no-op）
+    // 既存レコード分の入力をスキップ（score sidecar の marker 一致 resume、または
+    // full PSV の legacy resume。main 側で truncate(0) 済みなら no-op）
     let mut remaining = process_count;
     if resume_count > 0 {
         let skip = resume_count.min(remaining);
@@ -4132,7 +4344,20 @@ where
                 );
             }
         }
-        let fingerprint = build_run_fingerprint(config)?;
+        let fingerprint = if let Some(start) = sidecar_start_fingerprint {
+            let current = build_run_fingerprint(config)?;
+            reject_changed_sidecar_fingerprint(output_path, &start, &current, "during processing")?;
+            let active_marker = parse_marker(&in_progress_marker_path_for(output_path))?;
+            reject_changed_sidecar_fingerprint(
+                output_path,
+                &start,
+                &active_marker.fingerprint,
+                "in the active marker",
+            )?;
+            start
+        } else {
+            build_run_fingerprint(config)?
+        };
         let rescore_size = fs::metadata(output_path)?.len();
         let expand_size = match expand {
             Some(e) => Some(fs::metadata(e.output_path)?.len()),
@@ -4150,7 +4375,11 @@ where
                 replacement_output_size: replacement_size,
             },
         };
-        write_marker_atomic(output_path, &marker)?;
+        if out_scores {
+            promote_score_sidecar_marker(output_path, &marker)?;
+        } else {
+            write_marker_atomic(output_path, &marker)?;
+        }
         eprintln!("Marker written: {}", marker_path_for(output_path).display());
     }
 
@@ -4349,6 +4578,21 @@ mod marker_tests {
     }
 
     #[test]
+    fn old_marker_without_tensorrt_is_unknown_and_mismatches_both_values() {
+        let old = parse_text(&base_marker(""));
+        assert_eq!(old.fingerprint.use_tensorrt, None);
+
+        let cuda = parse_text(&base_marker("use_tensorrt=false\n"));
+        assert_eq!(cuda.fingerprint.use_tensorrt, Some(false));
+        assert_ne!(old.fingerprint, cuda.fingerprint);
+
+        let tensorrt = parse_text(&base_marker("use_tensorrt=true\n"));
+        assert_eq!(tensorrt.fingerprint.use_tensorrt, Some(true));
+        assert_ne!(old.fingerprint, tensorrt.fingerprint);
+        assert_eq!(tensorrt, parse_text(&serialize_marker(&tensorrt)));
+    }
+
+    #[test]
     fn new_marker_leaf_label_true_roundtrips() {
         let m = parse_text(&base_marker(LEAF_LABEL_KEYS));
         assert!(m.fingerprint.qsearch_leaf_label);
@@ -4427,6 +4671,164 @@ mod marker_tests {
         }
     }
 
+    fn test_fingerprint(out_scores: bool) -> RunFingerprint {
+        let extra = if out_scores { "out_scores=true\n" } else { "" };
+        parse_text(&base_marker(extra)).fingerprint
+    }
+
+    fn sidecar_bytes(records: &[PackedSfenValue]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for record in records {
+            append_rescore_bytes(&mut bytes, record, true);
+        }
+        bytes
+    }
+
+    #[test]
+    fn in_progress_marker_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("scores.i16");
+        let fingerprint = test_fingerprint(true);
+
+        write_in_progress_marker(&output, &fingerprint).unwrap();
+
+        let parsed = parse_marker(&in_progress_marker_path_for(&output)).unwrap();
+        assert_eq!(parsed.fingerprint, fingerprint);
+        assert_eq!(parsed.output_sizes.rescore_output_size, 0);
+    }
+
+    #[test]
+    fn matching_in_progress_marker_resumes_bit_identically() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("scores.i16");
+        let fingerprint = test_fingerprint(true);
+        let complete = sidecar_bytes(&[test_psv(-5), test_psv(6), test_psv(300)]);
+
+        assert_eq!(
+            prepare_in_progress_marker(&output, &fingerprint, false).unwrap(),
+            Some(SidecarStartDecision::Truncate)
+        );
+        std::fs::write(&output, &complete[..2]).unwrap();
+        assert_eq!(
+            prepare_in_progress_marker(&output, &fingerprint, false).unwrap(),
+            Some(SidecarStartDecision::Resume)
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), complete[..2]);
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&output)
+            .unwrap()
+            .write_all(&complete[2..])
+            .unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), complete);
+    }
+
+    #[test]
+    fn mismatched_in_progress_marker_truncates_and_regenerates() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("scores.i16");
+        let fingerprint = test_fingerprint(true);
+        let complete = sidecar_bytes(&[test_psv(-5), test_psv(6), test_psv(300)]);
+
+        prepare_in_progress_marker(&output, &fingerprint, false).unwrap();
+        std::fs::write(&output, &complete[..2]).unwrap();
+
+        let mut changed = fingerprint.clone();
+        changed.score_clip = 9999;
+        assert_eq!(
+            prepare_in_progress_marker(&output, &changed, false).unwrap(),
+            Some(SidecarStartDecision::Truncate)
+        );
+        assert_eq!(std::fs::metadata(&output).unwrap().len(), 0);
+        assert_eq!(
+            parse_marker(&in_progress_marker_path_for(&output)).unwrap().fingerprint,
+            changed
+        );
+
+        std::fs::write(&output, &complete).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), complete);
+    }
+
+    #[test]
+    fn missing_in_progress_marker_truncates_existing_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("scores.i16");
+        let fingerprint = test_fingerprint(true);
+        std::fs::write(&output, sidecar_bytes(&[test_psv(-5)])).unwrap();
+
+        assert_eq!(
+            prepare_in_progress_marker(&output, &fingerprint, false).unwrap(),
+            Some(SidecarStartDecision::Truncate)
+        );
+        assert_eq!(std::fs::metadata(&output).unwrap().len(), 0);
+        assert!(in_progress_marker_path_for(&output).exists());
+    }
+
+    #[test]
+    fn completed_sidecar_promotes_done_and_removes_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("scores.i16");
+        let fingerprint = test_fingerprint(true);
+        let complete = sidecar_bytes(&[test_psv(-5), test_psv(6)]);
+
+        prepare_in_progress_marker(&output, &fingerprint, false).unwrap();
+        std::fs::write(&output, &complete).unwrap();
+        let done = DoneMarker {
+            fingerprint: fingerprint.clone(),
+            output_sizes: OutputSizes {
+                rescore_output_size: complete.len() as u64,
+                expand_output_size: None,
+                replacement_output_size: None,
+            },
+        };
+
+        promote_score_sidecar_marker(&output, &done).unwrap();
+
+        assert_eq!(parse_marker(&marker_path_for(&output)).unwrap(), done);
+        assert!(!in_progress_marker_path_for(&output).exists());
+    }
+
+    #[test]
+    fn full_psv_mode_does_not_create_in_progress_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output.psv");
+        std::fs::write(&output, [1, 2, 3]).unwrap();
+
+        assert_eq!(
+            prepare_in_progress_marker(&output, &test_fingerprint(false), false).unwrap(),
+            None
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), [1, 2, 3]);
+        assert!(!in_progress_marker_path_for(&output).exists());
+    }
+
+    #[test]
+    fn changed_input_fingerprint_is_not_finalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("scores.i16");
+        let start = test_fingerprint(true);
+        let mut changed = start.clone();
+        changed.input_mtime_ns += 1;
+
+        prepare_in_progress_marker(&output, &start, false).unwrap();
+        std::fs::write(&output, [1, 2, 3, 4]).unwrap();
+        assert!(
+            reject_changed_sidecar_fingerprint(&output, &start, &start, "during processing")
+                .is_ok()
+        );
+        let error =
+            reject_changed_sidecar_fingerprint(&output, &start, &changed, "during processing")
+                .unwrap_err();
+        assert!(error.to_string().contains("changed during processing"));
+        assert_eq!(std::fs::metadata(&output).unwrap().len(), 0);
+        assert!(!in_progress_marker_path_for(&output).exists());
+        assert_eq!(
+            prepare_in_progress_marker(&output, &start, false).unwrap(),
+            Some(SidecarStartDecision::Truncate)
+        );
+    }
+
     #[test]
     fn score_sidecar_matches_full_psv_score_column() {
         let records = [test_psv(-1234), test_psv(0), test_psv(9876)];
@@ -4479,7 +4881,8 @@ mod marker_tests {
 
         let sidecar = dir.path().join("scores.i16");
         std::fs::write(&sidecar, [0u8; 3]).unwrap();
-        assert!(prepare_resume_count(&sidecar, 2, true).is_err());
+        let error = prepare_resume_count(&sidecar, 2, true).unwrap_err();
+        assert!(error.to_string().contains("Delete the .in-progress marker"));
         assert_eq!(std::fs::metadata(sidecar).unwrap().len(), 3);
     }
 
