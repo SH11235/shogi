@@ -18,33 +18,30 @@ const CHUNK_RECORDS: usize = 1 << 18;
 #[derive(Parser)]
 #[command(about = "入玉ドメインの PSV 合成またはゲート bitmap 生成")]
 struct Cli {
-    /// depth9 ラベル PSV
+    /// base PSV（ゲート該当行で score を採用し、学習側では温存される側）
     #[arg(long)]
-    d9: Option<PathBuf>,
-    /// DL リスコア PSV
-    #[arg(long)]
-    dl: Option<PathBuf>,
+    base: Option<PathBuf>,
+    /// override PSV（非該当行の score と非 score フィールドの供給元。学習側の `--score-override` に対応）
+    #[arg(long = "override")]
+    override_path: Option<PathBuf>,
     /// merge 出力 PSV
     #[arg(long)]
     out: Option<PathBuf>,
-    /// mask 判定元の base PSV
-    #[arg(long)]
-    input: Option<PathBuf>,
     /// mask bitmap 出力
     #[arg(long)]
     out_mask: Option<PathBuf>,
     /// 対象 tier（entered,advancing のカンマ区切り）
     #[arg(long, default_value = "entered,advancing")]
     tiers: String,
-    /// `|depth9 score| < N` の行だけを対象にする
+    /// `|base score| < N` の行だけをゲート対象にする
     #[arg(long)]
-    d9_abs_max: Option<i32>,
+    base_score_abs_max: Option<i32>,
 }
 
 #[derive(Clone, Copy)]
 struct GateConfig {
     tiers: [bool; 3],
-    d9_abs_max: Option<i32>,
+    base_score_abs_max: Option<i32>,
 }
 
 #[derive(Default)]
@@ -58,17 +55,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = GateConfig {
         tiers: parse_tiers(&cli.tiers)?,
-        d9_abs_max: cli.d9_abs_max,
+        base_score_abs_max: cli.base_score_abs_max,
     };
-    match (cli.d9, cli.dl, cli.out, cli.input, cli.out_mask) {
-        (Some(d9), Some(dl), Some(out), None, None) => {
-            print_stats(&merge(&d9, &dl, &out, config)?);
+    match (cli.base, cli.override_path, cli.out, cli.out_mask) {
+        (Some(base), Some(override_path), Some(out), None) => {
+            print_stats(&merge(&base, &override_path, &out, config)?);
         }
-        (None, None, None, Some(input), Some(out_mask)) => {
-            print_stats(&write_mask(&input, &out_mask, config)?);
+        (Some(base), None, None, Some(out_mask)) => {
+            print_stats(&write_mask(&base, &out_mask, config)?);
         }
         _ => anyhow::bail!(
-            "Specify exactly one mode: --d9/--dl/--out or --input/--out-mask; modes cannot be mixed"
+            "Specify exactly one mode: --base/--override/--out or --base/--out-mask; --override/--out and --out-mask cannot be mixed"
         ),
     }
     Ok(())
@@ -112,7 +109,8 @@ fn classify_record(record: &[u8], row: u64) -> Result<(usize, i16)> {
 }
 
 fn is_gated(config: GateConfig, tier: usize, score: i16) -> bool {
-    config.tiers[tier] && config.d9_abs_max.is_none_or(|limit| i32::from(score).abs() < limit)
+    config.tiers[tier]
+        && config.base_score_abs_max.is_none_or(|limit| i32::from(score).abs() < limit)
 }
 
 fn checked_records(path: &Path) -> Result<u64> {
@@ -189,51 +187,52 @@ fn read_record_chunk<R: Read>(reader: &mut R, buffer: &mut Vec<u8>, records: usi
     Ok(())
 }
 
-fn merge(d9: &Path, dl: &Path, out: &Path, config: GateConfig) -> Result<Stats> {
-    ensure_safe_output_path(out, d9)?;
-    ensure_safe_output_path(out, dl)?;
-    let d9_records = checked_records(d9)?;
-    let dl_records = checked_records(dl)?;
+fn merge(base: &Path, override_path: &Path, out: &Path, config: GateConfig) -> Result<Stats> {
+    ensure_safe_output_path(out, base)?;
+    ensure_safe_output_path(out, override_path)?;
+    let base_records = checked_records(base)?;
+    let override_records = checked_records(override_path)?;
     anyhow::ensure!(
-        dl_records == d9_records,
-        "Input record counts differ: d9={d9_records}, dl={dl_records}"
+        override_records == base_records,
+        "Input record counts differ: base={base_records}, override={override_records}"
     );
-    let mut d9_reader = BufReader::with_capacity(BUFFER_SIZE, File::open(d9)?);
-    let mut dl_reader = BufReader::with_capacity(BUFFER_SIZE, File::open(dl)?);
+    let mut base_reader = BufReader::with_capacity(BUFFER_SIZE, File::open(base)?);
+    let mut override_reader = BufReader::with_capacity(BUFFER_SIZE, File::open(override_path)?);
     let mut writer = BufWriter::with_capacity(BUFFER_SIZE, File::create(out)?);
-    let mut d9_chunk = Vec::with_capacity(CHUNK_RECORDS * RECORD_SIZE);
-    let mut dl_chunk = Vec::with_capacity(CHUNK_RECORDS * RECORD_SIZE);
+    let mut base_chunk = Vec::with_capacity(CHUNK_RECORDS * RECORD_SIZE);
+    let mut override_chunk = Vec::with_capacity(CHUNK_RECORDS * RECORD_SIZE);
     let mut stats = Stats::default();
     let mut first_row = 0u64;
-    while first_row < d9_records {
-        let chunk_records = (d9_records - first_row).min(CHUNK_RECORDS as u64) as usize;
-        read_record_chunk(&mut d9_reader, &mut d9_chunk, chunk_records)?;
-        read_record_chunk(&mut dl_reader, &mut dl_chunk, chunk_records)?;
-        let classifications = classify_chunk(&d9_chunk, first_row);
-        for (offset, ((d9_record, dl_record), classification)) in d9_chunk
+    while first_row < base_records {
+        let chunk_records = (base_records - first_row).min(CHUNK_RECORDS as u64) as usize;
+        read_record_chunk(&mut base_reader, &mut base_chunk, chunk_records)?;
+        read_record_chunk(&mut override_reader, &mut override_chunk, chunk_records)?;
+        let classifications = classify_chunk(&base_chunk, first_row);
+        for (offset, ((base_record, override_record), classification)) in base_chunk
             .chunks_exact(RECORD_SIZE)
-            .zip(dl_chunk.chunks_exact_mut(RECORD_SIZE))
+            .zip(override_chunk.chunks_exact_mut(RECORD_SIZE))
             .zip(classifications)
             .enumerate()
         {
             let row = first_row + offset as u64;
             anyhow::ensure!(
-                d9_record[..32] == dl_record[..32] && d9_record[34..39] == dl_record[34..39],
+                base_record[..32] == override_record[..32]
+                    && base_record[34..39] == override_record[34..39],
                 "Non-score fields differ at row {row}"
             );
             let (tier, score) = classification?;
             stats.tiers[tier] += 1;
             if is_gated(config, tier, score) {
-                dl_record[32..34].copy_from_slice(&d9_record[32..34]);
+                override_record[32..34].copy_from_slice(&base_record[32..34]);
                 stats.gated += 1;
             }
         }
-        writer.write_all(&dl_chunk)?;
+        writer.write_all(&override_chunk)?;
         first_row += chunk_records as u64;
         stats.records += chunk_records as u64;
     }
     writer.flush()?;
-    let expected = d9_records * RECORD_SIZE as u64;
+    let expected = base_records * RECORD_SIZE as u64;
     anyhow::ensure!(fs::metadata(out)?.len() == expected, "Output size mismatch");
     Ok(stats)
 }
@@ -343,7 +342,7 @@ mod tests {
                 &output,
                 GateConfig {
                     tiers: [true, false, false],
-                    d9_abs_max: None,
+                    base_score_abs_max: None,
                 },
             )?;
             let mask = std::fs::read(output)?;
@@ -361,32 +360,32 @@ mod tests {
     #[test]
     fn merge_matches_mask_selection() -> Result<()> {
         let dir = tempdir()?;
-        let d9 = dir.path().join("d9.psv");
-        let dl = dir.path().join("dl.psv");
+        let base = dir.path().join("base.psv");
+        let override_path = dir.path().join("override.psv");
         let merged = dir.path().join("merged.psv");
         let mask = dir.path().join("mask.bin");
-        std::fs::write(&d9, samples(17, 10)?)?;
-        std::fs::write(&dl, samples(17, 100)?)?;
+        std::fs::write(&base, samples(17, 10)?)?;
+        std::fs::write(&override_path, samples(17, 100)?)?;
         let config = GateConfig {
             tiers: [true, true, false],
-            d9_abs_max: Some(25),
+            base_score_abs_max: Some(25),
         };
-        merge(&d9, &dl, &merged, config)?;
-        write_mask(&d9, &mask, config)?;
-        let (d9b, dlb, mb, bits) = (
-            std::fs::read(d9)?,
-            std::fs::read(dl)?,
+        merge(&base, &override_path, &merged, config)?;
+        write_mask(&base, &mask, config)?;
+        let (base_bytes, override_bytes, merged_bytes, bits) = (
+            std::fs::read(base)?,
+            std::fs::read(override_path)?,
             std::fs::read(merged)?,
             std::fs::read(mask)?,
         );
         for i in 0..17 {
             let expected = if (bits[i / 8] >> (i % 8)) & 1 == 1 {
-                &d9b
+                &base_bytes
             } else {
-                &dlb
+                &override_bytes
             };
             assert_eq!(
-                &mb[i * RECORD_SIZE + 32..i * RECORD_SIZE + 34],
+                &merged_bytes[i * RECORD_SIZE + 32..i * RECORD_SIZE + 34],
                 &expected[i * RECORD_SIZE + 32..i * RECORD_SIZE + 34]
             );
         }
@@ -402,10 +401,10 @@ mod tests {
     }
 
     #[test]
-    fn d9_abs_max_boundary_is_exclusive() {
+    fn base_score_abs_max_boundary_is_exclusive() {
         let config = GateConfig {
             tiers: [true, false, false],
-            d9_abs_max: Some(25),
+            base_score_abs_max: Some(25),
         };
         assert!(is_gated(config, 0, 24));
         assert!(is_gated(config, 0, -24));
@@ -433,7 +432,7 @@ mod tests {
             &input,
             GateConfig {
                 tiers: [true, true, false],
-                d9_abs_max: None,
+                base_score_abs_max: None,
             },
         )
         .err()
@@ -459,7 +458,7 @@ mod tests {
             &output,
             GateConfig {
                 tiers: [true, true, false],
-                d9_abs_max: None,
+                base_score_abs_max: None,
             },
         )
         .err()
@@ -472,46 +471,46 @@ mod tests {
     #[test]
     fn merge_rejects_output_equal_to_input_without_truncating() -> Result<()> {
         let dir = tempdir()?;
-        let d9 = dir.path().join("d9.psv");
-        let dl = dir.path().join("dl.psv");
+        let base = dir.path().join("base.psv");
+        let override_path = dir.path().join("override.psv");
         let original = samples(3, 0)?;
-        std::fs::write(&d9, &original)?;
-        std::fs::write(&dl, samples(3, 100)?)?;
+        std::fs::write(&base, &original)?;
+        std::fs::write(&override_path, samples(3, 100)?)?;
         let error = merge(
-            &d9,
-            &dl,
-            &d9,
+            &base,
+            &override_path,
+            &base,
             GateConfig {
                 tiers: [true, true, false],
-                d9_abs_max: None,
+                base_score_abs_max: None,
             },
         )
         .err()
         .expect("operation must fail");
         assert!(error.to_string().contains("resolves to input file"));
-        assert_eq!(std::fs::read(d9)?, original);
+        assert_eq!(std::fs::read(base)?, original);
         Ok(())
     }
 
     #[test]
     fn merge_count_mismatch_reports_both_counts() -> Result<()> {
         let dir = tempdir()?;
-        let d9 = dir.path().join("d9.psv");
-        let dl = dir.path().join("dl.psv");
-        std::fs::write(&d9, samples(1, 0)?)?;
-        std::fs::write(&dl, samples(2, 0)?)?;
+        let base = dir.path().join("base.psv");
+        let override_path = dir.path().join("override.psv");
+        std::fs::write(&base, samples(1, 0)?)?;
+        std::fs::write(&override_path, samples(2, 0)?)?;
         let error = merge(
-            &d9,
-            &dl,
+            &base,
+            &override_path,
             &dir.path().join("out.psv"),
             GateConfig {
                 tiers: [true, true, false],
-                d9_abs_max: None,
+                base_score_abs_max: None,
             },
         )
         .err()
         .expect("operation must fail");
-        assert!(error.to_string().contains("d9=1, dl=2"));
+        assert!(error.to_string().contains("base=1, override=2"));
         Ok(())
     }
 
@@ -526,7 +525,7 @@ mod tests {
                 &dir.path().join("mask"),
                 GateConfig {
                     tiers: [true, true, false],
-                    d9_abs_max: None
+                    base_score_abs_max: None
                 }
             )
             .is_err()
