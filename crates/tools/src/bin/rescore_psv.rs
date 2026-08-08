@@ -51,6 +51,8 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -96,6 +98,10 @@ struct Cli {
     /// 出力ディレクトリ（入力ファイル名で出力）
     #[arg(short, long)]
     output_dir: PathBuf,
+
+    /// フル PSV の代わりに little-endian i16 の score sidecar を出力
+    #[arg(long)]
+    out_scores: bool,
 
     /// NNUEモデルファイル（--engine未使用時に必須）
     #[arg(long)]
@@ -422,6 +428,7 @@ fn onnx_marker_decide(
         onnx_path,
         input_path,
         output_path: rescore_output_path,
+        out_scores: cli.out_scores,
         process_count,
         batch_size: cli.onnx_batch_size,
         gpu_id: cli.onnx_gpu_id,
@@ -628,6 +635,36 @@ fn main() -> Result<()> {
     let use_engine = cli.engine.is_some();
     let use_onnx = cli.onnx_model.is_some();
     let use_dlshogi_onnx = cli.dlshogi_onnx_model.is_some();
+
+    if cli.out_scores {
+        if cli.delete_input {
+            anyhow::bail!(
+                "--out-scores cannot be combined with --delete-input because the base PSV is required to interpret the score sidecar"
+            );
+        }
+        if !use_dlshogi_onnx {
+            anyhow::bail!("--out-scores requires --dlshogi-onnx-model");
+        }
+        if use_onnx
+            || use_engine
+            || cli.nnue.is_some()
+            || cli.use_qsearch
+            || cli.search_depth.is_some()
+            || cli.qsearch_leaf_label
+            || cli.apply_qsearch_leaf
+            || cli.expand_output_dir.is_some()
+            || cli.qsearch_leaf_replacement_output.is_some()
+        {
+            anyhow::bail!(
+                "--out-scores supports only direct --dlshogi-onnx-model inference and cannot be combined with other evaluation, qsearch, search, expand, or replacement modes"
+            );
+        }
+        if cli.skip_in_check {
+            anyhow::bail!(
+                "--out-scores cannot be combined with --skip-in-check because it breaks row alignment"
+            );
+        }
+    }
 
     // 排他チェック
     if use_onnx && (use_dlshogi_onnx || use_engine || cli.use_qsearch || cli.search_depth.is_some())
@@ -939,7 +976,13 @@ fn main() -> Result<()> {
         let file_name = input_path
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("Invalid input file name: {}", input_path.display()))?;
-        let output_path = cli.output_dir.join(file_name);
+        let output_path = if cli.out_scores {
+            let mut sidecar_name = file_name.to_os_string();
+            sidecar_name.push(".scores.i16");
+            cli.output_dir.join(sidecar_name)
+        } else {
+            cli.output_dir.join(file_name)
+        };
         #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
         let expand_output_path = canonical_expand_dir.as_ref().map(|d| d.join(file_name));
         #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
@@ -947,6 +990,13 @@ fn main() -> Result<()> {
 
         // 入力ファイルサイズと process_count を最初に確定（marker 判定の前提）
         let input_file_size = fs::metadata(input_path)?.len();
+        if cli.out_scores && input_file_size % PackedSfenValue::SIZE as u64 != 0 {
+            anyhow::bail!(
+                "Input size is not a multiple of {}: {} ({input_file_size} bytes)",
+                PackedSfenValue::SIZE,
+                input_path.display()
+            );
+        }
         let input_record_count = input_file_size / PackedSfenValue::SIZE as u64;
         let process_count = if cli.limit > 0 && cli.limit < input_record_count {
             cli.limit
@@ -1012,9 +1062,31 @@ fn main() -> Result<()> {
             }
             if output_path.exists() {
                 let out_size = fs::metadata(&output_path)?.len();
-                let out_records = out_size / PackedSfenValue::SIZE as u64;
-                if out_records >= input_record_count && out_size % PackedSfenValue::SIZE as u64 == 0
-                {
+                let output_record_size = if cli.out_scores {
+                    std::mem::size_of::<i16>() as u64
+                } else {
+                    PackedSfenValue::SIZE as u64
+                };
+                if cli.out_scores && out_size % output_record_size != 0 {
+                    anyhow::bail!(
+                        "Output size is not a multiple of {output_record_size}: {} ({out_size} bytes)",
+                        output_path.display()
+                    );
+                }
+                let out_records = out_size / output_record_size;
+                if cli.out_scores && out_records > process_count {
+                    anyhow::bail!(
+                        "score sidecar has {out_records} records, exceeding expected {process_count}: {}",
+                        output_path.display()
+                    );
+                }
+                let complete = if cli.out_scores {
+                    out_records == process_count
+                } else {
+                    out_records >= input_record_count
+                        && out_size % PackedSfenValue::SIZE as u64 == 0
+                };
+                if complete {
                     eprintln!(
                         "=== [{}/{}] Skipping (complete: {} records): {} ===",
                         file_idx + 1,
@@ -2095,6 +2167,79 @@ fn onnx_ort_err(e: ort::Error) -> anyhow::Error {
     anyhow::anyhow!("ONNX Runtime error: {e}")
 }
 
+/// score 決定後のレコードを通常 PSV または score sidecar として直列化する。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn append_rescore_bytes(output: &mut Vec<u8>, psv: &PackedSfenValue, out_scores: bool) {
+    if out_scores {
+        output.extend_from_slice(&psv.score.to_le_bytes());
+    } else {
+        output.extend_from_slice(&psv.to_bytes());
+    }
+}
+
+/// score sidecar ではエラーを含むバッチを 1 byte も書かない。
+///
+/// reader の decode 失敗と producer の局面構築失敗を同じ errors に集約し、
+/// seq 順 writer が書き出し直前に拒否することで、既存 prefix の行対応を保つ。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn write_rescore_batch<W: Write>(
+    writer: &mut W,
+    bytes: &[u8],
+    out_scores: bool,
+    errors: u64,
+) -> Result<()> {
+    if out_scores && errors > 0 {
+        anyhow::bail!(
+            "score sidecar aborted before writing batch: {errors} input record(s) failed to decode or build"
+        );
+    }
+    writer.write_all(bytes)?;
+    Ok(())
+}
+
+/// 既存出力のレコード数を返す。通常 PSV の末尾 partial record は従来どおり
+/// 切り捨てて自己修復するが、事後検出不能な score sidecar は fail-closed にする。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn prepare_resume_count(
+    output_path: &std::path::Path,
+    output_record_size: u64,
+    out_scores: bool,
+) -> Result<u64> {
+    if !output_path.exists() {
+        return Ok(0);
+    }
+    let out_size = fs::metadata(output_path)?.len();
+    let remainder = out_size % output_record_size;
+    if remainder == 0 {
+        return Ok(out_size / output_record_size);
+    }
+    if out_scores {
+        anyhow::bail!(
+            "Output size is not a multiple of {output_record_size}: {} ({out_size} bytes)",
+            output_path.display()
+        );
+    }
+
+    let aligned_size = out_size - remainder;
+    File::options().write(true).open(output_path)?.set_len(aligned_size)?;
+    eprintln!(
+        "Truncated partial output record: {} ({out_size} -> {aligned_size} bytes)",
+        output_path.display()
+    );
+    Ok(aligned_size / output_record_size)
+}
+
+/// 入力を既処理レコードの直後へ移動する。巨大 sidecar の resume で入力 prefix を
+/// 空読みせず、checked offset に直接 seek する。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn seek_to_record<R: Seek>(reader: &mut R, record_count: u64) -> Result<u64> {
+    let offset = record_count
+        .checked_mul(PackedSfenValue::SIZE as u64)
+        .ok_or_else(|| anyhow::anyhow!("resume input offset overflow: {record_count} records"))?;
+    reader.seek(SeekFrom::Start(offset))?;
+    Ok(offset)
+}
+
 /// ONNX 直接推論パイプラインの共通設定
 ///
 /// 全フィールドが `Copy` のため、関数内で destructure して既存ローカル変数名と
@@ -2107,6 +2252,8 @@ struct OnnxPipelineConfig<'a> {
     onnx_path: &'a std::path::Path,
     input_path: &'a std::path::Path,
     output_path: &'a std::path::Path,
+    /// score sidecar（little-endian i16 × records）として出力する
+    out_scores: bool,
     process_count: u64,
     batch_size: usize,
     gpu_id: i32,
@@ -2174,6 +2321,7 @@ struct RunFingerprint {
     input_size: u64,
     input_mtime_ns: u128,
     process_count: u64,
+    out_scores: bool,
     skip_in_check: bool,
     score_clip: i16,
     eval_scale_bits: u32,
@@ -2253,6 +2401,7 @@ fn serialize_marker(marker: &DoneMarker) -> String {
     let _ = writeln!(out, "input_size={}", f.input_size);
     let _ = writeln!(out, "input_mtime_ns={}", f.input_mtime_ns);
     let _ = writeln!(out, "process_count={}", f.process_count);
+    let _ = writeln!(out, "out_scores={}", f.out_scores);
     let _ = writeln!(out, "skip_in_check={}", f.skip_in_check);
     let _ = writeln!(out, "score_clip={}", f.score_clip);
     let _ = writeln!(out, "eval_scale_bits=0x{:08x}", f.eval_scale_bits);
@@ -2400,6 +2549,11 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
         input_size: get("input_size")?.parse().context("invalid input_size")?,
         input_mtime_ns: get("input_mtime_ns")?.parse().context("invalid input_mtime_ns")?,
         process_count: get("process_count")?.parse().context("invalid process_count")?,
+        // 旧 marker はフル PSV 出力なので false として扱う。
+        out_scores: match map.get("out_scores") {
+            Some(v) => parse_bool(v)?,
+            None => false,
+        },
         skip_in_check: parse_bool(get("skip_in_check")?)?,
         score_clip: get("score_clip")?.parse().context("invalid score_clip")?,
         eval_scale_bits: parse_hex_u32(get("eval_scale_bits")?)?,
@@ -2616,6 +2770,7 @@ fn build_run_fingerprint(config: &OnnxPipelineConfig<'_>) -> Result<RunFingerpri
         input_size,
         input_mtime_ns,
         process_count: config.process_count,
+        out_scores: config.out_scores,
         skip_in_check: config.skip_in_check,
         score_clip: config.score_clip,
         eval_scale_bits: config.eval_scale.to_bits(),
@@ -2760,6 +2915,7 @@ where
         onnx_path,
         input_path,
         output_path,
+        out_scores,
         process_count,
         batch_size,
         gpu_id,
@@ -2998,19 +3154,12 @@ where
     let mut reader = BufReader::new(in_file);
 
     // レジューム対応: 出力ファイルに既存レコードがあればスキップして追記
-    let resume_count = if output_path.exists() {
-        let out_size = fs::metadata(output_path)?.len();
-        let records = out_size / PackedSfenValue::SIZE as u64;
-        // 不完全レコードがあれば切り捨て
-        let clean_size = records * PackedSfenValue::SIZE as u64;
-        if out_size != clean_size {
-            let f = File::options().write(true).open(output_path)?;
-            f.set_len(clean_size)?;
-        }
-        records
+    let output_record_size = if out_scores {
+        std::mem::size_of::<i16>() as u64
     } else {
-        0
+        PackedSfenValue::SIZE as u64
     };
+    let resume_count = prepare_resume_count(output_path, output_record_size, out_scores)?;
 
     let out_file = File::options()
         .create(true)
@@ -3049,18 +3198,11 @@ where
     let mut remaining = process_count;
     if resume_count > 0 {
         let skip = resume_count.min(remaining);
-        let mut skip_buf = [0u8; PackedSfenValue::SIZE];
-        let mut skipped = 0u64;
-        for _ in 0..skip {
-            if reader.read_exact(&mut skip_buf).is_err() {
-                break;
-            }
-            remaining -= 1;
-            skipped += 1;
-        }
+        seek_to_record(&mut reader, skip)?;
+        remaining -= skip;
         // 既処理分を進捗の起点として反映（per-file/overall とも前進）。
-        progress.advance_start(skipped);
-        eprintln!("Resuming: skipped {skipped} already-processed records");
+        progress.advance_start(skip);
+        eprintln!("Resuming: skipped {skip} already-processed records");
     }
 
     let mut skipped_count: u64 = 0;
@@ -3322,7 +3464,8 @@ where
                 // skip_in_check が真かつ親が王手の場合は書き出しを抑制（推論結果は破棄）。
                 let mut skipped = 0u64;
                 let mut clipped_n = 0u64;
-                let mut rescore_bytes = Vec::with_capacity(actual_batch * PackedSfenValue::SIZE);
+                let mut rescore_bytes =
+                    Vec::with_capacity(actual_batch * output_record_size as usize);
                 let mut replacement_bytes = if want_replacement {
                     Vec::with_capacity(actual_batch * PackedSfenValue::SIZE)
                 } else {
@@ -3361,7 +3504,7 @@ where
                         game_result: psv.game_result,
                         padding: 0,
                     };
-                    rescore_bytes.extend_from_slice(&new_psv.to_bytes());
+                    append_rescore_bytes(&mut rescore_bytes, &new_psv, out_scores);
 
                     // leaf-REPLACEMENT arm（有効時のみ、leaf-LABEL と 1:1 lockstep）。
                     // `--apply-qsearch-leaf` → DL rescore の 2 工程と bit 一致させる:
@@ -3808,12 +3951,19 @@ where
                 // 揃った分だけ seq 順に書き出す。pending は同時生存 slot 数で抑えられる。
                 while let Some(done) = pending.remove(&next_seq) {
                     next_seq += 1;
+                    let phase_t = Instant::now();
+                    // sidecar は i16 列だけで行ずれを事後検出できない。reader / producer
+                    // 由来のどちらのエラーも、当該バッチの最初の byte より前で拒否する。
+                    write_rescore_batch(
+                        &mut writer,
+                        &done.rescore_bytes,
+                        out_scores,
+                        done.slot.errors,
+                    )?;
                     stats.errors += done.slot.errors;
                     if done.slot.actual_batch == 0 {
                         break 'writer_loop; // EOF / 中断 sentinel（最終 seq）
                     }
-                    let phase_t = Instant::now();
-                    writer.write_all(&done.rescore_bytes)?;
                     if let Some(rw) = replacement_writer.as_mut() {
                         rw.write_all(&done.replacement_bytes)?;
                     }
@@ -3927,6 +4077,11 @@ where
     // 統計情報
     let rescore_written = total_processed.saturating_sub(skipped_count);
     let total = total_processed + error_count;
+    if out_scores && error_count > 0 {
+        anyhow::bail!(
+            "score sidecar aborted: {error_count} input record(s) failed to decode or build; row alignment cannot be guaranteed"
+        );
+    }
     if error_count > 0 {
         // 破損/パース不能でスキップしたレコードは推論バッチに入らず進捗に計上されないため、
         // それらがあると進捗表示が 100% に届かないことがある（rescore 出力は有効分のみで正常）。
@@ -3965,6 +4120,18 @@ where
     // INTERRUPTED が立っている場合（Ctrl-C で残ファイル分を打ち切った場合）も
     // 書き出した分は完了扱いとはせず、marker を作らない。
     if !INTERRUPTED.load(Ordering::SeqCst) {
+        if out_scores {
+            let expected_size = process_count
+                .checked_mul(output_record_size)
+                .context("Expected output size overflow")?;
+            let actual_size = fs::metadata(output_path)?.len();
+            if actual_size != expected_size {
+                anyhow::bail!(
+                    "Output size mismatch: {} has {actual_size} bytes, expected {expected_size}",
+                    output_path.display()
+                );
+            }
+        }
         let fingerprint = build_run_fingerprint(config)?;
         let rescore_size = fs::metadata(output_path)?.len();
         let expand_size = match expand {
@@ -4020,6 +4187,7 @@ fn process_file_with_onnx(
         onnx_path: cli.onnx_model.as_ref().unwrap(),
         input_path,
         output_path,
+        out_scores: cli.out_scores,
         process_count,
         batch_size: cli.onnx_batch_size,
         gpu_id: cli.onnx_gpu_id,
@@ -4081,6 +4249,7 @@ fn process_file_with_dlshogi_onnx(
         onnx_path: cli.dlshogi_onnx_model.as_ref().unwrap(),
         input_path,
         output_path,
+        out_scores: cli.out_scores,
         process_count,
         batch_size: cli.onnx_batch_size,
         gpu_id: cli.onnx_gpu_id,
@@ -4116,7 +4285,7 @@ fn process_file_with_dlshogi_onnx(
 #[cfg(all(test, any(feature = "aobazero-onnx", feature = "dlshogi-onnx")))]
 mod marker_tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     /// 必須キーを満たす最小 marker テキスト（expand=false）。`extra` に qsearch 系の追加行を差し込む。
     fn base_marker(extra: &str) -> String {
@@ -4164,6 +4333,19 @@ mod marker_tests {
         assert_eq!(m.fingerprint.qsearch_nnue_path, None);
         assert_eq!(m.fingerprint.qsearch_nnue_size, None);
         assert_eq!(m.fingerprint.qsearch_nnue_mtime_ns, None);
+    }
+
+    #[test]
+    fn old_marker_without_out_scores_defaults_to_false() {
+        let m = parse_text(&base_marker(""));
+        assert!(!m.fingerprint.out_scores);
+    }
+
+    #[test]
+    fn out_scores_true_roundtrips() {
+        let m = parse_text(&base_marker("out_scores=true\n"));
+        assert!(m.fingerprint.out_scores);
+        assert_eq!(m, parse_text(&serialize_marker(&m)));
     }
 
     #[test]
@@ -4232,5 +4414,86 @@ mod marker_tests {
         assert_eq!(m.output_sizes.replacement_output_size, Some(320));
         // serialize → parse で一致（replacement_* 行は replacement=true 時のみ出力）
         assert_eq!(m, parse_text(&serialize_marker(&m)));
+    }
+
+    fn test_psv(score: i16) -> PackedSfenValue {
+        PackedSfenValue {
+            sfen: [7; 32],
+            score,
+            move16: 123,
+            game_ply: 45,
+            game_result: -1,
+            padding: 0,
+        }
+    }
+
+    #[test]
+    fn score_sidecar_matches_full_psv_score_column() {
+        let records = [test_psv(-1234), test_psv(0), test_psv(9876)];
+        let mut full = Vec::new();
+        let mut scores = Vec::new();
+        for record in &records {
+            append_rescore_bytes(&mut full, record, false);
+            append_rescore_bytes(&mut scores, record, true);
+        }
+        let extracted: Vec<u8> = full
+            .chunks_exact(PackedSfenValue::SIZE)
+            .flat_map(|record| record[32..34].iter().copied())
+            .collect();
+        assert_eq!(scores, extracted);
+    }
+
+    #[test]
+    fn score_sidecar_resume_prefix_is_bit_identical() {
+        let records = [test_psv(-5), test_psv(6), test_psv(300)];
+        let mut complete = Vec::new();
+        for record in &records {
+            append_rescore_bytes(&mut complete, record, true);
+        }
+        let mut resumed = complete[..2].to_vec();
+        for record in &records[1..] {
+            append_rescore_bytes(&mut resumed, record, true);
+        }
+        assert_eq!(resumed, complete);
+    }
+
+    #[test]
+    fn score_sidecar_error_batch_keeps_clean_prefix() {
+        let mut output = Vec::new();
+        write_rescore_batch(&mut output, &[9, 8], true, 0).unwrap();
+        let error = write_rescore_batch(&mut output, &[1, 2], true, 1).unwrap_err();
+        assert!(error.to_string().contains("before writing batch"));
+        assert_eq!(output, [9, 8]);
+
+        write_rescore_batch(&mut output, &[3, 4], false, 1).unwrap();
+        assert_eq!(output, [9, 8, 3, 4]);
+    }
+
+    #[test]
+    fn normal_resume_truncates_partial_record_but_sidecar_rejects_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let normal = dir.path().join("normal.psv");
+        std::fs::write(&normal, vec![0u8; PackedSfenValue::SIZE + 1]).unwrap();
+        assert_eq!(prepare_resume_count(&normal, PackedSfenValue::SIZE as u64, false).unwrap(), 1);
+        assert_eq!(std::fs::metadata(normal).unwrap().len(), PackedSfenValue::SIZE as u64);
+
+        let sidecar = dir.path().join("scores.i16");
+        std::fs::write(&sidecar, [0u8; 3]).unwrap();
+        assert!(prepare_resume_count(&sidecar, 2, true).is_err());
+        assert_eq!(std::fs::metadata(sidecar).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn sidecar_resume_seek_preserves_record_alignment() {
+        let mut input = Vec::new();
+        for score in [-5, 6, 300] {
+            input.extend_from_slice(&test_psv(score).to_bytes());
+        }
+        let mut cursor = std::io::Cursor::new(input);
+        assert_eq!(seek_to_record(&mut cursor, 2).unwrap(), 2 * PackedSfenValue::SIZE as u64);
+        let mut record = [0u8; PackedSfenValue::SIZE];
+        cursor.read_exact(&mut record).unwrap();
+        assert_eq!(PackedSfenValue::from_bytes(&record).unwrap().score, 300);
+        assert!(seek_to_record(&mut cursor, u64::MAX).is_err());
     }
 }

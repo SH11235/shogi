@@ -142,11 +142,12 @@ ort は load-dynamic のためビルド時に libonnxruntime は不要（実行�
 |---|---|---|
 | `--input` | （必須） | 入力 PSV。glob / 複数指定可 |
 | `--output-dir` | （必須） | 出力ディレクトリ（入力ファイル名で出力） |
+| `--out-scores` | false | dlshogi ONNX の score のみを `<入力名>.scores.i16` に出力（後述） |
 | `--threads` | 0（論理コア数） | 並列処理スレッド数 |
 | `--limit` | 0（無制限） | 各入力ファイルで処理するレコード数上限 |
 | `--score-clip` | 10000 | スコアを ± この値にクリップ |
 | `--skip-in-check` | false | 王手局面を出力から除外 |
-| `--delete-input` | false | 各ファイル処理完了後に入力を削除（ディスク節約） |
+| `--delete-input` | false | 各ファイル処理完了後に入力を削除（ディスク節約、`--out-scores` と併用不可） |
 | `--verbose` | false | 詳細出力 |
 
 ### ONNX モード
@@ -222,6 +223,26 @@ ort は load-dynamic のためビルド時に libonnxruntime は不要（実行�
 スタートのコマンドがそのままこの形（`--input "data/shard_*.bin"`）。
 `nohup` / `tmux` で流しっぱなしにしておき、GPU 温度で止めた後の再開や、モデル
 差し替え時の一括再スコアに使える。
+
+### score sidecar 出力（`--out-scores`）
+
+```bash
+rescore_psv --input "data/*.psv" --output-dir scores/ \
+  --dlshogi-onnx-model model.onnx --out-scores
+```
+
+フル PSV の代わりに `<入力ファイル名>.scores.i16` を生成する。record `i` の score は
+offset `i * 2` にある little-endian i16 で、ファイルサイズは厳密に
+`処理対象 records（--limit=0 なら入力件数、それ以外は min(--limit, 入力件数)）× 2` byte となる。通常のフル PSV
+出力と同じ推論・符号変換・clip を通り、
+通常出力の offset 32..34 を行順に抽出したものと bit 一致する。
+
+このモードは `--dlshogi-onnx-model` の直接推論専用で、NNUE、qsearch、search、外部
+engine、AobaZero ONNX、leaf label/replacement、expand、入力を削除する `--delete-input`、
+および行を減らす `--skip-in-check` とは併用できない。入力は 40 byte の倍数、既存 sidecar は 2 byte の
+倍数でなければ即時エラーになる。中断後は sidecar サイズを 2 で割った record 位置から
+追記再開し、完了時に全 record 数との厳密一致を再検証する。decode / 局面構築エラーを
+含むバッチは書き出し前に停止するため、既存 sidecar の prefix は常に base PSV と行対応する。
 
 ### 王手局面を教師データから除外する
 
