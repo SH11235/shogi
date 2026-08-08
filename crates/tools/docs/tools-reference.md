@@ -52,7 +52,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 
 | ツール | 説明 |
 |--------|------|
-| `shuffle_psv` | PSV ファイル内のレコード（40バイト単位）をシャッフル |
+| `shuffle_psv` | PSV ファイル内のレコード（40バイト単位）をシャッフル。seed 指定による再現と、大規模向けチャンク方式・opt-in の段階削除に対応（[詳細](shuffle_psv.md)） |
 | `split_psv` | PSV ファイルを局面数または容量で複数ファイルへ分割 |
 | `merge_psv` | 複数の PSV ファイルを順序どおりストリーミング結合 |
 | `relabel_psv` | PSV の score を game_result 由来値へ置換し、宣言勝ち override / diversion 整合性 deblunder / dry-run / verdict sidecar に対応（[詳細](relabel_psv.md)） |
