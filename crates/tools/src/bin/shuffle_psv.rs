@@ -16,6 +16,11 @@
 //! # チャンク方式（大規模ファイル用、メモリ使用量を制限）
 //! cargo run -p tools --bin shuffle_psv -- \
 //!   --input large.psv --output shuffled.psv --chunk-size 10000000
+//!
+//! # チャンクと入力を段階削除してピークディスク使用量を抑える
+//! cargo run -p tools --bin shuffle_psv -- \
+//!   --input large.psv --output shuffled.psv --chunk-size 10000000 \
+//!   --delete-chunk-files --delete-input-after-pass1
 //! ```
 
 use anyhow::{Context, Result};
@@ -26,8 +31,8 @@ use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tools::common::memory::available_memory_bytes;
@@ -66,6 +71,14 @@ struct Cli {
     /// メモリ不足でも強制続行
     #[arg(long)]
     force: bool,
+
+    /// Pass 2 で出力へ書き終えたチャンクファイルを削除（チャンク方式のみ）
+    #[arg(long)]
+    delete_chunk_files: bool,
+
+    /// Pass 1 が完全に成功した後で入力ファイルを削除（チャンク方式のみ）
+    #[arg(long)]
+    delete_input_after_pass1: bool,
 }
 
 /// 処理中にCtrl-Cが押されたかを追跡
@@ -224,6 +237,8 @@ fn main() -> Result<()> {
             record_count,
             cli.chunk_size,
             cli.force,
+            cli.delete_chunk_files,
+            cli.delete_input_after_pass1,
             &mut rng,
         )?;
     } else {
@@ -260,6 +275,155 @@ fn progress_style(suffix: &str) -> ProgressStyle {
             "[{{elapsed_precise}}] {{bar:40.cyan/blue}} {{pos}}/{{len}} ({{per_sec}}) {suffix}"
         ))
         .expect("valid template")
+}
+
+fn preserved_chunks_message(
+    temp_dir_path: &Path,
+    input_deleted: bool,
+    delete_chunk_files: bool,
+    deleted_chunks: usize,
+    completed_output_len: u64,
+) -> String {
+    if !input_deleted {
+        return format!(
+            "入力ファイルの削除に失敗したため、入力は残っています。\
+             一時チャンクも {} に保全済みです。入力を正本として使用し、\
+             不要な一時チャンクは確認後に削除してください",
+            temp_dir_path.display()
+        );
+    }
+
+    if delete_chunk_files {
+        if deleted_chunks == 0 {
+            format!(
+                "入力削除後、チャンクを削除する前に処理が失敗しました。\
+                 すべてのチャンクは {} に保全済み。途中出力は復元に使用せず、\
+                 チャンクだけを数値 index 順で連結して復元できます\
+                 （順序はシャッフル前と異なります）",
+                temp_dir_path.display()
+            )
+        } else {
+            format!(
+                "入力削除後に処理が失敗しました。未処理のチャンクは {} に保全済み。\
+                 途中出力には削除済みの先頭 {deleted_chunks} チャンク\
+                 （{completed_output_len} bytes）が含まれます。エラー本文に切り戻し失敗が\
+                 記載されていなければ、その後ろに残ったチャンクを数値 index 順で連結して\
+                 復元できます（順序はシャッフル前と異なります）",
+                temp_dir_path.display()
+            )
+        }
+    } else {
+        format!(
+            "入力削除後に処理が失敗しました。チャンクは {} に保全済み。\
+             途中出力は復元に使用せず、チャンクだけを数値 index 順で連結して\
+             復元できます（順序はシャッフル前と異なります）",
+            temp_dir_path.display()
+        )
+    }
+}
+
+struct PreservedChunks {
+    path: PathBuf,
+    input_deleted: bool,
+    delete_chunk_files: bool,
+    deleted_chunks: usize,
+    completed_output_len: u64,
+    report_on_drop: bool,
+}
+
+impl PreservedChunks {
+    fn new(path: PathBuf, delete_chunk_files: bool) -> Self {
+        Self {
+            path,
+            input_deleted: false,
+            delete_chunk_files,
+            deleted_chunks: 0,
+            completed_output_len: 0,
+            report_on_drop: true,
+        }
+    }
+
+    fn message(&self) -> String {
+        preserved_chunks_message(
+            &self.path,
+            self.input_deleted,
+            self.delete_chunk_files,
+            self.deleted_chunks,
+            self.completed_output_len,
+        )
+    }
+
+    fn mark_input_deleted(&mut self) {
+        self.input_deleted = true;
+    }
+
+    fn mark_chunk_deleted(&mut self, completed_output_len: u64) {
+        self.deleted_chunks += 1;
+        self.completed_output_len = completed_output_len;
+    }
+
+    fn cleanup(mut self) -> Result<()> {
+        self.report_on_drop = false;
+        std::fs::remove_dir_all(&self.path).with_context(|| {
+            format!(
+                "Output is complete, but failed to remove preserved chunk directory {}; some temporary chunks may remain",
+                self.path.display()
+            )
+        })
+    }
+}
+
+impl Drop for PreservedChunks {
+    fn drop(&mut self) {
+        if self.report_on_drop {
+            eprintln!("{}", self.message());
+        }
+    }
+}
+
+trait TruncateOutput {
+    fn truncate_output(&mut self, len: u64) -> io::Result<()>;
+}
+
+impl TruncateOutput for File {
+    fn truncate_output(&mut self, len: u64) -> io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+fn rollback_output<W: Write + TruncateOutput>(
+    writer: &mut W,
+    completed_output_len: u64,
+    output_path: &Path,
+    cause: anyhow::Error,
+) -> anyhow::Error {
+    match writer.truncate_output(completed_output_len) {
+        Ok(()) => cause.context(format!(
+            "Output {} was rolled back to the last completed chunk boundary ({completed_output_len} bytes)",
+            output_path.display()
+        )),
+        Err(rollback_error) => cause.context(format!(
+            "Failed to roll back output {}: {rollback_error}. Manually truncate it to the last completed chunk boundary ({completed_output_len} bytes) before recovery",
+            output_path.display()
+        )),
+    }
+}
+
+fn write_chunk_checkpointed<W: Write + TruncateOutput>(
+    writer: &mut W,
+    buf: &[u8],
+    completed_output_len: u64,
+    output_path: &Path,
+) -> Result<u64> {
+    let next_output_len = completed_output_len
+        .checked_add(buf.len() as u64)
+        .context("Output length overflow")?;
+
+    if let Err(error) = writer.write_all(buf).and_then(|()| writer.flush()) {
+        return Err(rollback_output(writer, completed_output_len, output_path, error.into()));
+    }
+
+    Ok(next_output_len)
 }
 
 /// インメモリ方式でシャッフル
@@ -350,6 +514,8 @@ fn shuffle_chunked(
     record_count: u64,
     chunk_size: usize,
     force: bool,
+    delete_chunk_files: bool,
+    delete_input_after_pass1: bool,
     rng: &mut ChaCha8Rng,
 ) -> Result<()> {
     let num_chunks = (record_count as usize).div_ceil(chunk_size);
@@ -382,6 +548,8 @@ fn shuffle_chunked(
     check_memory(preflight_memory, force)?;
 
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let temp_dir_path = temp_dir.path().to_path_buf();
+    let mut preserved_chunks = None;
 
     // Pass 1: 各レコードをランダムなチャンクに振り分け
     info!("Pass 1: Distributing records to chunks...");
@@ -392,7 +560,7 @@ fn shuffle_chunked(
     // num_chunks > 64 の場合、個別バッファは 128KB まで縮小（合計は最大 125MB）
     let mut chunk_writers: Vec<BufWriter<File>> = (0..num_chunks)
         .map(|i| {
-            let path = temp_dir.path().join(format!("chunk_{i}.tmp"));
+            let path = temp_dir_path.join(format!("chunk_{i}.tmp"));
             File::create(&path)
                 .map(|f| BufWriter::with_capacity(BUF_SIZE / num_chunks.clamp(1, 64), f))
                 .with_context(|| format!("Failed to create chunk file: {}", path.display()))
@@ -403,6 +571,7 @@ fn shuffle_chunked(
         .with_context(|| format!("Failed to open {}", input_path.display()))?;
     let mut reader = BufReader::with_capacity(BUF_SIZE, in_file);
     let mut buffer = [0u8; RECORD_SIZE];
+    let mut distributed_records = 0u64;
 
     for _ in 0..record_count {
         if INTERRUPTED.load(Ordering::SeqCst) {
@@ -418,6 +587,7 @@ fn shuffle_chunked(
 
         let chunk_idx = rng.random_range(0..num_chunks);
         chunk_writers[chunk_idx].write_all(&buffer)?;
+        distributed_records += 1;
         progress.inc(1);
     }
     drop(reader);
@@ -428,6 +598,25 @@ fn shuffle_chunked(
     drop(chunk_writers);
     progress.finish();
 
+    if delete_input_after_pass1 {
+        if distributed_records != record_count {
+            anyhow::bail!(
+                "Pass 1 ended after {distributed_records}/{record_count} records; input file was not deleted"
+            );
+        }
+        // 入力削除後の危険区間では、TempDir の Drop で復旧元が消えないようにする。
+        let kept_path = temp_dir.keep();
+        debug_assert_eq!(kept_path, temp_dir_path);
+        preserved_chunks = Some(PreservedChunks::new(kept_path, delete_chunk_files));
+        std::fs::remove_file(input_path).with_context(|| {
+            format!("Failed to delete input file after Pass 1: {}", input_path.display())
+        })?;
+        preserved_chunks
+            .as_mut()
+            .expect("preserved chunks exist after TempDir::keep")
+            .mark_input_deleted();
+    }
+
     // Pass 2: チャンクをバッチ並列でシャッフル → 即座に書き出し
     // メモリ使用量 = バッチサイズ（コア数）× チャンクサイズ に制限
     info!("Pass 2: Shuffling chunks in batches and writing...");
@@ -436,9 +625,8 @@ fn shuffle_chunked(
 
     let chunk_seeds: Vec<u64> = (0..num_chunks).map(|_| rng.random()).collect();
 
-    let chunk_paths: Vec<PathBuf> = (0..num_chunks)
-        .map(|i| temp_dir.path().join(format!("chunk_{i}.tmp")))
-        .collect();
+    let chunk_paths: Vec<PathBuf> =
+        (0..num_chunks).map(|i| temp_dir_path.join(format!("chunk_{i}.tmp"))).collect();
 
     let chunk_sizes = chunk_paths
         .iter()
@@ -458,9 +646,14 @@ fn shuffle_chunked(
     // 出力ファイルを開く前に行う。
     check_memory_with_available(max_chunk_memory, force, available_memory)?;
 
-    let out_file = File::create(output_path)
-        .with_context(|| format!("Failed to create {}", output_path.display()))?;
+    let out_file = File::create(output_path).with_context(|| {
+        let message = format!("Failed to create {}", output_path.display());
+        preserved_chunks
+            .as_ref()
+            .map_or(message.clone(), |chunks| format!("{message}. {}", chunks.message()))
+    })?;
     let mut writer = BufWriter::with_capacity(BUF_SIZE, out_file);
+    let mut completed_output_len = 0u64;
 
     let num_threads = rayon::current_num_threads();
     // OS・他プロセス・バッファキャッシュ等のための余裕を 30% 確保し、
@@ -479,6 +672,9 @@ fn shuffle_chunked(
     while batch_start < num_chunks {
         if INTERRUPTED.load(Ordering::SeqCst) {
             progress.abandon_with_message("Interrupted");
+            if preserved_chunks.is_some() {
+                anyhow::bail!("Processing was interrupted after input deletion");
+            }
             return Ok(());
         }
 
@@ -519,9 +715,38 @@ fn shuffle_chunked(
             .collect();
 
         // バッチ結果を即座に書き出し（メモリ解放）
-        for chunk_result in shuffled {
+        for (batch_offset, chunk_result) in shuffled.into_iter().enumerate() {
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                progress.abandon_with_message("Interrupted");
+                if preserved_chunks.is_some() {
+                    anyhow::bail!("Processing was interrupted after input deletion");
+                }
+                return Ok(());
+            }
+
             let buf = chunk_result?;
-            if !buf.is_empty() {
+            if delete_chunk_files {
+                // このモードは underlying File にだけ書き込み、BufWriter のバッファを空に保つ。
+                // これにより、切り戻し後の Drop で失敗チャンクの残りが再 flush されない。
+                let chunk_start = completed_output_len;
+                completed_output_len =
+                    write_chunk_checkpointed(writer.get_mut(), &buf, chunk_start, output_path)?;
+                let chunk_path = &chunk_paths[batch_start + batch_offset];
+                if let Err(error) = std::fs::remove_file(chunk_path) {
+                    return Err(rollback_output(
+                        writer.get_mut(),
+                        chunk_start,
+                        output_path,
+                        anyhow::Error::new(error).context(format!(
+                            "Failed to delete completed chunk {}",
+                            chunk_path.display()
+                        )),
+                    ));
+                }
+                if let Some(chunks) = preserved_chunks.as_mut() {
+                    chunks.mark_chunk_deleted(completed_output_len);
+                }
+            } else if !buf.is_empty() {
                 writer.write_all(&buf)?;
             }
             progress.inc(1);
@@ -530,8 +755,17 @@ fn shuffle_chunked(
         batch_start = batch_end;
     }
 
-    writer.flush()?;
+    if !delete_chunk_files {
+        writer.flush()?;
+    }
+    if INTERRUPTED.swap(false, Ordering::SeqCst) {
+        warn!("Interrupt was requested after the final chunk started; output is complete");
+    }
     progress.finish();
+
+    if let Some(chunks) = preserved_chunks.take() {
+        chunks.cleanup()?;
+    }
 
     info!("Shuffling complete");
     Ok(())
@@ -576,5 +810,153 @@ mod tests {
         assert!(check_memory_with_available(801, false, Some(1_000)).is_err());
         assert!(check_memory_with_available(801, true, Some(1_000)).is_ok());
         assert!(check_memory_with_available(800, false, Some(1_000)).is_ok());
+    }
+
+    #[test]
+    fn incomplete_pass1_does_not_delete_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input_path = dir.path().join("input.psv");
+        let output_path = dir.path().join("output.psv");
+        std::fs::write(&input_path, [0u8; RECORD_SIZE]).expect("write input");
+
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let result = shuffle_chunked(&input_path, &output_path, 2, 1, true, false, true, &mut rng);
+
+        assert!(result.is_err());
+        assert!(input_path.exists());
+        assert!(!output_path.exists());
+    }
+
+    #[test]
+    fn pass2_failure_after_input_deletion_preserves_chunks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input_path = dir.path().join("input.psv");
+        let output_path = dir.path().join("missing-parent").join("output.psv");
+        std::fs::write(&input_path, [0u8; 4 * RECORD_SIZE]).expect("write input");
+
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let result = shuffle_chunked(&input_path, &output_path, 4, 1, true, true, true, &mut rng);
+
+        assert!(result.is_err());
+        assert!(!input_path.exists());
+        assert!(!output_path.exists());
+
+        let error = format!("{:#}", result.expect_err("Pass 2 must fail"));
+        let path_text = error
+            .split_once("すべてのチャンクは ")
+            .and_then(|(_, rest)| rest.split_once(" に保全済み").map(|(path, _)| path))
+            .expect("error contains preserved chunk path");
+        let preserved_path = PathBuf::from(path_text);
+        assert!(preserved_path.is_dir());
+        let chunk_count =
+            std::fs::read_dir(&preserved_path).expect("read preserved chunks").count();
+        assert_eq!(chunk_count, 4);
+
+        std::fs::remove_dir_all(&preserved_path).expect("remove preserved chunks after assertion");
+    }
+
+    #[test]
+    fn recovery_message_ignores_output_before_first_chunk_deletion() {
+        let message = preserved_chunks_message(Path::new("chunks"), true, true, 0, 0);
+
+        assert!(message.contains("途中出力は復元に使用せず"));
+        assert!(message.contains("チャンクだけを数値 index 順"));
+    }
+
+    #[test]
+    fn recovery_message_reports_deleted_prefix_checkpoint() {
+        let message = preserved_chunks_message(Path::new("chunks"), true, true, 2, 80);
+
+        assert!(message.contains("先頭 2 チャンク"));
+        assert!(message.contains("80 bytes"));
+        assert!(message.contains("切り戻し失敗"));
+    }
+
+    #[test]
+    fn input_deletion_failure_message_keeps_input_as_source_of_truth() {
+        let message = preserved_chunks_message(Path::new("chunks"), false, true, 0, 0);
+
+        assert!(message.contains("入力は残っています"));
+        assert!(message.contains("入力を正本として使用"));
+    }
+
+    #[test]
+    fn cleanup_failure_reports_that_output_is_complete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_path = dir.path().join("already-removed");
+        let mut chunks = PreservedChunks::new(missing_path, false);
+        chunks.mark_input_deleted();
+
+        let error = chunks.cleanup().expect_err("cleanup of a missing directory must fail");
+
+        assert!(format!("{error:#}").contains("Output is complete"));
+    }
+
+    struct PartialWriter {
+        bytes: Vec<u8>,
+        fail_after: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for PartialWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.bytes.len() >= self.fail_after {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "injected disk-full failure"));
+            }
+
+            let writable = (self.fail_after - self.bytes.len()).min(buf.len());
+            self.bytes.extend_from_slice(&buf[..writable]);
+            Ok(writable)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::other("injected flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl TruncateOutput for PartialWriter {
+        fn truncate_output(&mut self, len: u64) -> io::Result<()> {
+            self.bytes.truncate(len as usize);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn partial_chunk_write_rolls_back_to_completed_boundary() {
+        let inner = PartialWriter {
+            bytes: vec![1, 2, 3, 4],
+            fail_after: 6,
+            fail_flush: false,
+        };
+        let mut writer = inner;
+
+        let error =
+            write_chunk_checkpointed(&mut writer, &[5, 6, 7, 8], 4, Path::new("output.psv"))
+                .expect_err("partial write must fail");
+
+        assert!(format!("{error:#}").contains("rolled back"));
+        assert_eq!(writer.bytes, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn failed_chunk_flush_rolls_back_to_completed_boundary() {
+        let mut writer = PartialWriter {
+            bytes: vec![1, 2, 3, 4],
+            fail_after: usize::MAX,
+            fail_flush: true,
+        };
+
+        let error =
+            write_chunk_checkpointed(&mut writer, &[5, 6, 7, 8], 4, Path::new("output.psv"))
+                .expect_err("flush failure must fail");
+
+        assert!(format!("{error:#}").contains("rolled back"));
+        assert_eq!(writer.bytes, [1, 2, 3, 4]);
     }
 }

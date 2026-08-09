@@ -30,7 +30,7 @@
 
 | ツール | 説明 |
 |--------|------|
-| `shuffle_psv` | PSV ファイルのシャッフル |
+| `shuffle_psv` | PSV ファイルのシャッフル。seed 指定による再現と、大規模向けチャンク方式・opt-in の段階削除に対応（[詳細](docs/shuffle_psv.md)） |
 | `split_psv` | PSV ファイルを局面数または容量で分割 |
 | `merge_psv` | 複数の PSV ファイルを順序どおり結合 |
 | `relabel_psv` | PSV の score を game_result 由来値へ置換し、宣言勝ち override / diversion 整合性 deblunder / dry-run / verdict sidecar に対応（[詳細](docs/relabel_psv.md)） |
@@ -104,6 +104,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 - [benchmark](docs/benchmark.md) - ベンチマークツールの詳細
 - [dump_effect_bucket_golden](docs/dump_effect_bucket_golden.md) - 形式一致 golden 用 effect bucket active index dump
 - [pack_tools](docs/pack_tools.md) - 学習データ処理ツール群
+- [shuffle_psv](docs/shuffle_psv.md) - PSV の再現可能なシャッフルと大規模ファイル向け段階削除
 - [extract_bench_positions](docs/extract_bench_positions.md) - 教師ラベル品質測定用ベンチ局面の抽出
 - [label_bench_positions](docs/label_bench_positions.md) - ベンチ局面の深い探索ラベリング（ground truth）
 - [label_bench_dl](docs/label_bench_dl.md) - label_bench jsonl への DL水匠 (dlshogi ONNX) 評価値追記
