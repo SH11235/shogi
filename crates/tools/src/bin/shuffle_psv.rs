@@ -277,19 +277,46 @@ fn progress_style(suffix: &str) -> ProgressStyle {
         .expect("valid template")
 }
 
-fn preserved_chunks_message(temp_dir_path: &Path, delete_chunk_files: bool) -> String {
-    if delete_chunk_files {
-        format!(
-            "入力削除後に処理が失敗しました。未処理のチャンクは {} に保全済み。\
-             途中出力は最後に完了したチャンク境界まで確定済みです。\
-             途中出力の後ろに、残ったチャンクを数値 index 順で連結して復元できます\
-             （順序はシャッフル前と異なります）",
+fn preserved_chunks_message(
+    temp_dir_path: &Path,
+    input_deleted: bool,
+    delete_chunk_files: bool,
+    deleted_chunks: usize,
+    completed_output_len: u64,
+) -> String {
+    if !input_deleted {
+        return format!(
+            "入力ファイルの削除に失敗したため、入力は残っています。\
+             一時チャンクも {} に保全済みです。入力を正本として使用し、\
+             不要な一時チャンクは確認後に削除してください",
             temp_dir_path.display()
-        )
+        );
+    }
+
+    if delete_chunk_files {
+        if deleted_chunks == 0 {
+            format!(
+                "入力削除後、チャンクを削除する前に処理が失敗しました。\
+                 すべてのチャンクは {} に保全済み。途中出力は復元に使用せず、\
+                 チャンクだけを数値 index 順で連結して復元できます\
+                 （順序はシャッフル前と異なります）",
+                temp_dir_path.display()
+            )
+        } else {
+            format!(
+                "入力削除後に処理が失敗しました。未処理のチャンクは {} に保全済み。\
+                 途中出力には削除済みの先頭 {deleted_chunks} チャンク\
+                 （{completed_output_len} bytes）が含まれます。エラー本文に切り戻し失敗が\
+                 記載されていなければ、その後ろに残ったチャンクを数値 index 順で連結して\
+                 復元できます（順序はシャッフル前と異なります）",
+                temp_dir_path.display()
+            )
+        }
     } else {
         format!(
             "入力削除後に処理が失敗しました。チャンクは {} に保全済み。\
-             cat で復元可能です（順序はシャッフル前と異なります）",
+             途中出力は復元に使用せず、チャンクだけを数値 index 順で連結して\
+             復元できます（順序はシャッフル前と異なります）",
             temp_dir_path.display()
         )
     }
@@ -297,7 +324,10 @@ fn preserved_chunks_message(temp_dir_path: &Path, delete_chunk_files: bool) -> S
 
 struct PreservedChunks {
     path: PathBuf,
+    input_deleted: bool,
     delete_chunk_files: bool,
+    deleted_chunks: usize,
+    completed_output_len: u64,
     report_on_drop: bool,
 }
 
@@ -305,24 +335,41 @@ impl PreservedChunks {
     fn new(path: PathBuf, delete_chunk_files: bool) -> Self {
         Self {
             path,
+            input_deleted: false,
             delete_chunk_files,
+            deleted_chunks: 0,
+            completed_output_len: 0,
             report_on_drop: true,
         }
     }
 
     fn message(&self) -> String {
-        preserved_chunks_message(&self.path, self.delete_chunk_files)
+        preserved_chunks_message(
+            &self.path,
+            self.input_deleted,
+            self.delete_chunk_files,
+            self.deleted_chunks,
+            self.completed_output_len,
+        )
+    }
+
+    fn mark_input_deleted(&mut self) {
+        self.input_deleted = true;
+    }
+
+    fn mark_chunk_deleted(&mut self, completed_output_len: u64) {
+        self.deleted_chunks += 1;
+        self.completed_output_len = completed_output_len;
     }
 
     fn cleanup(mut self) -> Result<()> {
+        self.report_on_drop = false;
         std::fs::remove_dir_all(&self.path).with_context(|| {
             format!(
-                "Failed to remove preserved chunk directory after successful output flush: {}",
+                "Output is complete, but failed to remove preserved chunk directory {}; some temporary chunks may remain",
                 self.path.display()
             )
-        })?;
-        self.report_on_drop = false;
-        Ok(())
+        })
     }
 }
 
@@ -564,6 +611,10 @@ fn shuffle_chunked(
         std::fs::remove_file(input_path).with_context(|| {
             format!("Failed to delete input file after Pass 1: {}", input_path.display())
         })?;
+        preserved_chunks
+            .as_mut()
+            .expect("preserved chunks exist after TempDir::keep")
+            .mark_input_deleted();
     }
 
     // Pass 2: チャンクをバッチ並列でシャッフル → 即座に書き出し
@@ -665,6 +716,14 @@ fn shuffle_chunked(
 
         // バッチ結果を即座に書き出し（メモリ解放）
         for (batch_offset, chunk_result) in shuffled.into_iter().enumerate() {
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                progress.abandon_with_message("Interrupted");
+                if preserved_chunks.is_some() {
+                    anyhow::bail!("Processing was interrupted after input deletion");
+                }
+                return Ok(());
+            }
+
             let buf = chunk_result?;
             if delete_chunk_files {
                 // このモードは underlying File にだけ書き込み、BufWriter のバッファを空に保つ。
@@ -684,6 +743,9 @@ fn shuffle_chunked(
                         )),
                     ));
                 }
+                if let Some(chunks) = preserved_chunks.as_mut() {
+                    chunks.mark_chunk_deleted(completed_output_len);
+                }
             } else if !buf.is_empty() {
                 writer.write_all(&buf)?;
             }
@@ -696,9 +758,8 @@ fn shuffle_chunked(
     if !delete_chunk_files {
         writer.flush()?;
     }
-    if INTERRUPTED.load(Ordering::SeqCst) && preserved_chunks.is_some() {
-        progress.abandon_with_message("Interrupted");
-        anyhow::bail!("Processing was interrupted after input deletion");
+    if INTERRUPTED.swap(false, Ordering::SeqCst) {
+        warn!("Interrupt was requested after the final chunk started; output is complete");
     }
     progress.finish();
 
@@ -784,7 +845,7 @@ mod tests {
 
         let error = format!("{:#}", result.expect_err("Pass 2 must fail"));
         let path_text = error
-            .split_once("未処理のチャンクは ")
+            .split_once("すべてのチャンクは ")
             .and_then(|(_, rest)| rest.split_once(" に保全済み").map(|(path, _)| path))
             .expect("error contains preserved chunk path");
         let preserved_path = PathBuf::from(path_text);
@@ -794,6 +855,43 @@ mod tests {
         assert_eq!(chunk_count, 4);
 
         std::fs::remove_dir_all(&preserved_path).expect("remove preserved chunks after assertion");
+    }
+
+    #[test]
+    fn recovery_message_ignores_output_before_first_chunk_deletion() {
+        let message = preserved_chunks_message(Path::new("chunks"), true, true, 0, 0);
+
+        assert!(message.contains("途中出力は復元に使用せず"));
+        assert!(message.contains("チャンクだけを数値 index 順"));
+    }
+
+    #[test]
+    fn recovery_message_reports_deleted_prefix_checkpoint() {
+        let message = preserved_chunks_message(Path::new("chunks"), true, true, 2, 80);
+
+        assert!(message.contains("先頭 2 チャンク"));
+        assert!(message.contains("80 bytes"));
+        assert!(message.contains("切り戻し失敗"));
+    }
+
+    #[test]
+    fn input_deletion_failure_message_keeps_input_as_source_of_truth() {
+        let message = preserved_chunks_message(Path::new("chunks"), false, true, 0, 0);
+
+        assert!(message.contains("入力は残っています"));
+        assert!(message.contains("入力を正本として使用"));
+    }
+
+    #[test]
+    fn cleanup_failure_reports_that_output_is_complete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_path = dir.path().join("already-removed");
+        let mut chunks = PreservedChunks::new(missing_path, false);
+        chunks.mark_input_deleted();
+
+        let error = chunks.cleanup().expect_err("cleanup of a missing directory must fail");
+
+        assert!(format!("{error:#}").contains("Output is complete"));
     }
 
     struct PartialWriter {

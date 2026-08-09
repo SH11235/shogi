@@ -131,7 +131,7 @@ fn pass2_failure_after_input_deletion_exits_with_preserved_chunks() {
 
     let stderr = String::from_utf8_lossy(&result.stderr);
     let path_text = stderr
-        .split_once("未処理のチャンクは ")
+        .split_once("すべてのチャンクは ")
         .and_then(|(_, rest)| rest.split_once(" に保全済み").map(|(path, _)| path))
         .expect("stderr に保全したチャンクのパスが含まれること");
     let preserved_path = std::path::PathBuf::from(path_text);
