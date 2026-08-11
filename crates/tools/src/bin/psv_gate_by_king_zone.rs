@@ -1,14 +1,15 @@
 //! 行対応 PSV の入玉ドメイン score 合成、またはゲート bitmap 生成を行う。
 
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use rayon::prelude::*;
 use rshogi_core::position::Position;
-use rshogi_core::types::Color;
+use tools::king_zone::classify;
+use tools::output_path::ensure_safe_output_path;
 use tools::packed_sfen::{PackedSfenValue, unpack_sfen_to_parts};
 
 const RECORD_SIZE: usize = PackedSfenValue::SIZE;
@@ -84,19 +85,6 @@ fn parse_tiers(value: &str) -> Result<[bool; 3]> {
     Ok(tiers)
 }
 
-/// 玉位置から 0=entered、1=advancing、2=normal を返す。
-fn classify(pos: &Position) -> usize {
-    let black = pos.king_square(Color::Black).rank() as usize;
-    let white = pos.king_square(Color::White).rank() as usize;
-    if black <= 2 || white >= 6 {
-        0
-    } else if (3..=5).contains(&black) || (3..=5).contains(&white) {
-        1
-    } else {
-        2
-    }
-}
-
 fn classify_record(record: &[u8], row: u64) -> Result<(usize, i16)> {
     let psv = PackedSfenValue::from_bytes(record)
         .ok_or_else(|| anyhow::anyhow!("PSV parse failed at row {row}"))?;
@@ -123,51 +111,6 @@ fn checked_records(path: &Path) -> Result<u64> {
         path.display()
     );
     Ok(size / RECORD_SIZE as u64)
-}
-
-fn canonicalize_predicted_path(path: &Path) -> Result<PathBuf> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Path has no file name: {}", path.display()))?;
-    let canonical_parent = parent
-        .canonicalize()
-        .with_context(|| format!("Failed to canonicalize parent {}", parent.display()))?;
-    Ok(canonical_parent.join(file_name))
-}
-
-fn is_same_file(a: &Path, b: &Path) -> Result<bool> {
-    match same_file::is_same_file(a, b) {
-        Ok(same) => Ok(same),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).with_context(|| {
-            format!("Failed to compare file identities: {} and {}", a.display(), b.display())
-        }),
-    }
-}
-
-/// 出力が入力実体を指す場合は、truncate 前に拒否する。
-fn ensure_safe_output_path(output: &Path, input: &Path) -> Result<()> {
-    let canonical_input = input
-        .canonicalize()
-        .with_context(|| format!("Failed to canonicalize input {}", input.display()))?;
-    if let Ok(meta) = fs::symlink_metadata(output)
-        && meta.file_type().is_symlink()
-    {
-        anyhow::bail!("Output path is a symlink: {}", output.display());
-    }
-    let predicted = canonicalize_predicted_path(output)?;
-    if predicted == canonical_input || is_same_file(output, &canonical_input)? {
-        anyhow::bail!(
-            "Output path resolves to input file: {} -> {}",
-            output.display(),
-            canonical_input.display()
-        );
-    }
-    Ok(())
 }
 
 fn classify_chunk(chunk: &[u8], first_row: u64) -> Vec<Result<(usize, i16)>> {
@@ -389,14 +332,6 @@ mod tests {
                 &expected[i * RECORD_SIZE + 32..i * RECORD_SIZE + 34]
             );
         }
-        Ok(())
-    }
-
-    #[test]
-    fn bare_relative_output_path_is_supported() -> Result<()> {
-        let predicted = canonicalize_predicted_path(Path::new("out.psv"))?;
-        assert_eq!(predicted.file_name(), Some(std::ffi::OsStr::new("out.psv")));
-        assert_eq!(predicted.parent(), Some(std::env::current_dir()?.canonicalize()?.as_path()));
         Ok(())
     }
 
