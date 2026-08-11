@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tools::output_path::ensure_safe_output_path;
+use tools::output_path::{ensure_distinct_output_paths, ensure_safe_output_path};
 use tools::packed_sfen::PackedSfenValue;
 
 const RECORD_SIZE: usize = PackedSfenValue::SIZE;
@@ -109,6 +109,7 @@ fn select_by_mask(input: &Path, mask: &Path, out: &Path, chunk_records: usize) -
     let staged = partial_path(out);
     ensure_safe_output_path(&staged, input)?;
     ensure_safe_output_path(&staged, mask)?;
+    ensure_distinct_output_paths(out, &staged)?;
 
     let records = checked_input_records(input)?;
     validate_mask(mask, records)?;
@@ -302,6 +303,27 @@ mod tests {
         assert!(select_by_mask(&input, &mask, &out, 8).is_err());
         assert_eq!(fs::read(&out)?, b"sentinel");
         assert!(!partial_path(&out).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn hardlinked_staging_is_rejected_without_truncating_output() -> Result<()> {
+        let dir = tempdir()?;
+        let input = dir.path().join("shard.psv");
+        let mask = dir.path().join("entered.bits");
+        let out = dir.path().join("compact.psv");
+        let staged = partial_path(&out);
+        fs::write(&input, records(8))?;
+        fs::write(&mask, [0xff])?;
+        fs::write(&out, b"sentinel")?;
+        if let Err(error) = fs::hard_link(&out, &staged) {
+            eprintln!("hardlink を作成できないためテストをスキップします: {error}");
+            return Ok(());
+        }
+
+        let error = select_by_mask(&input, &mask, &out, 8).expect_err("operation must fail");
+        assert!(error.to_string().contains("resolve to the same file"));
+        assert_eq!(fs::read(&out)?, b"sentinel");
         Ok(())
     }
 
