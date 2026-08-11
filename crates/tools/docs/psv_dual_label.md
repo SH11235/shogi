@@ -91,3 +91,5 @@ cargo run -p tools --release --bin psv_dual_label -- validate \
 出力がいずれかの入力と同じパス・hardlink を指す場合や symlink の場合は、truncate 前に
 拒否します。extract の複数出力も同じ実体を指定できません。処理完了時には全出力のサイズを
 契約値と照合します。
+`embed` / `extract` は同じディレクトリの `<出力>.partial` に書き、全検査・flush・サイズ検算の
+成功後だけ最終パスへ publish します。途中でエラーになった場合は既存の最終パスを変更せず、`.partial` を削除します。

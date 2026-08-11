@@ -19,6 +19,8 @@ const DL_SCORE_OFFSET: usize = 34;
 const PADDING_OFFSET: usize = 39;
 const BUFFER_SIZE: usize = 32 << 20;
 const CHUNK_RECORDS: usize = 1 << 18;
+// mask の bit 添字を chunk 内 offset で計算するため、chunk 境界を byte 境界に揃える。
+const _: () = assert!(CHUNK_RECORDS.is_multiple_of(8));
 const DEFAULT_DL_ABS_MAX: u32 = 32_000;
 const DEFAULT_MAX_MOVE_LIKE_FRAC: f64 = 0.05;
 
@@ -174,54 +176,120 @@ fn read_bytes<R: Read>(reader: &mut R, buffer: &mut Vec<u8>, bytes: usize) -> Re
 }
 
 fn embed(base: &Path, scores: &Path, mask: &Path, out: &Path) -> Result<EmbedStats> {
+    embed_with_chunk_records(base, scores, mask, out, CHUNK_RECORDS)
+}
+
+fn partial_path(output: &Path) -> PathBuf {
+    let mut path = output.as_os_str().to_os_string();
+    path.push(".partial");
+    PathBuf::from(path)
+}
+
+fn remove_staging(paths: &[PathBuf]) {
+    for path in paths {
+        if let Err(error) = fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("staging file cleanup failed: {}: {error}", path.display());
+        }
+    }
+}
+
+fn publish_staged(outputs: &[(&Path, &Path)]) -> Result<()> {
+    let mut published: Vec<&Path> = Vec::new();
+    for &(staging, output) in outputs {
+        if let Err(error) = fs::rename(staging, output) {
+            let staging_paths: Vec<PathBuf> =
+                outputs.iter().map(|(path, _)| (*path).to_path_buf()).collect();
+            remove_staging(&staging_paths);
+            for published_path in published {
+                if let Err(cleanup_error) = fs::remove_file(published_path)
+                    && cleanup_error.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!(
+                        "published file cleanup failed: {}: {cleanup_error}",
+                        published_path.display()
+                    );
+                }
+            }
+            return Err(error).with_context(|| {
+                format!("{} -> {} の publish に失敗", staging.display(), output.display())
+            });
+        }
+        published.push(output);
+    }
+    Ok(())
+}
+
+fn embed_with_chunk_records(
+    base: &Path,
+    scores: &Path,
+    mask: &Path,
+    out: &Path,
+    chunk_records: usize,
+) -> Result<EmbedStats> {
+    anyhow::ensure!(
+        chunk_records > 0 && chunk_records.is_multiple_of(8),
+        "chunk_records must be a positive multiple of 8"
+    );
     let records = checked_psv_records(base)?;
     checked_sidecar_sizes(scores, mask, records)?;
+    let staging = partial_path(out);
     for input in [base, scores, mask] {
         ensure_safe_output_path(out, input)?;
+        ensure_safe_output_path(&staging, input)?;
     }
+    ensure_distinct_output_paths(out, &staging)?;
 
-    let mut base_reader = BufReader::with_capacity(BUFFER_SIZE, File::open(base)?);
-    let mut score_reader = BufReader::with_capacity(BUFFER_SIZE, File::open(scores)?);
-    let mut mask_reader = BufReader::with_capacity(BUFFER_SIZE, File::open(mask)?);
-    let mut writer = BufWriter::with_capacity(BUFFER_SIZE, File::create(out)?);
-    let mut base_chunk = Vec::with_capacity(CHUNK_RECORDS * RECORD_SIZE);
-    let mut score_chunk = Vec::with_capacity(CHUNK_RECORDS * 2);
-    let mut mask_chunk = Vec::with_capacity(CHUNK_RECORDS.div_ceil(8));
-    let mut stats = EmbedStats::default();
+    let result = (|| {
+        let mut base_reader = BufReader::with_capacity(BUFFER_SIZE, File::open(base)?);
+        let mut score_reader = BufReader::with_capacity(BUFFER_SIZE, File::open(scores)?);
+        let mut mask_reader = BufReader::with_capacity(BUFFER_SIZE, File::open(mask)?);
+        let mut writer = BufWriter::with_capacity(BUFFER_SIZE, File::create(&staging)?);
+        let mut base_chunk = Vec::with_capacity(chunk_records * RECORD_SIZE);
+        let mut score_chunk = Vec::with_capacity(chunk_records * 2);
+        let mut mask_chunk = Vec::with_capacity(chunk_records.div_ceil(8));
+        let mut stats = EmbedStats::default();
 
-    while stats.records < records {
-        let chunk_records = (records - stats.records).min(CHUNK_RECORDS as u64) as usize;
-        read_bytes(&mut base_reader, &mut base_chunk, chunk_records * RECORD_SIZE)?;
-        read_bytes(&mut score_reader, &mut score_chunk, chunk_records * 2)?;
-        read_bytes(&mut mask_reader, &mut mask_chunk, chunk_records.div_ceil(8))?;
+        while stats.records < records {
+            let current_records = (records - stats.records).min(chunk_records as u64) as usize;
+            read_bytes(&mut base_reader, &mut base_chunk, current_records * RECORD_SIZE)?;
+            read_bytes(&mut score_reader, &mut score_chunk, current_records * 2)?;
+            read_bytes(&mut mask_reader, &mut mask_chunk, current_records.div_ceil(8))?;
 
-        for (offset, record) in base_chunk.chunks_exact_mut(RECORD_SIZE).enumerate() {
-            let row = stats.records + offset as u64;
-            anyhow::ensure!(
-                record[PADDING_OFFSET] == 0,
-                "base padding is non-zero at row {row}: 0x{:02x}",
-                record[PADDING_OFFSET]
-            );
-            if record[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2] != [0, 0] {
-                stats.overwritten_nonzero_move16 += 1;
+            for (offset, record) in base_chunk.chunks_exact_mut(RECORD_SIZE).enumerate() {
+                let row = stats.records + offset as u64;
+                anyhow::ensure!(
+                    record[PADDING_OFFSET] == 0,
+                    "base padding is non-zero at row {row}: 0x{:02x}",
+                    record[PADDING_OFFSET]
+                );
+                if record[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2] != [0, 0] {
+                    stats.overwritten_nonzero_move16 += 1;
+                }
+                record[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2]
+                    .copy_from_slice(&score_chunk[offset * 2..offset * 2 + 2]);
+                record[PADDING_OFFSET] = (mask_chunk[offset / 8] >> (offset % 8)) & 1;
             }
-            record[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2]
-                .copy_from_slice(&score_chunk[offset * 2..offset * 2 + 2]);
-            record[PADDING_OFFSET] = (mask_chunk[offset / 8] >> (offset % 8)) & 1;
+            writer.write_all(&base_chunk)?;
+            stats.records += current_records as u64;
         }
-        writer.write_all(&base_chunk)?;
-        stats.records += chunk_records as u64;
-    }
 
-    writer.flush()?;
-    drop(writer);
-    let expected = records * RECORD_SIZE as u64;
-    anyhow::ensure!(
-        file_size(out)? == expected,
-        "output size mismatch: expected={expected}, actual={}",
-        file_size(out)?
-    );
-    Ok(stats)
+        writer.flush()?;
+        drop(writer);
+        let expected = records * RECORD_SIZE as u64;
+        let actual = file_size(&staging)?;
+        anyhow::ensure!(
+            actual == expected,
+            "output size mismatch: expected={expected}, actual={actual}"
+        );
+        publish_staged(&[(&staging, out)])?;
+        Ok(stats)
+    })();
+    if result.is_err() {
+        remove_staging(&[staging]);
+    }
+    result
 }
 
 fn output_paths<'a>(
@@ -232,14 +300,15 @@ fn output_paths<'a>(
     [out_base, out_scores, out_mask].into_iter().flatten().collect()
 }
 
-fn check_extract_paths(dual: &Path, outputs: &[&Path]) -> Result<()> {
+fn check_extract_paths(dual: &Path, outputs: &[&Path], staging_paths: &[&Path]) -> Result<()> {
     anyhow::ensure!(!outputs.is_empty(), "少なくとも 1 つの出力を指定してください");
-    for output in outputs {
-        ensure_safe_output_path(output, dual)?;
+    let all_paths: Vec<&Path> = outputs.iter().chain(staging_paths).copied().collect();
+    for path in &all_paths {
+        ensure_safe_output_path(path, dual)?;
     }
-    for i in 0..outputs.len() {
-        for j in i + 1..outputs.len() {
-            ensure_distinct_output_paths(outputs[i], outputs[j])?;
+    for i in 0..all_paths.len() {
+        for j in i + 1..all_paths.len() {
+            ensure_distinct_output_paths(all_paths[i], all_paths[j])?;
         }
     }
     Ok(())
@@ -260,79 +329,117 @@ fn extract(
     out_scores: Option<&Path>,
     out_mask: Option<&Path>,
 ) -> Result<ExtractStats> {
+    extract_with_chunk_records(dual, out_base, out_scores, out_mask, CHUNK_RECORDS)
+}
+
+fn extract_with_chunk_records(
+    dual: &Path,
+    out_base: Option<&Path>,
+    out_scores: Option<&Path>,
+    out_mask: Option<&Path>,
+    chunk_records: usize,
+) -> Result<ExtractStats> {
+    anyhow::ensure!(
+        chunk_records > 0 && chunk_records.is_multiple_of(8),
+        "chunk_records must be a positive multiple of 8"
+    );
     let records = checked_psv_records(dual)?;
     let outputs = output_paths(out_base, out_scores, out_mask);
-    check_extract_paths(dual, &outputs)?;
+    let base_staging = out_base.map(partial_path);
+    let scores_staging = out_scores.map(partial_path);
+    let mask_staging = out_mask.map(partial_path);
+    let staging_paths =
+        output_paths(base_staging.as_deref(), scores_staging.as_deref(), mask_staging.as_deref());
+    check_extract_paths(dual, &outputs, &staging_paths)?;
+    let owned_staging_paths: Vec<PathBuf> =
+        staging_paths.iter().map(|path| path.to_path_buf()).collect();
 
-    let mut reader = BufReader::with_capacity(BUFFER_SIZE, File::open(dual)?);
-    let mut base_writer = create_writer(out_base)?;
-    let mut score_writer = create_writer(out_scores)?;
-    let mut mask_writer = create_writer(out_mask)?;
-    let mut dual_chunk = Vec::with_capacity(CHUNK_RECORDS * RECORD_SIZE);
-    let mut base_chunk = Vec::with_capacity(CHUNK_RECORDS * RECORD_SIZE);
-    let mut score_chunk = Vec::with_capacity(CHUNK_RECORDS * 2);
-    let mut mask_chunk = Vec::with_capacity(CHUNK_RECORDS.div_ceil(8));
-    let mut stats = ExtractStats::default();
+    let result = (|| {
+        let mut reader = BufReader::with_capacity(BUFFER_SIZE, File::open(dual)?);
+        let mut base_writer = create_writer(base_staging.as_deref())?;
+        let mut score_writer = create_writer(scores_staging.as_deref())?;
+        let mut mask_writer = create_writer(mask_staging.as_deref())?;
+        let mut dual_chunk = Vec::with_capacity(chunk_records * RECORD_SIZE);
+        let mut base_chunk = Vec::with_capacity(chunk_records * RECORD_SIZE);
+        let mut score_chunk = Vec::with_capacity(chunk_records * 2);
+        let mut mask_chunk = Vec::with_capacity(chunk_records.div_ceil(8));
+        let mut stats = ExtractStats::default();
 
-    while stats.records < records {
-        let chunk_records = (records - stats.records).min(CHUNK_RECORDS as u64) as usize;
-        read_bytes(&mut reader, &mut dual_chunk, chunk_records * RECORD_SIZE)?;
+        while stats.records < records {
+            let current_records = (records - stats.records).min(chunk_records as u64) as usize;
+            read_bytes(&mut reader, &mut dual_chunk, current_records * RECORD_SIZE)?;
 
-        for (offset, record) in dual_chunk.chunks_exact(RECORD_SIZE).enumerate() {
-            let row = stats.records + offset as u64;
-            anyhow::ensure!(
-                record[PADDING_OFFSET] & !1 == 0,
-                "dual padding bit1-7 is non-zero at row {row}: 0x{:02x}",
-                record[PADDING_OFFSET]
-            );
-        }
-
-        if let Some(writer) = &mut base_writer {
-            base_chunk.clear();
-            base_chunk.extend_from_slice(&dual_chunk);
-            for record in base_chunk.chunks_exact_mut(RECORD_SIZE) {
-                record[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2].fill(0);
-                record[PADDING_OFFSET] = 0;
-            }
-            writer.write_all(&base_chunk)?;
-        }
-        if let Some(writer) = &mut score_writer {
-            score_chunk.clear();
-            score_chunk.reserve(chunk_records * 2);
-            for record in dual_chunk.chunks_exact(RECORD_SIZE) {
-                score_chunk.extend_from_slice(&record[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2]);
-            }
-            writer.write_all(&score_chunk)?;
-        }
-        if let Some(writer) = &mut mask_writer {
-            mask_chunk.clear();
-            mask_chunk.resize(chunk_records.div_ceil(8), 0);
             for (offset, record) in dual_chunk.chunks_exact(RECORD_SIZE).enumerate() {
-                mask_chunk[offset / 8] |= (record[PADDING_OFFSET] & 1) << (offset % 8);
+                let row = stats.records + offset as u64;
+                anyhow::ensure!(
+                    record[PADDING_OFFSET] & !1 == 0,
+                    "dual padding bit1-7 is non-zero at row {row}: 0x{:02x}",
+                    record[PADDING_OFFSET]
+                );
             }
-            writer.write_all(&mask_chunk)?;
+
+            if let Some(writer) = &mut base_writer {
+                base_chunk.clear();
+                base_chunk.extend_from_slice(&dual_chunk);
+                for record in base_chunk.chunks_exact_mut(RECORD_SIZE) {
+                    record[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2].fill(0);
+                    record[PADDING_OFFSET] = 0;
+                }
+                writer.write_all(&base_chunk)?;
+            }
+            if let Some(writer) = &mut score_writer {
+                score_chunk.clear();
+                score_chunk.reserve(current_records * 2);
+                for record in dual_chunk.chunks_exact(RECORD_SIZE) {
+                    score_chunk.extend_from_slice(&record[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2]);
+                }
+                writer.write_all(&score_chunk)?;
+            }
+            if let Some(writer) = &mut mask_writer {
+                mask_chunk.clear();
+                mask_chunk.resize(current_records.div_ceil(8), 0);
+                for (offset, record) in dual_chunk.chunks_exact(RECORD_SIZE).enumerate() {
+                    mask_chunk[offset / 8] |= (record[PADDING_OFFSET] & 1) << (offset % 8);
+                }
+                writer.write_all(&mask_chunk)?;
+            }
+            stats.records += current_records as u64;
         }
-        stats.records += chunk_records as u64;
-    }
 
-    for writer in [&mut base_writer, &mut score_writer, &mut mask_writer].into_iter().flatten() {
-        writer.flush()?;
-    }
-    drop((base_writer, score_writer, mask_writer));
+        for writer in [&mut base_writer, &mut score_writer, &mut mask_writer].into_iter().flatten()
+        {
+            writer.flush()?;
+        }
+        drop((base_writer, score_writer, mask_writer));
 
-    if let Some(path) = out_base {
-        let expected = records * RECORD_SIZE as u64;
-        anyhow::ensure!(file_size(path)? == expected, "base output size mismatch");
+        if let Some(path) = &base_staging {
+            let expected = records * RECORD_SIZE as u64;
+            anyhow::ensure!(file_size(path)? == expected, "base output size mismatch");
+        }
+        if let Some(path) = &scores_staging {
+            let expected = records * 2;
+            anyhow::ensure!(file_size(path)? == expected, "score output size mismatch");
+        }
+        if let Some(path) = &mask_staging {
+            let expected = records.div_ceil(8);
+            anyhow::ensure!(file_size(path)? == expected, "mask output size mismatch");
+        }
+
+        let publish_outputs: Vec<(&Path, &Path)> = [
+            base_staging.as_deref().zip(out_base),
+            scores_staging.as_deref().zip(out_scores),
+            mask_staging.as_deref().zip(out_mask),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        publish_staged(&publish_outputs)?;
+        Ok(stats)
+    })();
+    if result.is_err() {
+        remove_staging(&owned_staging_paths);
     }
-    if let Some(path) = out_scores {
-        let expected = records * 2;
-        anyhow::ensure!(file_size(path)? == expected, "score output size mismatch");
-    }
-    if let Some(path) = out_mask {
-        let expected = records.div_ceil(8);
-        anyhow::ensure!(file_size(path)? == expected, "mask output size mismatch");
-    }
-    Ok(stats)
+    result
 }
 
 fn same_move(lhs: Move, rhs: Move) -> bool {
@@ -483,6 +590,9 @@ fn move_like_fraction(stats: &ValidationStats) -> f64 {
 
 fn validation_failures(stats: &ValidationStats, config: ValidateConfig) -> Vec<String> {
     let mut failures = Vec::new();
+    if stats.records == 0 {
+        failures.push("レコードが 0 件です".to_owned());
+    }
     if stats.trailing_bytes != 0 {
         failures.push(format!("末尾に {} byte の端数があります", stats.trailing_bytes));
     }
@@ -597,6 +707,16 @@ mod tests {
     use tempfile::tempdir;
     use tools::packed_sfen::{move_to_psv_move16, pack_position};
 
+    #[cfg(unix)]
+    fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(original, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(original, link)
+    }
+
     fn record(sfen: &str, score: i16, move16: u16, padding: u8) -> Result<[u8; RECORD_SIZE]> {
         let mut pos = Position::new();
         pos.set_sfen(sfen)?;
@@ -679,6 +799,35 @@ mod tests {
     }
 
     #[test]
+    fn embed_extract_roundtrip_across_streaming_chunk_boundary() -> Result<()> {
+        const TEST_CHUNK_RECORDS: usize = 16;
+        for count in [
+            TEST_CHUNK_RECORDS - 1,
+            TEST_CHUNK_RECORDS,
+            TEST_CHUNK_RECORDS + 1,
+        ] {
+            let dir = tempdir()?;
+            let (base, scores, mask) = write_embed_inputs(dir.path(), count, 0, -1)?;
+            let dual = dir.path().join("dual.psv");
+            let extracted_base = dir.path().join("extracted.psv");
+            let extracted_scores = dir.path().join("extracted.i16");
+            let extracted_mask = dir.path().join("extracted.bits");
+            embed_with_chunk_records(&base, &scores, &mask, &dual, TEST_CHUNK_RECORDS)?;
+            extract_with_chunk_records(
+                &dual,
+                Some(&extracted_base),
+                Some(&extracted_scores),
+                Some(&extracted_mask),
+                TEST_CHUNK_RECORDS,
+            )?;
+            assert_eq!(fs::read(&extracted_base)?, fs::read(&base)?);
+            assert_eq!(fs::read(&extracted_scores)?, fs::read(&scores)?);
+            assert_eq!(fs::read(&extracted_mask)?, fs::read(&mask)?);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn embed_counts_overwritten_nonzero_move16() -> Result<()> {
         let dir = tempdir()?;
         let (base, scores, mask) = write_embed_inputs(dir.path(), 3, 42, -1)?;
@@ -730,12 +879,54 @@ mod tests {
     }
 
     #[test]
+    fn embed_error_preserves_existing_output_and_removes_staging() -> Result<()> {
+        let dir = tempdir()?;
+        let (base, scores, mask) = write_embed_inputs(dir.path(), 3, 0, -1)?;
+        let mut bytes = fs::read(&base)?;
+        bytes[RECORD_SIZE + PADDING_OFFSET] = 1;
+        fs::write(&base, bytes)?;
+        let output = dir.path().join("dual.psv");
+        let sentinel = b"existing valid output";
+        fs::write(&output, sentinel)?;
+
+        assert!(embed(&base, &scores, &mask, &output).is_err());
+        assert_eq!(fs::read(&output)?, sentinel);
+        assert!(!partial_path(&output).exists());
+        Ok(())
+    }
+
+    #[test]
     fn embed_rejects_output_equal_to_input_without_truncating() -> Result<()> {
         let dir = tempdir()?;
         let (base, scores, mask) = write_embed_inputs(dir.path(), 3, 0, -1)?;
         let original = fs::read(&base)?;
         assert!(embed(&base, &scores, &mask, &base).is_err());
         assert_eq!(fs::read(base)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn embed_rejects_scores_and_mask_as_output_aliases() -> Result<()> {
+        let dir = tempdir()?;
+        let (base, scores, mask) = write_embed_inputs(dir.path(), 3, 0, -1)?;
+        for output in [&scores, &mask] {
+            let original = fs::read(output)?;
+            assert!(embed(&base, &scores, &mask, output).is_err());
+            assert_eq!(fs::read(output)?, original);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn embed_rejects_staging_path_aliasing_input() -> Result<()> {
+        let dir = tempdir()?;
+        let (_, scores, mask) = write_embed_inputs(dir.path(), 3, 0, -1)?;
+        let output = dir.path().join("dual.psv");
+        let base = partial_path(&output);
+        fs::write(&base, base_records(3, 0)?)?;
+        let original = fs::read(&base)?;
+        assert!(embed(&base, &scores, &mask, &output).is_err());
+        assert_eq!(fs::read(&base)?, original);
         Ok(())
     }
 
@@ -747,6 +938,84 @@ mod tests {
         let error = extract(&dual, Some(&dir.path().join("base.psv")), None, None)
             .expect_err("reserved bit must fail");
         assert!(error.to_string().contains("row 0"));
+        Ok(())
+    }
+
+    #[test]
+    fn extract_error_preserves_all_existing_outputs_and_removes_staging() -> Result<()> {
+        let dir = tempdir()?;
+        let dual = dir.path().join("dual.psv");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&record("4k4/9/9/9/9/9/9/9/4K4 b - 1", 0, 1, 0)?);
+        bytes.extend_from_slice(&record("4k4/9/9/9/9/9/9/9/4K4 b - 1", 0, 1, 2)?);
+        fs::write(&dual, bytes)?;
+        let outputs = [
+            dir.path().join("base.psv"),
+            dir.path().join("scores.i16"),
+            dir.path().join("mask.bits"),
+        ];
+        let sentinels: [&[u8]; 3] = [b"base sentinel", b"scores sentinel", b"mask sentinel"];
+        for (path, sentinel) in outputs.iter().zip(sentinels) {
+            fs::write(path, sentinel)?;
+        }
+
+        assert!(extract(&dual, Some(&outputs[0]), Some(&outputs[1]), Some(&outputs[2])).is_err());
+        for (path, sentinel) in outputs.iter().zip(sentinels) {
+            assert_eq!(fs::read(path)?, sentinel);
+            assert!(!partial_path(path).exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn extract_publish_failure_removes_staging_and_already_published_outputs() -> Result<()> {
+        let dir = tempdir()?;
+        let staging_a = dir.path().join("a.partial");
+        let staging_b = dir.path().join("b.partial");
+        let output_a = dir.path().join("a.out");
+        let output_b = dir.path().join("directory-output");
+        fs::write(&staging_a, b"a")?;
+        fs::write(&staging_b, b"b")?;
+        fs::create_dir(&output_b)?;
+
+        assert!(publish_staged(&[(&staging_a, &output_a), (&staging_b, &output_b)]).is_err());
+        assert!(!staging_a.exists());
+        assert!(!staging_b.exists());
+        assert!(!output_a.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn extract_path_aliases_are_rejected_table_driven() -> Result<()> {
+        let dir = tempdir()?;
+        let dual = dir.path().join("dual.psv");
+        fs::write(&dual, [0u8; RECORD_SIZE])?;
+
+        let same = dir.path().join("same.out");
+        let hardlink_a = dir.path().join("hardlink-a.out");
+        let hardlink_b = dir.path().join("hardlink-b.out");
+        fs::write(&hardlink_a, b"output")?;
+        fs::hard_link(&hardlink_a, &hardlink_b)?;
+        let dual_hardlink = dir.path().join("dual-hardlink.out");
+        fs::hard_link(&dual, &dual_hardlink)?;
+        let symlink_target = dir.path().join("symlink-target.out");
+        let symlink_output = dir.path().join("symlink-output.out");
+        fs::write(&symlink_target, b"target")?;
+
+        let mut cases: Vec<(&str, [&Path; 2])> = vec![
+            ("same path", [&same, &same]),
+            ("output hardlink", [&hardlink_a, &hardlink_b]),
+            ("output-dual hardlink", [&dual_hardlink, &same]),
+        ];
+        match symlink_file(&symlink_target, &symlink_output) {
+            Ok(()) => cases.push(("symlink output", [&symlink_output, &same])),
+            #[cfg(windows)]
+            Err(error) if error.raw_os_error() == Some(1314) => {}
+            Err(error) => return Err(error.into()),
+        }
+        for (name, outputs) in cases {
+            assert!(check_extract_paths(&dual, &outputs, &[]).is_err(), "{name}");
+        }
         Ok(())
     }
 
@@ -809,6 +1078,16 @@ mod tests {
         let mut config = valid_config();
         config.dl_abs_max = 100;
         assert!(validate(&dual, config).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn validate_rejects_empty_file() -> Result<()> {
+        let dir = tempdir()?;
+        let input = dir.path().join("empty.psv");
+        fs::write(&input, [])?;
+        let error = validate(&input, valid_config()).expect_err("empty input must fail");
+        assert!(error.to_string().contains("0 件"));
         Ok(())
     }
 
