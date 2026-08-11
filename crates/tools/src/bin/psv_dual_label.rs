@@ -84,6 +84,7 @@ enum Command {
 struct EmbedStats {
     records: u64,
     overwritten_nonzero_move16: u64,
+    overwritten_nonzero_padding: u64,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -197,23 +198,36 @@ fn remove_staging(paths: &[PathBuf]) {
 
 fn publish_staged(outputs: &[(&Path, &Path)]) -> Result<()> {
     let mut published: Vec<&Path> = Vec::new();
-    for &(staging, output) in outputs {
+    for (index, &(staging, output)) in outputs.iter().enumerate() {
         if let Err(error) = fs::rename(staging, output) {
-            let staging_paths: Vec<PathBuf> =
-                outputs.iter().map(|(path, _)| (*path).to_path_buf()).collect();
-            remove_staging(&staging_paths);
-            for published_path in published {
-                if let Err(cleanup_error) = fs::remove_file(published_path)
-                    && cleanup_error.kind() != std::io::ErrorKind::NotFound
-                {
-                    eprintln!(
-                        "published file cleanup failed: {}: {cleanup_error}",
-                        published_path.display()
-                    );
-                }
-            }
+            let unpublished_outputs: Vec<&Path> =
+                outputs[index..].iter().map(|(_, path)| *path).collect();
+            let unpublished_staging: Vec<PathBuf> =
+                outputs[index..].iter().map(|(path, _)| (*path).to_path_buf()).collect();
+            remove_staging(&unpublished_staging);
+            let format_paths = |paths: &[&Path]| {
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let unpublished_staging_refs: Vec<&Path> =
+                unpublished_staging.iter().map(PathBuf::as_path).collect();
+            let publish_state = if published.is_empty() {
+                "publish 未完了"
+            } else {
+                "部分 publish 状態"
+            };
             return Err(error).with_context(|| {
-                format!("{} -> {} の publish に失敗", staging.display(), output.display())
+                format!(
+                    "{} -> {} の publish に失敗（{publish_state}）。publish 済み最終出力=[{}]; 未 publish 最終出力=[{}]; cleanup 対象の未 publish staging=[{}]",
+                    staging.display(),
+                    output.display(),
+                    format_paths(&published),
+                    format_paths(&unpublished_outputs),
+                    format_paths(&unpublished_staging_refs)
+                )
             });
         }
         published.push(output);
@@ -258,14 +272,11 @@ fn embed_with_chunk_records(
             read_bytes(&mut mask_reader, &mut mask_chunk, current_records.div_ceil(8))?;
 
             for (offset, record) in base_chunk.chunks_exact_mut(RECORD_SIZE).enumerate() {
-                let row = stats.records + offset as u64;
-                anyhow::ensure!(
-                    record[PADDING_OFFSET] == 0,
-                    "base padding is non-zero at row {row}: 0x{:02x}",
-                    record[PADDING_OFFSET]
-                );
                 if record[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2] != [0, 0] {
                     stats.overwritten_nonzero_move16 += 1;
+                }
+                if record[PADDING_OFFSET] != 0 {
+                    stats.overwritten_nonzero_padding += 1;
                 }
                 record[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2]
                     .copy_from_slice(&score_chunk[offset * 2..offset * 2 + 2]);
@@ -671,6 +682,7 @@ fn main() -> Result<()> {
             let stats = embed(&base, &scores, &mask, &out)?;
             println!("records={}", stats.records);
             println!("overwritten_nonzero_move16={}", stats.overwritten_nonzero_move16);
+            println!("overwritten_nonzero_padding={}", stats.overwritten_nonzero_padding);
         }
         Command::Extract {
             dual,
@@ -866,15 +878,22 @@ mod tests {
     }
 
     #[test]
-    fn embed_rejects_nonzero_base_padding() -> Result<()> {
+    fn embed_overwrites_and_counts_nonzero_base_padding() -> Result<()> {
         let dir = tempdir()?;
         let (base, scores, mask) = write_embed_inputs(dir.path(), 3, 0, -1)?;
         let mut bytes = fs::read(&base)?;
-        bytes[RECORD_SIZE + PADDING_OFFSET] = 1;
+        bytes[PADDING_OFFSET] = 0x02;
+        bytes[RECORD_SIZE + PADDING_OFFSET] = 0x03;
         fs::write(&base, bytes)?;
-        let error = embed(&base, &scores, &mask, &dir.path().join("dual.psv"))
-            .expect_err("padding must fail");
-        assert!(error.to_string().contains("row 1"));
+        let dual = dir.path().join("dual.psv");
+
+        let stats = embed(&base, &scores, &mask, &dual)?;
+
+        assert_eq!(stats.overwritten_nonzero_padding, 2);
+        let dual_bytes = fs::read(dual)?;
+        assert_eq!(dual_bytes[PADDING_OFFSET], 1);
+        assert_eq!(dual_bytes[RECORD_SIZE + PADDING_OFFSET], 0);
+        assert_eq!(dual_bytes[2 * RECORD_SIZE + PADDING_OFFSET], 0);
         Ok(())
     }
 
@@ -882,9 +901,7 @@ mod tests {
     fn embed_error_preserves_existing_output_and_removes_staging() -> Result<()> {
         let dir = tempdir()?;
         let (base, scores, mask) = write_embed_inputs(dir.path(), 3, 0, -1)?;
-        let mut bytes = fs::read(&base)?;
-        bytes[RECORD_SIZE + PADDING_OFFSET] = 1;
-        fs::write(&base, bytes)?;
+        fs::write(&scores, [0u8; 5])?;
         let output = dir.path().join("dual.psv");
         let sentinel = b"existing valid output";
         fs::write(&output, sentinel)?;
@@ -968,20 +985,29 @@ mod tests {
     }
 
     #[test]
-    fn extract_publish_failure_removes_staging_and_already_published_outputs() -> Result<()> {
+    fn extract_publish_failure_keeps_already_published_output() -> Result<()> {
         let dir = tempdir()?;
         let staging_a = dir.path().join("a.partial");
         let staging_b = dir.path().join("b.partial");
         let output_a = dir.path().join("a.out");
-        let output_b = dir.path().join("directory-output");
-        fs::write(&staging_a, b"a")?;
-        fs::write(&staging_b, b"b")?;
-        fs::create_dir(&output_b)?;
+        let output_b = dir.path().join("missing-parent").join("b.out");
+        fs::write(&output_a, b"sentinel")?;
+        fs::write(&staging_a, b"new validated a")?;
+        fs::write(&staging_b, b"new validated b")?;
 
-        assert!(publish_staged(&[(&staging_a, &output_a), (&staging_b, &output_b)]).is_err());
+        let error = publish_staged(&[(&staging_a, &output_a), (&staging_b, &output_b)])
+            .expect_err("the second publish must fail");
+
         assert!(!staging_a.exists());
         assert!(!staging_b.exists());
-        assert!(!output_a.exists());
+        assert_eq!(fs::read(&output_a)?, b"new validated a");
+        assert!(!output_b.exists());
+        let message = error.to_string();
+        assert!(message.contains("部分 publish 状態"));
+        assert!(message.contains("publish 済み最終出力"));
+        assert!(message.contains(output_a.to_string_lossy().as_ref()));
+        assert!(message.contains("未 publish 最終出力"));
+        assert!(message.contains(output_b.to_string_lossy().as_ref()));
         Ok(())
     }
 

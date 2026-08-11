@@ -15,7 +15,7 @@ DL score、entered gate bit を一つの 40 byte レコードとして原子的�
 | 34-35 | move16 | **DL score (i16 LE)** |
 | 36-37 | gamePly | 同じ |
 | 38 | game_result | 同じ |
-| 39 | padding (常に 0) | **bit0 = entered gate bit** (1 = 学習側で base を温存)、**bit1-7 は必ず 0** |
+| 39 | padding（生成系によっては非ゼロ） | **bit0 = entered gate bit** (1 = 学習側で base を温存)、**bit1-7 は必ず 0** |
 
 入力 sidecar の契約は次のとおりです。
 
@@ -38,10 +38,11 @@ cargo run -p tools --release --bin psv_dual_label -- embed \
   --out dual.psv
 ```
 
-base のサイズ、sidecar の厳密なサイズ、mask 最終 byte の未使用 bit を出力作成前に検査し、
-base の各行は streaming 中に padding が 0 であることを検査します。base の move16 は
-DL score で上書きされます。
-非ゼロ move16 を上書きした件数は `overwritten_nonzero_move16` として表示されます。
+base のサイズ、sidecar の厳密なサイズ、mask 最終 byte の未使用 bit を出力作成前に検査します。
+base の move16 は DL score、padding は entered gate bit（bit0 のみ）で上書きされます。
+生成系によっては base の padding が非ゼロの場合がありますが、embed は拒否せず上書きします。
+非ゼロ move16 と非ゼロ padding を上書きした件数は、それぞれ
+`overwritten_nonzero_move16` と `overwritten_nonzero_padding` として表示されます。
 
 ## extract: sidecar へ戻す
 
@@ -58,7 +59,7 @@ cargo run -p tools --release --bin psv_dual_label -- extract \
 `--out-mask` の最終 byte の未使用 bit は常に 0 です。reserved bit (padding bit1-7) が
 立っている入力は行番号付きで拒否します。
 
-`embed` に渡した base の move16 が全行 0 なら、続けて `extract` した
+`embed` に渡した base の move16 と padding が全行 0 なら、続けて `extract` した
 `base.psv`、`dl.i16`、`entered.bits` は元の入力と bit 一致します。
 
 ## validate: fail-closed 検証
@@ -92,4 +93,7 @@ cargo run -p tools --release --bin psv_dual_label -- validate \
 拒否します。extract の複数出力も同じ実体を指定できません。処理完了時には全出力のサイズを
 契約値と照合します。
 `embed` / `extract` は同じディレクトリの `<出力>.partial` に書き、全検査・flush・サイズ検算の
-成功後だけ最終パスへ publish します。途中でエラーになった場合は既存の最終パスを変更せず、`.partial` を削除します。
+成功後だけ最終パスへ publish します。publish 前にエラーになった場合は既存の最終パスを変更せず、
+`.partial` を削除します。複数出力の publish 途中で後続の rename に失敗した場合、先に publish 済みの
+最終出力は検証済み成果物として残し、未 publish の `.partial` だけを削除します。エラーには publish 済み・
+未 publish のパスを列挙します。
