@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const READER_BUF_CAP: usize = 128 * 1024; // 128 KiB
 
@@ -109,6 +109,13 @@ pub fn write_atomic_durable(path: &Path, content: &str) -> anyhow::Result<()> {
         .with_context(|| format!("publish durable file {}", path.display()))?;
     sync_directory(parent)?;
     Ok(())
+}
+
+/// staged write 用の `<output>.partial` パスを返す。
+pub fn partial_path(output: &Path) -> PathBuf {
+    let mut path = output.as_os_str().to_os_string();
+    path.push(".partial");
+    PathBuf::from(path)
 }
 
 /// dangling symlinkも含め、path entryの存在を確認する。

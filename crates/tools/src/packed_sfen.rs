@@ -1175,6 +1175,26 @@ pub fn psv_move16_to_move(move16: u16) -> Move {
     }
 }
 
+/// PSV move16 の表現力での指し手一致判定。move16 は駒種 bit を持たないため、
+/// Move 同士の等値比較ではなく to / drop / promote / from(または打ち駒種) のみを比べる。
+pub fn same_psv_move(lhs: Move, rhs: Move) -> bool {
+    lhs.to() == rhs.to()
+        && lhs.is_drop() == rhs.is_drop()
+        && lhs.is_promote() == rhs.is_promote()
+        && if lhs.is_drop() {
+            lhs.drop_piece_type() == rhs.drop_piece_type()
+        } else {
+            lhs.from() == rhs.from()
+        }
+}
+
+/// `mv` が `pos` の合法手に (PSV move16 の表現力で) 含まれるか判定する。
+pub fn is_legal_psv_move(pos: &Position, mv: Move) -> bool {
+    let mut legal_moves = rshogi_core::movegen::MoveList::new();
+    rshogi_core::movegen::generate_legal_all(pos, &mut legal_moves);
+    legal_moves.iter().any(|legal| same_psv_move(*legal, mv))
+}
+
 /// 実 YaneuraOu PSV 形式 (A) の Move16 を USI 形式へ変換する。
 pub fn psv_move16_to_usi(move16: u16) -> String {
     let mv = psv_move16_to_move(move16);

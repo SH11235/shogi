@@ -7,17 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 fn canonicalize_predicted_path(path: &Path) -> Result<PathBuf> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Path has no file name: {}", path.display()))?;
-    let canonical_parent = parent
-        .canonicalize()
-        .with_context(|| format!("Failed to canonicalize parent {}", parent.display()))?;
-    Ok(canonical_parent.join(file_name))
+    crate::common::dedup::canonicalize_maybe_new(path)
+        .with_context(|| format!("Failed to canonicalize {}", path.display()))
 }
 
 fn is_same_file(a: &Path, b: &Path) -> Result<bool> {
@@ -57,6 +48,31 @@ pub fn ensure_distinct_output_paths(a: &Path, b: &Path) -> Result<()> {
     let predicted_b = canonicalize_predicted_path(b)?;
     if predicted_a == predicted_b || is_same_file(a, b)? {
         anyhow::bail!("Output paths resolve to the same file: {} and {}", a.display(), b.display());
+    }
+    Ok(())
+}
+
+/// 作成済みファイル群の実体をペア毎に比較し、同一実体があれば拒否する。
+/// 未作成パスの予測比較は case-insensitive filesystem の alias
+/// (`Score.bin` と `score.bin` 等) を検出できないため、staging ファイルを
+/// 作成した直後・書き込み前にこの実体検査を通すこと。
+pub fn ensure_created_paths_distinct(paths: &[&Path]) -> Result<()> {
+    for i in 0..paths.len() {
+        for j in i + 1..paths.len() {
+            if same_file::is_same_file(paths[i], paths[j]).with_context(|| {
+                format!(
+                    "Failed to compare file identities: {} and {}",
+                    paths[i].display(),
+                    paths[j].display()
+                )
+            })? {
+                anyhow::bail!(
+                    "Output paths resolve to the same file: {} and {}",
+                    paths[i].display(),
+                    paths[j].display()
+                );
+            }
+        }
     }
     Ok(())
 }

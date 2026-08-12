@@ -81,7 +81,7 @@ cargo run -p tools --release --bin psv_dual_label -- validate \
   「先手玉 rank ≤ 2 または後手玉 rank ≥ 6」。
 - DL score の絶対値が `--dl-abs-max`（既定 32000）以下。
 - DL score の 16 bit を通常 PSV の move16 と解釈したとき、局面の合法手になる割合が
-  `--max-move-like-frac`（既定 0.05）未満。
+  `--max-move-like-frac`（既定 0.05）以下。0 を指定すると move-like 行を 1 行も許容しない。
 
 `--sample N` は entered 整合と move-like 判定だけを先頭固定の決定的な等間隔最大 N 件へ
 限定します。サイズ、reserved bit、DL range は常に全件を走査します。
@@ -92,8 +92,11 @@ cargo run -p tools --release --bin psv_dual_label -- validate \
 出力がいずれかの入力と同じパス・hardlink を指す場合や symlink の場合は、truncate 前に
 拒否します。extract の複数出力も同じ実体を指定できません。処理完了時には全出力のサイズを
 契約値と照合します。
-`embed` / `extract` は同じディレクトリの `<出力>.partial` に書き、全検査・flush・サイズ検算の
-成功後だけ最終パスへ publish します。publish 前にエラーになった場合は既存の最終パスを変更せず、
+空 (0 レコード) の入力は embed / extract とも拒否します (validate が不正とする空の
+dual PSV を成功として publish しない)。
+`embed` / `extract` は同じディレクトリの `<出力>.partial` に書き、全検査・fsync・サイズ検算の
+成功後だけ最終パスへ publish し、publish 後に親ディレクトリを sync します (電源断でも
+publish 済み出力が空・切り詰め状態に巻き戻らない)。publish 前にエラーになった場合は既存の最終パスを変更せず、
 `.partial` を削除します。複数出力の publish 途中で後続の rename に失敗した場合、先に publish 済みの
 最終出力は検証済み成果物として残し、未 publish の `.partial` だけを削除します。エラーには publish 済み・
 未 publish のパスを列挙します。

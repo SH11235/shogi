@@ -7,12 +7,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
-use rshogi_core::movegen::{MoveList, generate_legal_all};
 use rshogi_core::position::Position;
-use rshogi_core::types::Move;
+use tools::common::io::{partial_path, sync_directory};
 use tools::king_zone::{ENTERED_TIER, classify};
-use tools::output_path::{ensure_distinct_output_paths, ensure_safe_output_path};
-use tools::packed_sfen::{PackedSfenValue, psv_move16_to_move, unpack_sfen_to_parts};
+use tools::output_path::{
+    ensure_created_paths_distinct, ensure_distinct_output_paths, ensure_safe_output_path,
+};
+use tools::packed_sfen::{
+    PackedSfenValue, is_legal_psv_move, psv_move16_to_move, unpack_sfen_to_parts,
+};
 
 const RECORD_SIZE: usize = PackedSfenValue::SIZE;
 const DL_SCORE_OFFSET: usize = 34;
@@ -74,7 +77,8 @@ enum Command {
         /// 許容する DL score の絶対値上限
         #[arg(long, default_value_t = DEFAULT_DL_ABS_MAX)]
         dl_abs_max: u32,
-        /// 通常 PSV の move16 に見える行の許容割合。この値以上なら失敗
+        /// 通常 PSV の move16 に見える行の許容割合。この値を超えたら失敗
+        /// (0 は move-like 行を 1 行も許容しない最厳設定)
         #[arg(long, default_value_t = DEFAULT_MAX_MOVE_LIKE_FRAC)]
         max_move_like_frac: f64,
     },
@@ -180,12 +184,6 @@ fn embed(base: &Path, scores: &Path, mask: &Path, out: &Path) -> Result<EmbedSta
     embed_with_chunk_records(base, scores, mask, out, CHUNK_RECORDS)
 }
 
-fn partial_path(output: &Path) -> PathBuf {
-    let mut path = output.as_os_str().to_os_string();
-    path.push(".partial");
-    PathBuf::from(path)
-}
-
 fn remove_staging(paths: &[PathBuf]) {
     for path in paths {
         if let Err(error) = fs::remove_file(path)
@@ -232,6 +230,16 @@ fn publish_staged(outputs: &[(&Path, &Path)]) -> Result<()> {
         }
         published.push(output);
     }
+    // rename の永続化: crash 後に publish 済みエントリが巻き戻らないよう親 directory を sync。
+    let mut synced: Vec<&Path> = Vec::new();
+    for (_, output) in outputs {
+        let parent =
+            output.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        if !synced.contains(&parent) {
+            sync_directory(parent)?;
+            synced.push(parent);
+        }
+    }
     Ok(())
 }
 
@@ -247,6 +255,7 @@ fn embed_with_chunk_records(
         "chunk_records must be a positive multiple of 8"
     );
     let records = checked_psv_records(base)?;
+    anyhow::ensure!(records > 0, "{} が空です (0 レコード)", base.display());
     checked_sidecar_sizes(scores, mask, records)?;
     let staging = partial_path(out);
     for input in [base, scores, mask] {
@@ -287,7 +296,7 @@ fn embed_with_chunk_records(
         }
 
         writer.flush()?;
-        drop(writer);
+        writer.into_inner()?.sync_all()?;
         let expected = records * RECORD_SIZE as u64;
         let actual = file_size(&staging)?;
         anyhow::ensure!(
@@ -355,6 +364,7 @@ fn extract_with_chunk_records(
         "chunk_records must be a positive multiple of 8"
     );
     let records = checked_psv_records(dual)?;
+    anyhow::ensure!(records > 0, "{} が空です (0 レコード)", dual.display());
     let outputs = output_paths(out_base, out_scores, out_mask);
     let base_staging = out_base.map(partial_path);
     let scores_staging = out_scores.map(partial_path);
@@ -370,8 +380,10 @@ fn extract_with_chunk_records(
         let mut base_writer = create_writer(base_staging.as_deref())?;
         let mut score_writer = create_writer(scores_staging.as_deref())?;
         let mut mask_writer = create_writer(mask_staging.as_deref())?;
+        // 予測パス比較は case-insensitive filesystem の alias を見逃すため、
+        // 作成済み staging の実体でも同一性を検査する (書き込み前)。
+        ensure_created_paths_distinct(&staging_paths)?;
         let mut dual_chunk = Vec::with_capacity(chunk_records * RECORD_SIZE);
-        let mut base_chunk = Vec::with_capacity(chunk_records * RECORD_SIZE);
         let mut score_chunk = Vec::with_capacity(chunk_records * 2);
         let mut mask_chunk = Vec::with_capacity(chunk_records.div_ceil(8));
         let mut stats = ExtractStats::default();
@@ -389,15 +401,6 @@ fn extract_with_chunk_records(
                 );
             }
 
-            if let Some(writer) = &mut base_writer {
-                base_chunk.clear();
-                base_chunk.extend_from_slice(&dual_chunk);
-                for record in base_chunk.chunks_exact_mut(RECORD_SIZE) {
-                    record[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2].fill(0);
-                    record[PADDING_OFFSET] = 0;
-                }
-                writer.write_all(&base_chunk)?;
-            }
             if let Some(writer) = &mut score_writer {
                 score_chunk.clear();
                 score_chunk.reserve(current_records * 2);
@@ -414,14 +417,21 @@ fn extract_with_chunk_records(
                 }
                 writer.write_all(&mask_chunk)?;
             }
+            // score / mask の gather 後なら dual_chunk を直接 base 化してよい
+            // (chunk 全量の複製を避ける)。
+            if let Some(writer) = &mut base_writer {
+                for record in dual_chunk.chunks_exact_mut(RECORD_SIZE) {
+                    record[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2].fill(0);
+                    record[PADDING_OFFSET] = 0;
+                }
+                writer.write_all(&dual_chunk)?;
+            }
             stats.records += current_records as u64;
         }
 
-        for writer in [&mut base_writer, &mut score_writer, &mut mask_writer].into_iter().flatten()
-        {
-            writer.flush()?;
+        for writer in [base_writer, score_writer, mask_writer].into_iter().flatten() {
+            writer.into_inner()?.sync_all()?;
         }
-        drop((base_writer, score_writer, mask_writer));
 
         if let Some(path) = &base_staging {
             let expected = records * RECORD_SIZE as u64;
@@ -453,25 +463,9 @@ fn extract_with_chunk_records(
     result
 }
 
-fn same_move(lhs: Move, rhs: Move) -> bool {
-    lhs.to() == rhs.to()
-        && lhs.is_drop() == rhs.is_drop()
-        && lhs.is_promote() == rhs.is_promote()
-        && if lhs.is_drop() {
-            lhs.drop_piece_type() == rhs.drop_piece_type()
-        } else {
-            lhs.from() == rhs.from()
-        }
-}
-
 fn move16_is_legal(pos: &Position, move16: u16) -> bool {
     let mv = psv_move16_to_move(move16);
-    if mv.is_none() {
-        return false;
-    }
-    let mut legal_moves = MoveList::new();
-    generate_legal_all(pos, &mut legal_moves);
-    legal_moves.iter().any(|legal| same_move(*legal, mv))
+    !mv.is_none() && is_legal_psv_move(pos, mv)
 }
 
 /// `floor(i * total / count)` (`i=0..count`) で選ばれる等間隔行か判定する。
@@ -637,11 +631,9 @@ fn validation_failures(stats: &ValidationStats, config: ValidateConfig) -> Vec<S
         ));
     }
     let fraction = move_like_fraction(stats);
-    if stats.sampled_records != 0 && fraction >= config.max_move_like_frac {
-        failures.push(format!(
-            "move-like fraction {:.6} >= {:.6}",
-            fraction, config.max_move_like_frac
-        ));
+    if stats.sampled_records != 0 && fraction > config.max_move_like_frac {
+        failures
+            .push(format!("move-like fraction {:.6} > {:.6}", fraction, config.max_move_like_frac));
     }
     failures
 }
@@ -656,7 +648,7 @@ fn print_validation_stats(stats: &ValidationStats, config: ValidateConfig, passe
     println!("dl_abs_exceeded={} (limit={})", stats.dl_abs_exceeded, config.dl_abs_max);
     println!("decode_errors={}", stats.decode_errors);
     println!(
-        "move_like={} fraction={:.6} (fail_at={:.6})",
+        "move_like={} fraction={:.6} (fail_above={:.6})",
         stats.move_like,
         move_like_fraction(stats),
         config.max_move_like_frac
@@ -716,6 +708,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rshogi_core::movegen::{MoveList, generate_legal_all};
     use tempfile::tempdir;
     use tools::packed_sfen::{move_to_psv_move16, pack_position};
 
@@ -807,6 +800,55 @@ mod tests {
             assert_eq!(fs::read(&extracted_scores)?, fs::read(&scores)?);
             assert_eq!(fs::read(&extracted_mask)?, fs::read(&mask)?);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn embed_writes_dl_score_little_endian_golden() -> Result<()> {
+        // roundtrip は両方向を同じ実装で処理するため byte swap を検出できない。
+        // 生成物の生 byte を golden 値で直接固定する。
+        let dir = tempdir()?;
+        let (base, scores, mask) = write_embed_inputs(dir.path(), 1, 0, 0x1234)?;
+        fs::write(&mask, [1u8])?;
+        let dual = dir.path().join("dual.psv");
+        embed(&base, &scores, &mask, &dual)?;
+        let bytes = fs::read(&dual)?;
+        assert_eq!(&bytes[DL_SCORE_OFFSET..DL_SCORE_OFFSET + 2], &[0x34, 0x12]);
+        assert_eq!(bytes[PADDING_OFFSET], 1);
+
+        let extracted_scores = dir.path().join("extracted.i16");
+        extract(&dual, None, Some(&extracted_scores), None)?;
+        assert_eq!(fs::read(&extracted_scores)?, vec![0x34, 0x12]);
+        Ok(())
+    }
+
+    #[test]
+    fn embed_and_extract_reject_empty_inputs() -> Result<()> {
+        let dir = tempdir()?;
+        let base = dir.path().join("base.psv");
+        let scores = dir.path().join("dl.i16");
+        let mask = dir.path().join("entered.bits");
+        let dual = dir.path().join("dual.psv");
+        for path in [&base, &scores, &mask, &dual] {
+            fs::write(path, [])?;
+        }
+        assert!(embed(&base, &scores, &mask, &dir.path().join("out.psv")).is_err());
+        assert!(extract(&dual, Some(&dir.path().join("out.psv")), None, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn validate_passes_clean_file_at_zero_move_like_threshold() -> Result<()> {
+        let dir = tempdir()?;
+        let (base, scores, mask) = write_embed_inputs(dir.path(), 3, 0, -1)?;
+        let dual = dir.path().join("dual.psv");
+        embed(&base, &scores, &mask, &dual)?;
+        let config = ValidateConfig {
+            max_move_like_frac: 0.0,
+            ..valid_config()
+        };
+        let stats = validate(&dual, config)?;
+        assert_eq!(stats.move_like, 0);
         Ok(())
     }
 
