@@ -14,6 +14,89 @@ core 変更を公開する PR では `crates/rshogi-core/Cargo.toml` のバー�
 
 ## Unreleased
 
+## v1.4.0 — 2026-08-13
+
+v1.3.0 後の性能改善と教師データパイプライン拡張のリリース。NNUE 推論・探索・局面処理の
+性能改善バッチ、dual-label PSV (1 レコード内に base + DL の 2 ラベルを原子的に保持する
+教師形式) の生成・検証パイプライン、LayerStacks の KingRank9 bucket mode と
+runtime-dimensional universal edition、CSA server の入玉宣言ルール設定駆動化と検索・観戦系
+API、gensfen の resume / クラッシュ耐性、Windows 対応の一括修正が中心。
+
+詳細は各 PR を参照。
+
+### 性能改善 (NNUE / 探索 / 局面処理)
+
+特記なき項目は search_only_ab による ABBA x3 の固定時間計測 (括弧は測定窓)。数値は各 PR 本文の実測。
+
+- **LayerStacks L1 activation の AVX2 化** (#983): NPS +1.62% (10s)
+- **Finny accumulator 更新の tile 化** (#984): NPS +3.54% (10s)。AVX-512 有効 build 向けの
+  zmm tile path は #996 で追加
+- **LayerStacks copy + diff 更新の融合** (#985): NPS +4.12% (10s)
+- **LayerStacks 出力活性の融合** (#986): NPS +2.24% (10s)
+- **Finny cache accumulator コピー削減** (#987): NPS +3.12% (10s)
+- **StateInfo の in-place 更新** (#988): NPS +1.70% (5s)
+- **千日手履歴の直接 index 化** (#989): NPS +1.22% (10s)
+- **continuation correction table のキャッシュ** (#990): NPS +0.28% (10s)
+- **mate1ply の gold-like piece キャッシュ再利用** (#991): NPS +1.21% (10s)
+- **冗長な空 pin check の除去** (#992): NPS +0.71% (10s)
+- **LayerStacks fast path の changed-index 収集 defer** (#940): NPS +2.65% (5s)
+- **動的 LayerStacks (runtime-dimensional universal) の更新性能改善** (#951): 現行動的版比
+  **+32.80%**、固定次元版比 -7.29% まで縮小 (WASM・1 thread・固定ノードのベンチ計測)
+
+### NNUE モデル対応
+
+- **LayerStacks KingRank9 bucket mode** (#936): YaneuraOu KingRank9 互換の 9-bucket 構成
+- **universal edition の runtime-dimensional 化** (#950): モデルヘッダー駆動で任意次元の
+  LayerStacks / HalfKX を固定 edition 列挙なしに読み込む。underscore 形式 FT ヘッダー
+  (`HalfKA_hm` 等) の受理は #952
+- **nnue_saturation** (#924, #925): LayerStacks 活性飽和率の実局面計測ツール
+
+### 教師データパイプライン (dual-label PSV / gensfen)
+
+- **dual-label PSV パイプライン**: `rescore_psv --out-scores` (i16 sidecar) と
+  `psv_gate_by_king_zone --out-mask` (入玉ゲート bitmap) の出力 (#997)、CLI の base/override
+  語彙統一 (#998)、生成・逆抽出・fail-closed 検証ツール `psv_dual_label` (#1000)。
+  学習側 (tatara v0.7.0 の `--dual-label-psv`) と実データ 11,468,800 局面で loader batch stream
+  の bit 一致を検証済み
+- **shuffle_psv に段階削除フラグ** (#999): ピークディスク 3x → 2x
+- **gensfen**: 数日規模の無人生成でデータを失わない resume / クラッシュ耐性 (#937、互換性変更
+  は下記)、異常終局の偽勝敗ラベル排除と千日手・入玉宣言勝ちの裁定 (#935)、`--fv-scale`
+  override と control.json 動的制御 (#964)、`--omit-diversions` (#966)、hcpe3 policy 分布を
+  dlshogi 参照実装の既定に一致 (#973)、pack 形式の replay 整合性を hcpe3 と同等に (#974)
+- **relabel_psv**: diversion の result 整合性フィルタ (drop-contaminated) (#933)
+- **PSV move16 を実 YaneuraOu 形式 (A) に一本化** (#932)、hcpe → PSV 変換 `hcpe_to_psv` (#931)
+- **nyugyoku_metrics**: 宣言ルール距離ペア順序一致指標 (#967)、探索読み切り詰み距離
+  concordance (#972)
+
+### 探索
+
+- **update_all_stats の SF 追従 3 点 + LMR allNode depth スケールの tunable 化** (#927)
+- **固定 depth 探索の動的 depth-liveness guard** (#938)
+- **cutoff_cnt クリアの修正** (#979, #980): 探索開始時 stack[0]/[1] と毎 go の全スロット
+
+### CSA server / client
+
+- **入玉宣言ルールの設定駆動化** (#955, #956, #960): 24 点法 / 27 点法を env / CLI で切替、
+  マッチ単位で永続化、Game_Summary で広告し client がエンジンへ自動伝達
+- **player ratings API** (#948)、**D1 検索インデックスと `GET /api/v1/games/search`** (#923)
+- 観戦時計の同期 (#947)、再接続時の record 保持 (#944) / clock 補償の上限 (#945)、
+  DO 再起動後の cold rejoin fallback (#943)
+- viewer API の R2 get N+1 並列化 (#921)、games-index backfill の並列化 (#929)
+- CLOCK_PRESETS に per-preset max_moves (#942)、workers.dev / preview URL の無効化 (#957)
+
+### Windows 対応
+
+- ツール・テスト・ビルドの Windows 対応を一括修正 (#968, #969, #970, #971, #975, #977,
+  #978, #981, #982)。`search_only_ab` の Windows PMC counting (ETW) は #995
+
+### その他ツール
+
+- compare_nodes にエンジン別ノード上限 (#941)、SPRT 直接対決集計の test 視点統一 (#934)、
+  ONNX 使用バイナリの exit 時 abort 回避 (#926)、`--onnx-batch-size` 既定 1024 (#920, #922)、
+  jsonl_to_psv の破損ログ耐性 (#965)
+
+### rshogi-core (crates.io) / 互換性変更
+
 - **rshogi-core 0.5.2 (crates.io)**: Linux で使用する `libc::NAME_MAX` が公開された
   `libc 0.2.186` を最小依存バージョンとして明示。既存の lockfile が古い `libc` を選択した
   consumer で 0.5.1 がコンパイルできない問題を修正。
