@@ -11,7 +11,8 @@ use rshogi_core::position::Position;
 use tools::common::io::{partial_path, sync_directory};
 use tools::king_zone::{ENTERED_TIER, classify};
 use tools::output_path::{
-    ensure_created_paths_distinct, ensure_distinct_output_paths, ensure_safe_output_path,
+    ensure_created_paths_distinct, ensure_distinct_output_paths, ensure_no_entity_overlap,
+    ensure_safe_output_path,
 };
 use tools::packed_sfen::{
     PackedSfenValue, is_legal_psv_move, psv_move16_to_move, unpack_sfen_to_parts,
@@ -381,8 +382,11 @@ fn extract_with_chunk_records(
         let mut score_writer = create_writer(scores_staging.as_deref())?;
         let mut mask_writer = create_writer(mask_staging.as_deref())?;
         // 予測パス比較は case-insensitive filesystem の alias を見逃すため、
-        // 作成済み staging の実体でも同一性を検査する (書き込み前)。
+        // 作成済み staging の実体でも同一性を検査する (書き込み前)。staging の
+        // 作成が別出力の最終パスを実体化させるケースがあるため、最終出力との
+        // クロス比較も掛ける。
         ensure_created_paths_distinct(&staging_paths)?;
+        ensure_no_entity_overlap(&staging_paths, &outputs)?;
         let mut dual_chunk = Vec::with_capacity(chunk_records * RECORD_SIZE);
         let mut score_chunk = Vec::with_capacity(chunk_records * 2);
         let mut mask_chunk = Vec::with_capacity(chunk_records.div_ceil(8));
