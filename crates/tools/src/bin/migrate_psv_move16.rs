@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rshogi_core::movegen::{MoveList, generate_legal_all};
 use rshogi_core::position::Position;
 use rshogi_core::types::Move;
+use tools::common::io::partial_path;
 use tools::packed_sfen::{
-    PackedSfenValue, PsvMove16Class, classify_psv_move16, legacy_move16_to_move,
+    PackedSfenValue, PsvMove16Class, classify_psv_move16, is_legal_psv_move, legacy_move16_to_move,
     move_to_psv_move16, unpack_sfen_to_parts,
 };
 
@@ -90,17 +90,6 @@ fn convert_record_move16(
     (record, mv)
 }
 
-fn same_move(lhs: Move, rhs: Move) -> bool {
-    lhs.to() == rhs.to()
-        && lhs.is_drop() == rhs.is_drop()
-        && lhs.is_promote() == rhs.is_promote()
-        && if lhs.is_drop() {
-            lhs.drop_piece_type() == rhs.drop_piece_type()
-        } else {
-            lhs.from() == rhs.from()
-        }
-}
-
 fn is_legal_move(psv: &PackedSfenValue, mv: Move) -> bool {
     if mv.is_none() {
         return psv.move16 == 0;
@@ -112,15 +101,7 @@ fn is_legal_move(psv: &PackedSfenValue, mv: Move) -> bool {
     if pos.set_from_parts(&parts.board, &parts.hands, parts.side_to_move).is_err() {
         return false;
     }
-    let mut legal_moves = MoveList::new();
-    generate_legal_all(&pos, &mut legal_moves);
-    legal_moves.iter().any(|legal| same_move(*legal, mv))
-}
-
-fn partial_path(output: &Path) -> PathBuf {
-    let mut path = output.as_os_str().to_os_string();
-    path.push(".partial");
-    PathBuf::from(path)
+    is_legal_psv_move(&pos, mv)
 }
 
 fn main() -> Result<()> {
