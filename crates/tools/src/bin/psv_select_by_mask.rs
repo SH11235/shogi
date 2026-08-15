@@ -1,11 +1,12 @@
 //! LSB-first bitmap mask で PSV の行を入力順に抽出する。
 
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tools::mask_io::{checked_input_records, partial_path, validate_chunk_records, validate_mask};
 use tools::output_path::{ensure_distinct_output_paths, ensure_safe_output_path};
 use tools::packed_sfen::PackedSfenValue;
 
@@ -45,60 +46,6 @@ fn main() -> Result<()> {
         stats.selected as f64 / stats.records as f64 * 100.0
     };
     println!("records={} selected={} ({percent:.4}%)", stats.records, stats.selected);
-    Ok(())
-}
-
-fn partial_path(out: &Path) -> PathBuf {
-    let mut path = out.as_os_str().to_os_string();
-    path.push(".partial");
-    PathBuf::from(path)
-}
-
-fn checked_input_records(input: &Path) -> Result<u64> {
-    let bytes = fs::metadata(input)
-        .with_context(|| format!("Failed to stat input {}", input.display()))?
-        .len();
-    anyhow::ensure!(
-        bytes % RECORD_SIZE as u64 == 0,
-        "Input size is not a multiple of {RECORD_SIZE}: {} ({bytes} bytes)",
-        input.display()
-    );
-    Ok(bytes / RECORD_SIZE as u64)
-}
-
-fn validate_mask(mask: &Path, records: u64) -> Result<()> {
-    let expected_bytes = records.div_ceil(8);
-    let actual_bytes = fs::metadata(mask)
-        .with_context(|| format!("Failed to stat mask {}", mask.display()))?
-        .len();
-    anyhow::ensure!(
-        actual_bytes == expected_bytes,
-        "Mask size mismatch: expected {expected_bytes} bytes for {records} records, got {actual_bytes}: {}",
-        mask.display()
-    );
-
-    let used_bits = (records % 8) as u32;
-    if used_bits != 0 {
-        let mut file = File::open(mask)?;
-        file.seek(SeekFrom::End(-1))?;
-        let mut last = [0u8; 1];
-        file.read_exact(&mut last)?;
-        let unused_mask = !((1u8 << used_bits) - 1);
-        anyhow::ensure!(
-            last[0] & unused_mask == 0,
-            "Mask has non-zero unused bits in final byte: {}",
-            mask.display()
-        );
-    }
-    Ok(())
-}
-
-fn validate_chunk_records(chunk_records: usize) -> Result<()> {
-    anyhow::ensure!(chunk_records > 0, "chunk record count must be positive");
-    anyhow::ensure!(
-        chunk_records.is_multiple_of(8),
-        "chunk record count must be a multiple of 8: {chunk_records}"
-    );
     Ok(())
 }
 
