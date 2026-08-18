@@ -19,6 +19,7 @@ use tools::packed_sfen::{
 };
 
 const RECORD_SIZE: usize = PackedSfenValue::SIZE;
+const SCORE_OFFSET: usize = 32;
 const DL_SCORE_OFFSET: usize = 34;
 const PADDING_OFFSET: usize = 39;
 const BUFFER_SIZE: usize = 32 << 20;
@@ -37,6 +38,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 通常 PSV の score 列を sidecar に退避する
+    DumpScores {
+        /// score を読み出す通常 PSV
+        #[arg(long)]
+        base: PathBuf,
+        /// little-endian i16 × records の score sidecar
+        #[arg(long)]
+        out_scores: PathBuf,
+    },
     /// 通常 PSV と score/mask sidecar を dual-label PSV に埋め込む
     Embed {
         /// base score を持つ通常 PSV
@@ -90,6 +100,11 @@ struct EmbedStats {
     records: u64,
     overwritten_nonzero_move16: u64,
     overwritten_nonzero_padding: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DumpScoresStats {
+    records: u64,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -193,6 +208,62 @@ fn remove_staging(paths: &[PathBuf]) {
             eprintln!("staging file cleanup failed: {}: {error}", path.display());
         }
     }
+}
+
+fn dump_scores(base: &Path, out_scores: &Path) -> Result<DumpScoresStats> {
+    dump_scores_with_chunk_records(base, out_scores, CHUNK_RECORDS)
+}
+
+fn dump_scores_with_chunk_records(
+    base: &Path,
+    out_scores: &Path,
+    chunk_records: usize,
+) -> Result<DumpScoresStats> {
+    anyhow::ensure!(chunk_records > 0, "chunk_records must be positive");
+    let staging = partial_path(out_scores);
+    // preflight (サイズ・パス検査) の失敗でも過去 run の残骸 .partial を掃除するため、
+    // 検査もすべて cleanup 付きクロージャの内側で行う
+    let result = (|| {
+        let records = checked_psv_records(base)?;
+        ensure_safe_output_path(out_scores, base)?;
+        ensure_safe_output_path(&staging, base)?;
+        ensure_distinct_output_paths(out_scores, &staging)?;
+        let mut reader = BufReader::with_capacity(BUFFER_SIZE, File::open(base)?);
+        let mut writer = BufWriter::with_capacity(BUFFER_SIZE, File::create(&staging)?);
+        let mut base_chunk = Vec::with_capacity(chunk_records * RECORD_SIZE);
+        let mut score_chunk = Vec::with_capacity(chunk_records * 2);
+        let mut stats = DumpScoresStats::default();
+
+        while stats.records < records {
+            let current_records = (records - stats.records).min(chunk_records as u64) as usize;
+            read_bytes(&mut reader, &mut base_chunk, current_records * RECORD_SIZE)?;
+            score_chunk.clear();
+            score_chunk.reserve(current_records * 2);
+            for record in base_chunk.chunks_exact(RECORD_SIZE) {
+                score_chunk.extend_from_slice(&record[SCORE_OFFSET..SCORE_OFFSET + 2]);
+            }
+            writer.write_all(&score_chunk)?;
+            stats.records += current_records as u64;
+        }
+
+        writer.flush()?;
+        writer.into_inner()?.sync_all()?;
+        let expected = records * 2;
+        let actual = file_size(&staging)?;
+        anyhow::ensure!(
+            actual == expected,
+            "score output size mismatch: expected={expected}, actual={actual}"
+        );
+        publish_staged(&[(&staging, out_scores)])?;
+        Ok(stats)
+    })();
+    if result.is_err() {
+        // base が「<out>.partial」そのものだと staging == base になる — 入力を消さない
+        if ensure_safe_output_path(&staging, base).is_ok() {
+            remove_staging(&[staging]);
+        }
+    }
+    result
 }
 
 fn publish_staged(outputs: &[(&Path, &Path)]) -> Result<()> {
@@ -669,6 +740,10 @@ fn validate(path: &Path, config: ValidateConfig) -> Result<ValidationStats> {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::DumpScores { base, out_scores } => {
+            let stats = dump_scores(&base, &out_scores)?;
+            println!("records={}", stats.records);
+        }
         Command::Embed {
             base,
             scores,
@@ -804,6 +879,113 @@ mod tests {
             assert_eq!(fs::read(&extracted_scores)?, fs::read(&scores)?);
             assert_eq!(fs::read(&extracted_mask)?, fs::read(&mask)?);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn dump_embed_extract_scores_roundtrip() -> Result<()> {
+        let dir = tempdir()?;
+        let base = dir.path().join("plain.psv");
+        let dumped_scores = dir.path().join("dumped.i16");
+        let mask = dir.path().join("entered.bits");
+        let dual = dir.path().join("dual.psv");
+        let extracted_scores = dir.path().join("extracted.i16");
+        fs::write(&base, base_records(17, 0)?)?;
+        fs::write(&mask, sidecars(17, 0).1)?;
+
+        let stats = dump_scores(&base, &dumped_scores)?;
+        embed(&base, &dumped_scores, &mask, &dual)?;
+        extract(&dual, None, Some(&extracted_scores), None)?;
+
+        assert_eq!(stats.records, 17);
+        assert_eq!(fs::read(&extracted_scores)?, fs::read(&dumped_scores)?);
+        Ok(())
+    }
+
+    #[test]
+    fn dump_scores_handles_empty_single_and_chunk_boundary_inputs() -> Result<()> {
+        const TEST_CHUNK_RECORDS: usize = 3;
+        for count in [0, 1, TEST_CHUNK_RECORDS + 1] {
+            let dir = tempdir()?;
+            let base = dir.path().join("plain.psv");
+            let output = dir.path().join("scores.i16");
+            fs::write(&base, base_records(count, 0x5678)?)?;
+
+            let stats = dump_scores_with_chunk_records(&base, &output, TEST_CHUNK_RECORDS)?;
+
+            assert_eq!(stats.records, count as u64);
+            let actual = fs::read(output)?;
+            let expected: Vec<u8> =
+                (0..count).flat_map(|score| (score as i16).to_le_bytes()).collect();
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dump_scores_reads_score_column_little_endian_golden() -> Result<()> {
+        let dir = tempdir()?;
+        let base = dir.path().join("plain.psv");
+        let output = dir.path().join("scores.i16");
+        fs::write(&base, record("4k4/9/9/9/9/9/9/9/4K4 b - 1", 0x1234, 0x5678, 0)?)?;
+
+        dump_scores(&base, &output)?;
+
+        assert_eq!(fs::read(output)?, [0x34, 0x12]);
+        Ok(())
+    }
+
+    #[test]
+    fn dump_scores_rejects_trailing_bytes_without_output() -> Result<()> {
+        let dir = tempdir()?;
+        let base = dir.path().join("plain.psv");
+        let output = dir.path().join("scores.i16");
+        fs::write(&base, [0u8; RECORD_SIZE + 1])?;
+
+        assert!(dump_scores(&base, &output).is_err());
+        assert!(!output.exists());
+        assert!(!partial_path(&output).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn dump_scores_rejects_output_equal_to_base_without_truncating() -> Result<()> {
+        let dir = tempdir()?;
+        let base = dir.path().join("plain.psv");
+        fs::write(&base, base_records(1, 0)?)?;
+        let original = fs::read(&base)?;
+
+        assert!(dump_scores(&base, &base).is_err());
+        assert_eq!(fs::read(base)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn dump_scores_base_named_like_staging_is_rejected_without_deleting_input() -> Result<()> {
+        let dir = tempdir()?;
+        let out = dir.path().join("scores.i16");
+        let base = partial_path(&out);
+        let original = base_records(1, 0)?;
+        fs::write(&base, &original)?;
+
+        assert!(dump_scores(&base, &out).is_err());
+        assert_eq!(fs::read(&base)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn dump_scores_error_preserves_existing_output_and_removes_staging() -> Result<()> {
+        let dir = tempdir()?;
+        let base = dir.path().join("plain.psv");
+        let output = dir.path().join("scores.i16");
+        let sentinel = b"existing scores";
+        fs::write(&base, [0u8; RECORD_SIZE + 1])?;
+        fs::write(&output, sentinel)?;
+        fs::write(partial_path(&output), b"stale partial")?;
+
+        assert!(dump_scores(&base, &output).is_err());
+        assert_eq!(fs::read(&output)?, sentinel);
+        assert!(!partial_path(&output).exists());
         Ok(())
     }
 

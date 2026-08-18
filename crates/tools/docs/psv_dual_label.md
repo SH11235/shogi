@@ -1,7 +1,7 @@
 # psv_dual_label
 
-`psv_dual_label` は通常 PSV と行対応 sidecar から dual-label PSV を生成し、逆抽出と
-fail-closed 検証を行うツールです。dual-label PSV は dedup / shuffle で base score、
+`psv_dual_label` は通常 PSV の score sidecar への退避、行対応 sidecar からの
+dual-label PSV 生成、逆抽出、fail-closed 検証を行うツールです。dual-label PSV は dedup / shuffle で base score、
 DL score、entered gate bit を一つの 40 byte レコードとして原子的に運ぶための形式です。
 
 ## レコード形式
@@ -27,6 +27,21 @@ DL score、entered gate bit を一つの 40 byte レコードとして原子的�
 学習側 trainer が all 相当で読む場合は全レコードの DL score を使います。gated 相当では
 entered gate bit が 1 のレコードだけ base score を温存し、それ以外は DL score を使います。
 offset 34-35 は dual-label PSV では指し手ではないため、通常 PSV として読ませてはいけません。
+
+## dump-scores: 通常 PSV の score を退避する
+
+```bash
+cargo run -p tools --release --bin psv_dual_label -- dump-scores \
+  --base plain.psv \
+  --out-scores dl.i16
+```
+
+通常 PSV の各 40 byte レコードから score 列 (offset 32-33) を little-endian の 2 byte の
+まま入力順に転記します。出力サイズは `records × 2 byte` です。局面の decode は行いません。
+空の通常 PSV も受理し、空の sidecar を生成します。
+
+`extract --out-scores` は dual-label PSV の DL score 列 (offset 34-35、通常 PSV の move16
+列) を抽出する別の操作です。通常 PSV の score 列を退避するときは `dump-scores` を使います。
 
 ## embed: sidecar を埋め込む
 
@@ -94,7 +109,7 @@ cargo run -p tools --release --bin psv_dual_label -- validate \
 契約値と照合します。
 空 (0 レコード) の入力は embed / extract とも拒否します (validate が不正とする空の
 dual PSV を成功として publish しない)。
-`embed` / `extract` は同じディレクトリの `<出力>.partial` に書き、全検査・fsync・サイズ検算の
+`dump-scores` / `embed` / `extract` は同じディレクトリの `<出力>.partial` に書き、全検査・fsync・サイズ検算の
 成功後だけ最終パスへ publish し、publish 後に親ディレクトリを sync します (電源断でも
 publish 済み出力が空・切り詰め状態に巻き戻らない)。publish 前にエラーになった場合は既存の最終パスを変更せず、
 `.partial` を削除します。複数出力の publish 途中で後続の rename に失敗した場合、先に publish 済みの
