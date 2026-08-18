@@ -36,7 +36,7 @@
 | `relabel_psv` | PSV の score を game_result 由来値へ置換し、宣言勝ち override / diversion 整合性 deblunder / dry-run / verdict sidecar に対応（[詳細](docs/relabel_psv.md)） |
 | `rescore_psv` | 局面の再評価（探索スコア付与） |
 | `psv_gate_by_king_zone` | 入玉ドメインの score 合成 / mask bitmap 生成 |
-| `psv_dual_label` | dual-label PSV の生成・sidecar 抽出・fail-closed 検証（[詳細](docs/psv_dual_label.md)） |
+| `psv_dual_label` | 通常 PSV の score 退避、dual-label PSV の生成・sidecar 抽出・fail-closed 検証（[詳細](docs/psv_dual_label.md)） |
 | `psv_select_by_mask` | LSB-first bitmap mask の bit 1 に対応する PSV 行を入力順に抽出（[詳細](docs/psv_select_by_mask.md)） |
 | `psv_scatter_by_mask` | compact PSV の score を mask 対応で元 shard に書き戻す（[詳細](docs/psv_scatter_by_mask.md)） |
 | `rescore_hcpe` | hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（分散ラベリング・チャンク単位 + 途中 resume 対応） |
@@ -118,7 +118,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 - [nnue_saturation](docs/nnue_saturation.md) - LayerStacks NNUE の活性飽和率（u8 127 張り付き）を実局面で計測
 - [rescore_psv](docs/rescore_psv.md) - PSV 評価値の再スコアリング（推奨: dlshogi ONNX + TensorRT FP16。qsearch-leaf ラベル / policy 展開 / レジューム対応）
 - [psv_gate_by_king_zone](docs/psv_gate_by_king_zone.md) - 入玉ドメインの base/override score 合成と行対応 mask bitmap
-- [psv_dual_label](docs/psv_dual_label.md) - dual-label PSV の生成・sidecar 抽出・fail-closed 検証
+- [psv_dual_label](docs/psv_dual_label.md) - 通常 PSV の score 退避、dual-label PSV の生成・sidecar 抽出・fail-closed 検証
 - [psv_select_by_mask](docs/psv_select_by_mask.md) - bitmap mask の bit 1 に対応する PSV 行の順序保持抽出
 - [psv_scatter_by_mask](docs/psv_scatter_by_mask.md) - compact PSV の score を mask 対応で元 shard に書き戻し
 - [relabel_psv](docs/relabel_psv.md) - PSV score の勝敗ラベル置換、宣言勝ち override、diversion 整合性 deblunder
