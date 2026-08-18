@@ -32,6 +32,6 @@ records=1000000 selected=12345 (1.2345%)
 
 ## compact PSV の書き戻し対応
 
-再ラベル後の compact PSV を元の shard に対応付けるときは、`shard + mask + compact 列` を
-先頭から同時に walk します。mask の bit 1 ごとに compact 側を 1 行進め、その行を同じ shard
-行へ対応させます。抽出順は shard 内の行順から変わらないため、追加の行 ID や並べ替えは不要です。
+再ラベル後の compact PSV の score は
+[`psv_scatter_by_mask`](psv_scatter_by_mask.md) で元 shard の対応行へ書き戻せます。
+抽出時と同じ mask、および抽出順を変更していない compact PSV を指定してください。
