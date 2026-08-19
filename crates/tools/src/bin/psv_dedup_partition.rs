@@ -219,13 +219,13 @@ fn same_fs_output_headroom_bytes(estimate: &ResourceEstimate, keep_temp: bool) -
 fn output_disk_required_bytes(
     estimate: &ResourceEstimate,
     same_fs: bool,
-    skip_temp_check: bool,
+    phase1_skipped: bool,
     keep_temp: bool,
 ) -> u64 {
     if same_fs {
         let same_fs_headroom =
             (same_fs_output_headroom_bytes(estimate, keep_temp) as f64 * DISK_SAFETY_FACTOR) as u64;
-        if skip_temp_check {
+        if phase1_skipped {
             same_fs_headroom
         } else {
             ((estimate.phase1_temp_bytes as f64 * DISK_SAFETY_FACTOR) as u64)
@@ -244,7 +244,7 @@ fn preflight_check(
     estimate: &ResourceEstimate,
     temp_dir: &Path,
     output_path: Option<&Path>,
-    skip_temp_check: bool,
+    phase1_skipped: bool,
     keep_temp: bool,
     force: bool,
 ) -> io::Result<()> {
@@ -252,7 +252,7 @@ fn preflight_check(
         estimate,
         temp_dir,
         output_path,
-        skip_temp_check,
+        phase1_skipped,
         keep_temp,
         force,
         available_memory_bytes(),
@@ -263,7 +263,7 @@ fn preflight_check_with_available_memory(
     estimate: &ResourceEstimate,
     temp_dir: &Path,
     output_path: Option<&Path>,
-    skip_temp_check: bool,
+    phase1_skipped: bool,
     keep_temp: bool,
     force: bool,
     available_memory: Option<u64>,
@@ -273,7 +273,7 @@ fn preflight_check_with_available_memory(
         "Total input records:  {} ({} bytes / {})",
         estimate.total_records, estimate.phase1_temp_bytes, PSV_SIZE
     );
-    if !skip_temp_check {
+    if !phase1_skipped {
         eprintln!(
             "Phase 1 temp disk:    {} (cleaned up on success)",
             format_gib(estimate.phase1_temp_bytes),
@@ -289,7 +289,7 @@ fn preflight_check_with_available_memory(
         HASH_VARIANCE_FACTOR,
     );
 
-    let peak_mem = if skip_temp_check {
+    let peak_mem = if phase1_skipped {
         estimate.phase2_peak_memory_bytes
     } else {
         estimate.phase1_memory_bytes.max(estimate.phase2_peak_memory_bytes)
@@ -340,7 +340,7 @@ fn preflight_check_with_available_memory(
         }
     });
 
-    if !skip_temp_check {
+    if !phase1_skipped {
         let temp_required = (estimate.phase1_temp_bytes as f64 * DISK_SAFETY_FACTOR) as u64;
         if let Some(avail) = get_disk_available(temp_dir) {
             eprintln!("Temp disk available:  {} ({})", format_gib(avail), temp_dir.display());
@@ -385,9 +385,9 @@ fn preflight_check_with_available_memory(
                     }
                 );
                 let same_fs_required =
-                    output_disk_required_bytes(estimate, true, skip_temp_check, keep_temp);
+                    output_disk_required_bytes(estimate, true, phase1_skipped, keep_temp);
                 if same_fs_required > avail {
-                    let msg = if skip_temp_check {
+                    let msg = if phase1_skipped {
                         format!(
                             "出力ディスク不足: same filesystem 上で Phase 2 に追加 headroom {} 必要ですが \
                              {} しか空きがありません ({})。\n\
@@ -1051,7 +1051,7 @@ fn main() -> io::Result<()> {
             &estimate,
             &args.temp_dir,
             Some(output_path),
-            /* skip_temp_check = */ true,
+            /* phase1_skipped = */ true,
             args.keep_temp,
             args.force,
         )?;
@@ -1088,7 +1088,7 @@ fn main() -> io::Result<()> {
             &estimate,
             &args.temp_dir,
             Some(output_path),
-            /* skip_temp_check = */ false,
+            /* phase1_skipped = */ false,
             args.keep_temp,
             args.force,
         )?;
@@ -1300,7 +1300,7 @@ fn run_partition_only(
         &estimate,
         &args.temp_dir,
         /* output_path = */ None,
-        /* skip_temp_check = */ false,
+        /* phase1_skipped = */ false,
         keep_temp,
         args.force,
     )?;
@@ -1315,7 +1315,7 @@ fn run_partition_only(
     );
     eprintln!(
         "  partition buffer: {} KiB/partition (total ~{:.1} MiB)",
-        resolve_partition_buffer_kb(args.partition_buffer_kb, partitions),
+        partition_buffer_bytes / 1024,
         (partitions * partition_buffer_bytes) as f64 / (1024.0 * 1024.0),
     );
 
@@ -1429,27 +1429,27 @@ mod tests {
 
     #[test]
     fn partition_and_dedup_output_is_independent_of_buffer_size() {
-        let make_psv = |sfen_seed: u8, payload: u8| -> [u8; PSV_SIZE] {
+        let make_psv = |sfen_seed: u32, payload: u8| -> [u8; PSV_SIZE] {
             let mut buf = [payload; PSV_SIZE];
-            for (i, b) in buf[..SFEN_SIZE].iter_mut().enumerate() {
-                *b = sfen_seed.wrapping_add(i as u8);
+            buf[..4].copy_from_slice(&sfen_seed.to_le_bytes());
+            for (i, b) in buf[4..SFEN_SIZE].iter_mut().enumerate() {
+                *b = i as u8;
             }
             buf
         };
-        let records = [
-            make_psv(1, 10),
-            make_psv(2, 20),
-            make_psv(1, 11),
-            make_psv(3, 30),
-            make_psv(2, 21),
-            make_psv(4, 40),
-        ];
+        let mut records: Vec<_> = (0..2_000).map(|i| make_psv(i, (i % 251) as u8)).collect();
+        let small_buffer_bytes = 64 * 1024;
+        let first_record_after_flush = small_buffer_bytes / PSV_SIZE;
+        records[first_record_after_flush - 1] = make_psv(9_000, 0xa1);
+        records[first_record_after_flush] = make_psv(9_001, 0xb2);
+        records[first_record_after_flush + 1] = make_psv(9_000, 0xc3);
+        assert!(records.len() * PSV_SIZE > small_buffer_bytes);
         let workdir = TempDir::new().unwrap();
         let input = workdir.path().join("input.bin");
         {
             let mut file = File::create(&input).unwrap();
-            for record in records {
-                file.write_all(&record).unwrap();
+            for record in &records {
+                file.write_all(record).unwrap();
             }
         }
 
@@ -1457,14 +1457,14 @@ mod tests {
         let large_dir = workdir.path().join("large");
         let small_partitions = small_dir.join(INPUT_SUBDIR);
         let large_partitions = large_dir.join(INPUT_SUBDIR);
-        let num_partitions = 4;
+        let num_partitions = 1;
 
         partition_files_into(
             "input",
             std::slice::from_ref(&input),
             &small_partitions,
             num_partitions,
-            64 * 1024,
+            small_buffer_bytes,
             0,
             false,
             false,
