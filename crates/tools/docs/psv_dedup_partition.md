@@ -33,9 +33,9 @@
 
 `--shuffle-seed <u64>` を指定すると、Phase 2 で first-wins の unique 選別を終えた後、書き出し直前にパーティション内のレコード列を Fisher-Yates で shuffle する。勝者選択後に順序だけを変えるため、seed の有無によって残るレコードの集合は変わらない。full mode と `--dedup-only` で利用でき、Phase 2 を実行しない `--partition-only` との同時指定はエラーになる。
 
-乱数列は seed と partition index から SplitMix64 で状態を導出した xoshiro256++ で生成し、プラットフォームに依存しない。同じ入力順・partition 数・seed で同一環境から再実行すれば、同じ出力バイト列を再現する。
+乱数列は seed と partition index から SplitMix64 で状態を導出した xoshiro256++ で生成する。同じ順序の入力バイト列・partition 数・seed なら、プラットフォームをまたいで同じ出力バイト列を再現する。glob 展開や path ソートの結果が環境によって変わり、入力順が異なる場合はこの前提に含まれない。
 
-PackedSfen の FNV hash による擬似ランダムな bucket 割当、bucket 内の一様 shuffle、bucket 番号順の連結という構成は、`shuffle_psv` の chunked shuffle（ランダムな chunk 割当、chunk 内 shuffle、chunk 順連結）と同族の順列生成であり、学習用途には統計的に同等である。ただし bucket の作り方と乱数列が異なるため、`shuffle_psv` と同じ seed を指定しても出力はバイト互換にならない。
+PackedSfen の FNV hash による bucket 割当、bucket 内 shuffle、bucket 番号順の連結という、`shuffle_psv` の chunked shuffle と同様の二段構成（ランダム散布 + 区画内 shuffle + 連結）を取る。ただし fused shuffle は bucket 間を移動できないため順列分布は同一ではなく、学習用途への適合性は用途側で判断する必要がある。bucket の作り方と乱数列も異なるため、`shuffle_psv` と同じ seed を指定しても出力はバイト互換にならない。
 
 ### 一時ディレクトリ構造
 
@@ -57,7 +57,7 @@ PackedSfen の FNV hash による擬似ランダムな bucket 割当、bucket �
 Phase 2 の流れ (パーティションごと):
 
 1. `ref/partition_{i}.bin` を HashSet に全件ロード（出力しない）
-2. `input/partition_{i}.bin` を streaming し、HashSet に未登録なら出力 + 挿入
+2. `input/partition_{i}.bin` を streaming し、HashSet に未登録なら選別 + 挿入
 3. HashSet を解放して次パーティションへ
 
 これにより、既存ファイルと新規ファイルを結合してから dedup するよりも I/O が少なく、かつ reference 側の重複は出力に回らない。`psv_dedup_bloom --reference` の完全一致版に相当。
@@ -156,7 +156,7 @@ cargo run --release -p tools --bin psv_dedup_partition -- \
   --shuffle-seed 42
 ```
 
-同じ入力順・`--partitions`・seed で同一環境から再実行すると、出力は bit 単位で一致する。既存 temp から再開する場合も `--dedup-only --shuffle-seed 42` のように指定できる。
+既存 temp から再開する場合も `--dedup-only --shuffle-seed 42` のように指定できる。
 
 ### メモリをさらに絞る
 
@@ -277,4 +277,3 @@ cargo run --release -p tools --bin psv_dedup_partition -- \
 - 入力と出力が同一ファイルの場合はエラー
 - キーは PackedSfen のみ。同一局面に対する複数の教師手がある場合は `psv_dedup` と同様、最初の出現だけ残す
 - seed 未指定でもパーティション番号順に連結するため、入力全体の順序は保存されない（従来どおり）。`--shuffle-seed` 指定時はパーティション内の順序も shuffle される
-- fused shuffle は学習用途で `shuffle_psv` と統計的に同等だが、同じ seed でも出力バイト列は一致しない

@@ -847,7 +847,7 @@ fn deduplicate_partitions(
             }
         }
 
-        // --- Phase 2b: input partition を streaming し、未登録なら出力 ---
+        // --- Phase 2b: input partition を streaming し、未登録なら選別 ---
         let input_path = input_subdir.join(partition_filename(partition));
         if !input_path.exists() {
             return Err(io::Error::new(
@@ -1483,24 +1483,54 @@ mod tests {
         record
     }
 
-    fn run_dedup(records: &[[u8; PSV_SIZE]], shuffle_seed: Option<u64>) -> Vec<[u8; PSV_SIZE]> {
+    fn run_dedup_partitions(
+        input_partitions: &[Vec<[u8; PSV_SIZE]>],
+        reference_partitions: Option<&[Vec<[u8; PSV_SIZE]>]>,
+        shuffle_seed: Option<u64>,
+    ) -> Vec<[u8; PSV_SIZE]> {
         let dir = TempDir::new().unwrap();
         let input_dir = dir.path().join(INPUT_SUBDIR);
         std::fs::create_dir(&input_dir).unwrap();
-        let input_path = input_dir.join(partition_filename(0));
-        let mut input = File::create(input_path).unwrap();
-        for record in records {
-            input.write_all(record).unwrap();
+        for (partition, records) in input_partitions.iter().enumerate() {
+            let mut input = File::create(input_dir.join(partition_filename(partition))).unwrap();
+            for record in records {
+                input.write_all(record).unwrap();
+            }
         }
-        drop(input);
+
+        let reference_dir = reference_partitions.map(|partitions| {
+            assert_eq!(partitions.len(), input_partitions.len());
+            let reference_dir = dir.path().join(REF_SUBDIR);
+            std::fs::create_dir(&reference_dir).unwrap();
+            for (partition, records) in partitions.iter().enumerate() {
+                let mut reference =
+                    File::create(reference_dir.join(partition_filename(partition))).unwrap();
+                for record in records {
+                    reference.write_all(record).unwrap();
+                }
+            }
+            reference_dir
+        });
 
         let output_path = dir.path().join("output.bin");
-        deduplicate_partitions(&input_dir, None, 1, &output_path, true, shuffle_seed).unwrap();
+        deduplicate_partitions(
+            &input_dir,
+            reference_dir.as_deref(),
+            input_partitions.len(),
+            &output_path,
+            true,
+            shuffle_seed,
+        )
+        .unwrap();
         std::fs::read(output_path)
             .unwrap()
             .chunks_exact(PSV_SIZE)
             .map(|chunk| chunk.try_into().unwrap())
             .collect()
+    }
+
+    fn run_dedup(records: &[[u8; PSV_SIZE]], shuffle_seed: Option<u64>) -> Vec<[u8; PSV_SIZE]> {
+        run_dedup_partitions(&[records.to_vec()], None, shuffle_seed)
     }
 
     fn sorted(mut records: Vec<[u8; PSV_SIZE]>) -> Vec<[u8; PSV_SIZE]> {
@@ -1509,13 +1539,50 @@ mod tests {
     }
 
     #[test]
-    fn shuffle_same_seed_is_byte_deterministic() {
-        let input: Vec<_> = (0..32).map(|key| make_psv(key, key.wrapping_add(1))).collect();
+    fn shuffle_same_seed_is_byte_deterministic_across_partitions() {
+        let partitions: Vec<Vec<_>> = [0u8, 64]
+            .into_iter()
+            .map(|base| (0..32).map(|offset| make_psv(base + offset, offset)).collect())
+            .collect();
 
-        let first = run_dedup(&input, Some(42));
-        let second = run_dedup(&input, Some(42));
+        let first = run_dedup_partitions(&partitions, None, Some(42));
+        let second = run_dedup_partitions(&partitions, None, Some(42));
 
         assert_eq!(first, second);
+        let first_order: Vec<_> = first[..32].iter().map(|record| record[SFEN_SIZE]).collect();
+        let second_order: Vec<_> = first[32..].iter().map(|record| record[SFEN_SIZE]).collect();
+        assert_ne!(first_order, second_order);
+    }
+
+    #[test]
+    fn rng_golden_vectors_include_partition_index() {
+        let mut partition_0 = Xoshiro256PlusPlus::from_seed_and_partition(42, 0);
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|_| partition_0.next_u64()),
+            [
+                15_021_278_609_987_233_951,
+                5_881_210_131_331_364_753,
+                18_149_643_915_985_481_100,
+                12_933_668_939_759_105_464,
+            ]
+        );
+
+        let mut partition_1 = Xoshiro256PlusPlus::from_seed_and_partition(42, 1);
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|_| partition_1.next_u64()),
+            [
+                10_223_986_022_227_093_464,
+                15_122_917_447_189_544_937,
+                17_379_014_863_014_967_558,
+                1_955_285_833_234_038_687,
+            ]
+        );
+    }
+
+    #[test]
+    fn rng_index_one_is_zero() {
+        let mut rng = Xoshiro256PlusPlus::from_seed_and_partition(42, 0);
+        assert_eq!(rng.index(1), 0);
     }
 
     #[test]
@@ -1530,7 +1597,8 @@ mod tests {
     }
 
     #[test]
-    fn shuffle_does_not_change_first_wins_records() {
+    fn shuffle_preserves_first_wins_with_reference_and_input_duplicates() {
+        let reference = vec![vec![make_psv(1, 1)]];
         let input = vec![
             make_psv(1, 10),
             make_psv(2, 20),
@@ -1539,14 +1607,25 @@ mod tests {
             make_psv(2, 98),
         ];
 
-        let unshuffled = run_dedup(&input, None);
-        let shuffled = run_dedup(&input, Some(7));
+        let unshuffled = run_dedup_partitions(std::slice::from_ref(&input), Some(&reference), None);
+        let shuffled = run_dedup_partitions(&[input], Some(&reference), Some(7));
+        let expected = sorted(vec![make_psv(2, 20), make_psv(3, 30)]);
 
-        assert!(shuffled.contains(&make_psv(1, 10)));
-        assert!(shuffled.contains(&make_psv(2, 20)));
-        assert!(!shuffled.contains(&make_psv(1, 99)));
-        assert!(!shuffled.contains(&make_psv(2, 98)));
-        assert_eq!(sorted(unshuffled), sorted(shuffled));
+        assert!(!shuffled.iter().any(|record| record[..SFEN_SIZE] == [1; SFEN_SIZE]));
+        assert_eq!(sorted(unshuffled), expected);
+        assert_eq!(sorted(shuffled), expected);
+    }
+
+    #[test]
+    fn resource_estimate_adds_shuffle_buffer() {
+        let unshuffled = estimate_resources(400, 4_000, 4, 64 * 1024, false);
+        let shuffled = estimate_resources(400, 4_000, 4, 64 * 1024, true);
+
+        assert_eq!(shuffled.phase2_shuffle_buffer_bytes, 1_200);
+        assert_eq!(
+            shuffled.phase2_peak_memory_bytes,
+            unshuffled.phase2_peak_memory_bytes + shuffled.phase2_shuffle_buffer_bytes
+        );
     }
 
     #[test]
