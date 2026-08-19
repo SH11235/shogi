@@ -62,6 +62,9 @@ use tools::common::memory::available_memory_bytes;
 
 const INPUT_SUBDIR: &str = "input";
 const REF_SUBDIR: &str = "ref";
+const PARTITION_BUFFER_BUDGET_KB: usize = 1024 * 1024;
+const MIN_PARTITION_BUFFER_KB: usize = 64;
+const MAX_PARTITION_BUFFER_KB: usize = 16 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -95,14 +98,15 @@ struct Args {
     #[arg(long, default_value = "./psv_dedup_partition_tmp")]
     temp_dir: PathBuf,
 
-    /// パーティション数。多いほど Phase 2 の 1 パーティションあたりメモリが減るが
-    /// file descriptor と出力バッファの総量が増える。
+    /// パーティション数。多いほど Phase 2 の 1 パーティションあたりメモリが減るが、
+    /// file descriptor が増える。Phase 1 の自動バッファは合計約 1 GiB。
     #[arg(long, default_value = "1024")]
     partitions: usize,
 
-    /// Phase 1 でパーティションごとに確保する BufWriter のバッファサイズ (KiB)
-    #[arg(long, default_value = "64")]
-    partition_buffer_kb: usize,
+    /// Phase 1 でパーティションごとに確保する BufWriter のバッファサイズ (KiB)。
+    /// 省略時は合計 1 GiB を partitions で割り、64 KiB〜16 MiB に収める。
+    #[arg(long)]
+    partition_buffer_kb: Option<usize>,
 
     /// 処理する入力レコードの最大件数（0 = 全件、試走向け）。
     /// 参照ファイルは常に全件読み込まれる。
@@ -152,6 +156,13 @@ const DISK_SAFETY_FACTOR: f64 = 1.05;
 
 /// メモリ不足判定のしきい値（利用可能メモリの 80%）。
 const MEM_THRESHOLD_FACTOR: f64 = 0.8;
+
+fn resolve_partition_buffer_kb(requested_kb: Option<usize>, num_partitions: usize) -> usize {
+    requested_kb.unwrap_or_else(|| {
+        (PARTITION_BUFFER_BUDGET_KB / num_partitions)
+            .clamp(MIN_PARTITION_BUFFER_KB, MAX_PARTITION_BUFFER_KB)
+    })
+}
 
 struct ResourceEstimate {
     total_records: u64,
@@ -278,7 +289,11 @@ fn preflight_check_with_available_memory(
         HASH_VARIANCE_FACTOR,
     );
 
-    let peak_mem = estimate.phase1_memory_bytes.max(estimate.phase2_peak_memory_bytes);
+    let peak_mem = if skip_temp_check {
+        estimate.phase2_peak_memory_bytes
+    } else {
+        estimate.phase1_memory_bytes.max(estimate.phase2_peak_memory_bytes)
+    };
 
     // --- メモリチェック ---
     if let Some(avail) = available_memory {
@@ -896,7 +911,7 @@ fn main() -> io::Result<()> {
             "--partitions は 1 以上を指定してください",
         ));
     }
-    if args.partition_buffer_kb == 0 {
+    if args.partition_buffer_kb == Some(0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "--partition-buffer-kb は 1 以上を指定してください",
@@ -939,7 +954,9 @@ fn main() -> io::Result<()> {
         ));
     }
 
-    let partition_buffer_bytes = args.partition_buffer_kb * 1024;
+    let partition_buffer_kb =
+        resolve_partition_buffer_kb(args.partition_buffer_kb, args.partitions);
+    let partition_buffer_bytes = partition_buffer_kb * 1024;
     let input_subdir = args.temp_dir.join(INPUT_SUBDIR);
     let ref_subdir = args.temp_dir.join(REF_SUBDIR);
     // --partition-only では temp を消したら意味がない（次回起動で再利用するため）。
@@ -1079,7 +1096,7 @@ fn main() -> io::Result<()> {
         eprintln!("=== Phase 1: Partitioning ({partitions} partitions) ===");
         eprintln!(
             "  partition buffer: {} KiB/partition (total ~{:.1} MiB)",
-            args.partition_buffer_kb,
+            partition_buffer_kb,
             (partitions * partition_buffer_bytes) as f64 / (1024.0 * 1024.0),
         );
 
@@ -1298,7 +1315,7 @@ fn run_partition_only(
     );
     eprintln!(
         "  partition buffer: {} KiB/partition (total ~{:.1} MiB)",
-        args.partition_buffer_kb,
+        resolve_partition_buffer_kb(args.partition_buffer_kb, partitions),
         (partitions * partition_buffer_bytes) as f64 / (1024.0 * 1024.0),
     );
 
@@ -1385,10 +1402,10 @@ mod tests {
     }
 
     #[test]
-    fn dedup_only_preflight_succeeds_when_memory_is_available() {
+    fn dedup_only_preflight_ignores_phase1_buffer_memory() {
         let dir = TempDir::new().unwrap();
         let output = dir.path().join("output.bin");
-        let estimate = estimate_resources(0, 0, 1, 0);
+        let estimate = estimate_resources(0, 0, 1, 1 << 30);
 
         preflight_check_with_available_memory(
             &estimate,
@@ -1397,9 +1414,90 @@ mod tests {
             true,
             false,
             false,
-            Some(u64::MAX),
+            Some(1 << 30),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn partition_buffer_auto_size_uses_budget_and_clamps() {
+        assert_eq!(resolve_partition_buffer_kb(None, 1), 16 * 1024);
+        assert_eq!(resolve_partition_buffer_kb(None, 1024), 1024);
+        assert_eq!(resolve_partition_buffer_kb(None, 32 * 1024), 64);
+        assert_eq!(resolve_partition_buffer_kb(Some(8192), 1024), 8192);
+    }
+
+    #[test]
+    fn partition_and_dedup_output_is_independent_of_buffer_size() {
+        let make_psv = |sfen_seed: u8, payload: u8| -> [u8; PSV_SIZE] {
+            let mut buf = [payload; PSV_SIZE];
+            for (i, b) in buf[..SFEN_SIZE].iter_mut().enumerate() {
+                *b = sfen_seed.wrapping_add(i as u8);
+            }
+            buf
+        };
+        let records = [
+            make_psv(1, 10),
+            make_psv(2, 20),
+            make_psv(1, 11),
+            make_psv(3, 30),
+            make_psv(2, 21),
+            make_psv(4, 40),
+        ];
+        let workdir = TempDir::new().unwrap();
+        let input = workdir.path().join("input.bin");
+        {
+            let mut file = File::create(&input).unwrap();
+            for record in records {
+                file.write_all(&record).unwrap();
+            }
+        }
+
+        let small_dir = workdir.path().join("small");
+        let large_dir = workdir.path().join("large");
+        let small_partitions = small_dir.join(INPUT_SUBDIR);
+        let large_partitions = large_dir.join(INPUT_SUBDIR);
+        let num_partitions = 4;
+
+        partition_files_into(
+            "input",
+            std::slice::from_ref(&input),
+            &small_partitions,
+            num_partitions,
+            64 * 1024,
+            0,
+            false,
+            false,
+        )
+        .unwrap();
+        partition_files_into(
+            "input",
+            std::slice::from_ref(&input),
+            &large_partitions,
+            num_partitions,
+            8 * 1024 * 1024,
+            0,
+            false,
+            false,
+        )
+        .unwrap();
+
+        for partition in 0..num_partitions {
+            let small =
+                std::fs::read(small_partitions.join(partition_filename(partition))).unwrap();
+            let large =
+                std::fs::read(large_partitions.join(partition_filename(partition))).unwrap();
+            assert_eq!(small, large, "partition {partition} differs");
+        }
+
+        let small_output = small_dir.join("output.bin");
+        let large_output = large_dir.join("output.bin");
+        deduplicate_partitions(&small_partitions, None, num_partitions, &small_output, true)
+            .unwrap();
+        deduplicate_partitions(&large_partitions, None, num_partitions, &large_output, true)
+            .unwrap();
+
+        assert_eq!(std::fs::read(small_output).unwrap(), std::fs::read(large_output).unwrap());
     }
 
     #[test]

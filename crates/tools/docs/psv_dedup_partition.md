@@ -92,7 +92,7 @@ Phase 2 のピークメモリはおおよそ次の式で決まる:
 peak_memory ≈ (total_records / partitions) × entry_overhead
 ```
 
-`entry_overhead` は `HashSet<[u8; 32]>` で 1 エントリあたり 50〜70 B 程度（バケット + エントリ + load factor）。
+`entry_overhead` は `HashSet<[u8; 32]>` で 1 エントリあたり約 56 B と見積もる（バケット + エントリ + load factor）。
 
 ### 参考値（均等分布を仮定）
 
@@ -102,7 +102,25 @@ peak_memory ≈ (total_records / partitions) × entry_overhead
 | 100 億     | ~600 MiB      | ~150 MiB      |
 | 250 億     | ~1.5 GiB      | ~370 MiB      |
 
-Phase 1 の固定コストは `partitions × partition_buffer_kb`。デフォルト (`1024 × 64 KiB = 64 MiB`) で十分で、メモリが更に厳しい場合は `--partition-buffer-kb 16` 等に縮小できる。
+Phase 2 は 1 partition 分のユニーク局面を `HashSet` に載せるため、概算で
+`入力行数 / partitions × 約 56 B` が RAM に収まる partition 数を選ぶ。実際には
+ハッシュ分布の偏りと reference 分の余裕も見込むこと。
+
+### partition 数と Phase 1 buffer
+
+`--partition-buffer-kb` を省略すると、合計 1 GiB の予算を partition 数で割り、
+1 partition あたり 64 KiB〜16 MiB に clamp する。既定の 1024 partitions では
+1 MiB/partition、合計 1 GiB になる。明示指定した値はそのまま使われる。
+buffer は `BufWriter` の capacity だけを変え、partition ファイルや最終出力の
+バイト列には影響しない。
+
+HDD 上で temp を入力と同一ディスクに置く場合は、Phase 2 の概算メモリが収まる範囲で
+`--partitions` を減らし、partition ごとの buffer を厚くすると、分散 append の粒度を
+大きくできる。
+
+`--partitions` は dedup 出力の行順に影響する。出力は bucket 番号順に partition を
+連結するため、値を変えると同じユニーク集合でも行順が変わる。既存レシピの出力を
+bit 再現するには同じ値が必要であり、この互換性のため既定値は 1024 のまま維持する。
 
 ## 一時ディスク
 
@@ -226,7 +244,7 @@ cargo run --release -p tools --bin psv_dedup_partition -- \
 | `--output` | 出力ファイルパス | — |
 | `--temp-dir` | パーティション一時ファイルの置き場 | `./psv_dedup_partition_tmp` |
 | `--partitions` | パーティション数 | `1024` |
-| `--partition-buffer-kb` | 各パーティションの BufWriter バッファ (KiB) | `64` |
+| `--partition-buffer-kb` | 各パーティションの BufWriter バッファ (KiB)。省略時は合計 1 GiB 予算で自動算出 | 自動 (64 KiB〜16 MiB/partition) |
 | `--max-positions` | 処理する入力レコードの最大件数（0 = 全件、試走用）。参照は常に全件 | `0` |
 | `--dedup-only` | Phase 1 をスキップして既存一時ファイルから再開（ref/ は自動検出） | off |
 | `--partition-only` | Phase 2 をスキップして Phase 1 (振り分け) のみ実行（既存 partition には append） | off |
@@ -251,4 +269,4 @@ cargo run --release -p tools --bin psv_dedup_partition -- \
 
 - 入力と出力が同一ファイルの場合はエラー
 - キーは PackedSfen のみ。同一局面に対する複数の教師手がある場合は `psv_dedup` と同様、最初の出現だけ残す
-- パーティション出力の順序は保存されない（ハッシュ順）。順序を保ちたい場合は後段で `shuffle_psv` 等を使う
+- パーティション出力の順序は保存されない（bucket 番号順）。`--partitions` を変えると行順も変わるため、bit 再現には同じ値を使う
