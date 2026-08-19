@@ -33,7 +33,7 @@
 
 `--shuffle-seed <u64>` を指定すると、Phase 2 で first-wins の unique 選別を終えた後、書き出し直前にパーティション内のレコード列を Fisher-Yates で shuffle する。勝者選択後に順序だけを変えるため、seed の有無によって残るレコードの集合は変わらない。full mode と `--dedup-only` で利用でき、Phase 2 を実行しない `--partition-only` との同時指定はエラーになる。
 
-乱数列は seed と partition index から SplitMix64 で状態を導出した xoshiro256++ で生成する。同じ順序の入力バイト列・partition 数・seed なら、プラットフォームをまたいで同じ出力バイト列を再現する。glob 展開や path ソートの結果が環境によって変わり、入力順が異なる場合はこの前提に含まれない。
+乱数列は seed と partition index から SplitMix64 で状態を導出した xoshiro256++ で生成する。同じ実効入力 (入力バイト列とその順序・reference 内容・`--max-positions`)・partition 数・seed なら、プラットフォームをまたいで同じ出力バイト列を再現する。glob 展開や path ソートの結果が環境によって変わり、入力順が異なる場合はこの前提に含まれない。
 
 PackedSfen の FNV hash による bucket 割当、bucket 内 shuffle、bucket 番号順の連結という、`shuffle_psv` の chunked shuffle と同様の二段構成（ランダム散布 + 区画内 shuffle + 連結）を取る。ただし fused shuffle は bucket 間を移動できないため順列分布は同一ではなく、学習用途への適合性は用途側で判断する必要がある。bucket の作り方と乱数列も異なるため、`shuffle_psv` と同じ seed を指定しても出力はバイト互換にならない。
 

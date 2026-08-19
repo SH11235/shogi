@@ -618,7 +618,8 @@ fn partition_files_into(
 
                 let sfen: &[u8; SFEN_SIZE] = buf[..SFEN_SIZE].try_into().unwrap();
                 let h = hash_packed_sfen(sfen);
-                let partition = (h as usize) % num_partitions;
+                // 剰余は u64 上で取る (usize cast 先行だと 32-bit 環境で割当が変わる)
+                let partition = (h % num_partitions as u64) as usize;
                 writers[partition].write_all(&buf)?;
 
                 total_records += 1;
