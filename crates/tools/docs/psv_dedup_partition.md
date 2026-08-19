@@ -64,7 +64,7 @@ Phase 2 の流れ (パーティションごと):
 Total input records:  17000000000 (680000000000 bytes / 40)
 Phase 1 temp disk:    633.2 GiB (cleaned up on success)
 Phase 1 memory:       1.0 GiB (fixed: partitions × buffer)
-Phase 2 peak memory:  1.3 GiB (HashSet of largest partition, ~1.20x variance)
+Phase 2 peak memory:  1.0 GiB (HashSet of largest partition, ~1.20x variance)
 Memory available:     64.0 GiB (threshold 80% = 51.2 GiB)
 Temp disk available:  8.0 TiB (/fast/ssd/tmp)
 Output disk:          same filesystem as temp (/fast/ssd). 追加 headroom ...
