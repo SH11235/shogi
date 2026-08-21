@@ -11,7 +11,8 @@
 /// 2. **Phase 2 (deduplication)**: 各パーティションを 1 つずつ `HashSet<[u8;32]>`
 ///    にロードし、first-wins で出力ファイルへ追記する。参照パーティションが
 ///    あれば先に HashSet に入れ（出力はしない）、続けて入力パーティションを
-///    照合して新規局面だけ出力する。
+///    照合して新規局面だけ出力する。`--shuffle-seed` 指定時は、各パーティションの
+///    unique レコードを決定的に shuffle してから出力する。
 ///
 /// ピークメモリは「全ユニーク局面」ではなく「最大パーティションのユニーク局面」に
 /// 抑えられるため、`psv_dedup` では載らない規模でも exact dedup が可能。
@@ -139,6 +140,11 @@ struct Args {
     #[arg(long)]
     keep_temp: bool,
 
+    /// Phase 2 で first-wins の unique レコードをパーティション内 shuffle してから
+    /// 出力する seed。`--partition-only` とは併用不可。
+    #[arg(long)]
+    shuffle_seed: Option<u64>,
+
     /// メモリ/ディスクの事前見積りチェックをスキップして強制実行する。
     /// swap 多用・途中失敗のリスクを許容する場合のみ使う。
     #[arg(long)]
@@ -188,6 +194,7 @@ struct ResourceEstimate {
     phase2_peak_partition_input_bytes: u64,
     phase1_memory_bytes: u64,
     phase2_peak_memory_bytes: u64,
+    phase2_shuffle_buffer_bytes: u64,
 }
 
 fn estimate_resources(
@@ -195,13 +202,14 @@ fn estimate_resources(
     input_size_bytes: u64,
     num_partitions: usize,
     partition_buffer_bytes: usize,
+    shuffle: bool,
 ) -> ResourceEstimate {
     let total_bytes = ref_size_bytes + input_size_bytes;
     let total_records = total_bytes / PSV_SIZE as u64;
     let avg_records_per_partition = total_records as f64 / num_partitions.max(1) as f64;
     let peak_records_per_partition =
         (avg_records_per_partition * HASH_VARIANCE_FACTOR).ceil() as u64;
-    let phase2_peak_mem = peak_records_per_partition.saturating_mul(HASHSET_ENTRY_BYTES);
+    let phase2_hashset_mem = peak_records_per_partition.saturating_mul(HASHSET_ENTRY_BYTES);
     let phase1_mem = (num_partitions as u64).saturating_mul(partition_buffer_bytes as u64);
     let input_records = input_size_bytes / PSV_SIZE as u64;
     let avg_input_records_per_partition = input_records as f64 / num_partitions.max(1) as f64;
@@ -209,6 +217,12 @@ fn estimate_resources(
         (avg_input_records_per_partition * HASH_VARIANCE_FACTOR).ceil() as u64;
     let phase2_peak_partition_input_bytes =
         peak_input_records_per_partition.saturating_mul(PSV_SIZE as u64);
+    let phase2_shuffle_buffer_bytes = if shuffle {
+        phase2_peak_partition_input_bytes
+    } else {
+        0
+    };
+    let phase2_peak_mem = phase2_hashset_mem.saturating_add(phase2_shuffle_buffer_bytes);
 
     ResourceEstimate {
         total_records,
@@ -217,6 +231,7 @@ fn estimate_resources(
         phase2_peak_partition_input_bytes,
         phase1_memory_bytes: phase1_mem,
         phase2_peak_memory_bytes: phase2_peak_mem,
+        phase2_shuffle_buffer_bytes,
     }
 }
 
@@ -296,11 +311,20 @@ fn preflight_check_with_available_memory(
             format_gib(estimate.phase1_memory_bytes),
         );
     }
-    eprintln!(
-        "Phase 2 peak memory:  {} (HashSet of largest partition, ~{:.2}x variance)",
-        format_gib(estimate.phase2_peak_memory_bytes),
-        HASH_VARIANCE_FACTOR,
-    );
+    if estimate.phase2_shuffle_buffer_bytes == 0 {
+        eprintln!(
+            "Phase 2 peak memory:  {} (HashSet of largest partition, ~{:.2}x variance)",
+            format_gib(estimate.phase2_peak_memory_bytes),
+            HASH_VARIANCE_FACTOR,
+        );
+    } else {
+        eprintln!(
+            "Phase 2 peak memory:  {} (HashSet + shuffle buffer {}, ~{:.2}x variance)",
+            format_gib(estimate.phase2_peak_memory_bytes),
+            format_gib(estimate.phase2_shuffle_buffer_bytes),
+            HASH_VARIANCE_FACTOR,
+        );
+    }
 
     let peak_mem = if phase1_skipped {
         estimate.phase2_peak_memory_bytes
@@ -623,7 +647,8 @@ fn partition_files_into(
 
                 let sfen: &[u8; SFEN_SIZE] = buf[..SFEN_SIZE].try_into().unwrap();
                 let h = hash_packed_sfen(sfen);
-                let partition = (h as usize) % num_partitions;
+                // 剰余は u64 上で取る (usize cast 先行だと 32-bit 環境で割当が変わる)
+                let partition = (h % num_partitions as u64) as usize;
                 writers[partition].write_all(&buf)?;
 
                 total_records += 1;
@@ -744,6 +769,60 @@ fn read_partition_records(
     Ok(count)
 }
 
+struct Xoshiro256PlusPlus {
+    state: [u64; 4],
+}
+
+impl Xoshiro256PlusPlus {
+    fn from_seed_and_partition(seed: u64, partition: usize) -> Self {
+        let mut splitmix_state = seed ^ (partition as u64).wrapping_mul(0xd2b7_4407_b1ce_6e93);
+        let mut state = [0u64; 4];
+        for value in &mut state {
+            splitmix_state = splitmix_state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = splitmix_state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            *value = z ^ (z >> 31);
+        }
+        Self { state }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let result = self.state[0]
+            .wrapping_add(self.state[3])
+            .rotate_left(23)
+            .wrapping_add(self.state[0]);
+        let t = self.state[1] << 17;
+
+        self.state[2] ^= self.state[0];
+        self.state[3] ^= self.state[1];
+        self.state[1] ^= self.state[2];
+        self.state[0] ^= self.state[3];
+        self.state[2] ^= t;
+        self.state[3] = self.state[3].rotate_left(45);
+
+        result
+    }
+
+    fn index(&mut self, upper_exclusive: u64) -> usize {
+        let threshold = upper_exclusive.wrapping_neg() % upper_exclusive;
+        loop {
+            let value = self.next_u64();
+            if value >= threshold {
+                return (value % upper_exclusive) as usize;
+            }
+        }
+    }
+}
+
+fn shuffle_records(records: &mut [[u8; PSV_SIZE]], seed: u64, partition: usize) {
+    let mut rng = Xoshiro256PlusPlus::from_seed_and_partition(seed, partition);
+    for i in (1..records.len()).rev() {
+        let j = rng.index((i + 1) as u64);
+        records.swap(i, j);
+    }
+}
+
 /// Phase 2: 各パーティションを HashSet で exact dedup し、出力に追記する。
 ///
 /// `ref_subdir` が `Some` ならパーティション先頭で reference を HashSet に
@@ -756,6 +835,7 @@ fn deduplicate_partitions(
     num_partitions: usize,
     output_path: &Path,
     keep_temp: bool,
+    shuffle_seed: Option<u64>,
 ) -> io::Result<(u64, u64, u64)> {
     if let Some(parent) = output_path.parent()
         && !parent.as_os_str().is_empty()
@@ -797,7 +877,7 @@ fn deduplicate_partitions(
             }
         }
 
-        // --- Phase 2b: input partition を streaming し、未登録なら出力 ---
+        // --- Phase 2b: input partition を streaming し、未登録なら選別 ---
         let input_path = input_subdir.join(partition_filename(partition));
         if !input_path.exists() {
             return Err(io::Error::new(
@@ -810,13 +890,30 @@ fn deduplicate_partitions(
         }
 
         let mut unique_in_partition = 0u64;
+        let input_capacity = if shuffle_seed.is_some() {
+            (input_path.metadata()?.len() / PSV_SIZE as u64) as usize
+        } else {
+            0
+        };
+        let mut unique_records = shuffle_seed.map(|_| Vec::with_capacity(input_capacity));
         let input_records = read_partition_records(&input_path, |rec, sfen| {
             if seen.insert(*sfen) {
-                writer.write_all(rec)?;
+                if let Some(records) = &mut unique_records {
+                    records.push(*rec);
+                } else {
+                    writer.write_all(rec)?;
+                }
                 unique_in_partition += 1;
             }
             Ok(())
         })?;
+
+        if let (Some(seed), Some(records)) = (shuffle_seed, &mut unique_records) {
+            shuffle_records(records, seed, partition);
+            for record in records {
+                writer.write_all(record)?;
+            }
+        }
 
         total_seen += input_records;
         total_unique += unique_in_partition;
@@ -916,9 +1013,7 @@ fn has_any_partition_file(dir: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-fn main() -> io::Result<()> {
-    let args = Args::parse();
-
+fn validate_args(args: &Args) -> io::Result<()> {
     if args.partitions == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -935,6 +1030,12 @@ fn main() -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "--partition-only と --dedup-only は同時に指定できません",
+        ));
+    }
+    if args.partition_only && args.shuffle_seed.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--shuffle-seed は Phase 2 の機能のため --partition-only とは併用できません",
         ));
     }
     if !args.partition_only && args.output.is_none() {
@@ -967,6 +1068,13 @@ fn main() -> io::Result<()> {
             "--delete-input-on-success と --max-positions は併用できません（入力を途中までしか読まないため）",
         ));
     }
+
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    let args = Args::parse();
+    validate_args(&args)?;
 
     let available_memory = available_memory_bytes();
     let partition_buffer_kb =
@@ -1062,6 +1170,7 @@ fn main() -> io::Result<()> {
             existing_input_bytes,
             partitions,
             partition_buffer_bytes,
+            args.shuffle_seed.is_some(),
         );
         preflight_check(
             &estimate,
@@ -1099,8 +1208,13 @@ fn main() -> io::Result<()> {
         } else {
             input_size
         };
-        let estimate =
-            estimate_resources(ref_size, capped_input_size, partitions, partition_buffer_bytes);
+        let estimate = estimate_resources(
+            ref_size,
+            capped_input_size,
+            partitions,
+            partition_buffer_bytes,
+            args.shuffle_seed.is_some(),
+        );
         preflight_check(
             &estimate,
             &args.temp_dir,
@@ -1173,6 +1287,7 @@ fn main() -> io::Result<()> {
         partitions,
         output_path,
         args.keep_temp,
+        args.shuffle_seed,
     )?;
 
     if !args.keep_temp {
@@ -1314,7 +1429,7 @@ fn run_partition_only(
         input_size
     };
     let estimate =
-        estimate_resources(ref_size, capped_input_size, partitions, partition_buffer_bytes);
+        estimate_resources(ref_size, capped_input_size, partitions, partition_buffer_bytes, false);
     preflight_check(
         &estimate,
         &args.temp_dir,
@@ -1399,23 +1514,190 @@ mod tests {
     use std::io::Cursor;
     use tempfile::TempDir;
 
+    fn make_psv(key: u8, payload: u8) -> [u8; PSV_SIZE] {
+        let mut record = [0u8; PSV_SIZE];
+        record[..SFEN_SIZE].fill(key);
+        record[SFEN_SIZE..].fill(payload);
+        record
+    }
+
+    fn run_dedup_partitions(
+        input_partitions: &[Vec<[u8; PSV_SIZE]>],
+        reference_partitions: Option<&[Vec<[u8; PSV_SIZE]>]>,
+        shuffle_seed: Option<u64>,
+    ) -> Vec<[u8; PSV_SIZE]> {
+        let dir = TempDir::new().unwrap();
+        let input_dir = dir.path().join(INPUT_SUBDIR);
+        std::fs::create_dir(&input_dir).unwrap();
+        for (partition, records) in input_partitions.iter().enumerate() {
+            let mut input = File::create(input_dir.join(partition_filename(partition))).unwrap();
+            for record in records {
+                input.write_all(record).unwrap();
+            }
+        }
+
+        let reference_dir = reference_partitions.map(|partitions| {
+            assert_eq!(partitions.len(), input_partitions.len());
+            let reference_dir = dir.path().join(REF_SUBDIR);
+            std::fs::create_dir(&reference_dir).unwrap();
+            for (partition, records) in partitions.iter().enumerate() {
+                let mut reference =
+                    File::create(reference_dir.join(partition_filename(partition))).unwrap();
+                for record in records {
+                    reference.write_all(record).unwrap();
+                }
+            }
+            reference_dir
+        });
+
+        let output_path = dir.path().join("output.bin");
+        deduplicate_partitions(
+            &input_dir,
+            reference_dir.as_deref(),
+            input_partitions.len(),
+            &output_path,
+            true,
+            shuffle_seed,
+        )
+        .unwrap();
+        std::fs::read(output_path)
+            .unwrap()
+            .chunks_exact(PSV_SIZE)
+            .map(|chunk| chunk.try_into().unwrap())
+            .collect()
+    }
+
+    fn run_dedup(records: &[[u8; PSV_SIZE]], shuffle_seed: Option<u64>) -> Vec<[u8; PSV_SIZE]> {
+        run_dedup_partitions(&[records.to_vec()], None, shuffle_seed)
+    }
+
+    fn sorted(mut records: Vec<[u8; PSV_SIZE]>) -> Vec<[u8; PSV_SIZE]> {
+        records.sort_unstable();
+        records
+    }
+
+    #[test]
+    fn shuffle_same_seed_is_byte_deterministic_across_partitions() {
+        let partitions: Vec<Vec<_>> = [0u8, 64]
+            .into_iter()
+            .map(|base| (0..32).map(|offset| make_psv(base + offset, offset)).collect())
+            .collect();
+
+        let first = run_dedup_partitions(&partitions, None, Some(42));
+        let second = run_dedup_partitions(&partitions, None, Some(42));
+
+        assert_eq!(first, second);
+        let first_order: Vec<_> = first[..32].iter().map(|record| record[SFEN_SIZE]).collect();
+        let second_order: Vec<_> = first[32..].iter().map(|record| record[SFEN_SIZE]).collect();
+        assert_ne!(first_order, second_order);
+    }
+
+    #[test]
+    fn rng_golden_vectors_include_partition_index() {
+        let mut partition_0 = Xoshiro256PlusPlus::from_seed_and_partition(42, 0);
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|_| partition_0.next_u64()),
+            [
+                15_021_278_609_987_233_951,
+                5_881_210_131_331_364_753,
+                18_149_643_915_985_481_100,
+                12_933_668_939_759_105_464,
+            ]
+        );
+
+        let mut partition_1 = Xoshiro256PlusPlus::from_seed_and_partition(42, 1);
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|_| partition_1.next_u64()),
+            [
+                10_223_986_022_227_093_464,
+                15_122_917_447_189_544_937,
+                17_379_014_863_014_967_558,
+                1_955_285_833_234_038_687,
+            ]
+        );
+    }
+
+    #[test]
+    fn rng_index_one_is_zero() {
+        let mut rng = Xoshiro256PlusPlus::from_seed_and_partition(42, 0);
+        assert_eq!(rng.index(1), 0);
+    }
+
+    #[test]
+    fn shuffle_different_seeds_change_order_but_not_multiset() {
+        let input: Vec<_> = (0..32).map(|key| make_psv(key, key.wrapping_add(1))).collect();
+
+        let first = run_dedup(&input, Some(1));
+        let second = run_dedup(&input, Some(2));
+
+        assert_ne!(first, second);
+        assert_eq!(sorted(first), sorted(second));
+    }
+
+    #[test]
+    fn shuffle_preserves_first_wins_with_reference_and_input_duplicates() {
+        let reference = vec![vec![make_psv(1, 1)]];
+        let input = vec![
+            make_psv(1, 10),
+            make_psv(2, 20),
+            make_psv(1, 99),
+            make_psv(3, 30),
+            make_psv(2, 98),
+        ];
+
+        let unshuffled = run_dedup_partitions(std::slice::from_ref(&input), Some(&reference), None);
+        let shuffled = run_dedup_partitions(&[input], Some(&reference), Some(7));
+        let expected = sorted(vec![make_psv(2, 20), make_psv(3, 30)]);
+
+        assert!(!shuffled.iter().any(|record| record[..SFEN_SIZE] == [1; SFEN_SIZE]));
+        assert_eq!(sorted(unshuffled), expected);
+        assert_eq!(sorted(shuffled), expected);
+    }
+
+    #[test]
+    fn resource_estimate_adds_shuffle_buffer() {
+        let unshuffled = estimate_resources(400, 4_000, 4, 64 * 1024, false);
+        let shuffled = estimate_resources(400, 4_000, 4, 64 * 1024, true);
+
+        assert_eq!(shuffled.phase2_shuffle_buffer_bytes, 1_200);
+        assert_eq!(
+            shuffled.phase2_peak_memory_bytes,
+            unshuffled.phase2_peak_memory_bytes + shuffled.phase2_shuffle_buffer_bytes
+        );
+    }
+
+    #[test]
+    fn partition_only_rejects_shuffle_seed() {
+        let args = Args::try_parse_from([
+            "psv_dedup_partition",
+            "--partition-only",
+            "--shuffle-seed",
+            "42",
+        ])
+        .unwrap();
+
+        let err = validate_args(&args).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--partition-only"));
+    }
+
     #[test]
     fn same_fs_headroom_without_keep_temp_is_peak_partition_only() {
-        let estimate = estimate_resources(400, 4_000, 4, 64 * 1024);
+        let estimate = estimate_resources(400, 4_000, 4, 64 * 1024, false);
 
         assert_eq!(same_fs_output_headroom_bytes(&estimate, false), 1_200);
     }
 
     #[test]
     fn same_fs_headroom_with_keep_temp_is_full_output() {
-        let estimate = estimate_resources(400, 4_000, 4, 64 * 1024);
+        let estimate = estimate_resources(400, 4_000, 4, 64 * 1024, false);
 
         assert_eq!(same_fs_output_headroom_bytes(&estimate, true), 4_000);
     }
 
     #[test]
     fn dedup_only_same_fs_uses_headroom_not_full_output() {
-        let estimate = estimate_resources(400, 4_000, 4, 64 * 1024);
+        let estimate = estimate_resources(400, 4_000, 4, 64 * 1024, false);
 
         assert_eq!(output_disk_required_bytes(&estimate, true, true, false), 1_260);
         assert_eq!(output_disk_required_bytes(&estimate, false, true, false), 4_200);
@@ -1425,7 +1707,7 @@ mod tests {
     fn dedup_only_preflight_ignores_phase1_buffer_memory() {
         let dir = TempDir::new().unwrap();
         let output = dir.path().join("output.bin");
-        let estimate = estimate_resources(0, 0, 1, 1 << 30);
+        let estimate = estimate_resources(0, 0, 1, 1 << 30, false);
 
         preflight_check_with_available_memory(
             &estimate,
@@ -1455,7 +1737,7 @@ mod tests {
         let available_memory = 1 << 30;
         let partitions = 1024;
         let buffer_kb = resolve_partition_buffer_kb(None, partitions, Some(available_memory));
-        let estimate = estimate_resources(0, PSV_SIZE as u64, partitions, buffer_kb * 1024);
+        let estimate = estimate_resources(0, PSV_SIZE as u64, partitions, buffer_kb * 1024, false);
 
         preflight_check_with_available_memory(
             &estimate,
@@ -1535,9 +1817,9 @@ mod tests {
 
         let small_output = small_dir.join("output.bin");
         let large_output = large_dir.join("output.bin");
-        deduplicate_partitions(&small_partitions, None, num_partitions, &small_output, true)
+        deduplicate_partitions(&small_partitions, None, num_partitions, &small_output, true, None)
             .unwrap();
-        deduplicate_partitions(&large_partitions, None, num_partitions, &large_output, true)
+        deduplicate_partitions(&large_partitions, None, num_partitions, &large_output, true, None)
             .unwrap();
 
         assert_eq!(std::fs::read(small_output).unwrap(), std::fs::read(large_output).unwrap());

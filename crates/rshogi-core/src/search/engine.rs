@@ -2284,6 +2284,10 @@ mod tests {
 
     #[test]
     fn test_search_basic() {
+        // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
+        let guard = crate::eval::material::test_support::lock_material();
+        crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+
         // スタックサイズを増やした別スレッドで実行
         std::thread::Builder::new()
             .stack_size(STACK_SIZE)
@@ -2305,10 +2309,16 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+
+        drop(guard);
     }
 
     #[test]
     fn test_search_with_callback() {
+        // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
+        let guard = crate::eval::material::test_support::lock_material();
+        crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+
         // スタックサイズを増やした別スレッドで実行
         std::thread::Builder::new()
             .stack_size(STACK_SIZE)
@@ -2337,10 +2347,16 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+
+        drop(guard);
     }
 
     #[test]
     fn test_search_with_callback_last_info_matches_best_move() {
+        // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
+        let guard = crate::eval::material::test_support::lock_material();
+        crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+
         // スタックサイズを増やした別スレッドで実行
         std::thread::Builder::new()
             .stack_size(STACK_SIZE)
@@ -2374,6 +2390,8 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+
+        drop(guard);
     }
 
     #[test]

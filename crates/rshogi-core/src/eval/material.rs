@@ -644,6 +644,49 @@ pub fn evaluate_material(pos: &Position) -> Value {
     }
 }
 
+/// テスト専用: eval グローバル状態 (MATERIAL_LEVEL / MATERIAL_ENABLED /
+/// PASS_RIGHT_VALUE_EARLY / PASS_RIGHT_VALUE_LATE) を触るテストの直列化と状態復元
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// eval グローバルを変更するテストを直列化するロック
+    static EVAL_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
+
+    /// ロック取得時点の material グローバル状態を Drop で復元する guard
+    pub(crate) struct MaterialGuard {
+        _lock: MutexGuard<'static, ()>,
+        level: u8,
+        enabled: bool,
+        pass_right_early: i32,
+        pass_right_late: i32,
+    }
+
+    /// ロックを取得し、現在の material グローバル状態を snapshot する
+    ///
+    /// panic したテストが持っていた poison は無視してよい (Drop で状態復元済みのため)。
+    pub(crate) fn lock_material() -> MaterialGuard {
+        let lock = EVAL_GLOBAL_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        MaterialGuard {
+            _lock: lock,
+            level: MATERIAL_LEVEL.load(Ordering::Relaxed),
+            enabled: MATERIAL_ENABLED.load(Ordering::Relaxed),
+            pass_right_early: PASS_RIGHT_VALUE_EARLY.load(Ordering::Relaxed),
+            pass_right_late: PASS_RIGHT_VALUE_LATE.load(Ordering::Relaxed),
+        }
+    }
+
+    impl Drop for MaterialGuard {
+        fn drop(&mut self) {
+            MATERIAL_LEVEL.store(self.level, Ordering::Relaxed);
+            MATERIAL_ENABLED.store(self.enabled, Ordering::Relaxed);
+            PASS_RIGHT_VALUE_EARLY.store(self.pass_right_early, Ordering::Relaxed);
+            PASS_RIGHT_VALUE_LATE.store(self.pass_right_late, Ordering::Relaxed);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,6 +694,8 @@ mod tests {
 
     #[test]
     fn test_material_eval_hirate() {
+        let guard = test_support::lock_material();
+
         let mut pos = Position::new();
         pos.set_sfen(SFEN_HIRATE).unwrap();
 
@@ -658,6 +703,8 @@ mod tests {
 
         // 初期局面はほぼ互角（MaterialLvにより0から僅かにずれる場合がある）
         assert!(value.raw().abs() < 200);
+
+        drop(guard);
     }
 
     #[test]
@@ -690,8 +737,7 @@ mod tests {
 
     #[test]
     fn test_get_set_material_level() {
-        let original = get_material_level();
-        let original_enabled = is_material_enabled();
+        let guard = test_support::lock_material();
 
         set_material_level(MaterialLevel::Lv1);
         assert_eq!(get_material_level(), MaterialLevel::Lv1);
@@ -704,9 +750,7 @@ mod tests {
         disable_material();
         assert!(!is_material_enabled());
 
-        if original_enabled {
-            set_material_level(original);
-        }
+        drop(guard);
     }
 
     // =========================================================================
@@ -768,10 +812,7 @@ mod tests {
     fn test_pass_right_value_global_and_evaluation() {
         use crate::types::Color;
 
-        // 設定を保存
-        let orig_early = PASS_RIGHT_VALUE_EARLY.load(std::sync::atomic::Ordering::Relaxed);
-        let orig_late = PASS_RIGHT_VALUE_LATE.load(std::sync::atomic::Ordering::Relaxed);
-        let orig_level = get_material_level();
+        let guard = test_support::lock_material();
 
         // --- Part 1: set_pass_right_value_phased のテスト ---
         set_pass_right_value_phased(50, 200);
@@ -825,8 +866,6 @@ mod tests {
             "Negamax combined score should be negative: got {negamax_combined}"
         );
 
-        // 設定を復元
-        set_pass_right_value_phased(orig_early, orig_late);
-        set_material_level(orig_level);
+        drop(guard);
     }
 }

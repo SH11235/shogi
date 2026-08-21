@@ -48,7 +48,7 @@
 | `migrate_psv_move16` | 旧リポジトリ形式 (B) の PSV move16 を実 YaneuraOu 形式 (A) へ移行（[詳細](docs/migrate_psv_move16.md)） |
 | `pack_to_psv` | GenSfen .pack → PSV 変換（move16 は実着手ラベルの実 YaneuraOu 形式） |
 | `fix_scores` | スコアの補正 |
-| `psv_dedup` / `psv_dedup_bloom` / `psv_dedup_partition` | PSV 局面の重複除去（3 方式。partition 方式は Phase 1 buffer 自動調整対応。使い分けは [pack_tools.md](docs/pack_tools.md#重複除去ツールの選び方)） |
+| `psv_dedup` / `psv_dedup_bloom` / `psv_dedup_partition` | PSV 局面の重複除去（3 方式。partition 方式は Phase 1 buffer 自動調整・fused shuffle 対応。使い分けは [pack_tools.md](docs/pack_tools.md#重複除去ツールの選び方)） |
 | `prep_hcpe` | hcpe 教師プールの汚染除去・重複除去・決定的 shuffle・分割（[詳細](docs/prep_hcpe.md)） |
 | `hcpe_to_psv` | hcpe → PSV 変換（Linux/macOS・Windows対応、hardlinkを含む入力と出力の同一実体を拒否。外部公開 hcpe プールの学習/検証投入用、[詳細](docs/hcpe_to_psv.md)） |
 
