@@ -65,6 +65,7 @@ const REF_SUBDIR: &str = "ref";
 const PARTITION_BUFFER_BUDGET_KB: usize = 1024 * 1024;
 const MIN_PARTITION_BUFFER_KB: usize = 64;
 const MAX_PARTITION_BUFFER_KB: usize = 16 * 1024;
+const AUTO_BUFFER_AVAILABLE_MEMORY_DIVISOR: u64 = 2;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -99,12 +100,13 @@ struct Args {
     temp_dir: PathBuf,
 
     /// パーティション数。多いほど Phase 2 の 1 パーティションあたりメモリが減るが、
-    /// file descriptor が増える。Phase 1 の自動バッファは合計約 1 GiB。
+    /// file descriptor が増える。Phase 1 の自動バッファは合計最大 1 GiB。
     #[arg(long, default_value = "1024")]
     partitions: usize,
 
     /// Phase 1 でパーティションごとに確保する BufWriter のバッファサイズ (KiB)。
-    /// 省略時は合計 1 GiB を partitions で割り、64 KiB〜16 MiB に収める。
+    /// 省略時は合計最大 1 GiB（利用可能メモリの 50% 以下）を partitions で割り、
+    /// 64 KiB〜16 MiB に収める。既定の 1024 partitions では合計 64 MiB が下限。
     #[arg(long)]
     partition_buffer_kb: Option<usize>,
 
@@ -157,10 +159,20 @@ const DISK_SAFETY_FACTOR: f64 = 1.05;
 /// メモリ不足判定のしきい値（利用可能メモリの 80%）。
 const MEM_THRESHOLD_FACTOR: f64 = 0.8;
 
-fn resolve_partition_buffer_kb(requested_kb: Option<usize>, num_partitions: usize) -> usize {
+fn resolve_partition_buffer_kb(
+    requested_kb: Option<usize>,
+    num_partitions: usize,
+    available_memory: Option<u64>,
+) -> usize {
     requested_kb.unwrap_or_else(|| {
-        (PARTITION_BUFFER_BUDGET_KB / num_partitions)
-            .clamp(MIN_PARTITION_BUFFER_KB, MAX_PARTITION_BUFFER_KB)
+        let memory_budget_kb = available_memory
+            .map(|bytes| {
+                usize::try_from(bytes / AUTO_BUFFER_AVAILABLE_MEMORY_DIVISOR / 1024)
+                    .unwrap_or(usize::MAX)
+            })
+            .unwrap_or(PARTITION_BUFFER_BUDGET_KB);
+        let budget_kb = PARTITION_BUFFER_BUDGET_KB.min(memory_budget_kb);
+        (budget_kb / num_partitions).clamp(MIN_PARTITION_BUFFER_KB, MAX_PARTITION_BUFFER_KB)
     })
 }
 
@@ -247,6 +259,7 @@ fn preflight_check(
     phase1_skipped: bool,
     keep_temp: bool,
     force: bool,
+    available_memory: Option<u64>,
 ) -> io::Result<()> {
     preflight_check_with_available_memory(
         estimate,
@@ -255,7 +268,7 @@ fn preflight_check(
         phase1_skipped,
         keep_temp,
         force,
-        available_memory_bytes(),
+        available_memory,
     )
 }
 
@@ -308,7 +321,8 @@ fn preflight_check_with_available_memory(
             let msg = format!(
                 "メモリ不足: 推定ピーク {} が threshold {} を超えます。\n\
                  対処法:\n\
-                 - --partitions を大きくする（1 パーティションのメモリが減る）\n\
+                 - Phase 1 memory が支配的なら --partition-buffer-kb を小さくする\n\
+                 - Phase 2 memory が支配的なら --partitions を大きくする\n\
                  - --force で強制続行（swap 使用の可能性）",
                 format_gib(peak_mem),
                 format_gib(threshold),
@@ -954,8 +968,9 @@ fn main() -> io::Result<()> {
         ));
     }
 
+    let available_memory = available_memory_bytes();
     let partition_buffer_kb =
-        resolve_partition_buffer_kb(args.partition_buffer_kb, args.partitions);
+        resolve_partition_buffer_kb(args.partition_buffer_kb, args.partitions, available_memory);
     let partition_buffer_bytes = partition_buffer_kb * 1024;
     let input_subdir = args.temp_dir.join(INPUT_SUBDIR);
     let ref_subdir = args.temp_dir.join(REF_SUBDIR);
@@ -969,6 +984,7 @@ fn main() -> io::Result<()> {
             &ref_subdir,
             partition_buffer_bytes,
             keep_temp,
+            available_memory,
         );
     }
 
@@ -1054,6 +1070,7 @@ fn main() -> io::Result<()> {
             /* phase1_skipped = */ true,
             args.keep_temp,
             args.force,
+            available_memory,
         )?;
 
         (0u64, 0u64)
@@ -1091,6 +1108,7 @@ fn main() -> io::Result<()> {
             /* phase1_skipped = */ false,
             args.keep_temp,
             args.force,
+            available_memory,
         )?;
 
         eprintln!("=== Phase 1: Partitioning ({partitions} partitions) ===");
@@ -1203,6 +1221,7 @@ fn run_partition_only(
     ref_subdir: &Path,
     partition_buffer_bytes: usize,
     keep_temp: bool,
+    available_memory: Option<u64>,
 ) -> io::Result<()> {
     // ---- 早期検証 (重い I/O 前に全て返す) ----
     let ref_paths = match args.reference.as_deref() {
@@ -1303,6 +1322,7 @@ fn run_partition_only(
         /* phase1_skipped = */ false,
         keep_temp,
         args.force,
+        available_memory,
     )?;
 
     eprintln!(
@@ -1420,11 +1440,34 @@ mod tests {
     }
 
     #[test]
-    fn partition_buffer_auto_size_uses_budget_and_clamps() {
-        assert_eq!(resolve_partition_buffer_kb(None, 1), 16 * 1024);
-        assert_eq!(resolve_partition_buffer_kb(None, 1024), 1024);
-        assert_eq!(resolve_partition_buffer_kb(None, 32 * 1024), 64);
-        assert_eq!(resolve_partition_buffer_kb(Some(8192), 1024), 8192);
+    fn partition_buffer_auto_size_uses_memory_aware_budget_and_clamps() {
+        assert_eq!(resolve_partition_buffer_kb(None, 1, None), 16 * 1024);
+        assert_eq!(resolve_partition_buffer_kb(None, 1024, None), 1024);
+        assert_eq!(resolve_partition_buffer_kb(None, 32 * 1024, None), 64);
+        assert_eq!(resolve_partition_buffer_kb(None, 1024, Some(1 << 30)), 512);
+        assert_eq!(resolve_partition_buffer_kb(None, 1024, Some(128 << 20)), 64);
+        assert_eq!(resolve_partition_buffer_kb(Some(8192), 1024, Some(1)), 8192);
+    }
+
+    #[test]
+    fn low_memory_auto_buffer_preserves_small_job_preflight() {
+        let dir = TempDir::new().unwrap();
+        let available_memory = 1 << 30;
+        let partitions = 1024;
+        let buffer_kb = resolve_partition_buffer_kb(None, partitions, Some(available_memory));
+        let estimate = estimate_resources(0, PSV_SIZE as u64, partitions, buffer_kb * 1024);
+
+        preflight_check_with_available_memory(
+            &estimate,
+            dir.path(),
+            None,
+            false,
+            true,
+            false,
+            Some(available_memory),
+        )
+        .unwrap();
+        assert_eq!(estimate.phase1_memory_bytes, 512 << 20);
     }
 
     #[test]
