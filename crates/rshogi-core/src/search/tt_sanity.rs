@@ -234,7 +234,7 @@ mod trace {
         if seq >= MAX_TRACE_LOGS {
             return;
         }
-        let _guard = TRACE_LOCK.lock().ok();
+        let guard = TRACE_LOCK.lock().ok();
         eprintln!(
             "[TT-TRACE] seq={} kind=probe stage={} tid={} ply={} root={} hit={} key=0x{:016x} depth={} bound={:?} move={} stored={} converted={} eval={}",
             seq,
@@ -251,6 +251,7 @@ mod trace {
             log.converted_value.raw(),
             log.eval.raw(),
         );
+        drop(guard);
     }
 
     pub(in crate::search) fn maybe_trace_tt_write(log: TtWriteTrace<'_>) {
@@ -261,7 +262,7 @@ mod trace {
         if seq >= MAX_TRACE_LOGS {
             return;
         }
-        let _guard = TRACE_LOCK.lock().ok();
+        let guard = TRACE_LOCK.lock().ok();
         eprintln!(
             "[TT-TRACE] seq={} kind=write stage={} tid={} ply={} root={} key=0x{:016x} depth={} bound={:?} pv={} move={} stored={} eval={}",
             seq,
@@ -277,6 +278,7 @@ mod trace {
             log.stored_value.raw(),
             log.eval.raw(),
         );
+        drop(guard);
     }
 
     pub(in crate::search) fn maybe_trace_tt_cutoff(log: TtCutoffTrace<'_>) {
@@ -287,7 +289,7 @@ mod trace {
         if seq >= MAX_TRACE_LOGS {
             return;
         }
-        let _guard = TRACE_LOCK.lock().ok();
+        let guard = TRACE_LOCK.lock().ok();
         eprintln!(
             "[TT-TRACE] seq={} kind=cutoff stage={} tid={} ply={} root={} key=0x{:016x} search_depth={} depth={} bound={:?} value={} beta={}",
             seq,
@@ -302,6 +304,7 @@ mod trace {
             log.value.raw(),
             log.beta.raw(),
         );
+        drop(guard);
     }
 }
 

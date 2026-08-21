@@ -252,6 +252,10 @@ fn test_no_early_exit_when_mated() {
 /// MultiPV=3で3つのPVライン出力
 #[test]
 fn test_multi_pv_3_integration() {
+    // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
+    let guard = crate::eval::material::test_support::lock_material();
+    crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+
     use crate::position::Position;
     use crate::search::LimitsType;
     use crate::search::engine::{Search, SearchInfo};
@@ -306,11 +310,17 @@ fn test_multi_pv_3_integration() {
             first_moves.len()
         );
     });
+
+    drop(guard);
 }
 
 /// MultiPV=1でも multipv 1 を出力することを確認
 #[test]
 fn test_multi_pv_1_outputs_multipv_field() {
+    // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
+    let guard = crate::eval::material::test_support::lock_material();
+    crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+
     use crate::position::Position;
     use crate::search::LimitsType;
     use crate::search::engine::{Search, SearchInfo};
@@ -347,11 +357,17 @@ fn test_multi_pv_1_outputs_multipv_field() {
             "USI出力に 'multipv 1' が含まれる。実際: {usi_string}"
         );
     });
+
+    drop(guard);
 }
 
 /// 合法手数を超えるMultiPV値がクランプされることを確認
 #[test]
 fn test_multi_pv_clamped_to_legal_moves_integration() {
+    // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
+    let guard = crate::eval::material::test_support::lock_material();
+    crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+
     use crate::position::Position;
     use crate::search::LimitsType;
     use crate::search::engine::{Search, SearchInfo};
@@ -396,11 +412,17 @@ fn test_multi_pv_clamped_to_legal_moves_integration() {
             assert_eq!(value, i + 1, "multipv値が1から連続している");
         }
     });
+
+    drop(guard);
 }
 
 /// MultiPV出力がスコア降順で並ぶことを確認
 #[test]
 fn test_multi_pv_scores_sorted_desc() {
+    // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
+    let guard = crate::eval::material::test_support::lock_material();
+    crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+
     use crate::position::Position;
     use crate::search::LimitsType;
     use crate::search::engine::{Search, SearchInfo};
@@ -450,6 +472,8 @@ fn test_multi_pv_scores_sorted_desc() {
             );
         }
     });
+
+    drop(guard);
 }
 
 /// aspiration window が平均・二乗平均スコアを使うことを確認
@@ -478,6 +502,10 @@ fn test_aspiration_window_defaults_to_full_window_when_unseeded() {
 /// depthごとにMultiPV本数分のinfoが出て、最後に採択ラインが再出力される
 #[test]
 fn test_multi_pv_outputs_once_per_depth() {
+    // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
+    let guard = crate::eval::material::test_support::lock_material();
+    crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+
     use crate::position::Position;
     use crate::search::LimitsType;
     use crate::search::engine::{Search, SearchInfo};
@@ -514,6 +542,8 @@ fn test_multi_pv_outputs_once_per_depth() {
         let multipv: Vec<_> = depth1_infos.iter().map(|info| info.multi_pv).collect();
         assert_eq!(multipv, vec![1, 2, 1], "最後は採択ラインのmultipv 1を再出力する");
     });
+
+    drop(guard);
 }
 
 // =============================================================================
@@ -523,6 +553,10 @@ fn test_multi_pv_outputs_once_per_depth() {
 /// Depth完了後にprevious_scoreがシードされることを統合テストで確認
 #[test]
 fn test_previous_score_seeding() {
+    // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
+    let guard = crate::eval::material::test_support::lock_material();
+    crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+
     use crate::position::Position;
     use crate::search::LimitsType;
     use crate::search::engine::Search;
@@ -542,6 +576,8 @@ fn test_previous_score_seeding() {
         let result = search.go(&mut pos, limits, None::<fn(&_)>);
         assert_ne!(result.best_move, Move::NONE);
     });
+
+    drop(guard);
 }
 
 /// MultiPV>1で最終ソートが正しく動作することを確認
