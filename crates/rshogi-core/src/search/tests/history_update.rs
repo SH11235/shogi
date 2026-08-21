@@ -14,6 +14,10 @@ const STACK_SIZE: usize = 64 * 1024 * 1024; // 64MB
 /// TT手がbestだった場合にTTMoveHistoryが加点されることを確認
 #[test]
 fn tt_move_history_updates_on_bestmove() {
+    // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
+    let _guard = crate::eval::material::test_support::lock_material();
+    crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+
     std::thread::Builder::new()
         .stack_size(STACK_SIZE)
         .spawn(|| {
@@ -45,6 +49,10 @@ fn tt_move_history_updates_on_bestmove() {
 /// 簡易的に探索が完了することを確認するのみ
 #[test]
 fn continuation_history_updates_on_quiet_best() {
+    // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
+    let _guard = crate::eval::material::test_support::lock_material();
+    crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+
     std::thread::Builder::new()
         .stack_size(STACK_SIZE)
         .spawn(|| {

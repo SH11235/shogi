@@ -9,6 +9,10 @@ const STACK_SIZE: usize = 64 * 1024 * 1024;
 
 #[test]
 fn skill_forces_multipv_to_four() {
+    // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
+    let _guard = crate::eval::material::test_support::lock_material();
+    crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+
     std::thread::Builder::new()
         .stack_size(STACK_SIZE)
         .spawn(|| {
