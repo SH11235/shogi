@@ -63,6 +63,10 @@ use tools::common::memory::available_memory_bytes;
 
 const INPUT_SUBDIR: &str = "input";
 const REF_SUBDIR: &str = "ref";
+const PARTITION_BUFFER_BUDGET_KB: usize = 1024 * 1024;
+const MIN_PARTITION_BUFFER_KB: usize = 64;
+const MAX_PARTITION_BUFFER_KB: usize = 16 * 1024;
+const AUTO_BUFFER_AVAILABLE_MEMORY_DIVISOR: u64 = 2;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -96,14 +100,16 @@ struct Args {
     #[arg(long, default_value = "./psv_dedup_partition_tmp")]
     temp_dir: PathBuf,
 
-    /// パーティション数。多いほど Phase 2 の 1 パーティションあたりメモリが減るが
-    /// file descriptor と出力バッファの総量が増える。
+    /// パーティション数。多いほど Phase 2 の 1 パーティションあたりメモリが減るが、
+    /// file descriptor が増える。Phase 1 の自動バッファは合計最大 1 GiB。
     #[arg(long, default_value = "1024")]
     partitions: usize,
 
-    /// Phase 1 でパーティションごとに確保する BufWriter のバッファサイズ (KiB)
-    #[arg(long, default_value = "64")]
-    partition_buffer_kb: usize,
+    /// Phase 1 でパーティションごとに確保する BufWriter のバッファサイズ (KiB)。
+    /// 省略時は合計最大 1 GiB（利用可能メモリの 50% 以下）を partitions で割り、
+    /// 64 KiB〜16 MiB に収める。既定の 1024 partitions では合計 64 MiB が下限。
+    #[arg(long)]
+    partition_buffer_kb: Option<usize>,
 
     /// 処理する入力レコードの最大件数（0 = 全件、試走向け）。
     /// 参照ファイルは常に全件読み込まれる。
@@ -158,6 +164,23 @@ const DISK_SAFETY_FACTOR: f64 = 1.05;
 
 /// メモリ不足判定のしきい値（利用可能メモリの 80%）。
 const MEM_THRESHOLD_FACTOR: f64 = 0.8;
+
+fn resolve_partition_buffer_kb(
+    requested_kb: Option<usize>,
+    num_partitions: usize,
+    available_memory: Option<u64>,
+) -> usize {
+    requested_kb.unwrap_or_else(|| {
+        let memory_budget_kb = available_memory
+            .map(|bytes| {
+                usize::try_from(bytes / AUTO_BUFFER_AVAILABLE_MEMORY_DIVISOR / 1024)
+                    .unwrap_or(usize::MAX)
+            })
+            .unwrap_or(PARTITION_BUFFER_BUDGET_KB);
+        let budget_kb = PARTITION_BUFFER_BUDGET_KB.min(memory_budget_kb);
+        (budget_kb / num_partitions).clamp(MIN_PARTITION_BUFFER_KB, MAX_PARTITION_BUFFER_KB)
+    })
+}
 
 struct ResourceEstimate {
     total_records: u64,
@@ -223,13 +246,13 @@ fn same_fs_output_headroom_bytes(estimate: &ResourceEstimate, keep_temp: bool) -
 fn output_disk_required_bytes(
     estimate: &ResourceEstimate,
     same_fs: bool,
-    skip_temp_check: bool,
+    phase1_skipped: bool,
     keep_temp: bool,
 ) -> u64 {
     if same_fs {
         let same_fs_headroom =
             (same_fs_output_headroom_bytes(estimate, keep_temp) as f64 * DISK_SAFETY_FACTOR) as u64;
-        if skip_temp_check {
+        if phase1_skipped {
             same_fs_headroom
         } else {
             ((estimate.phase1_temp_bytes as f64 * DISK_SAFETY_FACTOR) as u64)
@@ -248,18 +271,19 @@ fn preflight_check(
     estimate: &ResourceEstimate,
     temp_dir: &Path,
     output_path: Option<&Path>,
-    skip_temp_check: bool,
+    phase1_skipped: bool,
     keep_temp: bool,
     force: bool,
+    available_memory: Option<u64>,
 ) -> io::Result<()> {
     preflight_check_with_available_memory(
         estimate,
         temp_dir,
         output_path,
-        skip_temp_check,
+        phase1_skipped,
         keep_temp,
         force,
-        available_memory_bytes(),
+        available_memory,
     )
 }
 
@@ -267,7 +291,7 @@ fn preflight_check_with_available_memory(
     estimate: &ResourceEstimate,
     temp_dir: &Path,
     output_path: Option<&Path>,
-    skip_temp_check: bool,
+    phase1_skipped: bool,
     keep_temp: bool,
     force: bool,
     available_memory: Option<u64>,
@@ -277,7 +301,7 @@ fn preflight_check_with_available_memory(
         "Total input records:  {} ({} bytes / {})",
         estimate.total_records, estimate.phase1_temp_bytes, PSV_SIZE
     );
-    if !skip_temp_check {
+    if !phase1_skipped {
         eprintln!(
             "Phase 1 temp disk:    {} (cleaned up on success)",
             format_gib(estimate.phase1_temp_bytes),
@@ -302,7 +326,11 @@ fn preflight_check_with_available_memory(
         );
     }
 
-    let peak_mem = estimate.phase1_memory_bytes.max(estimate.phase2_peak_memory_bytes);
+    let peak_mem = if phase1_skipped {
+        estimate.phase2_peak_memory_bytes
+    } else {
+        estimate.phase1_memory_bytes.max(estimate.phase2_peak_memory_bytes)
+    };
 
     // --- メモリチェック ---
     if let Some(avail) = available_memory {
@@ -317,7 +345,8 @@ fn preflight_check_with_available_memory(
             let msg = format!(
                 "メモリ不足: 推定ピーク {} が threshold {} を超えます。\n\
                  対処法:\n\
-                 - --partitions を大きくする（1 パーティションのメモリが減る）\n\
+                 - Phase 1 memory が支配的なら --partition-buffer-kb を小さくする\n\
+                 - Phase 2 memory が支配的なら --partitions を大きくする\n\
                  - --force で強制続行（swap 使用の可能性）",
                 format_gib(peak_mem),
                 format_gib(threshold),
@@ -349,7 +378,7 @@ fn preflight_check_with_available_memory(
         }
     });
 
-    if !skip_temp_check {
+    if !phase1_skipped {
         let temp_required = (estimate.phase1_temp_bytes as f64 * DISK_SAFETY_FACTOR) as u64;
         if let Some(avail) = get_disk_available(temp_dir) {
             eprintln!("Temp disk available:  {} ({})", format_gib(avail), temp_dir.display());
@@ -394,9 +423,9 @@ fn preflight_check_with_available_memory(
                     }
                 );
                 let same_fs_required =
-                    output_disk_required_bytes(estimate, true, skip_temp_check, keep_temp);
+                    output_disk_required_bytes(estimate, true, phase1_skipped, keep_temp);
                 if same_fs_required > avail {
-                    let msg = if skip_temp_check {
+                    let msg = if phase1_skipped {
                         format!(
                             "出力ディスク不足: same filesystem 上で Phase 2 に追加 headroom {} 必要ですが \
                              {} しか空きがありません ({})。\n\
@@ -991,7 +1020,7 @@ fn validate_args(args: &Args) -> io::Result<()> {
             "--partitions は 1 以上を指定してください",
         ));
     }
-    if args.partition_buffer_kb == 0 {
+    if args.partition_buffer_kb == Some(0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "--partition-buffer-kb は 1 以上を指定してください",
@@ -1047,7 +1076,10 @@ fn main() -> io::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
 
-    let partition_buffer_bytes = args.partition_buffer_kb * 1024;
+    let available_memory = available_memory_bytes();
+    let partition_buffer_kb =
+        resolve_partition_buffer_kb(args.partition_buffer_kb, args.partitions, available_memory);
+    let partition_buffer_bytes = partition_buffer_kb * 1024;
     let input_subdir = args.temp_dir.join(INPUT_SUBDIR);
     let ref_subdir = args.temp_dir.join(REF_SUBDIR);
     // --partition-only では temp を消したら意味がない（次回起動で再利用するため）。
@@ -1060,6 +1092,7 @@ fn main() -> io::Result<()> {
             &ref_subdir,
             partition_buffer_bytes,
             keep_temp,
+            available_memory,
         );
     }
 
@@ -1143,9 +1176,10 @@ fn main() -> io::Result<()> {
             &estimate,
             &args.temp_dir,
             Some(output_path),
-            /* skip_temp_check = */ true,
+            /* phase1_skipped = */ true,
             args.keep_temp,
             args.force,
+            available_memory,
         )?;
 
         (0u64, 0u64)
@@ -1185,15 +1219,16 @@ fn main() -> io::Result<()> {
             &estimate,
             &args.temp_dir,
             Some(output_path),
-            /* skip_temp_check = */ false,
+            /* phase1_skipped = */ false,
             args.keep_temp,
             args.force,
+            available_memory,
         )?;
 
         eprintln!("=== Phase 1: Partitioning ({partitions} partitions) ===");
         eprintln!(
             "  partition buffer: {} KiB/partition (total ~{:.1} MiB)",
-            args.partition_buffer_kb,
+            partition_buffer_kb,
             (partitions * partition_buffer_bytes) as f64 / (1024.0 * 1024.0),
         );
 
@@ -1301,6 +1336,7 @@ fn run_partition_only(
     ref_subdir: &Path,
     partition_buffer_bytes: usize,
     keep_temp: bool,
+    available_memory: Option<u64>,
 ) -> io::Result<()> {
     // ---- 早期検証 (重い I/O 前に全て返す) ----
     let ref_paths = match args.reference.as_deref() {
@@ -1398,9 +1434,10 @@ fn run_partition_only(
         &estimate,
         &args.temp_dir,
         /* output_path = */ None,
-        /* skip_temp_check = */ false,
+        /* phase1_skipped = */ false,
         keep_temp,
         args.force,
+        available_memory,
     )?;
 
     eprintln!(
@@ -1413,7 +1450,7 @@ fn run_partition_only(
     );
     eprintln!(
         "  partition buffer: {} KiB/partition (total ~{:.1} MiB)",
-        args.partition_buffer_kb,
+        partition_buffer_bytes / 1024,
         (partitions * partition_buffer_bytes) as f64 / (1024.0 * 1024.0),
     );
 
@@ -1667,10 +1704,10 @@ mod tests {
     }
 
     #[test]
-    fn dedup_only_preflight_succeeds_when_memory_is_available() {
+    fn dedup_only_preflight_ignores_phase1_buffer_memory() {
         let dir = TempDir::new().unwrap();
         let output = dir.path().join("output.bin");
-        let estimate = estimate_resources(0, 0, 1, 0, false);
+        let estimate = estimate_resources(0, 0, 1, 1 << 30, false);
 
         preflight_check_with_available_memory(
             &estimate,
@@ -1679,9 +1716,113 @@ mod tests {
             true,
             false,
             false,
-            Some(u64::MAX),
+            Some(1 << 30),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn partition_buffer_auto_size_uses_memory_aware_budget_and_clamps() {
+        assert_eq!(resolve_partition_buffer_kb(None, 1, None), 16 * 1024);
+        assert_eq!(resolve_partition_buffer_kb(None, 1024, None), 1024);
+        assert_eq!(resolve_partition_buffer_kb(None, 32 * 1024, None), 64);
+        assert_eq!(resolve_partition_buffer_kb(None, 1024, Some(1 << 30)), 512);
+        assert_eq!(resolve_partition_buffer_kb(None, 1024, Some(128 << 20)), 64);
+        assert_eq!(resolve_partition_buffer_kb(Some(8192), 1024, Some(1)), 8192);
+    }
+
+    #[test]
+    fn low_memory_auto_buffer_preserves_small_job_preflight() {
+        let dir = TempDir::new().unwrap();
+        let available_memory = 1 << 30;
+        let partitions = 1024;
+        let buffer_kb = resolve_partition_buffer_kb(None, partitions, Some(available_memory));
+        let estimate = estimate_resources(0, PSV_SIZE as u64, partitions, buffer_kb * 1024, false);
+
+        preflight_check_with_available_memory(
+            &estimate,
+            dir.path(),
+            None,
+            false,
+            true,
+            false,
+            Some(available_memory),
+        )
+        .unwrap();
+        assert_eq!(estimate.phase1_memory_bytes, 512 << 20);
+    }
+
+    #[test]
+    fn partition_and_dedup_output_is_independent_of_buffer_size() {
+        let make_psv = |sfen_seed: u32, payload: u8| -> [u8; PSV_SIZE] {
+            let mut buf = [payload; PSV_SIZE];
+            buf[..4].copy_from_slice(&sfen_seed.to_le_bytes());
+            for (i, b) in buf[4..SFEN_SIZE].iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            buf
+        };
+        let mut records: Vec<_> = (0..2_000).map(|i| make_psv(i, (i % 251) as u8)).collect();
+        let small_buffer_bytes = 64 * 1024;
+        let first_record_after_flush = small_buffer_bytes / PSV_SIZE;
+        records[first_record_after_flush - 1] = make_psv(9_000, 0xa1);
+        records[first_record_after_flush] = make_psv(9_001, 0xb2);
+        records[first_record_after_flush + 1] = make_psv(9_000, 0xc3);
+        assert!(records.len() * PSV_SIZE > small_buffer_bytes);
+        let workdir = TempDir::new().unwrap();
+        let input = workdir.path().join("input.bin");
+        {
+            let mut file = File::create(&input).unwrap();
+            for record in &records {
+                file.write_all(record).unwrap();
+            }
+        }
+
+        let small_dir = workdir.path().join("small");
+        let large_dir = workdir.path().join("large");
+        let small_partitions = small_dir.join(INPUT_SUBDIR);
+        let large_partitions = large_dir.join(INPUT_SUBDIR);
+        let num_partitions = 1;
+
+        partition_files_into(
+            "input",
+            std::slice::from_ref(&input),
+            &small_partitions,
+            num_partitions,
+            small_buffer_bytes,
+            0,
+            false,
+            false,
+        )
+        .unwrap();
+        partition_files_into(
+            "input",
+            std::slice::from_ref(&input),
+            &large_partitions,
+            num_partitions,
+            8 * 1024 * 1024,
+            0,
+            false,
+            false,
+        )
+        .unwrap();
+
+        for partition in 0..num_partitions {
+            let small =
+                std::fs::read(small_partitions.join(partition_filename(partition))).unwrap();
+            let large =
+                std::fs::read(large_partitions.join(partition_filename(partition))).unwrap();
+            assert_eq!(small, large, "partition {partition} differs");
+        }
+
+        let small_output = small_dir.join("output.bin");
+        let large_output = large_dir.join("output.bin");
+        deduplicate_partitions(&small_partitions, None, num_partitions, &small_output, true, None)
+            .unwrap();
+        deduplicate_partitions(&large_partitions, None, num_partitions, &large_output, true, None)
+            .unwrap();
+
+        assert_eq!(std::fs::read(small_output).unwrap(), std::fs::read(large_output).unwrap());
     }
 
     #[test]
