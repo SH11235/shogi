@@ -108,11 +108,58 @@ Phase 2 は 1 partition 分のユニーク局面を `HashSet` に載せるため
 
 ### partition 数と Phase 1 buffer
 
-`--partition-buffer-kb` を省略すると、合計 1 GiB の予算を partition 数で割り、
-1 partition あたり 64 KiB〜16 MiB に clamp する。既定の 1024 partitions では
-1 MiB/partition、合計 1 GiB になる。明示指定した値はそのまま使われる。
+`--partition-buffer-kb` を省略すると、合計最大 1 GiB（起動時の利用可能メモリの
+50% 以下）の予算を partition 数で割り、1 partition あたり 64 KiB〜16 MiB に
+clamp する。利用可能メモリが 2 GiB 以上なら、
+既定の 1024 partitions では
+1 MiB/partition、合計 1 GiB になる。低メモリ環境では自動的に縮小し、従来の
+合計 64 MiB を下限とする（partition 数を変えた場合の合計下限も変わる）。
+明示指定した値はそのまま使われる。
 buffer は `BufWriter` の capacity だけを変え、partition ファイルや最終出力の
 バイト列には影響しない。
+
+#### buffer 予算の実測 (2026-08-22)
+
+既定値は、実運用の 1.95 TB PSV の先頭 6 億レコード (24.0 GB) を使い、入力と
+temp を同じ単発 HDD に置いた Phase 1 の A/B で決めた。Windows 11
+(10.0.26200)、計測開始時の利用可能メモリ 102.5 GiB、`release` build
+(`7d3df59d`) で、先行 warm-up 後に旧既定と新既定を 5 回ずつ実行した。試行順は
+`old→new / old→new / new→old / old→new / new→old` とした。wall time は最終 flush
+を含み、プロセスの working set と private bytes は 250 ms 間隔で採取した。
+
+```powershell
+target/release/psv_dedup_partition.exe `
+  --input /path/to/production.psv `
+  --temp-dir /path/to/same-hdd/temp `
+  --partitions 1024 `
+  --partition-buffer-kb <64|256|1024> `
+  --max-positions 600000000 `
+  --partition-only
+```
+
+| buffer / partition | 合計 buffer | wall time (raw) | 中央値 | 平均 throughput | peak working set | peak private bytes |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 KiB (旧既定) | 64 MiB | 154.1 / 168.9 / 179.9 / 186.4 / 178.3 s | 178.3 s | 3.46 M rec/s | 24.2 MiB | 73.9 MiB |
+| 1 MiB (新上限) | 1 GiB | 152.8 / 154.1 / 202.3 / 162.4 / 166.7 s | 162.4 s | 3.58 M rec/s | 35.6 MiB | 1039.8 MiB |
+
+1 MiB は paired 5 回中 4 回で速く、平均 wall time は 3.4%短縮、paired 改善率の
+中央値は 6.5%だった。ただし raw range は重なり、1 回は 12.5%悪化しているため、
+これは分散 write 改善の存在を示す探索的測定であり、安定した効果量の推定ではない。
+参考に 256 KiB も 2 回測ったが 163.2 / 165.7 s で、1 MiB の代替になる明確な結果は
+得られなかった。
+
+Windows の peak working set 増加は 11.5 MiB でも private commit は約 966 MiB 増える。
+このため 1 GiB は無条件の固定値ではなく、高メモリ環境での自動予算の上限とした。
+利用可能メモリが 2 GiB 未満ならその 50%を目標に縮小し（既定 1024 partitions では
+合計 64 MiB が下限）、preflight が判定する Phase 1 memory は private commit に
+合わせる。メモリを優先する環境や測定結果が異なる
+ストレージでは `--partition-buffer-kb` を明示して縮小する。
+
+この A/B は分散 write の定常挙動を比較する warm-cache 測定であり、2 TB 全体の
+before/after 実測ではないため、2 TB の所要時間へは外挿しない。別途、同じ 2.08 TB
+の本番処理は 256 partitions × 16 MiB (合計 4 GiB)、入力 HDD・
+temp NVMe の条件で 2.8 h (5.2 M rec/s) だった。この本番値は規模の sanity check で、
+partition 数とストレージ配置が違うため上記 A/B の効果量には含めない。
 
 HDD 上で temp を入力と同一ディスクに置く場合は、Phase 2 の概算メモリが収まる範囲で
 `--partitions` を減らし、partition ごとの buffer を厚くすると、分散 append の粒度を
@@ -244,7 +291,7 @@ cargo run --release -p tools --bin psv_dedup_partition -- \
 | `--output` | 出力ファイルパス | — |
 | `--temp-dir` | パーティション一時ファイルの置き場 | `./psv_dedup_partition_tmp` |
 | `--partitions` | パーティション数 | `1024` |
-| `--partition-buffer-kb` | 各パーティションの BufWriter バッファ (KiB)。省略時は合計 1 GiB 予算で自動算出 | 自動 (64 KiB〜16 MiB/partition) |
+| `--partition-buffer-kb` | 各パーティションの BufWriter バッファ (KiB)。省略時は合計最大 1 GiB・利用可能メモリの 50% 以下で自動算出 | 自動 (64 KiB〜16 MiB/partition) |
 | `--max-positions` | 処理する入力レコードの最大件数（0 = 全件、試走用）。参照は常に全件 | `0` |
 | `--dedup-only` | Phase 1 をスキップして既存一時ファイルから再開（ref/ は自動検出） | off |
 | `--partition-only` | Phase 2 をスキップして Phase 1 (振り分け) のみ実行（既存 partition には append） | off |
