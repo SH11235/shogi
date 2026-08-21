@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn test_material_eval_hirate() {
-        let _guard = test_support::lock_material();
+        let guard = test_support::lock_material();
 
         let mut pos = Position::new();
         pos.set_sfen(SFEN_HIRATE).unwrap();
@@ -703,6 +703,8 @@ mod tests {
 
         // 初期局面はほぼ互角（MaterialLvにより0から僅かにずれる場合がある）
         assert!(value.raw().abs() < 200);
+
+        drop(guard);
     }
 
     #[test]
@@ -735,7 +737,7 @@ mod tests {
 
     #[test]
     fn test_get_set_material_level() {
-        let _guard = test_support::lock_material();
+        let guard = test_support::lock_material();
 
         set_material_level(MaterialLevel::Lv1);
         assert_eq!(get_material_level(), MaterialLevel::Lv1);
@@ -747,6 +749,8 @@ mod tests {
 
         disable_material();
         assert!(!is_material_enabled());
+
+        drop(guard);
     }
 
     // =========================================================================
@@ -808,7 +812,7 @@ mod tests {
     fn test_pass_right_value_global_and_evaluation() {
         use crate::types::Color;
 
-        let _guard = test_support::lock_material();
+        let guard = test_support::lock_material();
 
         // --- Part 1: set_pass_right_value_phased のテスト ---
         set_pass_right_value_phased(50, 200);
@@ -861,5 +865,7 @@ mod tests {
             negamax_combined < 0,
             "Negamax combined score should be negative: got {negamax_combined}"
         );
+
+        drop(guard);
     }
 }
