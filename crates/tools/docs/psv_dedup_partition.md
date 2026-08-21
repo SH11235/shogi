@@ -7,6 +7,7 @@
 - 出力: 最初に出現した局面のみを残した単一ファイル
 - 方式: ディスクパーティショニング → パーティションごとに `HashSet<[u8; 32]>`
 - 特徴: **偽陽性・偽陰性なし**、メモリは「最大パーティション分」に抑えられる
+- 任意機能: `--shuffle-seed` で dedup と学習用 shuffle を同じ Phase 2 に統合
 
 巨大データでも exact に dedup したいが、`psv_dedup`（全件 HashSet 保持）ではメモリが足りないケース向けです。
 
@@ -24,9 +25,17 @@
 
 ### Phase 2: Deduplication
 
-各パーティションファイルを 1 つずつ読み込み、`HashSet<[u8; 32]>` で first-wins の重複判定を行い、出力ファイルに追記する。処理済みパーティションは `HashSet` ごと解放してから次へ進むため、ピークメモリは「最大パーティション 1 つぶんのユニーク局面」で決まる。
+各パーティションファイルを 1 つずつ読み込み、`HashSet<[u8; 32]>` で first-wins の重複判定を行い、出力ファイルに追記する。`--shuffle-seed` 指定時は unique レコードをパーティション単位で保持し、後述の shuffle 後に書き出す。処理済みパーティションの作業領域は次へ進む前に解放する。
 
 `--keep-temp` を指定しない限り、処理済みパーティションは逐次削除される。
+
+### fused shuffle (`--shuffle-seed`)
+
+`--shuffle-seed <u64>` を指定すると、Phase 2 で first-wins の unique 選別を終えた後、書き出し直前にパーティション内のレコード列を Fisher-Yates で shuffle する。勝者選択後に順序だけを変えるため、seed の有無によって残るレコードの集合は変わらない。full mode と `--dedup-only` で利用でき、Phase 2 を実行しない `--partition-only` との同時指定はエラーになる。
+
+乱数列は seed と partition index から SplitMix64 で状態を導出した xoshiro256++ で生成する。同じ実効入力 (入力バイト列とその順序・reference 内容・`--max-positions`)・partition 数・seed なら、プラットフォームをまたいで同じ出力バイト列を再現する。glob 展開や path ソートの結果が環境によって変わり、入力順が異なる場合はこの前提に含まれない。
+
+PackedSfen の FNV hash による bucket 割当、bucket 内 shuffle、bucket 番号順の連結という、`shuffle_psv` の chunked shuffle と同様の二段構成（ランダム散布 + 区画内 shuffle + 連結）を取る。ただし fused shuffle は bucket 間を移動できないため順列分布は同一ではなく、学習用途への適合性は用途側で判断する必要がある。bucket の作り方と乱数列も異なるため、`shuffle_psv` と同じ seed を指定しても出力はバイト互換にならない。
 
 ### 一時ディレクトリ構造
 
@@ -48,7 +57,7 @@
 Phase 2 の流れ (パーティションごと):
 
 1. `ref/partition_{i}.bin` を HashSet に全件ロード（出力しない）
-2. `input/partition_{i}.bin` を streaming し、HashSet に未登録なら出力 + 挿入
+2. `input/partition_{i}.bin` を streaming し、HashSet に未登録なら選別 + 挿入
 3. HashSet を解放して次パーティションへ
 
 これにより、既存ファイルと新規ファイルを結合してから dedup するよりも I/O が少なく、かつ reference 側の重複は出力に回らない。`psv_dedup_bloom --reference` の完全一致版に相当。
@@ -93,6 +102,7 @@ peak_memory ≈ (total_records / partitions) × entry_overhead
 ```
 
 `entry_overhead` は `HashSet<[u8; 32]>` で 1 エントリあたり 50〜70 B 程度（バケット + エントリ + load factor）。
+`--shuffle-seed` 指定時は、これに最大 input partition のレコード列（1 件 40 B）が加わる。起動時の事前見積りもこの shuffle buffer を含める。
 
 ### 参考値（均等分布を仮定）
 
@@ -114,6 +124,8 @@ Phase 2 の進行に合わせて一時ファイルは削除されるので、ピ
 
 合計 I/O は通常 dedup の約 2 倍（Phase 1 で write once、Phase 2 で read once）。一方 `psv_dedup_bloom` は 1 パスなので、「メモリ vs ディスク I/O」のトレードオフになる。
 
+`--shuffle-seed` は Phase 2 の書き出し前に shuffle を済ませるため、後段の `shuffle_psv` が必要とする 2 パスの chunked shuffle（read × 2 + write × 2）を工程ごと省略できる。fused shuffle 自体は dedup に追加のディスクパスを増やさない。
+
 ## FD 上限
 
 `--partitions 1024` 指定時は ulimit の soft limit が 1024 以上必要。起動時にチェックして不足なら警告する。Linux のデフォルトは 1024 なので、多くの環境で次の指定が必要:
@@ -133,6 +145,18 @@ cargo run --release -p tools --bin psv_dedup_partition -- \
   --output /path/to/deduped.bin \
   --temp-dir /fast/ssd/psv_tmp
 ```
+
+### dedup と学習用 shuffle を同時に行う
+
+```bash
+cargo run --release -p tools --bin psv_dedup_partition -- \
+  --input-dir /path/to/dir \
+  --output deduped_shuffled.bin \
+  --temp-dir /fast/ssd/psv_tmp \
+  --shuffle-seed 42
+```
+
+既存 temp から再開する場合も `--dedup-only --shuffle-seed 42` のように指定できる。
 
 ### メモリをさらに絞る
 
@@ -219,19 +243,20 @@ cargo run --release -p tools --bin psv_dedup_partition -- \
 
 | オプション | 説明 | デフォルト |
 |---|---|---|
-| `--reference` | 参照ファイル（カンマ区切り）。HashSet に登録するが出力しない | — |
+| `--reference` | 参照ファイル。`--dedup-only` は指定値を使わず `ref/` を自動検出 | — |
 | `--input` | 入力ファイル、ディレクトリ、glob（カンマ区切り）。`--input-dir` と排他 | — |
 | `--input-dir` | 入力ディレクトリ。`--pattern` と組み合わせ | — |
 | `--pattern` | `--input-dir` 使用時の glob パターン | `*.bin` |
-| `--output` | 出力ファイルパス | — |
+| `--output` | 出力ファイルパス。full / `--dedup-only` では必須、`--partition-only` では指定不可 | — |
 | `--temp-dir` | パーティション一時ファイルの置き場 | `./psv_dedup_partition_tmp` |
-| `--partitions` | パーティション数 | `1024` |
-| `--partition-buffer-kb` | 各パーティションの BufWriter バッファ (KiB) | `64` |
-| `--max-positions` | 処理する入力レコードの最大件数（0 = 全件、試走用）。参照は常に全件 | `0` |
-| `--dedup-only` | Phase 1 をスキップして既存一時ファイルから再開（ref/ は自動検出） | off |
-| `--partition-only` | Phase 2 をスキップして Phase 1 (振り分け) のみ実行（既存 partition には append） | off |
+| `--partitions` | パーティション数（1 以上）。`--dedup-only` は既存 temp から自動検出 | `1024` |
+| `--partition-buffer-kb` | 各パーティションの BufWriter バッファ (KiB、1 以上) | `64` |
+| `--max-positions` | Phase 1 で処理する入力レコード上限（0 = 全件）。参照は常に全件 | `0` |
+| `--dedup-only` | 既存一時ファイルから Phase 2 を再開。`--input` / `--input-dir` / `--partition-only` と併用不可 | off |
+| `--partition-only` | Phase 1 のみ実行（既存 partition へ append）。`--dedup-only` と併用不可 | off |
 | `--delete-input-on-success` | `--partition-only` で各入力ファイルの処理成功後に元ファイルを削除する | off |
 | `--keep-temp` | 完了後も一時ファイル・ディレクトリを削除しない（`--partition-only` では暗黙で有効） | off |
+| `--shuffle-seed` | Phase 2 の unique レコードをパーティション内 shuffle する seed。`--partition-only` と併用不可 | — |
 | `--force` | メモリ/ディスク不足でも警告のみで続行する | off |
 
 ## `psv_dedup` / `psv_dedup_bloom` との比較
@@ -251,4 +276,4 @@ cargo run --release -p tools --bin psv_dedup_partition -- \
 
 - 入力と出力が同一ファイルの場合はエラー
 - キーは PackedSfen のみ。同一局面に対する複数の教師手がある場合は `psv_dedup` と同様、最初の出現だけ残す
-- パーティション出力の順序は保存されない（ハッシュ順）。順序を保ちたい場合は後段で `shuffle_psv` 等を使う
+- seed 未指定でもパーティション番号順に連結するため、入力全体の順序は保存されない（従来どおり）。`--shuffle-seed` 指定時はパーティション内の順序も shuffle される
