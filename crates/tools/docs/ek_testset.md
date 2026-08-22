@@ -41,6 +41,7 @@ cargo run -p tools --release --bin ek_testset -- eval \
   --testset runs/ek_testset/band/testset.jsonl \
   --eval-file "$SHOGI_DATA/nnue/model.bin" \
   --progress-file "$SHOGI_DATA/progress/progress.bin" \
+  --progress-buckets 8 \
   --out runs/ek_testset/band/metrics.json
 ```
 

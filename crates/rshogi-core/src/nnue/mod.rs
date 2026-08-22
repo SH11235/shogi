@@ -118,16 +118,17 @@ pub(crate) use network::nnue_requires_board_effects;
 pub(crate) use network::update_and_evaluate_layer_stacks_cached;
 pub use network::{
     LayerStackBucketMode, NNUENetwork, NnueFormatInfo, SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
-    compute_layer_stack_progress8kpabs_bucket_index, compute_progress8kpabs_sum, detect_format,
-    ensure_accumulator_computed, evaluate_dispatch, get_fv_scale_override,
-    get_layer_stack_bucket_mode, get_layer_stack_progress_kpabs_weights, get_network, init_nnue,
-    init_nnue_from_bytes, is_halfka_256_loaded, is_halfka_512_loaded, is_halfka_1024_loaded,
-    is_halfka_hm_256_loaded, is_halfka_hm_512_loaded, is_halfka_hm_1024_loaded,
-    is_layer_stacks_loaded, is_nnue_initialized, load_progress_coeff_kpabs,
-    load_progress_coeff_kpabs_from_bytes, parse_layer_stack_bucket_mode, parse_nnue_architecture,
-    progress_sum_to_bucket, reset_layer_stack_progress_kpabs_weights, set_fv_scale_override,
-    set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
-    set_nnue_architecture_override,
+    compute_layer_stack_progresskpabs_bucket_index, compute_progresskpabs_sum,
+    configure_layer_stack_routing, detect_format, ensure_accumulator_computed, evaluate_dispatch,
+    get_fv_scale_override, get_layer_stack_bucket_mode, get_layer_stack_progress_buckets,
+    get_layer_stack_progress_kpabs_weights, get_network, init_nnue, init_nnue_from_bytes,
+    is_halfka_256_loaded, is_halfka_512_loaded, is_halfka_1024_loaded, is_halfka_hm_256_loaded,
+    is_halfka_hm_512_loaded, is_halfka_hm_1024_loaded, is_layer_stacks_loaded, is_nnue_initialized,
+    load_progress_coeff_kpabs, load_progress_coeff_kpabs_from_bytes, parse_layer_stack_bucket_mode,
+    parse_nnue_architecture, progress_sum_to_bucket, reset_layer_stack_progress_buckets,
+    reset_layer_stack_progress_kpabs_weights, set_fv_scale_override,
+    set_layer_stack_progress_kpabs_weights, set_nnue_architecture_override,
+    validate_layer_stack_routing_configuration,
 };
 #[cfg(all(feature = "layerstacks-512x16x32", feature = "ft-halfka_hm_merged"))]
 pub use network_layer_stacks::NetworkLayerStacks512x16x32;

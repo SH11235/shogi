@@ -648,6 +648,7 @@ yo = [
   "EvalDir",
   "FV_SCALE",
   "LS_BUCKET_MODE",
+  "LS_PROGRESS_BUCKETS",
   "LS_PROGRESS_COEFF",
   # 定跡系
   "BookFile",

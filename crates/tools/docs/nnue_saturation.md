@@ -22,6 +22,7 @@ SqrClippedReLU 系の活性は u8 [0,127] に clamp されるため、127 到達
 cargo run -p tools --release --bin nnue_saturation -- \
   --nnue "$SHOGI_DATA/nnue/model.bin" \
   --progress-coeff "$SHOGI_DATA/progress/progress.bin" \
+  --progress-buckets 8 \
   --sfens sfens.txt \
   --out saturation.json
 ```
@@ -31,5 +32,5 @@ cargo run -p tools --release --bin nnue_saturation -- \
 `*_sat` / `*_total` / `*_rate`（127 到達数 / 総数 / 率）です。
 
 入玉局面（大評価値側）と一般局面で `--sfens` を替えて比較すると、評価値インフレが
-どの帯で天井に当たっているかを切り分けられます。bucket は progress8kpabs なので、
+どの帯で天井に当たっているかを切り分けられます。bucket は progresskpabs なので、
 終盤 bucket ほど入玉局面が集中します。

@@ -14,6 +14,17 @@ core 変更を公開する PR では `crates/rshogi-core/Cargo.toml` のバー�
 
 ## Unreleased
 
+### 破壊的変更: LayerStacks routing の明示化
+
+- bucket mode 名 `progress8kpabs` を `progresskpabs` へ変更した。旧名の alias はなく、指定するとエラーになる。
+- LayerStacks 推論では mode と構造を明示する。USI の progresskpabs は
+  `LS_BUCKET_MODE=progresskpabs`、`LS_PROGRESS_BUCKETS=<学習時の bucket 数>`、
+  `LS_PROGRESS_COEFF=<progress.bin>` が必須。KingRank9 は `LS_BUCKET_MODE=kingrank9` のみを指定する。
+- NNUE version は binary layout の判別専用で、routing semantics の推測には使わない。
+  特に旧 F20 の格納9 bucket モデルを `floor(p×8)` で学習した場合は
+  `LS_PROGRESS_BUCKETS=8` を指定する。未指定、格納数超過、KingRank9 と格納数9以外の組合せは
+  `isready` / native tool 初期化時にエラーになる。
+
 ## v1.4.0 — 2026-08-13
 
 v1.3.0 後の性能改善と教師データパイプライン拡張のリリース。NNUE 推論・探索・局面処理の

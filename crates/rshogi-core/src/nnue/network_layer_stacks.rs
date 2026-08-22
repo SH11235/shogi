@@ -19,7 +19,7 @@
 //!
 //! ## バケット選択
 //!
-//! `LS_BUCKET_MODE` で `progress8kpabs` または両玉の相対段に基づく `kingrank9` を選ぶ。
+//! `LS_BUCKET_MODE` で `progresskpabs` または両玉の相対段に基づく `kingrank9` を選ぶ。
 
 use super::accumulator::Aligned;
 use super::accumulator_layer_stacks::{AccumulatorLayerStacks, AccumulatorStackLayerStacks};
@@ -55,8 +55,9 @@ use super::ls_feature_spec::HalfKaSplitSpec;
 use super::ls_feature_spec::HalfKpSpec;
 use super::ls_feature_spec::LsFeatureSpec;
 use super::network::{
-    LayerStackBucketMode, compute_layer_stack_progress8kpabs_bucket_index, get_fv_scale_override,
-    get_layer_stack_bucket_mode, get_layer_stack_progress_kpabs_weights, parse_fv_scale_from_arch,
+    LayerStackBucketMode, compute_layer_stack_progresskpabs_bucket_index, get_fv_scale_override,
+    get_layer_stack_bucket_mode, get_layer_stack_progress_buckets,
+    get_layer_stack_progress_kpabs_weights, parse_fv_scale_from_arch,
 };
 #[cfg(feature = "nnue-effect-bucket")]
 use super::{EFFECT_BUCKET_KING_BUCKETED, EFFECT_BUCKET_NB};
@@ -81,22 +82,34 @@ fn compute_layer_stacks_bucket_index(
         LayerStackBucketMode::KingRank9 => {
             compute_layer_stack_kingrank9_bucket_index(pos, side_to_move, num_buckets)
         }
-        LayerStackBucketMode::Progress8KPAbs => {
+        LayerStackBucketMode::ProgressKPAbs => {
             let weights = get_layer_stack_progress_kpabs_weights();
-            compute_layer_stack_progress8kpabs_bucket_index(pos, side_to_move, weights, num_buckets)
+            let routing_buckets = get_layer_stack_progress_buckets()
+                .expect("LayerStacks progress routing is not configured");
+            assert!(
+                routing_buckets <= num_buckets,
+                "LayerStacks progress routing uses {routing_buckets} buckets, but the network stores only {num_buckets}"
+            );
+            compute_layer_stack_progresskpabs_bucket_index(
+                pos,
+                side_to_move,
+                weights,
+                routing_buckets,
+            )
         }
     }
 }
 
 /// YaneuraOu KingRank9 と同じ両玉の相対段から bucket index を計算する。
 ///
-/// ネットワークの bucket 数が 9 未満なら、末尾 bucket へ clamp する。
+/// `num_buckets` は 9 でなければならない。USI は `isready` で事前検証する。
 #[inline]
 pub fn compute_layer_stack_kingrank9_bucket_index(
     pos: &Position,
     side_to_move: Color,
     num_buckets: usize,
 ) -> usize {
+    assert_eq!(num_buckets, 9, "kingrank9 requires exactly 9 stored buckets");
     const F_TO_INDEX: [usize; 9] = [0, 0, 0, 3, 3, 3, 6, 6, 6];
     const E_TO_INDEX: [usize; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
 
@@ -112,9 +125,8 @@ pub fn compute_layer_stack_kingrank9_bucket_index(
     } else {
         e_king.rank().index()
     };
-    let bucket = F_TO_INDEX[f_rank] + E_TO_INDEX[e_rank];
 
-    bucket.min(num_buckets.saturating_sub(1))
+    F_TO_INDEX[f_rank] + E_TO_INDEX[e_rank]
 }
 
 /// i16 配列の要素和: dst[i] = a[i] + b[i] (SIMD 最適化)
@@ -220,9 +232,10 @@ impl<
 
         // version（呼び出し元 NNUENetwork::read で大枠の受理範囲を確認済み）
         // ここでは LayerStack として受理する 2 つ:
-        // - `NNUE_VERSION_HALFKA` (= `0x7AF32F20`): num_buckets field 無し、暗黙 9
+        // - `NNUE_VERSION_HALFKA` (= `0x7AF32F20`): num_buckets field 無し、格納数は 9
         // - `NNUE_VERSION_LAYERSTACK_NUM_BUCKETS` (= `0x7AF32F21`): arch_str 直後に
-        //   num_buckets u32 field を持つ self-describing layout
+        //   格納 bucket 数を示す num_buckets u32 field を持つ self-describing layout
+        // version は binary layout の判別にだけ使い、推論 routing の意味論は決めない。
         //
         // HalfKP version `NNUE_VERSION (0x7AF32F16)` を `NNUE_ARCHITECTURE=LayerStacks`
         // override 経由で本関数に渡されるケースの防衛: silent な偽 9-bucket 読込を
@@ -2139,12 +2152,13 @@ mod tests {
 
     #[cfg(feature = "layerstack-arch")]
     #[test]
-    fn test_kingrank9_clamps_to_network_bucket_count() {
+    #[should_panic(expected = "kingrank9 requires exactly 9 stored buckets")]
+    fn test_kingrank9_rejects_non_nine_bucket_network() {
         let mut pos = Position::new();
         pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
             .unwrap();
 
-        assert_eq!(compute_layer_stack_kingrank9_bucket_index(&pos, Color::Black, 4), 3);
+        compute_layer_stack_kingrank9_bucket_index(&pos, Color::Black, 4);
     }
 
     #[cfg(feature = "nnue-threat")]

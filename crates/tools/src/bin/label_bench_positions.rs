@@ -29,9 +29,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::{Value as JsonValue, json};
 
 use rshogi_core::nnue::{
-    LayerStackBucketMode, get_layer_stack_bucket_mode, init_nnue, is_layer_stacks_loaded,
+    LayerStackBucketMode, configure_layer_stack_routing, get_network, init_nnue,
     load_progress_coeff_kpabs, parse_layer_stack_bucket_mode, set_fv_scale_override,
-    set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
+    set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::Position;
 use rshogi_core::search::{LimitsType, Search, SearchInfo};
@@ -66,13 +66,16 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     fv_scale: i32,
 
-    /// LayerStacks の bucket mode（例: `progress8kpabs`）。LS ビルドでは既定が
-    /// progress8kpabs なので通常は指定不要。
+    /// LayerStacks の bucket mode（`progresskpabs` または `kingrank9`）。LayerStacks では必須。
     #[arg(long)]
     ls_bucket_mode: Option<String>,
 
-    /// progress8kpabs 用の進行度係数ファイル（USI `LS_PROGRESS_COEFF` と同じ）。
-    /// LayerStacks モデルで bucket mode が progress8kpabs のとき必須（非 LS モデルでは不要）。
+    /// progresskpabs が推論に使う bucket 数。LayerStacks + progresskpabs では必須。
+    #[arg(long)]
+    ls_progress_buckets: Option<usize>,
+
+    /// progresskpabs 用の進行度係数ファイル（USI `LS_PROGRESS_COEFF` と同じ）。
+    /// LayerStacks モデルで bucket mode が progresskpabs のとき必須（非 LS モデルでは不要）。
     #[arg(long)]
     ls_progress_coeff: Option<PathBuf>,
 
@@ -389,7 +392,7 @@ fn black_view_label(score: Value, stm: Color) -> (i32, Option<i32>) {
 /// 評価器（NNUE + LayerStacks bucket 設定）を USI エンジンと同じ手順で構成する。
 ///
 /// 設定はすべて評価時に参照されるグローバル状態なので init_nnue 前に適用しておく。
-/// progress8kpabs で係数未指定だと bucket 選択が学習時と食い違い、ラベルが静かに
+/// progresskpabs で係数未指定だと bucket 選択が学習時と食い違い、ラベルが静かに
 /// 狂うため、エンジン同様にここで弾く（防御的すり替えはしない＝エラーで停止）。
 fn configure_eval(cli: &Cli) -> Result<()> {
     if !cli.nnue.exists() {
@@ -403,13 +406,15 @@ fn configure_eval(cli: &Cli) -> Result<()> {
         eprintln!("FV_SCALE: auto-detect (header)");
     }
 
-    if let Some(mode_str) = &cli.ls_bucket_mode {
-        let mode = parse_layer_stack_bucket_mode(mode_str).with_context(|| {
-            format!("invalid --ls-bucket-mode '{mode_str}' (expected progress8kpabs or kingrank9)")
-        })?;
-        set_layer_stack_bucket_mode(mode);
-        eprintln!("LS_BUCKET_MODE: {}", mode.as_str());
-    }
+    let mode =
+        cli.ls_bucket_mode
+            .as_deref()
+            .map(|mode_str| {
+                parse_layer_stack_bucket_mode(mode_str).with_context(|| {
+            format!("invalid --ls-bucket-mode '{mode_str}' (expected progresskpabs or kingrank9)")
+            })
+            })
+            .transpose()?;
 
     let mut coeff_loaded = false;
     if let Some(path) = &cli.ls_progress_coeff {
@@ -423,17 +428,33 @@ fn configure_eval(cli: &Cli) -> Result<()> {
     init_nnue(&cli.nnue).context("Failed to load NNUE model")?;
     eprintln!("NNUE model loaded: {}", cli.nnue.display());
 
-    // progress bucket は LayerStacks のときだけ使う。非 LS モデル (HalfKP 等) では係数不要なので、
-    // USI エンジンと同じく LS ロード時のみ係数必須を課す（bucket mode は net の種別を表さない
-    // グローバル設定なので、実ネットワークの判定には is_layer_stacks_loaded を使う）。
-    if is_layer_stacks_loaded()
-        && get_layer_stack_bucket_mode() == LayerStackBucketMode::Progress8KPAbs
-        && !coeff_loaded
-    {
-        bail!(
-            "LS_BUCKET_MODE=progress8kpabs requires --ls-progress-coeff. \
-             Without it the progress bucket selection diverges from training and labels are wrong."
-        );
+    let stored_buckets =
+        get_network().as_deref().and_then(|network| network.layer_stack_num_buckets());
+    match stored_buckets {
+        Some(stored) => {
+            let mode = mode.context("LayerStacks requires --ls-bucket-mode")?;
+            if mode == LayerStackBucketMode::ProgressKPAbs && !coeff_loaded {
+                bail!("--ls-bucket-mode progresskpabs requires --ls-progress-coeff");
+            }
+            if mode == LayerStackBucketMode::KingRank9 && cli.ls_progress_coeff.is_some() {
+                bail!("--ls-bucket-mode kingrank9 does not use --ls-progress-coeff");
+            }
+            configure_layer_stack_routing(mode, stored, cli.ls_progress_buckets)
+                .map_err(anyhow::Error::msg)?;
+            eprintln!(
+                "LayerStacks routing: mode={} stored_buckets={} routing_buckets={}",
+                mode.as_str(),
+                stored,
+                cli.ls_progress_buckets.unwrap_or(9)
+            );
+        }
+        None if mode.is_some()
+            || cli.ls_progress_buckets.is_some()
+            || cli.ls_progress_coeff.is_some() =>
+        {
+            bail!("LayerStacks routing options were provided for a non-LayerStacks network");
+        }
+        None => {}
     }
     Ok(())
 }

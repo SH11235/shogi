@@ -30,7 +30,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::cell::RefCell;
 
-use rshogi_core::nnue::init_nnue;
+use rshogi_core::nnue::{
+    LayerStackBucketMode, configure_layer_stack_routing, get_network, init_nnue,
+    load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
+    set_layer_stack_progress_kpabs_weights,
+};
 use rshogi_core::position::Position;
 use tools::packed_sfen::{PackedSfenValue, pack_position, unpack_sfen};
 use tools::qsearch_pv::{
@@ -64,6 +68,18 @@ struct Cli {
     /// NNUEモデルファイル（省略時はMaterial評価、--rescoreには必須）
     #[arg(long)]
     nnue: Option<PathBuf>,
+
+    /// LayerStacks bucket mode。LayerStacks NNUE では必須。
+    #[arg(long)]
+    ls_bucket_mode: Option<String>,
+
+    /// progresskpabs が推論に使う bucket 数。
+    #[arg(long)]
+    ls_progress_buckets: Option<usize>,
+
+    /// progresskpabs 用の進行度係数ファイル。
+    #[arg(long)]
+    ls_progress_coeff: Option<PathBuf>,
 
     /// 処理するレコード数の上限（0=無制限）
     #[arg(long, default_value_t = 0)]
@@ -148,6 +164,42 @@ fn main() -> Result<()> {
         }
         init_nnue(nnue_path).context("Failed to load NNUE model")?;
         eprintln!("NNUE model loaded: {}", nnue_path.display());
+        let network = get_network().context("NNUE was not initialized")?;
+        match network.layer_stack_num_buckets() {
+            Some(stored) => {
+                let mode_str = cli
+                    .ls_bucket_mode
+                    .as_deref()
+                    .context("LayerStacks requires --ls-bucket-mode")?;
+                let mode = parse_layer_stack_bucket_mode(mode_str)
+                    .context("--ls-bucket-mode must be progresskpabs or kingrank9")?;
+                match (mode, cli.ls_progress_coeff.as_deref()) {
+                    (LayerStackBucketMode::ProgressKPAbs, Some(path)) => {
+                        let weights =
+                            load_progress_coeff_kpabs(path).map_err(anyhow::Error::msg)?;
+                        set_layer_stack_progress_kpabs_weights(weights)
+                            .map_err(anyhow::Error::msg)?;
+                    }
+                    (LayerStackBucketMode::ProgressKPAbs, None) => {
+                        anyhow::bail!("progresskpabs requires --ls-progress-coeff")
+                    }
+                    (LayerStackBucketMode::KingRank9, Some(_)) => {
+                        anyhow::bail!("kingrank9 does not use --ls-progress-coeff")
+                    }
+                    (LayerStackBucketMode::KingRank9, None) => {}
+                    _ => unreachable!(),
+                }
+                configure_layer_stack_routing(mode, stored, cli.ls_progress_buckets)
+                    .map_err(anyhow::Error::msg)?;
+            }
+            None if cli.ls_bucket_mode.is_some()
+                || cli.ls_progress_buckets.is_some()
+                || cli.ls_progress_coeff.is_some() =>
+            {
+                anyhow::bail!("LayerStacks routing options require a LayerStacks NNUE")
+            }
+            None => {}
+        }
         true
     } else {
         false

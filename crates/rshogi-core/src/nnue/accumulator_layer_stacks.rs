@@ -373,7 +373,7 @@ pub struct StackEntryLayerStacks<const L1: usize> {
     pub dirty_piece: DirtyPiece,
     /// 直前のエントリインデックス（差分計算用）
     pub previous: Option<usize>,
-    /// progress8kpabs の重み付き和（差分更新用）
+    /// progresskpabs の重み付き和（差分更新用）
     #[cfg(feature = "nnue-progress-diff")]
     pub progress_sum: f32,
     /// progress_sum 計算済みフラグ

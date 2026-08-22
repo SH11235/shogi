@@ -315,6 +315,11 @@ rescore_psv --input "data/*.bin" --output-dir rescored_leaflabel/ \
 # 静的 NNUE 評価（CPU のみ、最軽量）
 rescore_psv --input data.bin --output-dir rescored/ --nnue nn.bin
 
+# LayerStacks progresskpabs（routing は必ず学習時と同じ値を明示）
+rescore_psv --input data.bin --output-dir rescored/ --nnue ls.bin \
+  --ls-bucket-mode progresskpabs --ls-progress-buckets 8 \
+  --ls-progress-coeff progress.bin
+
 # qsearch 評価
 rescore_psv --input data.bin --output-dir rescored/ --nnue nn.bin --use-qsearch
 
@@ -332,6 +337,10 @@ rescore_psv --input data.bin --output-dir rescored/ \
 4 GB を超えると起動時に警告が出る。外部エンジンはプロセスが死んだ場合、担当分の
 未評価レコードを生存エンジンに再割り当てして継続する（全滅時はエラー終了し、
 `--delete-input` でも入力を保全する）。
+
+LayerStacks NNUE では `--ls-bucket-mode` が必須です。`progresskpabs` はさらに
+`--ls-progress-buckets` と `--ls-progress-coeff` が必須で、格納 bucket 数を routing 数へ
+暗黙採用しません。`kingrank9` は progress 用の2オプションを指定せず、格納9 bucket のモデルだけを受理します。
 
 ## 再開（resume）の仕組み
 

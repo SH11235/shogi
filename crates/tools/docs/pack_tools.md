@@ -101,6 +101,9 @@ cargo run -p tools --release --bin rescore_psv -- \
 | `-i, --input` | 入力ファイル | 必須 |
 | `-o, --output` | 出力ファイル | 必須 |
 | `--nnue` | NNUEモデルファイル | 必須 |
+| `--ls-bucket-mode` | LayerStacks routing (`progresskpabs` / `kingrank9`) | LS 時必須 |
+| `--ls-progress-buckets` | progresskpabs の routing bucket 数 | LS progress 時必須 |
+| `--ls-progress-coeff` | progresskpabs 係数ファイル | LS progress 時必須 |
 | `--use-qsearch` | qsearch評価を使用 | false |
 | `--search-depth` | 深さ指定探索（qsearchと排他） | - |
 | `--apply-qsearch-leaf` | qsearch leaf置換も適用 | false |
@@ -123,6 +126,9 @@ cargo run -p tools --release --bin preprocess_psv -- \
 | `-i, --input` | 入力ファイル | 必須 |
 | `-o, --output` | 出力ファイル | 必須 |
 | `--nnue` | NNUEモデルファイル | - |
+| `--ls-bucket-mode` | LayerStacks routing (`progresskpabs` / `kingrank9`) | LS 時必須 |
+| `--ls-progress-buckets` | progresskpabs の routing bucket 数 | LS progress 時必須 |
+| `--ls-progress-coeff` | progresskpabs 係数ファイル | LS progress 時必須 |
 | `--rescore` | 置換後にNNUEで再評価（推奨） | false |
 | `--skip-in-check` | 王手局面をスキップ | false |
 | `-t, --threads` | スレッド数（0=自動） | 1 |

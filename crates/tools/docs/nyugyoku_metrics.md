@@ -83,6 +83,7 @@ CSA（1 ファイル = 1 対局）をファイル名ソートの決定的順序�
 cargo run -p tools --release --bin nyugyoku_metrics -- eval-pairs \
   --pairs runs/nyugyoku_metrics/kachi/pairs.jsonl \
   --eval-file "$SHOGI_DATA/nnue/model.bin" \
+  --bucket-mode progresskpabs --progress-buckets 8 \
   --progress-file "$SHOGI_DATA/progress/progress.bin" \
   --out runs/nyugyoku_metrics/kachi/metrics.json
 ```
@@ -93,10 +94,10 @@ pair ごとに `sfen_before` / `sfen_after` を NNUE 静的評価（cp）し、�
 NNUE は `init_nnue` がロードできる全アーキテクチャ（LayerStacks、HalfKP 系など）に
 対応します。
 
-- **bucket-mode（LayerStacks 専用）**: LayerStacks では `--bucket-mode` 省略時に
-  `progress8kpabs` を使い、`--progress-file` が必須です。`--bucket-mode kingrank9` は
+- **bucket-mode（LayerStacks 専用）**: LayerStacks では `--bucket-mode` が必須です。
+  `progresskpabs` では `--progress-buckets` と `--progress-file` が必須です。`--bucket-mode kingrank9` は
   progress 係数を使わないため `--progress-file` 不要です（指定するとエラーにします）。
-  LayerStacks 以外の NNUE で `--bucket-mode` または `--progress-file` を指定すると
+  LayerStacks 以外の NNUE でこれらの routing option を指定すると
   エラーになります。
 - **95% CI**: 対局クラスタ bootstrap（`source_csa` 単位の復元抽出、既定 `--bootstrap 10000`、
   `--seed 20260726`）で出します。分位点は replicate 統計量を昇順ソートし、0 始まりの
@@ -120,7 +121,7 @@ NNUE は `init_nnue` がロードできる全アーキテクチャ（LayerStacks
 ```json
 {
   "pairs": "...", "eval_file": "...", "progress_file": "...",
-  "bucket_mode": "progress8kpabs", "bootstrap": 10000, "seed": 20260726,
+  "bucket_mode": "progresskpabs", "progress_buckets": 8, "bootstrap": 10000, "seed": 20260726,
   "overall":    { "agreement": 0.7, "n_pairs": 123, "n_games": 40, "ci95_lo": 0.6, "ci95_hi": 0.8 },
   "conditions": {
     "check_resolved":  { "agreement": ..., "n_pairs": ..., "n_games": ..., "ci95_lo": ..., "ci95_hi": ... },
@@ -198,13 +199,14 @@ oracle 探索へかけ、**詰みを読み切れた局面のみ**を `mates.json
 cargo run -p tools --release --bin nyugyoku_metrics -- eval-mates \
   --mates runs/nyugyoku_metrics/mates/mates.jsonl \
   --eval-file "$SHOGI_DATA/nnue/model.bin" \
+  --bucket-mode progresskpabs --progress-buckets 8 \
   --progress-file "$SHOGI_DATA/progress/progress.bin" \
   --out runs/nyugyoku_metrics/mates/metrics.json
 ```
 
 mates.jsonl を NNUE 静的評価で採点し、2 指標を出します。NNUE は `init_nnue` がロード
 できる全アーキテクチャに対応します。LayerStacks 専用の `--bucket-mode`・
-`--progress-file` の扱いと対局クラスタ bootstrap（95% CI、分位点規約、決定性）は
+`--progress-buckets`・`--progress-file` の扱いと対局クラスタ bootstrap（95% CI、分位点規約、決定性）は
 eval-pairs と同一です。
 
 1. **concordance**: 同一対局の mate 局面の全 pair（`mate_in` が厳密に異なる組合せのみ）に
@@ -228,7 +230,7 @@ CI は幅ではなく `n_games` を見て判断してください。
 ```json
 {
   "mates": "...", "eval_file": "...", "progress_file": "...",
-  "bucket_mode": "progress8kpabs", "bootstrap": 10000, "seed": 20260726,
+  "bucket_mode": "progresskpabs", "progress_buckets": 8, "bootstrap": 10000, "seed": 20260726,
   "concordance": { "agreement": 0.8, "n_pairs": 210, "n_games": 60, "ci95_lo": 0.7, "ci95_hi": 0.9 },
   "mate_top1":   { "rate": 0.4, "n_positions": 95, "n_games": 70, "ci95_lo": 0.3, "ci95_hi": 0.5 }
 }

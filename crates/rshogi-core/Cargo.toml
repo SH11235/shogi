@@ -143,7 +143,7 @@ mode-universal = []
 mode-family    = []
 mode-specific  = []
 
-# NNUE progress8kpabs バケットの差分更新最適化
+# NNUE progresskpabs バケットの差分更新最適化
 # - 有効時: StackEntry に progress_sum/computed_progress フィールド追加、
 #   ensure_progress_bucket で DirtyPiece 差分から O(1) 更新
 # - L0=1536 系 / L0=3072 で性能向上、L0=768/512 で退行する trade-off

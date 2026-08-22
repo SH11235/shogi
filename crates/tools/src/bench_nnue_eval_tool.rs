@@ -3,7 +3,7 @@
 //! 3バリアント階層構造に対応したベンチマーク。
 //! 各ネットワークアーキテクチャの推論性能を測定する。
 //!
-//! ## progress8kpabs bucket 計算ベンチ
+//! ## progresskpabs bucket 計算ベンチ
 //!
 //! `--ls-progress-coeff` を指定すると、bucket index 計算のマイクロベンチも実行:
 //! ```bash
@@ -23,12 +23,13 @@ use clap::Parser;
 
 use rshogi_core::movegen::{MoveList, generate_legal_all};
 use rshogi_core::nnue::{
-    AccumulatorCacheLayerStacks, AccumulatorLayerStacks, DEFAULT_NUM_BUCKETS, DirtyPiece,
-    LayerStackBucketMode, LsFeatureSpec, NNUEEvaluator, NNUENetwork, NetworkLayerStacks,
+    AccumulatorCacheLayerStacks, AccumulatorLayerStacks, DirtyPiece, LayerStackBucketMode,
+    LsFeatureSpec, NNUEEvaluator, NNUENetwork, NetworkLayerStacks,
     SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, compute_layer_stack_kingrank9_bucket_index,
-    compute_layer_stack_progress8kpabs_bucket_index, get_layer_stack_progress_kpabs_weights,
-    ls_dispatch_ft_size, parse_layer_stack_bucket_mode, set_layer_stack_bucket_mode,
-    set_layer_stack_progress_kpabs_weights, sqr_clipped_relu_transform,
+    compute_layer_stack_progresskpabs_bucket_index, configure_layer_stack_routing,
+    get_layer_stack_progress_buckets, get_layer_stack_progress_kpabs_weights, ls_dispatch_ft_size,
+    parse_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
+    sqr_clipped_relu_transform,
 };
 use rshogi_core::position::Position;
 use rshogi_core::types::{Color, PieceType};
@@ -57,14 +58,18 @@ struct Cli {
     #[arg(long, default_value = "10000")]
     warmup: u64,
 
-    /// progress8kpabs 重みファイル（progress.bin）
+    /// progresskpabs 重みファイル（progress.bin）
     /// 指定時は bucket index 計算のマイクロベンチも実行
     #[arg(long)]
     ls_progress_coeff: Option<PathBuf>,
 
+    /// progresskpabs が推論に使う bucket 数。LayerStacks + progresskpabs では必須。
+    #[arg(long)]
+    ls_progress_buckets: Option<usize>,
+
     /// LayerStacks bucket モード
-    #[arg(long, default_value = "progress8kpabs")]
-    ls_bucket_mode: String,
+    #[arg(long)]
+    ls_bucket_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,10 +264,9 @@ fn load_progress_kpabs_weights(path: &PathBuf) -> Result<Box<[f32]>> {
     Ok(weights.into_boxed_slice())
 }
 
-/// progress8kpabs bucket 計算のマイクロベンチマーク
+/// progresskpabs bucket 計算のマイクロベンチマーク
 ///
-/// `num_buckets` は net file 由来の bucket 数。net をロードしていない bench-only
-/// 経路では caller が渡す (通常は `net.num_buckets()` または `DEFAULT_NUM_BUCKETS`)。
+/// `num_buckets` は学習時と一致する、CLI で明示された routing bucket 数。
 fn bench_progress_bucket(
     positions: &[Position],
     weights: &[f32],
@@ -273,7 +277,7 @@ fn bench_progress_bucket(
     // ウォームアップ
     for i in 0..warmup {
         let pos = &positions[i as usize % positions.len()];
-        black_box(compute_layer_stack_progress8kpabs_bucket_index(
+        black_box(compute_layer_stack_progresskpabs_bucket_index(
             pos,
             pos.side_to_move(),
             weights,
@@ -285,7 +289,7 @@ fn bench_progress_bucket(
     let start = Instant::now();
     for i in 0..iterations {
         let pos = &positions[i as usize % positions.len()];
-        black_box(compute_layer_stack_progress8kpabs_bucket_index(
+        black_box(compute_layer_stack_progresskpabs_bucket_index(
             pos,
             pos.side_to_move(),
             weights,
@@ -298,9 +302,9 @@ fn bench_progress_bucket(
     let ops_per_sec = 1_000_000_000.0 / ns_per_op;
 
     // 各局面の bucket 値を表示
-    println!("=== progress8kpabs bucket (N={num_buckets}) ===");
+    println!("=== progresskpabs bucket (N={num_buckets}) ===");
     for (i, pos) in positions.iter().enumerate() {
-        let bucket = compute_layer_stack_progress8kpabs_bucket_index(
+        let bucket = compute_layer_stack_progresskpabs_bucket_index(
             pos,
             pos.side_to_move(),
             weights,
@@ -310,7 +314,7 @@ fn bench_progress_bucket(
     }
     println!("  {:.1} ns/op ({:.0} ops/sec)", ns_per_op, ops_per_sec);
     println!();
-    println!("--- progress8kpabs JSON ---");
+    println!("--- progresskpabs JSON ---");
     println!(
         r#"{{"bucket_ns":{:.1},"bucket_ops_per_sec":{:.0},"num_buckets":{}}}"#,
         ns_per_op, ops_per_sec, num_buckets
@@ -328,7 +332,7 @@ fn compute_layer_stack_bucket_index(
         LayerStackBucketMode::KingRank9 => {
             compute_layer_stack_kingrank9_bucket_index(pos, side_to_move, num_buckets)
         }
-        LayerStackBucketMode::Progress8KPAbs => compute_layer_stack_progress8kpabs_bucket_index(
+        LayerStackBucketMode::ProgressKPAbs => compute_layer_stack_progresskpabs_bucket_index(
             pos,
             side_to_move,
             get_layer_stack_progress_kpabs_weights(),
@@ -355,22 +359,25 @@ fn format_bucket_counts(bucket_counts: &[usize]) -> String {
 fn configure_layer_stack_bucket(
     cli: &Cli,
     progress_weights: Option<&[f32]>,
+    stored_buckets: usize,
 ) -> Result<LayerStackBucketMode> {
-    let mode = parse_layer_stack_bucket_mode(&cli.ls_bucket_mode).ok_or_else(|| {
-        anyhow!(
-            "invalid --ls-bucket-mode '{}'. expected: progress8kpabs or kingrank9",
-            cli.ls_bucket_mode
-        )
+    let mode_str =
+        cli.ls_bucket_mode.as_deref().context("LayerStacks requires --ls-bucket-mode")?;
+    let mode = parse_layer_stack_bucket_mode(mode_str).ok_or_else(|| {
+        anyhow!("invalid --ls-bucket-mode '{}'. expected: progresskpabs or kingrank9", mode_str)
     })?;
-    set_layer_stack_bucket_mode(mode);
 
-    if mode == LayerStackBucketMode::Progress8KPAbs {
+    if mode == LayerStackBucketMode::ProgressKPAbs {
         let weights = progress_weights.context(
-            "--ls-bucket-mode progress8kpabs requires --ls-progress-coeff <progress.bin>",
+            "--ls-bucket-mode progresskpabs requires --ls-progress-coeff <progress.bin>",
         )?;
         set_layer_stack_progress_kpabs_weights(weights.to_vec().into_boxed_slice())
-            .map_err(|e| anyhow!("failed to set progress8kpabs weights: {e}"))?;
+            .map_err(|e| anyhow!("failed to set progresskpabs weights: {e}"))?;
+    } else if cli.ls_progress_coeff.is_some() {
+        bail!("--ls-bucket-mode kingrank9 does not use --ls-progress-coeff");
     }
+    configure_layer_stack_routing(mode, stored_buckets, cli.ls_progress_buckets)
+        .map_err(anyhow::Error::msg)?;
 
     Ok(mode)
 }
@@ -387,6 +394,12 @@ fn prepare_layer_stack_cases<
     bucket_mode: LayerStackBucketMode,
 ) -> Result<LayerStackCases<L1>> {
     let num_buckets = net.num_buckets;
+    let routing_buckets = match bucket_mode {
+        LayerStackBucketMode::ProgressKPAbs => get_layer_stack_progress_buckets()
+            .expect("progress routing configured before preparing cases"),
+        LayerStackBucketMode::KingRank9 => num_buckets,
+        _ => unreachable!("unsupported LayerStack bucket mode"),
+    };
     let mut propagate_cases = Vec::with_capacity(positions.len());
     let mut eval_cases = Vec::with_capacity(positions.len());
     let mut update_cache_cases = Vec::with_capacity(positions.len());
@@ -397,7 +410,7 @@ fn prepare_layer_stack_cases<
         let mut accumulator = AccumulatorLayerStacks::<L1>::new();
         net.refresh_accumulator(pos, &mut accumulator);
 
-        let bucket_index = compute_layer_stack_bucket_index(pos, bucket_mode, num_buckets);
+        let bucket_index = compute_layer_stack_bucket_index(pos, bucket_mode, routing_buckets);
         bucket_counts[bucket_index] += 1;
 
         let (us_acc, them_acc) = if pos.side_to_move() == Color::Black {
@@ -423,7 +436,7 @@ fn prepare_layer_stack_cases<
             let mut next_pos = pos.clone();
             let dirty_piece = next_pos.do_move(mv, pos.gives_check(mv));
             let next_bucket_index =
-                compute_layer_stack_bucket_index(&next_pos, bucket_mode, num_buckets);
+                compute_layer_stack_bucket_index(&next_pos, bucket_mode, routing_buckets);
             update_bucket_counts[next_bucket_index] += 1;
 
             update_cache_cases.push(LayerStackUpdateCacheCase {
@@ -695,7 +708,7 @@ pub fn run() -> Result<()> {
     println!();
 
     let progress_weights = if let Some(ref coeff_path) = cli.ls_progress_coeff {
-        println!("Loading progress8kpabs weights: {}", coeff_path.display());
+        println!("Loading progresskpabs weights: {}", coeff_path.display());
         let weights = load_progress_kpabs_weights(coeff_path)?;
         println!("  weights: {} elements", weights.len());
         println!();
@@ -708,13 +721,24 @@ pub fn run() -> Result<()> {
     let network = Arc::new(NNUENetwork::load(&cli.nnue_file)?);
     let arch_name = network.architecture_name();
 
-    // progress8kpabs bucket ベンチマーク (net 由来の num_buckets で駆動)
+    let stored_buckets = network.layer_stack_num_buckets();
+    let bucket_mode = match stored_buckets {
+        Some(stored) => {
+            Some(configure_layer_stack_bucket(&cli, progress_weights.as_deref(), stored)?)
+        }
+        None if cli.ls_bucket_mode.is_some()
+            || cli.ls_progress_buckets.is_some()
+            || cli.ls_progress_coeff.is_some() =>
+        {
+            bail!("LayerStacks routing options were provided for a non-LayerStacks network")
+        }
+        None => None,
+    };
+
     if let Some(weights) = progress_weights.as_deref() {
-        // `as_layer_stacks()` は runtime-dimensions ビルドで DynamicLayerStacks として
-        // load された net に対して panic する (`is_layer_stacks()` は Dynamic でも true)。
-        // 両 variant を扱う `layer_stack_num_buckets()` で取得する。
-        // 非 LayerStack net: 微小ベンチに net 由来 N が無いので default
-        let num_buckets = network.layer_stack_num_buckets().unwrap_or(DEFAULT_NUM_BUCKETS);
+        let num_buckets = cli
+            .ls_progress_buckets
+            .context("progresskpabs requires --ls-progress-buckets")?;
         bench_progress_bucket(&positions, weights, num_buckets, cli.warmup, cli.iterations);
     }
     println!("Architecture: {arch_name}");
@@ -743,7 +767,7 @@ pub fn run() -> Result<()> {
         | BenchMode::LayerStackEval
         | BenchMode::LayerStackRefreshCache
         | BenchMode::LayerStackUpdateCache => {
-            let bucket_mode = configure_layer_stack_bucket(&cli, progress_weights.as_deref())?;
+            let bucket_mode = bucket_mode.expect("LayerStacks checked below");
 
             let NNUENetwork::LayerStacks(ref ls_net) = *network else {
                 bail!("LayerStack 専用モードは LayerStacks NNUE のみ対応");

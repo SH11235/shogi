@@ -17,9 +17,10 @@ use rand::Rng;
 use rand::seq::SliceRandom;
 use rshogi_core::movegen::{MoveList, generate_legal, is_legal_with_pass};
 use rshogi_core::nnue::{
-    compute_layer_stack_progress8kpabs_bucket_index, get_layer_stack_progress_kpabs_weights,
-    get_network, init_nnue_from_bytes, load_progress_coeff_kpabs_from_bytes, set_fv_scale_override,
-    set_layer_stack_progress_kpabs_weights,
+    LayerStackBucketMode, compute_layer_stack_progresskpabs_bucket_index,
+    configure_layer_stack_routing, get_layer_stack_progress_kpabs_weights, get_network,
+    init_nnue_from_bytes, load_progress_coeff_kpabs_from_bytes, parse_layer_stack_bucket_mode,
+    set_fv_scale_override, set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::{EnteringKingPointInfo, Position};
 use rshogi_core::types::{Color, EnteringKingRule, Move};
@@ -305,9 +306,17 @@ struct Cli {
     #[arg(long)]
     eval_file: Option<PathBuf>,
 
-    /// progress8kpabs 用の進行度係数ファイル（NativeBackend の LayerStacks ネットで使用）
+    /// progresskpabs 用の進行度係数ファイル（NativeBackend の LayerStacks ネットで使用）
     #[arg(long)]
     progress_file: Option<PathBuf>,
+
+    /// NativeBackend の LayerStacks bucket mode。LayerStacks では必須。
+    #[arg(long)]
+    bucket_mode: Option<String>,
+
+    /// NativeBackend の progresskpabs が推論に使う bucket 数。
+    #[arg(long)]
+    progress_buckets: Option<usize>,
 
     /// FV_SCALE オーバーライド（0=arch 文字列から自動判定、1 以上=指定値。NativeBackend 専用。
     /// arch 文字列の fv_scale が実際の学習スケールと食い違うネットで使用する）
@@ -429,12 +438,18 @@ struct MetaSettings {
     /// 開始局面シャッフルの乱数シード（--startpos-no-repeat 用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     shuffle_seed: Option<u64>,
-    /// NativeBackend の progress8kpabs 進行度係数ファイル
+    /// NativeBackend の progresskpabs 進行度係数ファイル
     #[serde(default, skip_serializing_if = "Option::is_none")]
     progress_file: Option<String>,
     /// progress_file 内容の SHA-256（resume 時に同一パスへの係数差し替えを検出する）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     progress_file_sha256: Option<String>,
+    /// NativeBackend の LayerStacks bucket mode。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bucket_mode: Option<String>,
+    /// NativeBackend の progresskpabs routing bucket 数。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    progress_buckets: Option<usize>,
     /// FV_SCALE オーバーライド（未指定 = arch 文字列から自動判定）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fv_scale: Option<i32>,
@@ -2036,7 +2051,7 @@ struct WorkerConfig {
     /// --for-train 時のみ有効（棋力評価用途では使用しない）。
     usi_single: bool,
     eval_hash_size_mb: usize,
-    layer_stack_num_buckets: Option<usize>,
+    progress_routing_buckets: Option<usize>,
     // gensfen: 重複回避
     keep_tt: bool,
     dedup_hash: Option<Arc<SharedDedupHash>>,
@@ -2178,9 +2193,9 @@ fn worker_main(
         let mut interval_positions_checked = 0u64;
         let mut committed_games = 0u32;
         let progress_weights =
-            cfg.layer_stack_num_buckets.map(|_| get_layer_stack_progress_kpabs_weights());
+            cfg.progress_routing_buckets.map(|_| get_layer_stack_progress_kpabs_weights());
         let mut progress_bucket_counts = cfg
-            .layer_stack_num_buckets
+            .progress_routing_buckets
             .map(|num_buckets| vec![0u64; num_buckets])
             .unwrap_or_default();
 
@@ -2242,9 +2257,9 @@ fn worker_main(
                     "white"
                 };
                 if let (Some(weights), Some(num_buckets)) =
-                    (progress_weights, cfg.layer_stack_num_buckets)
+                    (progress_weights, cfg.progress_routing_buckets)
                 {
-                    let bucket = compute_layer_stack_progress8kpabs_bucket_index(
+                    let bucket = compute_layer_stack_progresskpabs_bucket_index(
                         &pos,
                         side,
                         weights,
@@ -2735,7 +2750,7 @@ fn worker_main(
                 cfg.worker_id, dedup_hits, dedup_discarded, multipv_diversions, random_moves_played
             );
         }
-        if let Some(num_buckets) = cfg.layer_stack_num_buckets {
+        if let Some(num_buckets) = cfg.progress_routing_buckets {
             let used = progress_bucket_counts.iter().filter(|&&count| count > 0).count();
             eprintln!(
                 "worker {}: progress bucket distribution: {:?} (used {}/{})",
@@ -3028,14 +3043,16 @@ fn usi_option_path_fingerprints(options: &[String]) -> Result<Vec<Value>> {
 
 /// fingerprint の model 節を構築する。
 ///
-/// `fv_scale` は 0 (自動判定) のときキー自体を出さない。旧バージョンで生成した run の
-/// fingerprint と bit 一致させ、resume を壊さないための互換要件。
+/// `fv_scale` と LayerStacks routing は未指定時にキー自体を出さない。旧バージョンで
+/// 生成した無関係な run の fingerprint と bit 一致させ、resume を壊さないための互換要件。
 fn build_model_fingerprint(
     native_mode: bool,
     eval_file: Option<String>,
     eval_file_sha256: Option<String>,
     progress_file: Option<String>,
     progress_file_sha256: Option<String>,
+    bucket_mode: Option<String>,
+    progress_buckets: Option<usize>,
     fv_scale: i32,
 ) -> Value {
     let mut model = serde_json::json!({
@@ -3045,6 +3062,12 @@ fn build_model_fingerprint(
         "progress_file": progress_file,
         "progress_file_sha256": progress_file_sha256,
     });
+    if let Some(bucket_mode) = bucket_mode {
+        model["bucket_mode"] = serde_json::json!(bucket_mode);
+    }
+    if let Some(progress_buckets) = progress_buckets {
+        model["progress_buckets"] = serde_json::json!(progress_buckets);
+    }
     if fv_scale > 0 {
         model["fv_scale"] = serde_json::json!(fv_scale);
     }
@@ -4571,10 +4594,15 @@ fn main() -> Result<()> {
             "warning: NativeBackend ignores the EnteringKingRule USI option and uses CSARule27"
         );
     }
-    if !native_mode && cli.progress_file.is_some() {
+    if !native_mode
+        && (cli.progress_file.is_some()
+            || cli.bucket_mode.is_some()
+            || cli.progress_buckets.is_some())
+    {
         bail!(
-            "--progress-file is only supported with --native=true. \
-             In USI mode, pass the engine option directly with --usi-option LS_PROGRESS_COEFF=<path>."
+            "--progress-file, --bucket-mode, and --progress-buckets are only supported with \
+             --native=true. In USI mode, pass LS_BUCKET_MODE, LS_PROGRESS_BUCKETS, and (for \
+             progresskpabs) LS_PROGRESS_COEFF with --usi-option."
         );
     }
     if cli.fv_scale < 0 {
@@ -4665,7 +4693,7 @@ fn main() -> Result<()> {
     let random_multi_pv_resolved = cli.random_multi_pv.unwrap_or(0);
     let random_multi_pv_diff_resolved = cli.random_multi_pv_diff.unwrap_or(0);
 
-    let mut native_layer_stack_buckets = None;
+    let mut native_progress_routing_buckets = None;
     let mut native_eval_file_sha256 = None;
     let mut native_progress_file_sha256 = None;
     let mut native_eval_bytes = None;
@@ -4692,10 +4720,12 @@ fn main() -> Result<()> {
         }
         if !cli.resume {
             // 新規 run は初期化失敗で不完全な meta を残さないよう、meta 永続化より先に検証する。
-            native_layer_stack_buckets = initialize_native_backend(
+            native_progress_routing_buckets = initialize_native_backend(
                 eval_file,
                 native_eval_bytes.as_deref().context("native eval bytes missing")?,
                 cli.progress_file.as_deref().zip(native_progress_bytes.as_deref()),
+                cli.bucket_mode.as_deref(),
+                cli.progress_buckets,
             )?;
         }
     }
@@ -4738,6 +4768,8 @@ fn main() -> Result<()> {
         eval_file_sha256,
         cli.progress_file.as_ref().map(|path| path.display().to_string()),
         native_progress_file_sha256.clone(),
+        cli.bucket_mode.clone(),
+        cli.progress_buckets,
         cli.fv_scale,
     );
     let mut generation_fingerprint = serde_json::json!({
@@ -4881,6 +4913,8 @@ fn main() -> Result<()> {
                 shuffle_seed: shuffle_seed_resolved,
                 progress_file: cli.progress_file.as_ref().map(|p| p.display().to_string()),
                 progress_file_sha256: native_progress_file_sha256.clone(),
+                bucket_mode: cli.bucket_mode.clone(),
+                progress_buckets: cli.progress_buckets,
                 fv_scale: (cli.fv_scale > 0).then_some(cli.fv_scale),
                 omit_diversions: cli.omit_diversions.then_some(true),
             },
@@ -5051,10 +5085,12 @@ fn main() -> Result<()> {
     if !all_games_completed {
         if native_mode && cli.resume {
             // checkpoint だけで完了できる resume では大きな NNUE をロードする必要がない。
-            native_layer_stack_buckets = initialize_native_backend(
+            native_progress_routing_buckets = initialize_native_backend(
                 cli.eval_file.as_deref().context("native eval path missing")?,
                 native_eval_bytes.as_deref().context("native eval bytes missing")?,
                 cli.progress_file.as_deref().zip(native_progress_bytes.as_deref()),
+                cli.bucket_mode.as_deref(),
+                cli.progress_buckets,
             )?;
         }
         for w in 0..cli.concurrency {
@@ -5108,7 +5144,7 @@ fn main() -> Result<()> {
                 native_mode,
                 usi_single,
                 eval_hash_size_mb: DEFAULT_EVAL_HASH_SIZE_MB,
-                layer_stack_num_buckets: native_layer_stack_buckets,
+                progress_routing_buckets: native_progress_routing_buckets,
                 keep_tt: keep_tt_resolved,
                 dedup_hash: shared_dedup_hash.clone(),
                 random_multi_pv: random_multi_pv_resolved,
@@ -5901,36 +5937,59 @@ fn normalize_output_path_inner(path: &Path, symlink_depth: usize) -> Result<Path
     Ok(normalized)
 }
 
-fn native_progress_file_required(layer_stack_num_buckets: Option<usize>) -> bool {
-    layer_stack_num_buckets.is_some_and(|n| n > 1)
-}
-
 fn initialize_native_backend(
     eval_path: &Path,
     eval_bytes: &[u8],
     progress: Option<(&Path, &[u8])>,
+    bucket_mode: Option<&str>,
+    progress_buckets: Option<usize>,
 ) -> Result<Option<usize>> {
     init_nnue_from_bytes(eval_bytes).map_err(|e| anyhow!("NNUE init failed: {e}"))?;
     eprintln!("NativeBackend: NNUE loaded from {}", eval_path.display());
     let layer_stack_buckets =
         get_network().as_deref().and_then(|network| network.layer_stack_num_buckets());
-    if native_progress_file_required(layer_stack_buckets) && progress.is_none() {
-        bail!(
-            "--native LayerStacks NNUE with num_buckets={} requires --progress-file",
-            layer_stack_buckets.unwrap_or_default()
-        );
-    }
-    if let Some((path, bytes)) = progress {
-        let weights = load_progress_coeff_kpabs_from_bytes(bytes)
-            .map_err(|e| anyhow!("failed to load --progress-file {}: {e}", path.display()))?;
-        set_layer_stack_progress_kpabs_weights(weights)
-            .map_err(|e| anyhow!("failed to set --progress-file weights: {e}"))?;
-        eprintln!("NativeBackend: progress file loaded from {}", path.display());
-    }
-    if let Some(num_buckets) = layer_stack_buckets {
-        eprintln!("NativeBackend: LayerStacks num_buckets={num_buckets}");
-    }
-    Ok(layer_stack_buckets)
+    let progress_routing_buckets = match layer_stack_buckets {
+        Some(stored_buckets) => {
+            let mode_str =
+                bucket_mode.context("--native LayerStacks NNUE requires --bucket-mode")?;
+            let mode = parse_layer_stack_bucket_mode(mode_str).with_context(|| {
+                format!("invalid --bucket-mode '{mode_str}' (expected progresskpabs or kingrank9)")
+            })?;
+            match (mode, progress) {
+                (LayerStackBucketMode::ProgressKPAbs, Some((path, bytes))) => {
+                    let weights = load_progress_coeff_kpabs_from_bytes(bytes).map_err(|e| {
+                        anyhow!("failed to load --progress-file {}: {e}", path.display())
+                    })?;
+                    set_layer_stack_progress_kpabs_weights(weights)
+                        .map_err(|e| anyhow!("failed to set --progress-file weights: {e}"))?;
+                    eprintln!("NativeBackend: progress file loaded from {}", path.display());
+                }
+                (LayerStackBucketMode::ProgressKPAbs, None) => {
+                    bail!("--bucket-mode progresskpabs requires --progress-file")
+                }
+                (LayerStackBucketMode::KingRank9, Some(_)) => {
+                    bail!("--bucket-mode kingrank9 does not use --progress-file")
+                }
+                (LayerStackBucketMode::KingRank9, None) => {}
+                _ => unreachable!("known LayerStack bucket mode"),
+            }
+            configure_layer_stack_routing(mode, stored_buckets, progress_buckets)
+                .map_err(anyhow::Error::msg)?;
+            eprintln!(
+                "NativeBackend: LayerStacks mode={} stored_buckets={} routing_buckets={}",
+                mode.as_str(),
+                stored_buckets,
+                progress_buckets.unwrap_or(9)
+            );
+            (mode == LayerStackBucketMode::ProgressKPAbs)
+                .then_some(progress_buckets.expect("validated progress bucket count"))
+        }
+        None if bucket_mode.is_some() || progress_buckets.is_some() || progress.is_some() => {
+            bail!("LayerStacks routing options were provided for a non-LayerStacks network")
+        }
+        None => None,
+    };
+    Ok(progress_routing_buckets)
 }
 
 fn resolve_engine_paths(cli: &Cli) -> ResolvedEnginePaths {
@@ -6812,6 +6871,8 @@ mod tests {
             Some("evalsha".into()),
             Some("progress.bin".into()),
             Some("progsha".into()),
+            Some("progresskpabs".into()),
+            Some(8),
             0,
         );
         assert!(auto.get("fv_scale").is_none());
@@ -6820,8 +6881,12 @@ mod tests {
         assert_eq!(auto.get("eval_file_sha256").and_then(|v| v.as_str()), Some("evalsha"));
         assert_eq!(auto.get("progress_file").and_then(|v| v.as_str()), Some("progress.bin"));
         assert_eq!(auto.get("progress_file_sha256").and_then(|v| v.as_str()), Some("progsha"));
-        let overridden = build_model_fingerprint(true, None, None, None, None, 14);
+        assert_eq!(auto.get("bucket_mode").and_then(|v| v.as_str()), Some("progresskpabs"));
+        assert_eq!(auto.get("progress_buckets").and_then(|v| v.as_u64()), Some(8));
+        let overridden = build_model_fingerprint(true, None, None, None, None, None, None, 14);
         assert_eq!(overridden.get("fv_scale").and_then(|v| v.as_i64()), Some(14));
+        assert!(overridden.get("bucket_mode").is_none());
+        assert!(overridden.get("progress_buckets").is_none());
     }
 
     #[test]
@@ -6849,14 +6914,6 @@ mod tests {
         assert_eq!(restored.game_idx, ticket.game_idx);
         assert_eq!(restored.startpos_idx, ticket.startpos_idx);
         assert!(parked.is_none());
-    }
-
-    #[test]
-    fn native_progress_file_required_only_for_multi_bucket_layerstacks() {
-        assert!(!native_progress_file_required(None));
-        assert!(!native_progress_file_required(Some(1)));
-        assert!(native_progress_file_required(Some(2)));
-        assert!(native_progress_file_required(Some(9)));
     }
 
     #[test]

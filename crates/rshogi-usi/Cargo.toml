@@ -44,7 +44,7 @@ threat-profile-same-class-major-pawn = ["rshogi-core/threat-profile-same-class-m
 threat-profile-step-attacker = ["rshogi-core/threat-profile-step-attacker"]
 threat-profile-full-symdedup = ["rshogi-core/threat-profile-full-symdedup"]
 threat-profile-cross-side = ["rshogi-core/threat-profile-cross-side"]
-# NNUE progress8kpabs 差分更新最適化（L0=1536 系 / L0=3072 で有効、L0=768/512 で退行）
+# NNUE progresskpabs 差分更新最適化（L0=1536 系 / L0=3072 で有効、L0=768/512 で退行）
 nnue-progress-diff = ["rshogi-core/nnue-progress-diff"]
 # 探索経路限定で pass_rights を無効化
 search-no-pass-rules = ["rshogi-core/search-no-pass-rules"]

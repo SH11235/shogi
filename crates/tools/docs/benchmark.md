@@ -39,8 +39,14 @@ cargo run -p tools --bin benchmark --release -- \
 | `-v, --verbose` | 詳細なinfo行を表示 | false |
 | `--engine` | エンジンバイナリパス | なし（内部API） |
 | `--internal` | 内部API直接呼び出しモード | false |
+| `--nnue-file` | NNUE ファイル | なし |
+| `--usi-option Name=Value` | 評価設定（複数指定可） | なし |
 | `--reuse-search` | Searchインスタンス再利用モード | false |
 | `--warmup` | ウォームアップ回数 | 0 |
+
+内部APIで LayerStacks を使う場合も routing は明示します。progresskpabs なら
+`--usi-option LS_BUCKET_MODE=progresskpabs --usi-option LS_PROGRESS_BUCKETS=8
+--usi-option LS_PROGRESS_COEFF=/path/to/progress.bin` を指定します。
 
 ### カスタム局面ファイル
 

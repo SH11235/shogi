@@ -52,6 +52,7 @@ rescore_hcpe \
   --out-dir teacher_d15/ \
   --nnue "$SHOGI_DATA/nnue/ls_halfka_hm_merged_1536x16x32_none/nnue_train_allfp16-r3-400.bin" \
   --fv-scale 28 \
+  --ls-bucket-mode progresskpabs --ls-progress-buckets 8 \
   --ls-progress-coeff "$SHOGI_DATA/progress/progress_hao_full_cuda.e1.bin" \
   --spsa-params spsa_params/v99-400-suisho10.rshogi.params \
   --depth 15 --nodes 0 --hash-mb 32 --threads 0
@@ -67,8 +68,9 @@ rescore_hcpe \
 | `--out-dir <DIR>` | （必須） | 出力先。入力ファイル名と同名で hcpe を書く（= resume の単位） |
 | `--nnue <PATH>` | （必須） | labeler の NNUE モデル |
 | `--fv-scale <i32>` | 0 | FV_SCALE（0=ヘッダ自動、none/threat LayerStacks 系は 28） |
-| `--ls-bucket-mode <STR>` | — | LayerStacks bucket mode (`progress8kpabs` / `kingrank9`)。既定は `progress8kpabs` |
-| `--ls-progress-coeff <PATH>` | — | progress8kpabs 用係数（LS + progress8kpabs で必須、kingrank9 では不要） |
+| `--ls-bucket-mode <STR>` | — | LayerStacks bucket mode (`progresskpabs` / `kingrank9`)。LayerStacks では必須 |
+| `--ls-progress-buckets <N>` | — | progresskpabs の routing bucket 数。LayerStacks + progresskpabs では必須 |
+| `--ls-progress-coeff <PATH>` | — | progresskpabs 用係数（LS + progresskpabs で必須、kingrank9 では不要） |
 | `--spsa-params <PATH>` | — | SPSA 探索 params（USI `SPSAParamsFile` 同形式）を各局面の探索へ適用。未指定は engine 既定値 |
 | `--depth <i32>` | 15 | 探索深さ（固定 depth ラベリング） |
 | `--nodes <u64>` | 0 | 探索ノード上限（0=無制限）。depth を binding にするなら 0 |

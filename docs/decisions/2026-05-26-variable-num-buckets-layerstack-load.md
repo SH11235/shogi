@@ -1,5 +1,9 @@
 # ADR: 可変バケット数 LayerStack net の読込・bucket 推論対応 (Issue #727)
 
+> **後続変更:** `progress8kpabs` という名称と「routing 数 = 格納 bucket 数」という前提は
+> 廃止された。現在は `progresskpabs` と `LS_PROGRESS_BUCKETS` を明示し、NNUE version は
+> binary layout の判別にのみ使用する。本 ADR の旧名称・旧前提は当時の判断記録として残す。
+
 - Date: 2026-05-26
 - Scope: rshogi-core (`crates/rshogi-core/src/nnue/`)
 - Related: tatara ADR `2026-05-23-num-buckets-configurable.md`, rshogi Issue #727, tatara #233 / #236

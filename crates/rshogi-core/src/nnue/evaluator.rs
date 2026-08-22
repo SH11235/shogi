@@ -11,6 +11,9 @@
 //!
 //! // ネットワークを読み込み
 //! let network = Arc::new(NNUENetwork::load("model.nnue")?);
+//! // LayerStacks の場合は評価器を作る前に、学習時の routing mode / bucket 数と
+//! // progress 係数を明示し、network.layer_stack_num_buckets() との整合性を
+//! // configure_layer_stack_routing(...) で検証する。HalfKX 系では不要。
 //!
 //! // 評価器を作成（局面を指定して初期化）
 //! let mut evaluator = NNUEEvaluator::new_with_position(network, &position);

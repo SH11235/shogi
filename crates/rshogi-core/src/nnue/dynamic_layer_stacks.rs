@@ -24,8 +24,9 @@ use super::ls_feature_spec::{
     LsFeatureSpec,
 };
 use super::network::{
-    LayerStackBucketMode, compute_layer_stack_progress8kpabs_bucket_index, get_fv_scale_override,
-    get_layer_stack_bucket_mode, get_layer_stack_progress_kpabs_weights, parse_fv_scale_from_arch,
+    LayerStackBucketMode, compute_layer_stack_progresskpabs_bucket_index, get_fv_scale_override,
+    get_layer_stack_bucket_mode, get_layer_stack_progress_buckets,
+    get_layer_stack_progress_kpabs_weights, parse_fv_scale_from_arch,
 };
 use super::network_layer_stacks::compute_layer_stack_kingrank9_bucket_index;
 use super::piece_list::PieceNumber;
@@ -883,12 +884,19 @@ impl DynamicLayerStacksNetwork {
                 pos.side_to_move(),
                 self.num_buckets,
             ),
-            LayerStackBucketMode::Progress8KPAbs => {
-                compute_layer_stack_progress8kpabs_bucket_index(
+            LayerStackBucketMode::ProgressKPAbs => {
+                let routing_buckets = get_layer_stack_progress_buckets()
+                    .expect("LayerStacks progress routing is not configured");
+                assert!(
+                    routing_buckets <= self.num_buckets,
+                    "LayerStacks progress routing uses {routing_buckets} buckets, but the network stores only {}",
+                    self.num_buckets
+                );
+                compute_layer_stack_progresskpabs_bucket_index(
                     pos,
                     pos.side_to_move(),
                     get_layer_stack_progress_kpabs_weights(),
-                    self.num_buckets,
+                    routing_buckets,
                 )
             }
         };
@@ -1615,6 +1623,12 @@ mod tests {
         let l2 = 2;
         let l3 = 1;
         let num_buckets = DEFAULT_NUM_BUCKETS;
+        crate::nnue::configure_layer_stack_routing(
+            LayerStackBucketMode::ProgressKPAbs,
+            num_buckets,
+            Some(num_buckets),
+        )
+        .unwrap();
         let mut net = test_network(feature, l1, l2, l3, num_buckets, false, 0);
         net.ft_weights = AlignedBox::new_zeroed(feature.dimensions() * l1);
         net.buckets = (0..num_buckets)
