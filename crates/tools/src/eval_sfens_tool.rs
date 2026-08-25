@@ -6,6 +6,8 @@
 //! cargo run --release -p tools --bin eval_sfens -- \
 //!   --nnue path/to/quantised.bin \
 //!   --sfens path/to/sfens.txt \
+//!   --progress-coeff path/to/progress.bin \
+//!   --progress-buckets 8 \
 //!   --count 10
 //! ```
 
