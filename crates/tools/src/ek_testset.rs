@@ -542,24 +542,17 @@ fn run_export_hcpe(args: &ExportHcpeArgs) -> Result<()> {
     let tmp_output = partial_path(&args.out);
 
     // 入力と出力 (一時ファイル含む) が同一実体だと File::create が読み取り前に入力を
-    // truncate してしまうため拒否する。パス比較 (canonicalize) では hardlink
-    // (別パス・同一 inode) を検出できないので same-file の Handle で判定する。
-    let in_id = same_file::Handle::from_path(&args.testset)
-        .with_context(|| format!("testset のメタデータ取得に失敗: {}", args.testset.display()))?;
-    if same_file::Handle::from_path(&args.out).ok().as_ref() == Some(&in_id) {
-        bail!("入力と出力が同一ファイルです: {}", args.testset.display());
-    }
-    if same_file::Handle::from_path(&tmp_output).ok().as_ref() == Some(&in_id) {
-        bail!("一時ファイル {} が入力と同一です", tmp_output.display());
-    }
-    // File::open / File::create の前に Handle を閉じておく。
-    drop(in_id);
+    // truncate してしまうため拒否する。判定は crate 共通の ensure_safe_output_path に
+    // 委ねる (hardlink 検出・symlink 出力拒否・NotFound 以外の比較エラーを握り潰さない)。
+    crate::output_path::ensure_safe_output_path(&args.out, &args.testset)?;
+    crate::output_path::ensure_safe_output_path(&tmp_output, &args.testset)?;
 
     let input = File::open(&args.testset)
         .with_context(|| format!("testset を開けません: {}", args.testset.display()))?;
-    // 前回中断の残骸 `.partial` が既存 `<out>` や別ファイルへの hardlink/symlink だと
-    // File::create が追跡 truncate でリンク先を壊すため、entry を消してから新規作成する
+    // 前回中断の残骸 `.partial` が既存 `<out>` 等への hardlink だと File::create が
+    // 追跡 truncate でリンク先を壊すため、entry を消してから新規作成する
     // (「正常完了時のみ最終パスへ反映」の保証を staging 経路でも守る)。
+    // symlink の `.partial` は ensure_safe_output_path が先に拒否している。
     if let Err(err) = fs::remove_file(&tmp_output)
         && err.kind() != std::io::ErrorKind::NotFound
     {
@@ -572,20 +565,33 @@ fn run_export_hcpe(args: &ExportHcpeArgs) -> Result<()> {
         .create_new(true)
         .open(&tmp_output)
         .with_context(|| format!("hcpe を出力できません: {}", tmp_output.display()))?;
-    let mut writer = BufWriter::new(output);
-    let stats = export_hcpe(
-        BufReader::new(input),
-        &mut writer,
-        &args.testset,
-        args.drop_draw,
-        args.allow_missing_eval,
-    )?;
-    writer.flush()?;
-    // Windows は開いたままの rename に失敗し得るため、先に閉じる。
-    drop(writer);
-    fs::rename(&tmp_output, &args.out).with_context(|| {
-        format!("{} → {} の rename に失敗", tmp_output.display(), args.out.display())
-    })?;
+    let result = (|| -> Result<ExportHcpeStats> {
+        let mut writer = BufWriter::new(output);
+        let stats = export_hcpe(
+            BufReader::new(input),
+            &mut writer,
+            &args.testset,
+            args.drop_draw,
+            args.allow_missing_eval,
+        )?;
+        // rename 直後の電源断で最終パスにゼロ埋め/途中までの実体が残らないよう、
+        // rename 前に fsync する。Windows は開いたままの rename に失敗し得るため、
+        // sync 後にここで閉じる。
+        writer.into_inner()?.sync_all()?;
+        fs::rename(&tmp_output, &args.out).with_context(|| {
+            format!("{} → {} の rename に失敗", tmp_output.display(), args.out.display())
+        })?;
+        Ok(stats)
+    })();
+    let stats = match result {
+        Ok(stats) => stats,
+        Err(err) => {
+            // 途中失敗の `.partial` は 38B の倍数の妥当なサイズになり得るため、
+            // 偏った部分集合が誤って採点に使われないよう残さず消す。
+            let _ = fs::remove_file(&tmp_output);
+            return Err(err);
+        }
+    };
 
     eprintln!("{}", export_hcpe_summary(&stats, &args.out));
     Ok(())
@@ -635,6 +641,10 @@ fn export_hcpe<R: BufRead, W: Write>(
                 format!("{}:{}: hcpe レコードへ変換できません", input_path.display(), line_no + 1)
             })?;
 
+        // clamp は教師値スケールの汚染検知が目的なので、--drop-draw で出力から
+        // 除外されるレコードの分も入力側で計上する。
+        stats.eval_clamped += usize::from(eval_clamped);
+
         if eval_missing {
             if !allow_missing_eval {
                 bail!(
@@ -661,7 +671,6 @@ fn export_hcpe<R: BufRead, W: Write>(
 
         writer.write_all(&bytes)?;
         stats.output_records += 1;
-        stats.eval_clamped += usize::from(eval_clamped);
     }
     Ok(stats)
 }
@@ -1302,7 +1311,7 @@ mod tests {
             allow_missing_eval: false,
         })
         .expect_err("same input/output must be rejected");
-        assert!(format!("{err:#}").contains("同一ファイル"));
+        assert!(format!("{err:#}").contains("resolves to input file"));
         assert!(fs::metadata(&testset).expect("input must survive").len() > 0);
 
         // 正常系は .partial 経由で最終パスへ rename され、.partial は残らない。
@@ -1335,7 +1344,7 @@ mod tests {
             allow_missing_eval: false,
         })
         .expect_err("hardlinked output must be rejected");
-        assert!(format!("{err:#}").contains("同一ファイル"));
+        assert!(format!("{err:#}").contains("resolves to input file"));
 
         // `.partial` が入力への hardlink。
         let out = dir.path().join("out.hcpe");
@@ -1347,7 +1356,7 @@ mod tests {
             allow_missing_eval: false,
         })
         .expect_err("hardlinked .partial must be rejected");
-        assert!(format!("{err:#}").contains("入力と同一"));
+        assert!(format!("{err:#}").contains("resolves to input file"));
 
         // どちらの経路でも入力は無傷。
         assert_eq!(fs::read(&testset).expect("read input back"), content);
@@ -1376,8 +1385,9 @@ mod tests {
         })
         .expect_err("missing eval must fail the export");
 
-        // 途中失敗では既存出力を truncate も置換もしない。
+        // 途中失敗では既存出力を truncate も置換もせず、書きかけの `.partial` も残さない。
         assert_eq!(fs::read(&out).expect("existing output survives"), b"sentinel");
+        assert!(!partial_path(&out).exists());
     }
 
     #[test]

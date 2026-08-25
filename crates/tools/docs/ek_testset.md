@@ -42,12 +42,21 @@ core が `entering_king_point_info` を公開していないため、点数系�
 cargo run -p tools --release --bin ek_testset -- export-hcpe \
   --testset runs/ek_testset/band/testset.jsonl \
   --out runs/ek_testset/band/testset.hcpe \
-  --drop-draw false
+  --drop-draw false \
+  --allow-missing-eval true
 ```
+
+`build` の出力には `floodgate_eval_cp` が `null` のレコードが通常含まれます
+（終局局面のサンプルと、`'**` 評価コメントの無い手。定跡手・評価値を出さない
+エンジンなど）。そのため既定（`--allow-missing-eval false`）ではエラーで止まります。
+欠損レコードを除外して変換するには上記のように `--allow-missing-eval true` を
+指定してください。
 
 `yardstick_label` が読む cshogi HuffmanCodedPosAndEval（38B/レコード）へ、入力順を保って
 逐次変換します。局面は既存の HCP packer を使い、`floodgate_eval_cp` は手番側視点の i16 LE
-として保存します。i16 範囲外は clamp し、件数を標準エラーへ表示します。
+として保存します。i16 範囲外は clamp し、件数を標準エラーへ表示します（教師値スケールの
+汚染検知が目的のため、`--drop-draw` で出力から除外されたレコードの分も計上する入力側の
+件数です）。
 `bestMove16` は指し手なしを表す 0、`gameResult` は `oc_label` と `stm` から絶対視点へ変換、
 padding は 0 です。
 
@@ -58,9 +67,10 @@ padding は 0 です。
 指定した場合のみ該当レコードを**出力から除外**して続行し、除外件数
 （`eval_missing_skipped`）を標準エラーへ表示します。
 
-出力は `<out>.partial` へ書き、正常完了時のみ最終パスへ rename します（中断時の途中書きが
-正常な hcpe サイズのまま残らないようにするため）。入力と出力（`.partial` 含む）が同一実体の
-場合は truncate する前にエラーで拒否します。
+出力は `<out>.partial` へ書き、fsync してから正常完了時のみ最終パスへ rename します
+（中断時の途中書きが正常な hcpe サイズのまま残らないようにするため。途中失敗した
+`.partial` も削除します）。入力と出力（`.partial` 含む）が同一実体の場合、および出力が
+symlink の場合は truncate する前にエラーで拒否します。
 
 `--drop-draw` の既定値は `false` です。標準エラーの `draw` は入力で検出した draw 件数なので、
 `true` のときは出力件数に含まれません。`stm` と SFEN の手番が一致しないレコードは、
