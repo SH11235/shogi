@@ -146,8 +146,8 @@ mask の byte `j` の bit `k`（LSB が bit 0）は、出力 PSV の record `j *
 出力レコードの先頭 32 byte（packed SFEN）が入力レコードと異なることです。score、move16、
 game_ply、game_result だけが変わった行は bit 0 です。
 
-`--skip-in-check` で除外した入力行と、処理エラーの行（パース・unpack 失敗など。従来どおり
-破棄）は PSV にも mask にも行を作りません。`--moved-mask` の有無で PSV 出力は変わりません。
+`--skip-in-check` で除外した入力行と、処理エラーの行（パース・unpack 失敗など。破棄されます）
+は PSV にも mask にも行を作りません。`--moved-mask` の有無で PSV 出力は変わりません。
 後続の bit index は
 入力行番号ではなく、実際の出力行番号に詰められます。出力 PSV と mask は `.tmp` へ書き、
 正常完了時だけ最終パスへ rename します。input、output、moved mask に同じパスまたは同一実体は
@@ -156,8 +156,10 @@ game_ply、game_result だけが変わった行は bit 0 です。
 互いに衝突する場合も拒否します。
 
 2 ファイルの確定は PSV、mask の順に行うため、両方をまとめたトランザクションではありません。
-mask の rename だけが失敗した場合は PSV のみ確定することがありますが、不完全な mask を最終パスへ
-公開することはありません。処理・書き込み中のエラーや中断ではどちらも確定せず、`.tmp` を削除します。
+「新 PSV + 前回 run の古い mask」の組ができないよう、PSV を確定する前に既存の最終 mask を
+削除します。mask の rename だけが失敗した場合は PSV のみ確定し、完成済みの mask は `.tmp` に
+残します（エラーメッセージにパスを表示）。処理・書き込み中のエラーではどちらも確定せず
+`.tmp` を削除します。Ctrl-C による中断も同様にどちらも確定せず、エラー終了（非 0 exit）します。
 
 完了時の `Moved: <件数> (<率>%)` は、実際に書き出した PSV レコード数を分母とします。
 `--moved-mask` を省略した場合も統計は表示されます。

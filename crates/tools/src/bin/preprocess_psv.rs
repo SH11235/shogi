@@ -29,8 +29,8 @@
 //! `--moved-mask` を指定すると、出力 PSV の packed SFEN（各レコードの先頭32 byte）が
 //! 入力と異なる行を bit 1 とした LSB-first bitmap を出力する。byte `j` の bit `k` は
 //! 出力 record `j * 8 + k` に対応し、サイズは `ceil(出力 records / 8)` byte、最終 byte の
-//! 未使用 bit は 0 になる。処理エラー行は skip 行と同様に出力にも mask にも現れない
-//! (従来どおり破棄。`--moved-mask` の有無で PSV 出力は変わらない)。
+//! 未使用 bit は 0 になる。処理エラー行は skip 行と同様に破棄され、出力にも mask にも
+//! 現れない (`--moved-mask` の有無で PSV 出力は変わらない)。
 //! `--skip-in-check` で除外した行は PSV にも mask にも出力せず、後続 bit は出力行番号に詰める。
 //! PSV と mask はそれぞれ一時ファイルへ書き、処理成功時だけ最終パスへ rename する。
 
@@ -154,7 +154,6 @@ enum ProcessResult {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ResultCounts {
-    ok: u64,
     skipped: u64,
     errors: u64,
     written: u64,
@@ -210,6 +209,11 @@ impl TemporaryFiles {
 
     fn track(&mut self, path: PathBuf) {
         self.paths.push(path);
+    }
+
+    /// rename 済み・失敗時に残したいパスを Drop の削除対象から外す。
+    fn untrack(&mut self, path: &Path) {
+        self.paths.retain(|p| p != path);
     }
 }
 
@@ -360,13 +364,9 @@ fn main() -> Result<()> {
     // 処理実行
     process_file(&cli, process_count, use_nnue, opts)?;
 
-    if INTERRUPTED.load(Ordering::Acquire) {
-        eprintln!("Note: Processing was interrupted; output files were not updated");
-    } else {
-        eprintln!("Output: {}", cli.output.display());
-        if let Some(path) = &cli.moved_mask {
-            eprintln!("Moved mask: {}", path.display());
-        }
+    eprintln!("Output: {}", cli.output.display());
+    if let Some(path) = &cli.moved_mask {
+        eprintln!("Moved mask: {}", path.display());
     }
 
     Ok(())
@@ -396,7 +396,6 @@ fn collect_results<W: Write, M: Write>(
                 if let Some(mask) = mask_writer.as_deref_mut() {
                     mask.push(moved)?;
                 }
-                counts.ok += 1;
                 counts.written += 1;
                 counts.moved += u64::from(moved);
             }
@@ -579,6 +578,19 @@ fn process_file(cli: &Cli, process_count: u64, use_nnue: bool, opts: ProcessOpti
     } else {
         None
     };
+    // 未作成パスの事前比較は case-insensitive filesystem の alias
+    // (`Leaf.psv` と `leaf.psv` 等) を検出できないため、staging を作成した直後に
+    // 実体 (inode) で照合する。
+    {
+        let mut created: Vec<&Path> = vec![&tmp_output];
+        if let Some(mask_tmp) = &tmp_mask {
+            created.push(mask_tmp);
+        }
+        tools::output_path::ensure_created_paths_distinct(&created)?;
+        let mut existing_inputs: Vec<&Path> = vec![cli.input.as_path()];
+        existing_inputs.extend(read_only_resource_paths(cli));
+        tools::output_path::ensure_no_entity_overlap(&created, &existing_inputs)?;
+    }
 
     if use_nnue {
         eprintln!("Using NNUE evaluation (with incremental updates)");
@@ -605,7 +617,9 @@ fn process_file(cli: &Cli, process_count: u64, use_nnue: bool, opts: ProcessOpti
         if INTERRUPTED.load(Ordering::Acquire) {
             progress.abandon_with_message("Interrupted");
             drop(writer);
-            return Ok(());
+            // 何も公開していないので、ラッパースクリプトが後段へ進まないよう
+            // 成功 (exit 0) にはしない。
+            anyhow::bail!("Interrupted; output files were not updated");
         }
 
         // チャンクを読み込み
@@ -676,7 +690,7 @@ fn process_file(cli: &Cli, process_count: u64, use_nnue: bool, opts: ProcessOpti
     // 最終チャンクの並列処理中に割り込まれた場合も成果物を確定しない。
     if INTERRUPTED.load(Ordering::Acquire) {
         progress.abandon_with_message("Interrupted");
-        return Ok(());
+        anyhow::bail!("Interrupted; output files were not updated");
     }
 
     writer.flush()?;
@@ -687,15 +701,33 @@ fn process_file(cli: &Cli, process_count: u64, use_nnue: bool, opts: ProcessOpti
     // flush 中に割り込まれた場合も rename 前なら公開を止める。
     if INTERRUPTED.load(Ordering::Acquire) {
         progress.abandon_with_message("Interrupted");
-        return Ok(());
+        anyhow::bail!("Interrupted; output files were not updated");
     }
-    // 正常完了: 一時ファイルを最終出力パスに移動
+    // 正常完了: 一時ファイルを最終出力パスに移動。
+    // 前回 run の完成 mask が残っていると、PSV rename 成功 + mask rename 失敗のとき
+    // 「新 PSV + 旧 mask」の組が下流の validate_mask (サイズ検査のみ) を素通りするため、
+    // PSV を公開する前に旧 mask を消しておく (mask 欠落なら下流は大声で失敗する)。
+    if let Some(mask) = &cli.moved_mask
+        && let Err(err) = std::fs::remove_file(mask)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(err).with_context(|| format!("Failed to remove stale mask {}", mask.display()));
+    }
     std::fs::rename(&tmp_output, &cli.output).with_context(|| {
         format!("Failed to rename {} -> {}", tmp_output.display(), cli.output.display())
     })?;
+    temporary_files.untrack(&tmp_output);
     if let (Some(tmp), Some(output)) = (&tmp_mask, &cli.moved_mask) {
-        std::fs::rename(tmp, output).with_context(|| {
-            format!("Failed to rename {} -> {}", tmp.display(), output.display())
+        let renamed = std::fs::rename(tmp, output);
+        // rename に失敗しても完成済み mask を Drop で消さず、`.tmp` に残して再試行可能にする。
+        temporary_files.untrack(tmp);
+        renamed.with_context(|| {
+            format!(
+                "Failed to rename {} -> {}; finished mask left at {}",
+                tmp.display(),
+                output.display(),
+                tmp.display()
+            )
         })?;
     }
     // EOF で早期終了した場合でも進捗バーが100%になるよう実処理件数に合わせる
@@ -997,7 +1029,6 @@ mod tests {
         assert_eq!(
             counts,
             ResultCounts {
-                ok: 2,
                 errors: 1,
                 written: 2,
                 moved: 1,
@@ -1050,7 +1081,6 @@ mod tests {
         assert_eq!(
             counts,
             ResultCounts {
-                ok: 1,
                 errors: 1,
                 written: 1,
                 moved: 0,
@@ -1200,6 +1230,41 @@ mod tests {
     }
 
     #[test]
+    fn stale_final_mask_is_removed_before_psv_publish() {
+        let _lock = PROCESS_FILE_TEST_LOCK.lock().unwrap();
+        INTERRUPTED.store(false, Ordering::Release);
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.psv");
+        let output = dir.path().join("output.psv");
+        let moved_mask = dir.path().join("moved.bits");
+        std::fs::write(&input, []).unwrap();
+        std::fs::write(&moved_mask, b"stale").unwrap();
+        let opts = ProcessOptions {
+            max_ply: 16,
+            fix_stm_sign: true,
+            rescore: false,
+            skip_in_check: false,
+            score_clip: 10000,
+        };
+
+        let cli = test_cli(input.clone(), output.clone(), Some(moved_mask.clone()));
+        process_file(&cli, 0, false, opts).unwrap();
+        // 前回 run の mask は新しい mask で置き換わる (0 レコードなので空)。
+        assert!(std::fs::read(&moved_mask).unwrap().is_empty());
+
+        // 旧 mask を消せない場合は PSV を公開する前に失敗する
+        // (新 PSV + 旧 mask の組を作らない)。
+        std::fs::write(&output, b"previous psv").unwrap();
+        std::fs::remove_file(&moved_mask).unwrap();
+        std::fs::create_dir(&moved_mask).unwrap();
+        let err = process_file(&cli, 0, false, opts).unwrap_err();
+        assert!(format!("{err:#}").contains("stale mask"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous psv");
+        assert!(!temporary_path(&output).unwrap().exists());
+        assert!(!temporary_path(&moved_mask).unwrap().exists());
+    }
+
+    #[test]
     fn interruption_before_publish_removes_both_temporary_files() {
         let _lock = PROCESS_FILE_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -1220,7 +1285,9 @@ mod tests {
         let result = process_file(&cli, 0, false, opts);
         INTERRUPTED.store(false, Ordering::Release);
 
-        result.unwrap();
+        // 何も公開しなかった run を成功 (exit 0) にすると、ラッパースクリプトが
+        // 欠けた成果物のまま後段へ進んでしまう。
+        assert!(result.is_err());
         assert!(!output.exists());
         assert!(!moved_mask.exists());
         assert!(!temporary_path(&output).unwrap().exists());
