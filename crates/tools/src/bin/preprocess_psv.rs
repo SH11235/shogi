@@ -482,21 +482,21 @@ fn validate_output_paths(cli: &Cli) -> Result<()> {
         }
     }
 
-    // NNUE モデルは読み込み後もディスク上の実体が残る前提のファイルなので、
-    // 出力の rename で置換されないよう書き込み先とは衝突検査する
+    // NNUE モデルと progress 係数は読み込み後もディスク上の実体が残る前提の
+    // ファイルなので、出力の rename で置換されないよう書き込み先とは衝突検査する
     // (入力とは read-read なので共有可)。
-    if let Some(nnue) = &cli.nnue {
-        if paths_resolve_to_same_file(&cli.output, nnue)? {
+    for resource in read_only_resource_paths(cli) {
+        if paths_resolve_to_same_file(&cli.output, resource)? {
             anyhow::bail!(
-                "Output and NNUE model paths resolve to the same file: {}",
+                "Output path resolves to a read-only resource file: {}",
                 cli.output.display()
             );
         }
         if let Some(mask) = &cli.moved_mask
-            && paths_resolve_to_same_file(mask, nnue)?
+            && paths_resolve_to_same_file(mask, resource)?
         {
             anyhow::bail!(
-                "Moved mask and NNUE model paths resolve to the same file: {}",
+                "Moved mask path resolves to a read-only resource file: {}",
                 mask.display()
             );
         }
@@ -505,16 +505,19 @@ fn validate_output_paths(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// 処理中に読み込むだけでディスク上に残す前提のファイル (書き込み先と衝突させない)。
+fn read_only_resource_paths(cli: &Cli) -> impl Iterator<Item = &Path> {
+    [cli.nnue.as_deref(), cli.ls_progress_coeff.as_deref()].into_iter().flatten()
+}
+
 fn validate_temporary_paths(cli: &Cli, tmp_output: &Path, tmp_mask: Option<&Path>) -> Result<()> {
     let mut final_paths = vec![cli.input.as_path(), cli.output.as_path()];
     if let Some(mask) = cli.moved_mask.as_deref() {
         final_paths.push(mask);
     }
-    // `.tmp` の作成 (truncate) や終了時削除が NNUE モデルを壊さないよう、
-    // 一時パスは NNUE モデルとも衝突検査する。
-    if let Some(nnue) = cli.nnue.as_deref() {
-        final_paths.push(nnue);
-    }
+    // `.tmp` の作成 (truncate) や終了時削除が NNUE モデル・progress 係数を
+    // 壊さないよう、一時パスは read-only resource とも衝突検査する。
+    final_paths.extend(read_only_resource_paths(cli));
 
     for final_path in final_paths {
         if paths_resolve_to_same_file(final_path, tmp_output)? {
@@ -1116,20 +1119,32 @@ mod tests {
         output_collision.nnue = Some(nnue.clone());
         assert!(validate_output_paths(&output_collision).is_err());
 
-        // `.tmp` が NNUE モデルと同一実体でも拒否する (truncate / 終了時削除を防ぐ)。
+        // progress 係数も同じ read-only resource として拒否する。
+        let mut coeff_collision =
+            test_cli(input.clone(), dir.path().join("output.psv"), Some(nnue.clone()));
+        coeff_collision.ls_progress_coeff = Some(nnue.clone());
+        assert!(validate_output_paths(&coeff_collision).is_err());
+
+        // `.tmp` が NNUE モデル / 係数と同一実体でも拒否する (truncate / 終了時削除を防ぐ)。
         let output = dir.path().join("output.psv");
         let mask = dir.path().join("moved.bits");
-        let mut cli = test_cli(input, output.clone(), Some(mask.clone()));
-        cli.nnue = Some(temporary_path(&mask).unwrap());
-        std::fs::write(cli.nnue.as_ref().unwrap(), [0u8]).unwrap();
-        assert!(
-            validate_temporary_paths(
-                &cli,
-                &temporary_path(&output).unwrap(),
-                Some(&temporary_path(&mask).unwrap())
-            )
-            .is_err()
-        );
+        for set_resource in [
+            (|cli: &mut Cli, p: PathBuf| cli.nnue = Some(p)) as fn(&mut Cli, PathBuf),
+            |cli, p| cli.ls_progress_coeff = Some(p),
+        ] {
+            let mut cli = test_cli(input.clone(), output.clone(), Some(mask.clone()));
+            let resource = temporary_path(&mask).unwrap();
+            std::fs::write(&resource, [0u8]).unwrap();
+            set_resource(&mut cli, resource);
+            assert!(
+                validate_temporary_paths(
+                    &cli,
+                    &temporary_path(&output).unwrap(),
+                    Some(&temporary_path(&mask).unwrap())
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

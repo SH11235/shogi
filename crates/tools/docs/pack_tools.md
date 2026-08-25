@@ -151,8 +151,9 @@ game_ply、game_result だけが変わった行は bit 0 です。
 後続の bit index は
 入力行番号ではなく、実際の出力行番号に詰められます。出力 PSV と mask は `.tmp` へ書き、
 正常完了時だけ最終パスへ rename します。input、output、moved mask に同じパスまたは同一実体は
-指定できません。output / moved mask が `--nnue` モデルと同一実体の場合も拒否します。
-派生する `.tmp` パスがこれらのパス (NNUE モデル含む) や互いに衝突する場合も拒否します。
+指定できません。output / moved mask が `--nnue` モデルや `--ls-progress-coeff` 係数と
+同一実体の場合も拒否します。派生する `.tmp` パスがこれらのパス (NNUE モデル・係数含む) や
+互いに衝突する場合も拒否します。
 
 2 ファイルの確定は PSV、mask の順に行うため、両方をまとめたトランザクションではありません。
 mask の rename だけが失敗した場合は PSV のみ確定することがありますが、不完全な mask を最終パスへ
