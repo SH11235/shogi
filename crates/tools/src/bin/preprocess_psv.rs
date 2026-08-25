@@ -587,9 +587,15 @@ fn process_file(cli: &Cli, process_count: u64, use_nnue: bool, opts: ProcessOpti
             created.push(mask_tmp);
         }
         tools::output_path::ensure_created_paths_distinct(&created)?;
-        let mut existing_inputs: Vec<&Path> = vec![cli.input.as_path()];
-        existing_inputs.extend(read_only_resource_paths(cli));
-        tools::output_path::ensure_no_entity_overlap(&created, &existing_inputs)?;
+        // 最終出力パスも対象にする: staging の作成が別出力の最終パスを実体化させる
+        // alias (例: output=`MASK.TMP` と mask staging=`mask.tmp`) は staging 同士の
+        // 比較では検出できない。未作成の最終パスは NotFound として不一致扱いになる。
+        let mut targets: Vec<&Path> = vec![cli.input.as_path(), cli.output.as_path()];
+        if let Some(mask) = cli.moved_mask.as_deref() {
+            targets.push(mask);
+        }
+        targets.extend(read_only_resource_paths(cli));
+        tools::output_path::ensure_no_entity_overlap(&created, &targets)?;
     }
 
     if use_nnue {
