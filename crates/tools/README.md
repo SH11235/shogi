@@ -40,7 +40,7 @@
 | `psv_select_by_mask` | LSB-first bitmap mask の bit 1 に対応する PSV 行を入力順に抽出（[詳細](docs/psv_select_by_mask.md)） |
 | `psv_scatter_by_mask` | compact PSV の score を mask 対応で元 shard に書き戻す（[詳細](docs/psv_scatter_by_mask.md)） |
 | `rescore_hcpe` | hcpe 教師の eval を NNUE 固定 depth 探索で付け替え（分散ラベリング・チャンク単位 + 途中 resume 対応） |
-| `preprocess_psv` | PSV ファイルの前処理（qsearch leaf置換等） |
+| `preprocess_psv` | PSV の qsearch leaf 置換と、任意の局面変更行 bitmap mask 生成（[詳細](docs/pack_tools.md#preprocess_psv)） |
 | `validate_psv` | PSV ファイルの不正局面検出・除去 |
 | `psv_to_jsonl` | PSV 形式 → JSONL 変換（デバッグ・確認用） |
 | `jsonl_to_psv` | 自己対局 JSONL → PSV 変換（破損行は破棄して継続、件数を Summary に計上。[詳細](docs/pack_tools.md#jsonl_to_psv)） |
