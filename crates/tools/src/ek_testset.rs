@@ -576,8 +576,10 @@ fn run_export_hcpe(args: &ExportHcpeArgs) -> Result<()> {
         )?;
         // rename 直後の電源断で最終パスにゼロ埋め/途中までの実体が残らないよう、
         // rename 前に fsync する。Windows は開いたままの rename に失敗し得るため、
-        // sync 後にここで閉じる。
-        writer.into_inner()?.sync_all()?;
+        // sync 後にここで閉じる。IntoInnerError は開いた writer を内包するため、
+        // into_error() で writer ごと破棄してから伝播する (開いたままだと後段の
+        // `.partial` 削除が Windows で失敗する)。
+        writer.into_inner().map_err(|err| err.into_error())?.sync_all()?;
         fs::rename(&tmp_output, &args.out).with_context(|| {
             format!("{} → {} の rename に失敗", tmp_output.display(), args.out.display())
         })?;
@@ -588,7 +590,15 @@ fn run_export_hcpe(args: &ExportHcpeArgs) -> Result<()> {
         Err(err) => {
             // 途中失敗の `.partial` は 38B の倍数の妥当なサイズになり得るため、
             // 偏った部分集合が誤って採点に使われないよう残さず消す。
-            let _ = fs::remove_file(&tmp_output);
+            // 削除失敗は元エラーを主に残しつつ警告で報告する。
+            if let Err(remove_err) = fs::remove_file(&tmp_output)
+                && remove_err.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "warning: 一時ファイル {} を削除できません: {remove_err}",
+                    tmp_output.display()
+                );
+            }
             return Err(err);
         }
     };
