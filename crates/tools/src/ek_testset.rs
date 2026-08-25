@@ -4,7 +4,7 @@
 //! `Position::declaration_win(EnteringKingRule::Point27)` を使う。core が
 //! `entering_king_point_info` を公開していないため、点数系フィールドは JSONL に出さない。
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
@@ -13,16 +13,20 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use rshogi_core::nnue::{
     AccumulatorStackVariant, LayerStackBucketMode, LayerStacksAccCache,
-    SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, evaluate_dispatch, get_network, init_nnue,
-    set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
+    SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, configure_layer_stack_routing, evaluate_dispatch,
+    get_network, init_nnue, layer_stack_progress_coeff_required,
+    set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::Position;
 use rshogi_core::types::{Color, EnteringKingRule, Move, Rank};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+use crate::common::io::partial_path;
+use crate::packed_sfen::{pack_position_hcp, stm_result_to_hcpe};
 use crate::replay::csa_source::CsaSource;
 use crate::replay::model::{GameIndex, GameIndexEntry, GameOutcomeView, GameSource, MoveView};
+use crate::teacher_labeler::HCPE_RECORD_SIZE;
 
 const DEFAULT_MIN_PLY_FROM_ENTRY: i32 = -20;
 const DEFAULT_SAMPLE_STRIDE: u32 = 4;
@@ -35,7 +39,7 @@ const PROB_EPS: f64 = 1e-12;
 #[command(
     name = "ek_testset",
     version,
-    about = "入玉評価テストセットを CSA から構築し、NNUE 静的評価で採点する"
+    about = "入玉評価テストセットを CSA から構築し、NNUE 静的評価または hcpe export → yardstick で採点する"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -48,6 +52,8 @@ enum Command {
     Build(BuildArgs),
     /// testset.jsonl を native NNUE 評価で採点する。
     Eval(EvalArgs),
+    /// testset.jsonl を yardstick_label 用 hcpe へ変換する。
+    ExportHcpe(ExportHcpeArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -78,15 +84,35 @@ struct EvalArgs {
     /// NNUE ファイル。
     #[arg(long)]
     eval_file: PathBuf,
-    /// LayerStacks progress8kpabs 用 progress.bin。
+    /// LayerStacks progresskpabs 用 progress.bin。
+    /// `--progress-buckets 1` (no-op routing) 以外では必須。
     #[arg(long)]
-    progress_file: PathBuf,
+    progress_file: Option<PathBuf>,
+    /// progresskpabs が推論に使う bucket 数。
+    #[arg(long)]
+    progress_buckets: usize,
     /// sigmoid(eval / scale) の scale。
     #[arg(long, default_value_t = DEFAULT_SCALE)]
     scale: f64,
     /// metrics.json の出力先。
     #[arg(long)]
     out: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+struct ExportHcpeArgs {
+    /// `ek_testset build` が出した testset.jsonl。
+    #[arg(long)]
+    testset: PathBuf,
+    /// hcpe（38B/レコード）の出力先。
+    #[arg(long)]
+    out: PathBuf,
+    /// draw レコードを出力から除外するか。
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    drop_draw: bool,
+    /// `floodgate_eval_cp` 欠損レコードをエラーにせず出力から除外して続行するか。
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    allow_missing_eval: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -132,7 +158,8 @@ struct BuildMeta {
 struct EvalMetrics {
     testset: String,
     eval_file: String,
-    progress_file: String,
+    progress_file: Option<String>,
+    progress_buckets: usize,
     scale: f64,
     records: usize,
     dt: DtMetrics,
@@ -228,12 +255,21 @@ struct PositionSample {
     floodgate_eval_cp: Option<i32>,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ExportHcpeStats {
+    output_records: usize,
+    draw_records: usize,
+    eval_clamped: usize,
+    eval_missing: usize,
+}
+
 /// CLI entrypoint。
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Build(args) => run_build(&args),
         Command::Eval(args) => run_eval(&args),
+        Command::ExportHcpe(args) => run_export_hcpe(&args),
     }
 }
 
@@ -506,16 +542,205 @@ fn color_label(c: Color) -> char {
     }
 }
 
+fn run_export_hcpe(args: &ExportHcpeArgs) -> Result<()> {
+    // 中断時の途中書きが正常な hcpe サイズ (38B の倍数) で残らないよう、`.partial` へ
+    // 書いて成功時のみ最終パスへ rename する (hcpe_to_psv と同じ方式)。
+    let tmp_output = partial_path(&args.out);
+
+    // 入力と出力 (一時ファイル含む) が同一実体だと File::create が読み取り前に入力を
+    // truncate してしまうため拒否する。判定は crate 共通の ensure_safe_output_path に
+    // 委ねる (hardlink 検出・symlink 出力拒否・NotFound 以外の比較エラーを握り潰さない)。
+    crate::output_path::ensure_safe_output_path(&args.out, &args.testset)?;
+    crate::output_path::ensure_safe_output_path(&tmp_output, &args.testset)?;
+
+    let input = File::open(&args.testset)
+        .with_context(|| format!("testset を開けません: {}", args.testset.display()))?;
+    // 前回中断の残骸 `.partial` が既存 `<out>` 等への hardlink だと File::create が
+    // 追跡 truncate でリンク先を壊すため、entry を消してから新規作成する
+    // (「正常完了時のみ最終パスへ反映」の保証を staging 経路でも守る)。
+    // symlink の `.partial` は ensure_safe_output_path が先に拒否している。
+    if let Err(err) = fs::remove_file(&tmp_output)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(err).with_context(|| {
+            format!("既存の一時ファイル {} を削除できません", tmp_output.display())
+        });
+    }
+    let output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_output)
+        .with_context(|| format!("hcpe を出力できません: {}", tmp_output.display()))?;
+    let result = (|| -> Result<ExportHcpeStats> {
+        let mut writer = BufWriter::new(output);
+        let stats = export_hcpe(
+            BufReader::new(input),
+            &mut writer,
+            &args.testset,
+            args.drop_draw,
+            args.allow_missing_eval,
+        )?;
+        // rename 直後の電源断で最終パスにゼロ埋め/途中までの実体が残らないよう、
+        // rename 前に fsync する。Windows は開いたままの rename に失敗し得るため、
+        // sync 後にここで閉じる。IntoInnerError は開いた writer を内包するため、
+        // into_error() で writer ごと破棄してから伝播する (開いたままだと後段の
+        // `.partial` 削除が Windows で失敗する)。
+        writer.into_inner().map_err(|err| err.into_error())?.sync_all()?;
+        fs::rename(&tmp_output, &args.out).with_context(|| {
+            format!("{} → {} の rename に失敗", tmp_output.display(), args.out.display())
+        })?;
+        Ok(stats)
+    })();
+    let stats = match result {
+        Ok(stats) => stats,
+        Err(err) => {
+            // 途中失敗の `.partial` は 38B の倍数の妥当なサイズになり得るため、
+            // 偏った部分集合が誤って採点に使われないよう残さず消す。
+            // 削除失敗は元エラーを主に残しつつ警告で報告する。
+            if let Err(remove_err) = fs::remove_file(&tmp_output)
+                && remove_err.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "warning: 一時ファイル {} を削除できません: {remove_err}",
+                    tmp_output.display()
+                );
+            }
+            return Err(err);
+        }
+    };
+
+    eprintln!("{}", export_hcpe_summary(&stats, &args.out));
+    Ok(())
+}
+
+fn export_hcpe_summary(stats: &ExportHcpeStats, output_path: &Path) -> String {
+    let mut summary = format!(
+        "wrote {} records (draw={}, eval_clamped={}, eval_missing_skipped={}) to {}",
+        stats.output_records,
+        stats.draw_records,
+        stats.eval_clamped,
+        stats.eval_missing,
+        output_path.display(),
+    );
+    if stats.eval_missing > 0 {
+        summary.push_str(&format!(
+            "\nfloodgate_eval_cp 欠損 {} 件は出力から除外しました (yardstick は保存 eval から \
+             eval_band / mate_ref を作って採点に使うため 0 埋めしない)。",
+            stats.eval_missing
+        ));
+    }
+    summary
+}
+
+fn export_hcpe<R: BufRead, W: Write>(
+    reader: R,
+    writer: &mut W,
+    input_path: &Path,
+    drop_draw: bool,
+    allow_missing_eval: bool,
+) -> Result<ExportHcpeStats> {
+    let mut stats = ExportHcpeStats::default();
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line
+            .with_context(|| format!("{}:{}: 行を読めません", input_path.display(), line_no + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: TestsetRecord = serde_json::from_str(&line).with_context(|| {
+            format!("{}:{}: JSON を読めません", input_path.display(), line_no + 1)
+        })?;
+
+        // 検証 (stm/SFEN 整合・盤面 pack) は除外判定より先に行い、--drop-draw や
+        // --allow-missing-eval が整合検査を迂回しないようにする。
+        let (bytes, eval_clamped, eval_missing) =
+            encode_hcpe_record(&record).with_context(|| {
+                format!("{}:{}: hcpe レコードへ変換できません", input_path.display(), line_no + 1)
+            })?;
+
+        // clamp は教師値スケールの汚染検知が目的なので、--drop-draw で出力から
+        // 除外されるレコードの分も入力側で計上する。
+        stats.eval_clamped += usize::from(eval_clamped);
+
+        if eval_missing {
+            if !allow_missing_eval {
+                bail!(
+                    "{}:{}: floodgate_eval_cp がありません。yardstick_label は保存 eval から \
+                     eval_band / mate_ref を作り、yardstick_score が mate 除外・a_ref 較正・\
+                     参照系指標に使うため 0 埋めできません。該当レコードを除外して続行するには \
+                     --allow-missing-eval true を指定してください",
+                    input_path.display(),
+                    line_no + 1
+                );
+            }
+            stats.eval_missing += 1;
+            if record.oc_label == Label::Draw {
+                stats.draw_records += 1;
+            }
+            continue;
+        }
+        if record.oc_label == Label::Draw {
+            stats.draw_records += 1;
+            if drop_draw {
+                continue;
+            }
+        }
+
+        writer.write_all(&bytes)?;
+        stats.output_records += 1;
+    }
+    Ok(stats)
+}
+
+fn encode_hcpe_record(record: &TestsetRecord) -> Result<([u8; HCPE_RECORD_SIZE], bool, bool)> {
+    let stm = match record.stm {
+        'b' => Color::Black,
+        'w' => Color::White,
+        other => bail!("stm は b/w のいずれかである必要があります: {other}"),
+    };
+
+    let mut pos = Position::new();
+    pos.set_sfen(&record.sfen)
+        .with_context(|| format!("SFEN を読めません: {}", record.sfen))?;
+    if pos.side_to_move() != stm {
+        bail!(
+            "stm ({}) と SFEN の手番 ({}) が一致しません",
+            record.stm,
+            color_label(pos.side_to_move())
+        );
+    }
+
+    let eval_missing = record.floodgate_eval_cp.is_none();
+    let eval_cp = record.floodgate_eval_cp.unwrap_or(0);
+    let clamped_eval = eval_cp.clamp(i32::from(i16::MIN), i32::from(i16::MAX));
+    let eval_clamped = clamped_eval != eval_cp;
+    let stored_eval = i16::try_from(clamped_eval).expect("i16 範囲へ clamp 済み");
+    let stm_result = match record.oc_label {
+        Label::Win => 1,
+        Label::Loss => -1,
+        Label::Draw => 0,
+    };
+
+    let mut bytes = [0u8; HCPE_RECORD_SIZE];
+    bytes[0..32].copy_from_slice(&pack_position_hcp(&pos));
+    bytes[32..34].copy_from_slice(&stored_eval.to_le_bytes());
+    // bestMove16 は「指し手なし」の 0。padding も初期値の 0 のままにする。
+    bytes[36] = stm_result_to_hcpe(stm_result, stm);
+    Ok((bytes, eval_clamped, eval_missing))
+}
+
 fn run_eval(args: &EvalArgs) -> Result<()> {
     if !args.scale.is_finite() || args.scale <= 0.0 {
         bail!("--scale は正の有限値を指定してください");
     }
 
-    let weights = load_progress_coeff_kpabs(&args.progress_file)
-        .map_err(|e| anyhow!("progress 読み込みに失敗しました: {e}"))?;
-    set_layer_stack_progress_kpabs_weights(weights)
-        .map_err(|e| anyhow!("progress 設定に失敗しました: {e}"))?;
-    set_layer_stack_bucket_mode(LayerStackBucketMode::Progress8KPAbs);
+    if let Some(progress_file) = &args.progress_file {
+        let weights = load_progress_coeff_kpabs(progress_file)
+            .map_err(|e| anyhow!("progress 読み込みに失敗しました: {e}"))?;
+        set_layer_stack_progress_kpabs_weights(weights)
+            .map_err(|e| anyhow!("progress 設定に失敗しました: {e}"))?;
+    } else if layer_stack_progress_coeff_required(Some(args.progress_buckets)) {
+        bail!("--progress-buckets が 2 以上のときは --progress-file が必須です");
+    }
     init_nnue(&args.eval_file)
         .with_context(|| format!("NNUE を読み込めません: {}", args.eval_file.display()))?;
 
@@ -526,6 +751,12 @@ fn run_eval(args: &EvalArgs) -> Result<()> {
             network.architecture_name()
         );
     }
+    configure_layer_stack_routing(
+        LayerStackBucketMode::ProgressKPAbs,
+        network.layer_stack_num_buckets().expect("LayerStacks checked above"),
+        Some(args.progress_buckets),
+    )
+    .map_err(anyhow::Error::msg)?;
     let mut stack = AccumulatorStackVariant::from_network(&network);
     // acc_cache (Finny Tables) は静的 LayerStacks variant 専用の API で、
     // runtime-dimensions ビルドでは同じ net でも DynamicLayerStacks として load され
@@ -559,7 +790,8 @@ fn run_eval(args: &EvalArgs) -> Result<()> {
     let out = EvalMetrics {
         testset: args.testset.display().to_string(),
         eval_file: args.eval_file.display().to_string(),
-        progress_file: args.progress_file.display().to_string(),
+        progress_file: args.progress_file.as_ref().map(|p| p.display().to_string()),
+        progress_buckets: args.progress_buckets,
         scale: args.scale,
         records,
         dt,
@@ -739,6 +971,31 @@ fn sigmoid(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packed_sfen::{pack_position, unpack_hcp};
+
+    const STARTPOS_BOARD: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL";
+
+    fn export_record(stm: char, oc_label: Label, eval_cp: i32) -> TestsetRecord {
+        TestsetRecord {
+            sfen: format!("{STARTPOS_BOARD} {stm} - 1"),
+            stm,
+            ply: 1,
+            source_csa: "game.csa".to_string(),
+            is_declarable: false,
+            dt_label: None,
+            oc_label,
+            floodgate_eval_cp: Some(eval_cp),
+        }
+    }
+
+    fn records_jsonl(records: &[TestsetRecord]) -> Vec<u8> {
+        let mut input = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut input, record).expect("serialize record");
+            input.push(b'\n');
+        }
+        input
+    }
 
     fn write_csa(dir: &Path, name: &str, text: &str) -> PathBuf {
         let path = dir.join(name);
@@ -788,6 +1045,375 @@ mod tests {
             panic!("build expected")
         };
         assert!(args.drop_draw);
+    }
+
+    #[test]
+    fn export_hcpe_drop_draw_flag_is_settable() {
+        let base = [
+            "ek_testset",
+            "export-hcpe",
+            "--testset",
+            "in.jsonl",
+            "--out",
+            "out.hcpe",
+        ];
+        let cli = Cli::try_parse_from(base).expect("parse default");
+        let Command::ExportHcpe(args) = cli.command else {
+            panic!("export-hcpe expected")
+        };
+        assert!(!args.drop_draw);
+
+        let with_true = base.iter().chain(&["--drop-draw", "true"]);
+        let cli = Cli::try_parse_from(with_true).expect("parse --drop-draw true");
+        let Command::ExportHcpe(args) = cli.command else {
+            panic!("export-hcpe expected")
+        };
+        assert!(args.drop_draw);
+        assert!(!args.allow_missing_eval);
+
+        let with_allow = base.iter().chain(&["--allow-missing-eval", "true"]);
+        let cli = Cli::try_parse_from(with_allow).expect("parse --allow-missing-eval true");
+        let Command::ExportHcpe(args) = cli.command else {
+            panic!("export-hcpe expected")
+        };
+        assert!(args.allow_missing_eval);
+    }
+
+    #[test]
+    fn export_hcpe_round_trips_position_with_existing_hcp_reader() {
+        let record = export_record('w', Label::Win, 123);
+        let (bytes, eval_clamped, eval_missing) = encode_hcpe_record(&record).expect("encode hcpe");
+        assert!(!eval_clamped);
+        assert!(!eval_missing);
+
+        let mut hcp = [0u8; 32];
+        hcp.copy_from_slice(&bytes[0..32]);
+        let decoded_sfen = unpack_hcp(&hcp).expect("unpack hcp");
+        let mut decoded = Position::new();
+        decoded.set_sfen(&decoded_sfen).expect("set decoded SFEN");
+        let mut original = Position::new();
+        original.set_sfen(&record.sfen).expect("set original SFEN");
+
+        assert_eq!(pack_position(&decoded), pack_position(&original));
+        assert_eq!(bytes[34..36], [0, 0]);
+        assert_eq!(bytes[37], 0);
+    }
+
+    #[test]
+    fn export_hcpe_converts_stm_results_to_absolute_results() {
+        for (stm, label, expected) in [
+            ('b', Label::Win, 1),
+            ('b', Label::Loss, 2),
+            ('w', Label::Win, 2),
+            ('w', Label::Loss, 1),
+        ] {
+            let record = export_record(stm, label, 0);
+            let (bytes, _, _) = encode_hcpe_record(&record).expect("encode hcpe");
+            assert_eq!(bytes[36], expected, "stm={stm} label={label:?}");
+        }
+    }
+
+    #[test]
+    fn export_hcpe_keeps_or_drops_draws() {
+        let records = [
+            export_record('b', Label::Win, 10),
+            export_record('w', Label::Draw, -20),
+        ];
+        let input = records_jsonl(&records);
+
+        let mut kept = Vec::new();
+        let kept_stats = export_hcpe(
+            std::io::Cursor::new(&input),
+            &mut kept,
+            Path::new("testset.jsonl"),
+            false,
+            false,
+        )
+        .expect("export with draws");
+        assert_eq!(
+            kept_stats,
+            ExportHcpeStats {
+                output_records: 2,
+                draw_records: 1,
+                eval_clamped: 0,
+                eval_missing: 0,
+            }
+        );
+        assert_eq!(kept.len(), 2 * HCPE_RECORD_SIZE);
+        assert_eq!(kept[HCPE_RECORD_SIZE + 36], 0);
+
+        let mut dropped = Vec::new();
+        let dropped_stats = export_hcpe(
+            std::io::Cursor::new(&input),
+            &mut dropped,
+            Path::new("testset.jsonl"),
+            true,
+            false,
+        )
+        .expect("export without draws");
+        assert_eq!(
+            dropped_stats,
+            ExportHcpeStats {
+                output_records: 1,
+                draw_records: 1,
+                eval_clamped: 0,
+                eval_missing: 0,
+            }
+        );
+        assert_eq!(dropped.len(), HCPE_RECORD_SIZE);
+    }
+
+    #[test]
+    fn export_hcpe_clamps_eval_to_i16_boundaries() {
+        for (input, expected, was_clamped) in [
+            (i32::from(i16::MIN) - 1, i16::MIN, true),
+            (i32::from(i16::MIN), i16::MIN, false),
+            (i32::from(i16::MAX), i16::MAX, false),
+            (i32::from(i16::MAX) + 1, i16::MAX, true),
+        ] {
+            let record = export_record('b', Label::Win, input);
+            let (bytes, actual_clamped, eval_missing) =
+                encode_hcpe_record(&record).expect("encode hcpe");
+            assert_eq!(i16::from_le_bytes([bytes[32], bytes[33]]), expected);
+            assert_eq!(actual_clamped, was_clamped);
+            assert!(!eval_missing);
+        }
+    }
+
+    fn missing_eval_jsonl() -> Vec<u8> {
+        // TestsetRecord は skip_serializing_if 付きなので、明示 `null` ケースは
+        // serde_json::Value 経由で作る (struct を serialize するとフィールド欠落になる)。
+        let mut null_eval = serde_json::to_value(export_record('b', Label::Win, 1))
+            .expect("serialize null-eval record");
+        null_eval["floodgate_eval_cp"] = serde_json::Value::Null;
+        let mut missing_eval = serde_json::to_value(export_record('w', Label::Loss, 2))
+            .expect("serialize missing-eval record");
+        missing_eval
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("floodgate_eval_cp");
+        let following = export_record('b', Label::Draw, 345);
+
+        let mut input = Vec::new();
+        serde_json::to_writer(&mut input, &null_eval).expect("serialize null-eval record");
+        input.push(b'\n');
+        serde_json::to_writer(&mut input, &missing_eval).expect("serialize missing-eval record");
+        input.push(b'\n');
+        serde_json::to_writer(&mut input, &following).expect("serialize following record");
+        input.push(b'\n');
+        input
+    }
+
+    #[test]
+    fn export_hcpe_missing_eval_is_an_error_by_default() {
+        let input = missing_eval_jsonl();
+        let mut output = Vec::new();
+        let err = export_hcpe(
+            std::io::Cursor::new(input),
+            &mut output,
+            Path::new("testset.jsonl"),
+            false,
+            false,
+        )
+        .expect_err("missing eval must error by default");
+        let message = format!("{err:#}");
+        assert!(message.contains("testset.jsonl:1"), "unexpected error: {message}");
+        assert!(message.contains("--allow-missing-eval"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn export_hcpe_skips_missing_evals_when_allowed() {
+        let input = missing_eval_jsonl();
+        let mut output = Vec::new();
+        let stats = export_hcpe(
+            std::io::Cursor::new(input),
+            &mut output,
+            Path::new("testset.jsonl"),
+            false,
+            true,
+        )
+        .expect("export with --allow-missing-eval");
+
+        assert_eq!(
+            stats,
+            ExportHcpeStats {
+                output_records: 1,
+                draw_records: 1,
+                eval_clamped: 0,
+                eval_missing: 2,
+            }
+        );
+        // 欠損 2 件は出力されず、eval ありの 1 件 (345) だけが残る。
+        assert_eq!(output.len(), HCPE_RECORD_SIZE);
+        assert_eq!(i16::from_le_bytes([output[32], output[33]]), 345);
+
+        let summary = export_hcpe_summary(&stats, Path::new("out.hcpe"));
+        assert!(summary.contains("eval_missing_skipped=2"));
+        assert!(summary.contains("欠損 2 件は出力から除外しました"));
+    }
+
+    #[test]
+    fn export_hcpe_validates_even_when_missing_eval_is_allowed() {
+        // --allow-missing-eval true は欠損 eval の除外だけを許可し、stm/SFEN 整合検査は
+        // 迂回しない。
+        let mut record = export_record('b', Label::Win, 0);
+        record.stm = 'w';
+        record.floodgate_eval_cp = None;
+        let input = records_jsonl(&[record]);
+
+        let mut output = Vec::new();
+        let err = export_hcpe(
+            std::io::Cursor::new(input),
+            &mut output,
+            Path::new("testset.jsonl"),
+            false,
+            true,
+        )
+        .expect_err("mismatched stm must error even with --allow-missing-eval");
+        assert!(format!("{err:#}").contains("一致しません"));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn export_hcpe_counts_overlapping_draw_and_missing_eval_once_each() {
+        let mut record = export_record('b', Label::Draw, 0);
+        record.floodgate_eval_cp = None;
+        let input = records_jsonl(&[record]);
+
+        let mut output = Vec::new();
+        let stats = export_hcpe(
+            std::io::Cursor::new(input),
+            &mut output,
+            Path::new("testset.jsonl"),
+            false,
+            true,
+        )
+        .expect("export draw+missing record");
+        assert_eq!(
+            stats,
+            ExportHcpeStats {
+                output_records: 0,
+                draw_records: 1,
+                eval_clamped: 0,
+                eval_missing: 1,
+            }
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn export_hcpe_validates_records_before_dropping_draws() {
+        // stm と SFEN の手番が矛盾した draw レコードは --drop-draw true でもエラーにする
+        // (除外パスが整合検査を迂回しない)。
+        let mut record = export_record('b', Label::Draw, 0);
+        record.stm = 'w';
+        let input = records_jsonl(&[record]);
+
+        let mut output = Vec::new();
+        let err = export_hcpe(
+            std::io::Cursor::new(input),
+            &mut output,
+            Path::new("testset.jsonl"),
+            true,
+            false,
+        )
+        .expect_err("mismatched stm must error even for dropped draws");
+        assert!(format!("{err:#}").contains("一致しません"));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn run_export_hcpe_rejects_same_input_and_output_and_stages_partial() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let testset = dir.path().join("testset.jsonl");
+        fs::write(&testset, records_jsonl(&[export_record('b', Label::Win, 10)]))
+            .expect("write testset");
+
+        // 入力と出力が同一実体なら truncate 前に拒否し、入力を壊さない。
+        let err = run_export_hcpe(&ExportHcpeArgs {
+            testset: testset.clone(),
+            out: testset.clone(),
+            drop_draw: false,
+            allow_missing_eval: false,
+        })
+        .expect_err("same input/output must be rejected");
+        assert!(format!("{err:#}").contains("resolves to input file"));
+        assert!(fs::metadata(&testset).expect("input must survive").len() > 0);
+
+        // 正常系は .partial 経由で最終パスへ rename され、.partial は残らない。
+        let out = dir.path().join("out.hcpe");
+        run_export_hcpe(&ExportHcpeArgs {
+            testset: testset.clone(),
+            out: out.clone(),
+            drop_draw: false,
+            allow_missing_eval: false,
+        })
+        .expect("export to a fresh output");
+        assert_eq!(fs::metadata(&out).expect("output exists").len(), HCPE_RECORD_SIZE as u64);
+        assert!(!partial_path(&out).exists());
+    }
+
+    #[test]
+    fn run_export_hcpe_rejects_hardlinks_to_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let testset = dir.path().join("testset.jsonl");
+        let content = records_jsonl(&[export_record('b', Label::Win, 10)]);
+        fs::write(&testset, &content).expect("write testset");
+
+        // 出力が入力への hardlink (別パス・同一実体)。
+        let out_link = dir.path().join("out-link.hcpe");
+        fs::hard_link(&testset, &out_link).expect("hardlink out");
+        let err = run_export_hcpe(&ExportHcpeArgs {
+            testset: testset.clone(),
+            out: out_link,
+            drop_draw: false,
+            allow_missing_eval: false,
+        })
+        .expect_err("hardlinked output must be rejected");
+        assert!(format!("{err:#}").contains("resolves to input file"));
+
+        // `.partial` が入力への hardlink。
+        let out = dir.path().join("out.hcpe");
+        fs::hard_link(&testset, partial_path(&out)).expect("hardlink partial");
+        let err = run_export_hcpe(&ExportHcpeArgs {
+            testset: testset.clone(),
+            out,
+            drop_draw: false,
+            allow_missing_eval: false,
+        })
+        .expect_err("hardlinked .partial must be rejected");
+        assert!(format!("{err:#}").contains("resolves to input file"));
+
+        // どちらの経路でも入力は無傷。
+        assert_eq!(fs::read(&testset).expect("read input back"), content);
+    }
+
+    #[test]
+    fn run_export_hcpe_failure_keeps_existing_output_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let testset = dir.path().join("testset.jsonl");
+        // 1 行目は変換に成功し、2 行目の欠損 eval で失敗する入力。
+        let ok = export_record('b', Label::Win, 10);
+        let mut broken = export_record('w', Label::Loss, 0);
+        broken.floodgate_eval_cp = None;
+        fs::write(&testset, records_jsonl(&[ok, broken])).expect("write testset");
+
+        // 既存の最終出力と、それへの hardlink として残った前回の `.partial`。
+        let out = dir.path().join("out.hcpe");
+        fs::write(&out, b"sentinel").expect("write existing output");
+        fs::hard_link(&out, partial_path(&out)).expect("stale partial hardlink");
+
+        run_export_hcpe(&ExportHcpeArgs {
+            testset,
+            out: out.clone(),
+            drop_draw: false,
+            allow_missing_eval: false,
+        })
+        .expect_err("missing eval must fail the export");
+
+        // 途中失敗では既存出力を truncate も置換もせず、書きかけの `.partial` も残さない。
+        assert_eq!(fs::read(&out).expect("existing output survives"), b"sentinel");
+        assert!(!partial_path(&out).exists());
     }
 
     #[test]

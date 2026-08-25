@@ -6,6 +6,8 @@
 //! cargo run --release -p tools --bin eval_sfens -- \
 //!   --nnue path/to/quantised.bin \
 //!   --sfens path/to/sfens.txt \
+//!   --progress-coeff path/to/progress.bin \
+//!   --progress-buckets 8 \
 //!   --count 10
 //! ```
 
@@ -17,9 +19,10 @@ use std::path::PathBuf;
 use rshogi_core::nnue::{
     AccumulatorLayerStacks, AffineTransform, FeatureSet, LayerStackBucketMode, LsFeatureSpec,
     NNUE_PYTORCH_L3, NNUENetwork, NetworkLayerStacks,
-    compute_layer_stack_progress8kpabs_bucket_index, get_layer_stack_progress_kpabs_weights,
-    load_progress_coeff_kpabs, ls_dispatch_ft_size, set_layer_stack_bucket_mode,
-    set_layer_stack_progress_kpabs_weights, sqr_clipped_relu_transform,
+    compute_layer_stack_progresskpabs_bucket_index, configure_layer_stack_routing,
+    get_layer_stack_progress_kpabs_weights, layer_stack_progress_coeff_required,
+    load_progress_coeff_kpabs, ls_dispatch_ft_size, set_layer_stack_progress_kpabs_weights,
+    sqr_clipped_relu_transform,
 };
 use rshogi_core::position::Position;
 use rshogi_core::types::Color;
@@ -39,13 +42,17 @@ struct Cli {
     #[arg(long, default_value_t = 10)]
     count: usize,
 
-    /// Output bucket mode (progress8kpabs)
-    #[arg(long, value_enum, default_value = "progress8kpabs")]
+    /// Output bucket mode (progresskpabs)
+    #[arg(long, value_enum, default_value = "progresskpabs")]
     bucket_mode: BucketMode,
 
     /// progress.bin (YaneuraOu 互換 KP-absolute 進行度重み) のパス
     #[arg(long)]
     progress_coeff: Option<PathBuf>,
+
+    /// progresskpabs が推論に使う bucket 数。
+    #[arg(long)]
+    progress_buckets: usize,
 
     /// Dump detailed intermediates for the first evaluated position (to stderr)
     #[arg(long, default_value_t = false)]
@@ -54,7 +61,8 @@ struct Cli {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum BucketMode {
-    Progress8kpabs,
+    #[value(name = "progresskpabs")]
+    ProgressKpabs,
 }
 
 fn padded_input(input_dim: usize) -> usize {
@@ -303,7 +311,7 @@ fn run_eval_for_network<
     eprintln!(
         "bucket_mode: {}",
         match cli.bucket_mode {
-            BucketMode::Progress8kpabs => "progress8kpabs",
+            BucketMode::ProgressKpabs => "progresskpabs",
         }
     );
 
@@ -343,13 +351,13 @@ fn run_eval_for_network<
         sqr_clipped_relu_transform(us_acc, them_acc, &mut transformed);
 
         let bucket_index = match cli.bucket_mode {
-            BucketMode::Progress8kpabs => {
+            BucketMode::ProgressKpabs => {
                 let weights = get_layer_stack_progress_kpabs_weights();
-                compute_layer_stack_progress8kpabs_bucket_index(
+                compute_layer_stack_progresskpabs_bucket_index(
                     &pos,
                     side_to_move,
                     weights,
-                    network.num_buckets,
+                    cli.progress_buckets,
                 )
             }
         };
@@ -370,15 +378,15 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.bucket_mode {
-        BucketMode::Progress8kpabs => {
-            let coeff_path = cli.progress_coeff.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("--bucket-mode progress8kpabs requires --progress-coeff")
-            })?;
-            let weights = load_progress_coeff_kpabs(coeff_path)
-                .map_err(|e| anyhow::anyhow!("failed to load --progress-coeff: {e}"))?;
-            set_layer_stack_progress_kpabs_weights(weights)
-                .map_err(|e| anyhow::anyhow!("failed to set kpabs weights: {e}"))?;
-            set_layer_stack_bucket_mode(LayerStackBucketMode::Progress8KPAbs);
+        BucketMode::ProgressKpabs => {
+            if let Some(coeff_path) = cli.progress_coeff.as_ref() {
+                let weights = load_progress_coeff_kpabs(coeff_path)
+                    .map_err(|e| anyhow::anyhow!("failed to load --progress-coeff: {e}"))?;
+                set_layer_stack_progress_kpabs_weights(weights)
+                    .map_err(|e| anyhow::anyhow!("failed to set kpabs weights: {e}"))?;
+            } else if layer_stack_progress_coeff_required(Some(cli.progress_buckets)) {
+                anyhow::bail!("--bucket-mode progresskpabs requires --progress-coeff");
+            }
         }
     }
 
@@ -389,6 +397,12 @@ pub fn run() -> Result<()> {
         NNUENetwork::LayerStacks(net) => net,
         _ => anyhow::bail!("eval_sfens は LayerStacks NNUE のみ対応"),
     };
+    configure_layer_stack_routing(
+        LayerStackBucketMode::ProgressKPAbs,
+        ls_net.num_buckets(),
+        Some(cli.progress_buckets),
+    )
+    .map_err(anyhow::Error::msg)?;
 
     ls_dispatch_ft_size!(
         ls_net,

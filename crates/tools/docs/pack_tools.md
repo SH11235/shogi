@@ -101,6 +101,9 @@ cargo run -p tools --release --bin rescore_psv -- \
 | `-i, --input` | 入力ファイル | 必須 |
 | `-o, --output` | 出力ファイル | 必須 |
 | `--nnue` | NNUEモデルファイル | 必須 |
+| `--ls-bucket-mode` | LayerStacks routing (`progresskpabs` / `kingrank9`) | LS 時必須 |
+| `--ls-progress-buckets` | progresskpabs の routing bucket 数 | LS progress 時必須 |
+| `--ls-progress-coeff` | progresskpabs 係数ファイル | LS progress 時必須 |
 | `--use-qsearch` | qsearch評価を使用 | false |
 | `--search-depth` | 深さ指定探索（qsearchと排他） | - |
 | `--apply-qsearch-leaf` | qsearch leaf置換も適用 | false |
@@ -128,6 +131,9 @@ cargo run -p tools --release --bin preprocess_psv -- \
 | `--max-ply` | qsearch の最大深さ | 16 |
 | `-t, --threads` | 並列処理スレッド数（0=自動） | 1 |
 | `--nnue` | NNUEモデルファイル（省略時は Material 評価、`--rescore` には必須） | なし |
+| `--ls-bucket-mode` | LayerStacks routing (`progresskpabs` / `kingrank9`) | LS 時必須 |
+| `--ls-progress-buckets` | progresskpabs の routing bucket 数 | LS progress 時必須 |
+| `--ls-progress-coeff` | progresskpabs 係数ファイル | LS progress 時必須 |
 | `--limit` | 処理するレコード数の上限（0=無制限） | 0 |
 | `-v, --verbose` | レコード処理エラーの詳細を表示 | false |
 | `--no-fix-stm-sign` | 手番反転時の score / game_result 符号補正を無効化 | false |

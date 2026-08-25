@@ -27,7 +27,9 @@ user-invocable: true
 
 ### デフォルト値（変更不要なら省略可）
 - **progress.bin**: `$SHOGI_DATA/progress/nodchip_progress_e1_f1_cuda.bin`
-- **bucket-mode**: `progress8kpabs`
+- **bucket-mode**: rshogi 側は `progresskpabs` + `LS_PROGRESS_BUCKETS`/`--ls-progress-buckets` 8
+  (bullet v87〜v93 系は格納 9 bucket / routing 8)。bullet 側 CLI (`shogi_layerstack_eval`) は
+  旧名 `progress8kpabs` のままなので置換しない
 - **教師データ**: `$SHOGI_DATA/teachers/DLSuisho15b_deduped_shuffled.bin`
 - **moves**: `100`
 
@@ -37,6 +39,8 @@ user-invocable: true
 
 ```bash
 cargo run --release --bin verify_nnue_accumulator -- \
+  --ls-bucket-mode progresskpabs \
+  --ls-progress-buckets 8 \
   --nnue-file <quantised.bin> \
   --ls-progress-coeff <progress.bin> \
   --moves 100
@@ -68,7 +72,8 @@ cargo run --release --example shogi_layerstack_eval -- \
 cargo build --release -p rshogi-usi --features diagnostics
 
 printf 'setoption name EvalFile value <quantised.bin>
-setoption name LS_BUCKET_MODE value progress8kpabs
+setoption name LS_BUCKET_MODE value progresskpabs
+setoption name LS_PROGRESS_BUCKETS value 8
 setoption name LS_PROGRESS_COEFF value <progress.bin>
 isready
 position sfen <Step 2a の SFEN>
@@ -88,6 +93,8 @@ quit
 ```bash
 # Step 1
 cargo run --release --bin verify_nnue_accumulator -- \
+  --ls-bucket-mode progresskpabs \
+  --ls-progress-buckets 8 \
   --nnue-file $SHOGI_DATA/runs/bullet/v88/v88-20/quantised.bin \
   --ls-progress-coeff $SHOGI_DATA/progress/nodchip_progress_e1_f1_cuda.bin \
   --moves 100
@@ -107,6 +114,8 @@ cargo run --release --example shogi_layerstack_eval -- \
 ```bash
 # Step 1
 cargo run --release --bin verify_nnue_accumulator -- \
+  --ls-bucket-mode progresskpabs \
+  --ls-progress-buckets 8 \
   --nnue-file /path/to/v89-checkpoint/quantised.bin \
   --ls-progress-coeff $SHOGI_DATA/progress/nodchip_progress_e1_f1_cuda.bin \
   --moves 100
@@ -127,6 +136,8 @@ cargo run --release --example shogi_layerstack_eval -- \
 ```bash
 # Step 1: 同一コマンド（モデルが自動判定）
 cargo run --release --bin verify_nnue_accumulator -- \
+  --ls-bucket-mode progresskpabs \
+  --ls-progress-buckets 8 \
   --nnue-file /path/to/v90-checkpoint/quantised.bin \
   --ls-progress-coeff $SHOGI_DATA/progress/nodchip_progress_e1_f1_cuda.bin \
   --moves 100
@@ -147,6 +158,8 @@ cargo run --release --example shogi_layerstack_eval -- \
 ```bash
 # Step 1
 cargo run --release --bin verify_nnue_accumulator -- \
+  --ls-bucket-mode progresskpabs \
+  --ls-progress-buckets 8 \
   --nnue-file /path/to/v87-checkpoint/quantised.bin \
   --ls-progress-coeff $SHOGI_DATA/progress/nodchip_progress_e1_f1_cuda.bin \
   --moves 100
@@ -172,6 +185,8 @@ profile が不一致だと THREAT_DIMENSIONS が異なり、weight 読み込み�
 cargo build --release -p tools --no-default-features \
   --features layerstacks-768x16x32,nnue-threat,threat-profile-same-class
 cargo run --release --bin verify_nnue_accumulator -- \
+  --ls-bucket-mode progresskpabs \
+  --ls-progress-buckets 8 \
   --nnue-file $SHOGI_DATA/runs/bullet/v93/v93-20/quantised.bin \
   --ls-progress-coeff $SHOGI_DATA/progress/nodchip_progress_e1_f1_cuda.bin \
   --moves 100

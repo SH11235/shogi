@@ -11,6 +11,8 @@
 //! ```bash
 //! cargo run --release --bin verify_nnue_accumulator -- \
 //!   --nnue-file path/to/quantised.bin \
+//!   --ls-bucket-mode progresskpabs \
+//!   --ls-progress-buckets 8 \
 //!   --ls-progress-coeff path/to/nodchip_progress_e1_f1_cuda.bin
 //! ```
 
@@ -22,8 +24,9 @@ use std::path::PathBuf;
 use rshogi_core::movegen::{MoveList, generate_legal_all};
 use rshogi_core::nnue::{
     AccumulatorLayerStacks, LayerStackBucketMode, LayerStacksNetwork, LsFeatureSpec, NNUENetwork,
-    NetworkLayerStacks, SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ls_dispatch_ft_size,
-    set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
+    NetworkLayerStacks, SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, configure_layer_stack_routing,
+    layer_stack_progress_coeff_required, ls_dispatch_ft_size, parse_layer_stack_bucket_mode,
+    set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::Position;
 
@@ -36,8 +39,16 @@ struct Cli {
     #[arg(long)]
     nnue_file: PathBuf,
 
+    /// LayerStacks bucket mode (`progresskpabs` または `kingrank9`)。
+    #[arg(long)]
+    ls_bucket_mode: String,
+
     #[arg(long)]
     ls_progress_coeff: Option<PathBuf>,
+
+    /// progresskpabs が推論に使う bucket 数。
+    #[arg(long)]
+    ls_progress_buckets: Option<usize>,
 
     /// テスト手数 (default: 50)
     #[arg(long, default_value = "50")]
@@ -171,12 +182,27 @@ fn ls_verify_dispatch(net: &LayerStacksNetwork, cli: &Cli) -> Result<(usize, usi
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // Bucket mode 設定
-    if let Some(ref coeff_path) = cli.ls_progress_coeff {
-        let weights = load_progress_coeff_weights(coeff_path)?;
-        set_layer_stack_progress_kpabs_weights(weights).map_err(anyhow::Error::msg)?;
-        set_layer_stack_bucket_mode(LayerStackBucketMode::Progress8KPAbs);
-        println!("Bucket mode: progress8kpabs");
+    let mode = parse_layer_stack_bucket_mode(&cli.ls_bucket_mode).with_context(|| {
+        format!(
+            "invalid --ls-bucket-mode '{}' (expected progresskpabs or kingrank9)",
+            cli.ls_bucket_mode
+        )
+    })?;
+    match (mode, cli.ls_progress_coeff.as_ref()) {
+        (LayerStackBucketMode::ProgressKPAbs, Some(coeff_path)) => {
+            let weights = load_progress_coeff_weights(coeff_path)?;
+            set_layer_stack_progress_kpabs_weights(weights).map_err(anyhow::Error::msg)?;
+        }
+        (LayerStackBucketMode::ProgressKPAbs, None) => {
+            if layer_stack_progress_coeff_required(cli.ls_progress_buckets) {
+                bail!("progresskpabs requires --ls-progress-coeff")
+            }
+        }
+        (LayerStackBucketMode::KingRank9, Some(_)) => {
+            bail!("kingrank9 does not use --ls-progress-coeff")
+        }
+        (LayerStackBucketMode::KingRank9, None) => {}
+        _ => unreachable!(),
     }
 
     // NNUE モデル読み込み
@@ -187,6 +213,9 @@ pub fn run() -> Result<()> {
         NNUENetwork::LayerStacks(n) => n,
         _ => anyhow::bail!("Expected LayerStacks network"),
     };
+    configure_layer_stack_routing(mode, net.num_buckets(), cli.ls_progress_buckets)
+        .map_err(anyhow::Error::msg)?;
+    println!("Bucket mode: {}", mode.as_str());
 
     println!("Model loaded successfully (L1={}).", net.l1_size());
 

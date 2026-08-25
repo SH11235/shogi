@@ -51,7 +51,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
 /// グローバルなNNUEネットワーク（HalfKP/HalfKaSplit/HalfKaHmMerged^）
@@ -132,23 +132,23 @@ pub fn parse_nnue_architecture(value: &str) -> Option<NNUEArchitectureOverride> 
 pub enum LayerStackBucketMode {
     /// 両玉の相対段で 9 バケットを選択する YaneuraOu 互換方式
     KingRank9 = 0,
-    /// 進行度方式(KP-absolute): YaneuraOu 互換 progress.bin で 8 バケットへ分割（bucket8は未使用）
-    Progress8KPAbs = 4,
+    /// 進行度方式 (KP-absolute)。bucket 数は推論設定で明示する。
+    ProgressKPAbs = 4,
 }
 
 impl LayerStackBucketMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::KingRank9 => "kingrank9",
-            Self::Progress8KPAbs => "progress8kpabs",
+            Self::ProgressKPAbs => "progresskpabs",
         }
     }
 }
 
-/// progress8kpabs で使用する重み数（81 king squares x FE_OLD_END BonaPiece）
+/// progresskpabs で使用する重み数（81 king squares x FE_OLD_END BonaPiece）
 pub const SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS: usize = 81 * FE_OLD_END;
 
-/// progress8kpabs 用の進行度係数ファイルを読み込む。
+/// progresskpabs 用の進行度係数ファイルを読み込む。
 ///
 /// ファイルは `f64` little-endian の生配列として読み、評価器で使う `f32` 重みへ変換する。
 /// サイズは [`SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS`] 個ぶんの `f64` と厳密一致する必要がある。
@@ -209,10 +209,10 @@ fn layer_stack_progress_thresholds(num_buckets: usize) -> &'static [f32] {
         .as_ref()
 }
 
-// progress8kpabs の差分計算済み bucket index キャッシュ（スレッドローカル）
+// progresskpabs の差分計算済み bucket index キャッシュ（スレッドローカル）
 //
 // `update_and_evaluate_layer_stacks` で差分計算した結果を格納し、
-// `compute_layer_stack_progress8kpabs_bucket_index` 内で消費する。
+// `compute_layer_stack_progresskpabs_bucket_index` 内で消費する。
 // 一度消費されると None にリセットされる（1回限り）。
 thread_local! {
     static CACHED_PROGRESS_BUCKET: Cell<Option<usize>> = const { Cell::new(None) };
@@ -220,13 +220,16 @@ thread_local! {
 
 /// LayerStacks bucket mode のグローバル設定
 static LAYER_STACK_BUCKET_MODE: AtomicI32 =
-    AtomicI32::new(LayerStackBucketMode::Progress8KPAbs as i32);
+    AtomicI32::new(LayerStackBucketMode::ProgressKPAbs as i32);
 
-/// progress8kpabs 重みのデフォルト（未設定時は全ゼロ）
+/// progresskpabs の推論 bucket 数。0 は未設定。
+static LAYER_STACK_PROGRESS_BUCKETS: AtomicUsize = AtomicUsize::new(0);
+
+/// progresskpabs 重みのデフォルト（未設定時は全ゼロ）
 static LAYER_STACK_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS] =
     [0.0; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
 
-/// progress8kpabs 重みのグローバル設定
+/// progresskpabs 重みのグローバル設定
 ///
 /// `progress.bin` 読み込み時に Box を leak してポインタだけ差し替える。
 /// 設定は起動時の一度を想定し、評価ホットパスでは lock を取らない。
@@ -254,16 +257,98 @@ pub fn set_fv_scale_override(value: i32) {
 pub fn get_layer_stack_bucket_mode() -> LayerStackBucketMode {
     match LAYER_STACK_BUCKET_MODE.load(Ordering::Relaxed) {
         0 => LayerStackBucketMode::KingRank9,
-        _ => LayerStackBucketMode::Progress8KPAbs,
+        _ => LayerStackBucketMode::ProgressKPAbs,
     }
 }
 
 /// LayerStacks bucket mode を設定
-pub fn set_layer_stack_bucket_mode(mode: LayerStackBucketMode) {
+pub(crate) fn set_layer_stack_bucket_mode(mode: LayerStackBucketMode) {
     LAYER_STACK_BUCKET_MODE.store(mode as i32, Ordering::Relaxed);
 }
 
-/// LayerStacks progress8kpabs 重みを取得
+/// LayerStacks progresskpabs の推論 bucket 数を取得する。
+pub fn get_layer_stack_progress_buckets() -> Option<usize> {
+    let configured = LAYER_STACK_PROGRESS_BUCKETS.load(Ordering::Relaxed);
+    (configured != 0).then_some(configured)
+}
+
+/// LayerStacks の routing mode と格納 bucket 数の整合性を検証し、設定を反映する。
+///
+/// `progresskpabs` は学習時の routing bucket 数を必須とし、格納数以下でなければならない。
+/// `kingrank9` は格納数が 9 の場合だけ受理する。
+pub fn configure_layer_stack_routing(
+    mode: LayerStackBucketMode,
+    stored_bucket_count: usize,
+    progress_bucket_count: Option<usize>,
+) -> Result<(), String> {
+    validate_layer_stack_routing_configuration(mode, stored_bucket_count, progress_bucket_count)?;
+    let configured_progress_buckets = progress_bucket_count.unwrap_or(0);
+    LAYER_STACK_PROGRESS_BUCKETS.store(configured_progress_buckets, Ordering::Relaxed);
+    set_layer_stack_bucket_mode(mode);
+    Ok(())
+}
+
+/// LayerStacks の routing 設定と格納 bucket 数の構造的整合性を検証する。
+pub fn validate_layer_stack_routing_configuration(
+    mode: LayerStackBucketMode,
+    stored_bucket_count: usize,
+    progress_bucket_count: Option<usize>,
+) -> Result<(), String> {
+    match mode {
+        LayerStackBucketMode::ProgressKPAbs => {
+            let routing_bucket_count = progress_bucket_count.ok_or_else(|| {
+                "progresskpabs requires an explicit progress bucket count".to_string()
+            })?;
+            // 1 は常に bucket 0 を選ぶ no-op routing として許可する。loader は
+            // 格納 1 bucket の net を受理するため、拒否すると routing を設定できる
+            // mode が存在しなくなる (kingrank9 は格納 9 固定)。
+            if routing_bucket_count == 0 {
+                return Err(format!(
+                    "progress bucket count {routing_bucket_count} is invalid; at least 1 bucket is required"
+                ));
+            }
+            if routing_bucket_count > MAX_LAYER_STACK_BUCKETS {
+                return Err(format!(
+                    "progress bucket count {routing_bucket_count} exceeds the supported maximum {MAX_LAYER_STACK_BUCKETS}"
+                ));
+            }
+            if routing_bucket_count > stored_bucket_count {
+                return Err(format!(
+                    "progress bucket count {routing_bucket_count} exceeds stored bucket count {stored_bucket_count}"
+                ));
+            }
+            Ok(())
+        }
+        LayerStackBucketMode::KingRank9 => {
+            if stored_bucket_count != 9 {
+                return Err(format!(
+                    "kingrank9 requires exactly 9 stored buckets, but the model stores {stored_bucket_count}"
+                ));
+            }
+            if let Some(routing_bucket_count) = progress_bucket_count {
+                return Err(format!(
+                    "kingrank9 conflicts with progress bucket count {routing_bucket_count}"
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// progresskpabs routing が progress 係数を実際に参照するか。
+///
+/// routing bucket 数 1 は常に bucket 0 を選ぶ no-op routing のため係数を参照しない。
+/// 係数必須チェックはこの述語で判定を統一する。
+pub fn layer_stack_progress_coeff_required(progress_bucket_count: Option<usize>) -> bool {
+    progress_bucket_count != Some(1)
+}
+
+/// LayerStacks の progress routing bucket 数を未設定へ戻す。
+pub fn reset_layer_stack_progress_buckets() {
+    LAYER_STACK_PROGRESS_BUCKETS.store(0, Ordering::Relaxed);
+}
+
+/// LayerStacks progresskpabs 重みを取得
 pub fn get_layer_stack_progress_kpabs_weights() -> &'static [f32] {
     let ptr = LAYER_STACK_PROGRESS_KP_ABS_PTR.load(Ordering::Relaxed);
     if ptr.is_null() {
@@ -274,11 +359,11 @@ pub fn get_layer_stack_progress_kpabs_weights() -> &'static [f32] {
     }
 }
 
-/// LayerStacks progress8kpabs 重みを設定
+/// LayerStacks progresskpabs 重みを設定
 pub fn set_layer_stack_progress_kpabs_weights(weights: Box<[f32]>) -> Result<(), String> {
     if weights.len() != SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS {
         return Err(format!(
-            "progress8kpabs weights length mismatch: got {}, expected {}",
+            "progresskpabs weights length mismatch: got {}, expected {}",
             weights.len(),
             SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS
         ));
@@ -299,7 +384,7 @@ pub fn set_layer_stack_progress_kpabs_weights(weights: Box<[f32]>) -> Result<(),
     Ok(())
 }
 
-/// LayerStacks progress8kpabs 重みを既定値（全ゼロ）へ戻す
+/// LayerStacks progresskpabs 重みを既定値（全ゼロ）へ戻す
 pub fn reset_layer_stack_progress_kpabs_weights() {
     let old_ptr = LAYER_STACK_PROGRESS_KP_ABS_PTR.swap(std::ptr::null_mut(), Ordering::Relaxed);
     // SAFETY: 同上。old_ptr は Box::leak 由来のポインタ（または null）。
@@ -339,7 +424,7 @@ pub enum NNUENetwork {
     HalfKaHmSplit(HalfKaHmSplitNetwork),
     /// HalfKP 特徴量セット（L256/L512）
     HalfKP(HalfKPNetwork),
-    /// LayerStacks（L1=1536/768 + 9バケット）
+    /// LayerStacks（L1=1536/768、格納 bucket 数はファイル由来）
     #[cfg(feature = "layerstack-arch")]
     LayerStacks(LayerStacksNetwork),
 }
@@ -1005,18 +1090,18 @@ pub fn parse_fv_scale_from_arch(arch_str: &str) -> Option<i32> {
 pub fn parse_layer_stack_bucket_mode(value: &str) -> Option<LayerStackBucketMode> {
     match value.trim().to_ascii_lowercase().as_str() {
         "kingrank9" => Some(LayerStackBucketMode::KingRank9),
-        "progress8kpabs" => Some(LayerStackBucketMode::Progress8KPAbs),
+        "progresskpabs" => Some(LayerStackBucketMode::ProgressKPAbs),
         _ => None,
     }
 }
 
-/// progress8kpabs 重みに基づいて LayerStacks bucket index `[0, num_buckets)` を計算
+/// progresskpabs 重みに基づいて LayerStacks bucket index `[0, num_buckets)` を計算
 ///
 /// `CACHED_PROGRESS_BUCKET` にキャッシュされた値がある場合はそちらを消費する。
-/// `num_buckets` は net file の `num_buckets` (active net 由来) を渡す。
+/// `num_buckets` は学習時と一致する、明示設定済みの routing bucket 数を渡す。
 /// キャッシュは active net 1 つの不変条件のもとで作成・消費される
 /// (ADR `2026-05-26` §2.4.3)。
-pub fn compute_layer_stack_progress8kpabs_bucket_index(
+pub fn compute_layer_stack_progresskpabs_bucket_index(
     pos: &Position,
     _side_to_move: Color,
     weights: &[f32],
@@ -1028,16 +1113,16 @@ pub fn compute_layer_stack_progress8kpabs_bucket_index(
         return bucket;
     }
     // フォールバック: 全駒スキャン
-    let sum = compute_progress8kpabs_sum(pos, weights);
+    let sum = compute_progresskpabs_sum(pos, weights);
     progress_sum_to_bucket(sum, num_buckets)
 }
 
-/// progress8kpabs の重み付き和を全駒スキャンで計算（refresh 用）
-pub fn compute_progress8kpabs_sum(pos: &Position, weights: &[f32]) -> f32 {
+/// progresskpabs の重み付き和を全駒スキャンで計算（refresh 用）
+pub fn compute_progresskpabs_sum(pos: &Position, weights: &[f32]) -> f32 {
     debug_assert_eq!(
         weights.len(),
         SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
-        "progress8kpabs weights length mismatch"
+        "progresskpabs weights length mismatch"
     );
 
     let sq_bk = pos.king_square(Color::Black).index();
@@ -1092,10 +1177,10 @@ pub fn compute_progress8kpabs_sum(pos: &Position, weights: &[f32]) -> f32 {
 /// progress_sum から DirtyPiece の変化分を差分更新
 ///
 /// 玉が動いていない場合にのみ使用可能。
-/// DirtyPiece の ExtBonaPiece.fb/fw は progress8kpabs と同じ BonaPiece 体系。
+/// DirtyPiece の ExtBonaPiece.fb/fw は progresskpabs と同じ BonaPiece 体系。
 #[cfg(feature = "nnue-progress-diff")]
 #[inline]
-pub fn update_progress8kpabs_sum_diff(
+pub fn update_progresskpabs_sum_diff(
     prev_sum: f32,
     dirty_piece: &super::accumulator::DirtyPiece,
     sq_bk: usize,
@@ -1109,7 +1194,7 @@ pub fn update_progress8kpabs_sum_diff(
     debug_assert_eq!(
         weights.len(),
         SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
-        "progress8kpabs weights length mismatch"
+        "progresskpabs weights length mismatch"
     );
     let weights_b = unsafe { weights.get_unchecked(sq_bk * FE_OLD_END..(sq_bk + 1) * FE_OLD_END) };
     let weights_w = unsafe { weights.get_unchecked(sq_wk * FE_OLD_END..(sq_wk + 1) * FE_OLD_END) };
@@ -1400,7 +1485,7 @@ pub fn get_network() -> Option<Arc<NNUENetwork>> {
 /// `LayerStacksNetwork::update_accumulator()` と `evaluate()` に委譲する。
 /// AccumulatorCaches（Finny Tables）を使用して refresh を高速化する。
 ///
-/// `nnue-progress-diff` feature 有効時は progress8kpabs モードで差分更新を試み、
+/// `nnue-progress-diff` feature 有効時は progresskpabs モードで差分更新を試み、
 /// 結果を `CACHED_PROGRESS_BUCKET` に格納して `evaluate()` 内の全駒スキャンを回避する。
 /// Threat なし環境では +3〜4% NPS、Threat あり環境では cache 圧迫で退行するため
 /// 運用モデルに応じて明示指定する。
@@ -1415,13 +1500,16 @@ pub(crate) fn update_and_evaluate_layer_stacks_cached(
     // アキュムレータの更新
     net.update_accumulator(pos, stack, acc_cache);
 
-    // progress8kpabs: 差分更新を試み、結果を CACHED_PROGRESS_BUCKET に格納
+    // progresskpabs: 差分更新を試み、結果を CACHED_PROGRESS_BUCKET に格納
     #[cfg(feature = "nnue-progress-diff")]
-    if matches!(get_layer_stack_bucket_mode(), LayerStackBucketMode::Progress8KPAbs) {
-        // bucket binning は net の num_buckets で駆動する (file から読んだ値、
-        // ADR `2026-05-26` §2.4.3)。enum dispatch 経由で各 variant の値を取り、
-        // ensure_progress_bucket に伝播する。
-        let num_buckets = net.num_buckets();
+    if matches!(get_layer_stack_bucket_mode(), LayerStackBucketMode::ProgressKPAbs) {
+        let num_buckets = get_layer_stack_progress_buckets()
+            .expect("LayerStacks progress routing is not configured");
+        assert!(
+            num_buckets <= net.num_buckets(),
+            "LayerStacks progress routing uses {num_buckets} buckets, but the network stores only {}",
+            net.num_buckets()
+        );
         let bucket = match stack {
             #[cfg(feature = "layerstacks-1536x16x32")]
             LayerStacksAccStack::L1536x16x32(s) => ensure_progress_bucket(pos, s, num_buckets),
@@ -1455,7 +1543,7 @@ pub(crate) fn update_and_evaluate_layer_stacks_cached(
     net.evaluate(pos, stack)
 }
 
-/// progress8kpabs の progress_sum を計算済みにして bucket index を返す
+/// progresskpabs の progress_sum を計算済みにして bucket index を返す
 ///
 /// 差分更新が可能な場合（前局面が計算済み、玉移動なし）は DirtyPiece の差分で O(1) 更新。
 /// それ以外は全駒スキャンにフォールバック。
@@ -1479,14 +1567,14 @@ fn ensure_progress_bucket<const L1: usize>(
             let prev_sum = stack.entry_at(prev_idx).progress_sum;
             let sq_bk = pos.king_square(Color::Black).index();
             let sq_wk = pos.king_square(Color::White).inverse().index();
-            let new_sum = update_progress8kpabs_sum_diff(prev_sum, dirty, sq_bk, sq_wk, weights);
+            let new_sum = update_progresskpabs_sum_diff(prev_sum, dirty, sq_bk, sq_wk, weights);
             let entry = stack.current_mut();
             entry.progress_sum = new_sum;
             entry.computed_progress = true;
         }
 
         if !stack.current().computed_progress {
-            let sum = compute_progress8kpabs_sum(pos, weights);
+            let sum = compute_progresskpabs_sum(pos, weights);
             let entry = stack.current_mut();
             entry.progress_sum = sum;
             entry.computed_progress = true;
@@ -2054,6 +2142,12 @@ mod tests {
         assert!(network.is_layer_stacks(), "epoch82.nnue should be detected as LayerStacks");
         assert_eq!(network.architecture_name(), "LayerStacks");
 
+        // 評価前に routing の明示設定が必要。smoke 用に stored=routing の progresskpabs
+        // (係数ゼロ = 常に中央 bucket) を使う。
+        let stored = network.layer_stack_num_buckets().expect("LayerStacks checked above");
+        configure_layer_stack_routing(LayerStackBucketMode::ProgressKPAbs, stored, Some(stored))
+            .unwrap();
+
         // LayerStacks 用の評価が動作することを確認
         let mut pos = crate::position::Position::new();
         pos.set_sfen(SFEN_HIRATE).unwrap();
@@ -2285,21 +2379,106 @@ mod tests {
             Some(LayerStackBucketMode::KingRank9)
         );
         assert_eq!(
-            parse_layer_stack_bucket_mode("progress8kpabs"),
-            Some(LayerStackBucketMode::Progress8KPAbs)
+            parse_layer_stack_bucket_mode("progresskpabs"),
+            Some(LayerStackBucketMode::ProgressKPAbs)
         );
         assert_eq!(
-            parse_layer_stack_bucket_mode("PROGRESS8KPABS"),
-            Some(LayerStackBucketMode::Progress8KPAbs)
+            parse_layer_stack_bucket_mode("PROGRESSKPABS"),
+            Some(LayerStackBucketMode::ProgressKPAbs)
         );
         assert_eq!(
-            parse_layer_stack_bucket_mode(" progress8kpabs "),
-            Some(LayerStackBucketMode::Progress8KPAbs)
+            parse_layer_stack_bucket_mode(" progresskpabs "),
+            Some(LayerStackBucketMode::ProgressKPAbs)
         );
         assert_eq!(parse_layer_stack_bucket_mode("unknown"), None);
+        assert_eq!(parse_layer_stack_bucket_mode("progress8kpabs"), None);
         assert_eq!(parse_layer_stack_bucket_mode("progress8"), None);
         assert_eq!(parse_layer_stack_bucket_mode("progress8gikou"), None);
         assert_eq!(parse_layer_stack_bucket_mode("ply9"), None);
+    }
+
+    #[test]
+    fn test_validate_layer_stack_routing_configuration() {
+        assert!(
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::ProgressKPAbs,
+                9,
+                Some(8),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::ProgressKPAbs,
+                8,
+                Some(8),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(LayerStackBucketMode::KingRank9, 9, None,)
+                .is_ok()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::ProgressKPAbs,
+                1,
+                Some(1),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::ProgressKPAbs,
+                9,
+                Some(1),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::ProgressKPAbs,
+                1,
+                Some(0),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::ProgressKPAbs,
+                8,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::ProgressKPAbs,
+                MAX_LAYER_STACK_BUCKETS + 1,
+                Some(MAX_LAYER_STACK_BUCKETS + 1),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::ProgressKPAbs,
+                8,
+                Some(9),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(LayerStackBucketMode::KingRank9, 8, None,)
+                .is_err()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::KingRank9,
+                9,
+                Some(8),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2339,20 +2518,25 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_layer_stack_progress8kpabs_bucket_index_range() {
+    fn test_compute_layer_stack_progresskpabs_bucket_index_range() {
         let mut pos = Position::new();
         pos.set_sfen(SFEN_HIRATE).unwrap();
 
         let weights = vec![0.0f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
-        // legacy 配布 net 互換の N=9 (DEFAULT_NUM_BUCKETS) で確認: sigmoid(0) = 0.5 →
+        // routing N=9 で確認: sigmoid(0) = 0.5 →
         // floor(0.5 * 9) = 4 (中間 bucket)。
-        let b = compute_layer_stack_progress8kpabs_bucket_index(
+        let b = compute_layer_stack_progresskpabs_bucket_index(
             &pos,
             pos.side_to_move(),
             &weights,
             DEFAULT_NUM_BUCKETS,
         );
-        assert_eq!(b, 4, "zero-weight progress8kpabs at N=9 should map to bucket 4");
+        assert_eq!(b, 4, "zero-weight progresskpabs at N=9 should map to bucket 4");
+
+        // routing N=1 (no-op routing): 係数未ロード (ゼロ重み) でも常に bucket 0。
+        let b1 =
+            compute_layer_stack_progresskpabs_bucket_index(&pos, pos.side_to_move(), &weights, 1);
+        assert_eq!(b1, 0, "N=1 no-op routing should always map to bucket 0");
     }
 
     #[test]
@@ -2508,7 +2692,7 @@ mod tests {
 
     #[cfg(feature = "nnue-progress-diff")]
     #[test]
-    fn test_progress8kpabs_diff_update() {
+    fn test_progresskpabs_diff_update() {
         use crate::types::Move;
 
         // ランダムな重みを生成（固定シード）
@@ -2526,7 +2710,7 @@ mod tests {
         pos.set_sfen(SFEN_HIRATE).unwrap();
 
         // 初期局面での全駒スキャン sum
-        let sum0 = compute_progress8kpabs_sum(&pos, &weights);
+        let sum0 = compute_progresskpabs_sum(&pos, &weights);
 
         // いくつかの手を実行して差分更新と全計算を比較
         let moves_usi = [
@@ -2540,7 +2724,7 @@ mod tests {
             let dirty = pos.do_move(mv, gives_check);
 
             // 全駒スキャンによる正解値
-            let expected_sum = compute_progress8kpabs_sum(&pos, &weights);
+            let expected_sum = compute_progresskpabs_sum(&pos, &weights);
             let expected_bucket = progress_sum_to_bucket(expected_sum, DEFAULT_NUM_BUCKETS);
 
             if dirty.king_moved[0] || dirty.king_moved[1] {
@@ -2551,7 +2735,7 @@ mod tests {
                 let sq_bk = pos.king_square(Color::Black).index();
                 let sq_wk = pos.king_square(Color::White).inverse().index();
                 let diff_sum =
-                    update_progress8kpabs_sum_diff(prev_sum, &dirty, sq_bk, sq_wk, &weights);
+                    update_progresskpabs_sum_diff(prev_sum, &dirty, sq_bk, sq_wk, &weights);
                 let diff_bucket = progress_sum_to_bucket(diff_sum, DEFAULT_NUM_BUCKETS);
 
                 assert!(

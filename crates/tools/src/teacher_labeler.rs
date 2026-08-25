@@ -18,9 +18,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use rshogi_core::nnue::{
-    LayerStackBucketMode, get_layer_stack_bucket_mode, init_nnue, is_layer_stacks_loaded,
-    load_progress_coeff_kpabs, parse_layer_stack_bucket_mode, set_fv_scale_override,
-    set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
+    LayerStackBucketMode, configure_layer_stack_routing, get_network, init_nnue,
+    layer_stack_progress_coeff_required, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
+    set_fv_scale_override, set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::Position;
 use rshogi_core::search::{LimitsType, Search, SearchInfo};
@@ -38,17 +38,20 @@ pub struct LabelerEvalConfig<'a> {
     pub nnue: &'a Path,
     /// FV_SCALE オーバーライド（0=ヘッダ自動判定、1 以上=指定値。threat/none LayerStacks 系は 28）。
     pub fv_scale: i32,
-    /// LayerStacks の bucket mode（例 `progress8kpabs`）。LS ビルドでは既定なので通常 None。
+    /// LayerStacks の bucket mode（例 `progresskpabs`）。LayerStacks では必須。
     pub ls_bucket_mode: Option<&'a str>,
-    /// progress8kpabs 用の進行度係数ファイル（USI `LS_PROGRESS_COEFF` と同じ）。
+    /// progresskpabs が推論に使う bucket 数。LayerStacks + progresskpabs では必須。
+    pub ls_progress_buckets: Option<usize>,
+    /// progresskpabs 用の進行度係数ファイル（USI `LS_PROGRESS_COEFF` と同じ）。
     pub ls_progress_coeff: Option<&'a Path>,
 }
 
 /// 評価器（NNUE + LayerStacks bucket 設定）を USI エンジンと同じ手順で構成する。
-/// `label_bench_positions::configure_eval` と同じく progress8kpabs で係数未指定なら弾く。
+/// `label_bench_positions::configure_eval` と同じく progresskpabs で係数未指定なら弾く
+/// (routing bucket 数 1 の no-op routing は係数を参照しないため除く)。
 ///
 /// # 注意（グローバル状態）
-/// `set_fv_scale_override` / `set_layer_stack_bucket_mode` /
+/// `set_fv_scale_override` / `configure_layer_stack_routing` /
 /// `set_layer_stack_progress_kpabs_weights` / `init_nnue` はいずれもプロセスグローバルな状態を
 /// 書き換える。**1 プロセスにつき起動時に 1 回だけ呼ぶこと。** 同一プロセス内で複数の設定を
 /// 切り替えるとグローバル状態が競合するため、その用途では別途排他制御が必要になる。
@@ -62,13 +65,14 @@ pub fn configure_eval(cfg: &LabelerEvalConfig) -> Result<()> {
     } else {
         eprintln!("FV_SCALE: auto-detect (header)");
     }
-    if let Some(mode_str) = cfg.ls_bucket_mode {
-        let mode = parse_layer_stack_bucket_mode(mode_str).with_context(|| {
-            format!("invalid --ls-bucket-mode '{mode_str}' (expected progress8kpabs or kingrank9)")
-        })?;
-        set_layer_stack_bucket_mode(mode);
-        eprintln!("LS_BUCKET_MODE: {}", mode.as_str());
-    }
+    let mode =
+        cfg.ls_bucket_mode
+            .map(|mode_str| {
+                parse_layer_stack_bucket_mode(mode_str).with_context(|| {
+            format!("invalid --ls-bucket-mode '{mode_str}' (expected progresskpabs or kingrank9)")
+            })
+            })
+            .transpose()?;
     let mut coeff_loaded = false;
     if let Some(path) = cfg.ls_progress_coeff {
         let weights = load_progress_coeff_kpabs(path).map_err(anyhow::Error::msg)?;
@@ -79,14 +83,36 @@ pub fn configure_eval(cfg: &LabelerEvalConfig) -> Result<()> {
     }
     init_nnue(cfg.nnue).context("Failed to load NNUE model")?;
     eprintln!("NNUE model loaded: {}", cfg.nnue.display());
-    if is_layer_stacks_loaded()
-        && get_layer_stack_bucket_mode() == LayerStackBucketMode::Progress8KPAbs
-        && !coeff_loaded
-    {
-        bail!(
-            "LS_BUCKET_MODE=progress8kpabs requires --ls-progress-coeff. \
-             Without it the progress bucket selection diverges from training and labels are wrong."
-        );
+    let stored_buckets =
+        get_network().as_deref().and_then(|network| network.layer_stack_num_buckets());
+    match stored_buckets {
+        Some(stored) => {
+            let mode = mode.context("LayerStacks requires --ls-bucket-mode")?;
+            if mode == LayerStackBucketMode::ProgressKPAbs
+                && !coeff_loaded
+                && layer_stack_progress_coeff_required(cfg.ls_progress_buckets)
+            {
+                bail!("--ls-bucket-mode progresskpabs requires --ls-progress-coeff");
+            }
+            if mode == LayerStackBucketMode::KingRank9 && cfg.ls_progress_coeff.is_some() {
+                bail!("--ls-bucket-mode kingrank9 does not use --ls-progress-coeff");
+            }
+            configure_layer_stack_routing(mode, stored, cfg.ls_progress_buckets)
+                .map_err(anyhow::Error::msg)?;
+            eprintln!(
+                "LayerStacks routing: mode={} stored_buckets={} routing_buckets={}",
+                mode.as_str(),
+                stored,
+                cfg.ls_progress_buckets.unwrap_or(9)
+            );
+        }
+        None if mode.is_some()
+            || cfg.ls_progress_buckets.is_some()
+            || cfg.ls_progress_coeff.is_some() =>
+        {
+            bail!("LayerStacks routing options were provided for a non-LayerStacks network");
+        }
+        None => {}
     }
     Ok(())
 }

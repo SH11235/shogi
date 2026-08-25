@@ -1,6 +1,8 @@
 # ek_testset
 
-`ek_testset` は、held-out CSA 棋譜から入玉局面の静的評価テストセットを作り、native NNUE 評価で採点するツールです。
+`ek_testset` は、held-out CSA 棋譜から入玉局面の評価テストセットを作るツールです。
+native NNUE の静的評価に加え、hcpe へ export して `yardstick_label` → `yardstick_score` で
+探索ラベル品質を採点できます。
 
 局面には 2 種類のラベルを付け、それぞれ別の指標系で採点します:
 
@@ -34,6 +36,47 @@ core が `entering_king_point_info` を公開していないため、点数系�
 （`points_stm`, `king_in_enemy_stm`, `enemy_zone_pieces_stm`）は出力しません。DT ラベルは
 `Position::declaration_win(EnteringKingRule::Point27)` で作ります。
 
+## export-hcpe
+
+```bash
+cargo run -p tools --release --bin ek_testset -- export-hcpe \
+  --testset runs/ek_testset/band/testset.jsonl \
+  --out runs/ek_testset/band/testset.hcpe \
+  --drop-draw false \
+  --allow-missing-eval true
+```
+
+`build` の出力には `floodgate_eval_cp` が `null` のレコードが通常含まれます
+（終局局面のサンプルと、`'**` 評価コメントの無い手。定跡手・評価値を出さない
+エンジンなど）。そのため既定（`--allow-missing-eval false`）ではエラーで止まります。
+欠損レコードを除外して変換するには上記のように `--allow-missing-eval true` を
+指定してください。
+
+`yardstick_label` が読む cshogi HuffmanCodedPosAndEval（38B/レコード）へ、入力順を保って
+逐次変換します。局面は既存の HCP packer を使い、`floodgate_eval_cp` は手番側視点の i16 LE
+として保存します。i16 範囲外は clamp し、件数を標準エラーへ表示します（教師値スケールの
+汚染検知が目的のため、`--drop-draw` で出力から除外されたレコードの分も計上する入力側の
+件数です）。
+`bestMove16` は指し手なしを表す 0、`gameResult` は `oc_label` と `stm` から絶対視点へ変換、
+padding は 0 です。
+
+保存 eval は `yardstick_label`（stage 1）が eval_band / mate_ref の生成に読み、
+`yardstick_score`（stage 2）がそれを mate 除外・`a_ref` 較正・参照系指標に使うため、
+0 埋めすると採点を静かに歪めます。`floodgate_eval_cp` がない、
+または `null` のレコードは既定で行番号付きエラーです。`--allow-missing-eval true` を
+指定した場合のみ該当レコードを**出力から除外**して続行し、除外件数
+（`eval_missing_skipped`）を標準エラーへ表示します。
+
+出力は `<out>.partial` へ書き、fsync してから正常完了時のみ最終パスへ rename します
+（中断時の途中書きが正常な hcpe サイズのまま残らないようにするため。途中失敗した
+`.partial` も削除します）。入力と出力（`.partial` 含む）が同一実体の場合、および出力が
+symlink の場合は truncate する前にエラーで拒否します。
+
+`--drop-draw` の既定値は `false` です。標準エラーの `draw` は入力で検出した draw 件数なので、
+`true` のときは出力件数に含まれません。`stm` と SFEN の手番が一致しないレコードは、
+誤った教師値を作らないため行番号付きエラーにします。この検証は `--drop-draw` /
+`--allow-missing-eval` の除外判定より先に行うため、除外対象のレコードでも迂回されません。
+
 ## eval
 
 ```bash
@@ -41,8 +84,12 @@ cargo run -p tools --release --bin ek_testset -- eval \
   --testset runs/ek_testset/band/testset.jsonl \
   --eval-file "$SHOGI_DATA/nnue/model.bin" \
   --progress-file "$SHOGI_DATA/progress/progress.bin" \
+  --progress-buckets 8 \
   --out runs/ek_testset/band/metrics.json
 ```
+
+`--progress-buckets` は学習時の routing bucket 数を指定します。`--progress-buckets 1` は
+常に bucket 0 を選ぶ no-op routing のため、その場合のみ `--progress-file` は省略できます。
 
 標準出力と `--out` に同じ JSON を出します。評価値は手番側視点 cp として扱い、DT は宣言可能局面の
 符号一致率と +600cp 超過率、OC は実対局結果との符号一致率（勝敗のみ）、cross entropy、Brier、
