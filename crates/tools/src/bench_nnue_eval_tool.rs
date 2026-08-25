@@ -772,11 +772,10 @@ pub fn run() -> Result<()> {
         | BenchMode::LayerStackEval
         | BenchMode::LayerStackRefreshCache
         | BenchMode::LayerStackUpdateCache => {
-            let bucket_mode = bucket_mode.expect("LayerStacks checked below");
-
             let NNUENetwork::LayerStacks(ref ls_net) = *network else {
                 bail!("LayerStack 専用モードは LayerStacks NNUE のみ対応");
             };
+            let bucket_mode = bucket_mode.expect("LayerStacks net was configured above");
 
             ls_dispatch_ft_size!(
                 ls_net,

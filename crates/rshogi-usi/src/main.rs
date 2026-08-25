@@ -771,6 +771,7 @@ impl UsiEngine {
                 if value.is_empty() || value == "<empty>" {
                     // 空 → 明示指定を解除し isready の自動ロードに戻す
                     clear_nnue();
+                    reset_layer_stack_progress_buckets();
                     self.eval_file_explicit = None;
                     self.eval_file_path = None;
                 } else {
@@ -778,6 +779,9 @@ impl UsiEngine {
                     self.eval_file_path = Some(value.to_string());
                     match init_nnue(&value) {
                         Ok(()) => {
+                            // 前 net 向けの routing 数を新 net に引き継がない。次の isready で
+                            // 再検証・再設定されるまで LayerStacks 評価は loud に失敗する。
+                            reset_layer_stack_progress_buckets();
                             self.eval_file_explicit = Some(true);
                             let payload = json!({
                                 "type": "info",
@@ -826,6 +830,7 @@ impl UsiEngine {
                         let was_loaded = get_network().is_some();
                         match init_nnue(path) {
                             Ok(()) => {
+                                reset_layer_stack_progress_buckets();
                                 self.eval_file_explicit = Some(true);
                                 let action = if was_loaded {
                                     "reloaded"
@@ -853,6 +858,7 @@ impl UsiEngine {
                     } else if get_network().is_some() {
                         // EvalFile 未指定で自動ロード済み → クリアして isready に任せる
                         clear_nnue();
+                        reset_layer_stack_progress_buckets();
                         self.eval_file_explicit = None;
                         eprintln!(
                             "info string NNUE_ARCHITECTURE: {} (NNUE cleared, will reload on isready)",
@@ -880,9 +886,10 @@ impl UsiEngine {
                             eprintln!("info string LS_BUCKET_MODE: {}", mode.as_str());
                         }
                         None => {
-                            self.ls_bucket_mode = None;
+                            // 設定済みの正しい mode を typo や旧名 (progress8kpabs) で
+                            // 上書き消去しない。isready の「未設定」エラーは誤診を招く。
                             eprintln!(
-                                "info string Warning: invalid LS_BUCKET_MODE '{}', expected progresskpabs or kingrank9",
+                                "info string Warning: invalid LS_BUCKET_MODE '{}' ignored, expected progresskpabs or kingrank9",
                                 value
                             );
                         }

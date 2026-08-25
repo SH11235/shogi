@@ -28,6 +28,9 @@ core 変更を公開する PR では `crates/rshogi-core/Cargo.toml` のバー�
   (格納 1 bucket net の設定経路)。この場合のみ `LS_PROGRESS_COEFF` は不要。
 - 公開 API の破壊的 rename (`Progress8KPAbs` → `ProgressKPAbs` 等) に伴い
   `rshogi-core` を 0.6.0 へ bump。
+- gensfen: native LayerStacks run の generation fingerprint に `bucket_mode` /
+  `progress_buckets` が加わるため、本変更前に開始した native LayerStacks run は
+  resume できない (fingerprint 不一致で fail)。新規 run として作り直すこと。
 
 ## v1.4.0 — 2026-08-13
 

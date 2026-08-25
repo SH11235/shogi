@@ -2217,6 +2217,15 @@ mod tests {
             }
         };
 
+        // 評価前に routing の明示設定が必要。smoke 用に stored=routing の progresskpabs
+        // (係数ゼロ = 常に中央 bucket) を使う。
+        crate::nnue::configure_layer_stack_routing(
+            crate::nnue::LayerStackBucketMode::ProgressKPAbs,
+            network.num_buckets,
+            Some(network.num_buckets),
+        )
+        .unwrap();
+
         // Feature Transformer のバイアスが読み込まれていることを確認
         let bias_sum: i64 = network.feature_transformer.biases.0.iter().map(|&x| x as i64).sum();
         eprintln!("FT bias sum: {bias_sum}");

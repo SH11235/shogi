@@ -33,7 +33,8 @@ use rshogi_core::movegen::{MoveList, generate_legal_all};
 use rshogi_core::nnue::{
     AccumulatorStackVariant, LayerStackBucketMode, LayerStacksAccCache,
     configure_layer_stack_routing, evaluate_dispatch, get_network, init_nnue,
-    load_progress_coeff_kpabs, set_layer_stack_progress_kpabs_weights,
+    layer_stack_progress_coeff_required, load_progress_coeff_kpabs,
+    set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::Position;
 use rshogi_core::search::{LimitsType, Search, SearchInfo};
@@ -950,7 +951,9 @@ fn resolve_bucket_mode(
 
     let bucket_mode = bucket_mode.context("LayerStacks では --bucket-mode が必須です")?;
     match bucket_mode {
-        BucketModeArg::ProgressKpabs if !has_progress_file => {
+        BucketModeArg::ProgressKpabs
+            if !has_progress_file && layer_stack_progress_coeff_required(progress_buckets) =>
+        {
             bail!("--bucket-mode progresskpabs では --progress-file が必須です");
         }
         BucketModeArg::ProgressKpabs if progress_buckets.is_none() => {
@@ -989,13 +992,14 @@ fn init_eval(
 
     match bucket_mode {
         Some(BucketModeArg::ProgressKpabs) => {
-            let progress_file = progress_file.ok_or_else(|| {
-                anyhow!("--bucket-mode progresskpabs では --progress-file が必須です")
-            })?;
-            let weights = load_progress_coeff_kpabs(progress_file)
-                .map_err(|e| anyhow!("progress 読み込みに失敗しました: {e}"))?;
-            set_layer_stack_progress_kpabs_weights(weights)
-                .map_err(|e| anyhow!("progress 設定に失敗しました: {e}"))?;
+            if let Some(progress_file) = progress_file {
+                let weights = load_progress_coeff_kpabs(progress_file)
+                    .map_err(|e| anyhow!("progress 読み込みに失敗しました: {e}"))?;
+                set_layer_stack_progress_kpabs_weights(weights)
+                    .map_err(|e| anyhow!("progress 設定に失敗しました: {e}"))?;
+            } else if layer_stack_progress_coeff_required(progress_buckets) {
+                bail!("--bucket-mode progresskpabs では --progress-file が必須です");
+            }
             configure_layer_stack_routing(
                 LayerStackBucketMode::ProgressKPAbs,
                 network.layer_stack_num_buckets().expect("LayerStacks checked"),
@@ -1889,6 +1893,13 @@ mod tests {
             resolve_bucket_mode(true, Some(BucketModeArg::ProgressKpabs), false, Some(8))
                 .expect_err("progresskpabs には progress-file が必要");
         assert!(missing_progress.to_string().contains("--progress-file が必須"));
+        // routing bucket 数 1 は no-op routing のため progress-file なしでも通る。
+        assert_eq!(
+            resolve_bucket_mode(true, Some(BucketModeArg::ProgressKpabs), false, Some(1))
+                .expect("N=1 は係数不要"),
+            Some(BucketModeArg::ProgressKpabs)
+        );
+
         let unused_progress = resolve_bucket_mode(true, Some(BucketModeArg::Kingrank9), true, None)
             .expect_err("kingrank9 では progress-file を拒否");
         assert!(unused_progress.to_string().contains("--progress-file は使いません"));

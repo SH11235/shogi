@@ -1651,6 +1651,9 @@ mod tests {
         let dirty = pos.do_move(mv, pos.gives_check(mv));
         evaluator.push(dirty);
         assert_eq!(evaluator.evaluate(&pos), Value::ZERO);
+
+        // routing はプロセスグローバルのため、他テストへ持ち越さないよう未設定へ戻す。
+        crate::nnue::reset_layer_stack_progress_buckets();
     }
 
     #[cfg(feature = "layerstack-arch")]

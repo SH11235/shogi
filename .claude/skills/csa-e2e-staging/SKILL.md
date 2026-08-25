@@ -82,7 +82,6 @@ test 側で済んでいる前提で、本 skill は実機しか取れない通�
   ```text
   EvalFile=/abs/path/to/halfkp_256x2-32-32_crelu/suisho5.bin,
   FV_SCALE=24,
-  LS_PROGRESS_COEFF=/abs/path/to/progress.bin,
   USI_Hash=256,Threads=1,MinimumThinkingTime=100,
   NetworkDelay=0,NetworkDelay2=0,PvInterval=0
   ```

@@ -2142,6 +2142,12 @@ mod tests {
         assert!(network.is_layer_stacks(), "epoch82.nnue should be detected as LayerStacks");
         assert_eq!(network.architecture_name(), "LayerStacks");
 
+        // 評価前に routing の明示設定が必要。smoke 用に stored=routing の progresskpabs
+        // (係数ゼロ = 常に中央 bucket) を使う。
+        let stored = network.layer_stack_num_buckets().expect("LayerStacks checked above");
+        configure_layer_stack_routing(LayerStackBucketMode::ProgressKPAbs, stored, Some(stored))
+            .unwrap();
+
         // LayerStacks 用の評価が動作することを確認
         let mut pos = crate::position::Position::new();
         pos.set_sfen(SFEN_HIRATE).unwrap();

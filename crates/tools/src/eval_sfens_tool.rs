@@ -18,8 +18,9 @@ use rshogi_core::nnue::{
     AccumulatorLayerStacks, AffineTransform, FeatureSet, LayerStackBucketMode, LsFeatureSpec,
     NNUE_PYTORCH_L3, NNUENetwork, NetworkLayerStacks,
     compute_layer_stack_progresskpabs_bucket_index, configure_layer_stack_routing,
-    get_layer_stack_progress_kpabs_weights, load_progress_coeff_kpabs, ls_dispatch_ft_size,
-    set_layer_stack_progress_kpabs_weights, sqr_clipped_relu_transform,
+    get_layer_stack_progress_kpabs_weights, layer_stack_progress_coeff_required,
+    load_progress_coeff_kpabs, ls_dispatch_ft_size, set_layer_stack_progress_kpabs_weights,
+    sqr_clipped_relu_transform,
 };
 use rshogi_core::position::Position;
 use rshogi_core::types::Color;
@@ -376,13 +377,14 @@ pub fn run() -> Result<()> {
 
     match cli.bucket_mode {
         BucketMode::ProgressKpabs => {
-            let coeff_path = cli.progress_coeff.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("--bucket-mode progresskpabs requires --progress-coeff")
-            })?;
-            let weights = load_progress_coeff_kpabs(coeff_path)
-                .map_err(|e| anyhow::anyhow!("failed to load --progress-coeff: {e}"))?;
-            set_layer_stack_progress_kpabs_weights(weights)
-                .map_err(|e| anyhow::anyhow!("failed to set kpabs weights: {e}"))?;
+            if let Some(coeff_path) = cli.progress_coeff.as_ref() {
+                let weights = load_progress_coeff_kpabs(coeff_path)
+                    .map_err(|e| anyhow::anyhow!("failed to load --progress-coeff: {e}"))?;
+                set_layer_stack_progress_kpabs_weights(weights)
+                    .map_err(|e| anyhow::anyhow!("failed to set kpabs weights: {e}"))?;
+            } else if layer_stack_progress_coeff_required(Some(cli.progress_buckets)) {
+                anyhow::bail!("--bucket-mode progresskpabs requires --progress-coeff");
+            }
         }
     }
 
