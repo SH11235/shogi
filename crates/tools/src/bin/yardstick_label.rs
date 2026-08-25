@@ -72,13 +72,16 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     fv_scale: i32,
 
-    /// LayerStacks の bucket mode（例: `progress8kpabs`）。LS ビルドでは既定が
-    /// progress8kpabs なので通常は指定不要。
+    /// LayerStacks の bucket mode（`progresskpabs` または `kingrank9`）。LayerStacks では必須。
     #[arg(long)]
     ls_bucket_mode: Option<String>,
 
-    /// progress8kpabs 用の進行度係数ファイル（USI `LS_PROGRESS_COEFF` と同じ）。
-    /// LayerStacks モデルで bucket mode が progress8kpabs のとき必須。
+    /// progresskpabs が推論に使う bucket 数。LayerStacks + progresskpabs では必須。
+    #[arg(long)]
+    ls_progress_buckets: Option<usize>,
+
+    /// progresskpabs 用の進行度係数ファイル（USI `LS_PROGRESS_COEFF` と同じ）。
+    /// LayerStacks モデルで bucket mode が progresskpabs のとき必須。
     #[arg(long)]
     ls_progress_coeff: Option<PathBuf>,
 
@@ -287,6 +290,7 @@ fn run_nnue_mode(cli: &Cli, total: u64, progress: &ProgressBar) -> Result<RunSta
         nnue,
         fv_scale: cli.fv_scale,
         ls_bucket_mode: cli.ls_bucket_mode.as_deref(),
+        ls_progress_buckets: cli.ls_progress_buckets,
         ls_progress_coeff: cli.ls_progress_coeff.as_deref(),
     })?;
 

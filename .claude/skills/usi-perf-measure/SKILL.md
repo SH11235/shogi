@@ -164,7 +164,8 @@ taskset -c 0 target/release/search_only_ab \
   --cpu 0 \
   --eval-file <MODEL_PATH> \
   --material-level none \
-  --usi-option LS_BUCKET_MODE=progress8kpabs \
+  --usi-option LS_BUCKET_MODE=progresskpabs \
+  --usi-option LS_PROGRESS_BUCKETS=8 \
   --usi-option LS_PROGRESS_COEFF=$SHOGI_DATA/progress/nodchip_progress_e1_f1_cuda.bin \
   --usi-option FV_SCALE=28 \
   --usi-option Threads=1 \

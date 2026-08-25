@@ -19,7 +19,7 @@ LayerStacks モデルを評価器に使うため、ビルドはその architectu
 
 ## 使い方
 
-bullet v100-400（LayerStacks 1536x16x32 / HalfKaHmMerged / progress8kpabs）で
+bullet v100-400（LayerStacks 1536x16x32 / HalfKaHmMerged / progresskpabs）で
 depth 25・500,000 nodes ラベリングする例:
 
 ```bash
@@ -28,6 +28,7 @@ target/release/label_bench_positions \
   --out runs/label_bench/label_bench.deep.jsonl \
   --nnue eval/ls_halfka_hm_merged_1536x16x32_none/bullet_v100-400.bin \
   --fv-scale 28 \
+  --ls-bucket-mode progresskpabs --ls-progress-buckets 8 \
   --ls-progress-coeff $SHOGI_DATA/progress/progress_hao_full_cuda.e1.bin \
   --depth 25 --nodes 500000 \
   --threads 8
@@ -43,8 +44,9 @@ target/release/label_bench_positions \
 | `--out <FILE>` | （必須） | 出力 jsonl（入力レコード + 探索結果フィールド） |
 | `--nnue <FILE>` | （必須） | ground truth 評価器の NNUE モデル |
 | `--fv-scale <i32>` | 0 | FV_SCALE オーバーライド（0=ヘッダ自動判定）。評価器に合わせ明示すること（v100 系=28） |
-| `--ls-bucket-mode <STR>` | — | LayerStacks bucket mode (`progress8kpabs` / `kingrank9`)。既定は `progress8kpabs` |
-| `--ls-progress-coeff <FILE>` | — | progress8kpabs 用の進行度係数（USI `LS_PROGRESS_COEFF` と同じ）。LayerStacks モデルをロードし bucket mode が progress8kpabs のとき必須（非 LS モデルでは不要） |
+| `--ls-bucket-mode <STR>` | — | LayerStacks bucket mode (`progresskpabs` / `kingrank9`)。LayerStacks では必須 |
+| `--ls-progress-buckets <N>` | — | progresskpabs の routing bucket 数。LayerStacks + progresskpabs では必須 |
+| `--ls-progress-coeff <FILE>` | — | progresskpabs 用の進行度係数（USI `LS_PROGRESS_COEFF` と同じ）。LayerStacks モデルをロードし bucket mode が progresskpabs のとき必須（非 LS モデルでは不要） |
 | `--depth <i32>` | 25 | 探索深さ上限（0=無制限）。`--nodes` と両方 0 は不可 |
 | `--nodes <u64>` | 500000 | 探索ノード数上限（0=無制限）。深さと併用し先に到達した方で停止。`--depth` と両方 0 は不可 |
 | `--hash-mb <usize>` | 128 | 置換表サイズ（MB）。局面ごとに作り直すため過大にしない |
@@ -55,8 +57,8 @@ target/release/label_bench_positions \
 LayerStacks モデルは `init_nnue` のロードだけでは正しく評価できません。USI エンジンと
 同じ推論設定（FV_SCALE / bucket mode / 進行度係数）を揃える必要があります。
 
-- LayerStacks モデルをロードしている場合、bucket mode 既定は `progress8kpabs` で、このとき
-  `--ls-progress-coeff` を**必ず**指定してください。未指定だと bucket 選択が学習時と食い違って
+- LayerStacks モデルでは bucket mode を明示します。`progresskpabs` では
+  `--ls-progress-buckets` と `--ls-progress-coeff` を**必ず**指定してください。未指定だと bucket 選択が学習時と食い違って
   ラベルが静かに狂うため、ツールはエラーで停止します（安全側に倒す）。非 LayerStacks モデル
   （HalfKP 等）では係数は不要です。
 - `--ls-bucket-mode kingrank9` では両玉の相対段から bucket を選ぶため、

@@ -8,7 +8,11 @@ use anyhow::{Context, Result};
 use rshogi_core::eval::{MaterialLevel, set_eval_hash_enabled, set_material_level};
 #[cfg(feature = "diagnostics")]
 use rshogi_core::eval::{eval_hash_stats, reset_eval_hash_stats};
-use rshogi_core::nnue::init_nnue;
+use rshogi_core::nnue::{
+    LayerStackBucketMode, configure_layer_stack_routing, get_network, init_nnue,
+    layer_stack_progress_coeff_required, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
+    set_layer_stack_progress_kpabs_weights,
+};
 use rshogi_core::position::Position;
 use rshogi_core::search::{LimitsType, Search, SearchInfo};
 
@@ -70,6 +74,57 @@ fn setup_eval(config: &BenchmarkConfig) -> Result<()> {
                     nnue_path.display()
                 ));
             }
+        }
+        let option_value = |name: &str| {
+            config.eval_config.usi_options.iter().find_map(|option| {
+                let (key, value) = option.split_once('=')?;
+                key.eq_ignore_ascii_case(name).then_some(value)
+            })
+        };
+        let mode = option_value("LS_BUCKET_MODE")
+            .map(|value| {
+                parse_layer_stack_bucket_mode(value)
+                    .with_context(|| format!("invalid LS_BUCKET_MODE={value}"))
+            })
+            .transpose()?;
+        let progress_buckets = option_value("LS_PROGRESS_BUCKETS")
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid LS_PROGRESS_BUCKETS={value}"))
+            })
+            .transpose()?;
+        let coeff = option_value("LS_PROGRESS_COEFF");
+        let network = get_network().context("NNUE was not initialized")?;
+        match network.layer_stack_num_buckets() {
+            Some(stored) => {
+                let mode =
+                    mode.context("internal LayerStacks benchmark requires LS_BUCKET_MODE")?;
+                match (mode, coeff) {
+                    (LayerStackBucketMode::ProgressKPAbs, Some(path)) => {
+                        let weights =
+                            load_progress_coeff_kpabs(path).map_err(anyhow::Error::msg)?;
+                        set_layer_stack_progress_kpabs_weights(weights)
+                            .map_err(anyhow::Error::msg)?;
+                    }
+                    (LayerStackBucketMode::ProgressKPAbs, None) => {
+                        if layer_stack_progress_coeff_required(progress_buckets) {
+                            anyhow::bail!("progresskpabs requires LS_PROGRESS_COEFF")
+                        }
+                    }
+                    (LayerStackBucketMode::KingRank9, Some(_)) => {
+                        anyhow::bail!("kingrank9 does not use LS_PROGRESS_COEFF")
+                    }
+                    (LayerStackBucketMode::KingRank9, None) => {}
+                    _ => unreachable!(),
+                }
+                configure_layer_stack_routing(mode, stored, progress_buckets)
+                    .map_err(anyhow::Error::msg)?;
+            }
+            None if mode.is_some() || progress_buckets.is_some() || coeff.is_some() => {
+                anyhow::bail!("LayerStacks USI options require a LayerStacks NNUE")
+            }
+            None => {}
         }
     }
     Ok(())

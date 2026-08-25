@@ -59,6 +59,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 // mpsc/Arc/Mutex/Instant は ONNX 直推論パイプライン専用（バッチ供給の Receiver 共有・
 // フェーズ計時）。ONNX 無効ビルドでの unused import を避けるため cfg で囲う。
 #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+use sha2::{Digest, Sha256};
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 use std::sync::mpsc;
 #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 use std::sync::{Arc, Mutex};
@@ -66,7 +68,11 @@ use std::thread;
 #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 use std::time::Instant;
 
-use rshogi_core::nnue::init_nnue;
+use rshogi_core::nnue::{
+    LayerStackBucketMode, configure_layer_stack_routing, get_network, init_nnue,
+    layer_stack_progress_coeff_required, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
+    set_layer_stack_progress_kpabs_weights,
+};
 use rshogi_core::position::Position;
 use rshogi_core::search::{LimitsType, Search};
 use tools::packed_sfen::{
@@ -106,6 +112,18 @@ struct Cli {
     /// NNUEモデルファイル（--engine未使用時に必須）
     #[arg(long)]
     nnue: Option<PathBuf>,
+
+    /// LayerStacks bucket mode。LayerStacks NNUE では必須。
+    #[arg(long)]
+    ls_bucket_mode: Option<String>,
+
+    /// progresskpabs が推論に使う bucket 数。
+    #[arg(long)]
+    ls_progress_buckets: Option<usize>,
+
+    /// progresskpabs 用の進行度係数ファイル。
+    #[arg(long)]
+    ls_progress_coeff: Option<PathBuf>,
 
     /// qsearch評価を使用（デフォルトは静的評価）
     #[arg(long)]
@@ -450,6 +468,9 @@ fn onnx_marker_decide(
         qsearch_leaf_label: cli.qsearch_leaf_label,
         qsearch_max_ply: cli.max_ply,
         qsearch_nnue_path: cli.nnue.as_deref(),
+        qsearch_ls_bucket_mode: cli.ls_bucket_mode.as_deref(),
+        qsearch_ls_progress_buckets: cli.ls_progress_buckets,
+        qsearch_ls_progress_coeff_path: cli.ls_progress_coeff.as_deref(),
         replacement_output,
     };
     let current = build_run_fingerprint(&cfg)?;
@@ -863,6 +884,44 @@ fn main() -> Result<()> {
         }
         init_nnue(nnue).context("Failed to load NNUE model")?;
         eprintln!("NNUE model loaded: {}", nnue.display());
+        let network = get_network().context("NNUE was not initialized")?;
+        match network.layer_stack_num_buckets() {
+            Some(stored) => {
+                let mode_str = cli
+                    .ls_bucket_mode
+                    .as_deref()
+                    .context("LayerStacks requires --ls-bucket-mode")?;
+                let mode = parse_layer_stack_bucket_mode(mode_str)
+                    .context("--ls-bucket-mode must be progresskpabs or kingrank9")?;
+                match (mode, cli.ls_progress_coeff.as_deref()) {
+                    (LayerStackBucketMode::ProgressKPAbs, Some(path)) => {
+                        let weights =
+                            load_progress_coeff_kpabs(path).map_err(anyhow::Error::msg)?;
+                        set_layer_stack_progress_kpabs_weights(weights)
+                            .map_err(anyhow::Error::msg)?;
+                    }
+                    (LayerStackBucketMode::ProgressKPAbs, None) => {
+                        if layer_stack_progress_coeff_required(cli.ls_progress_buckets) {
+                            anyhow::bail!("progresskpabs requires --ls-progress-coeff")
+                        }
+                    }
+                    (LayerStackBucketMode::KingRank9, Some(_)) => {
+                        anyhow::bail!("kingrank9 does not use --ls-progress-coeff")
+                    }
+                    (LayerStackBucketMode::KingRank9, None) => {}
+                    _ => unreachable!(),
+                }
+                configure_layer_stack_routing(mode, stored, cli.ls_progress_buckets)
+                    .map_err(anyhow::Error::msg)?;
+            }
+            None if cli.ls_bucket_mode.is_some()
+                || cli.ls_progress_buckets.is_some()
+                || cli.ls_progress_coeff.is_some() =>
+            {
+                anyhow::bail!("LayerStacks routing options require a LayerStacks NNUE")
+            }
+            None => {}
+        }
     }
 
     // Ctrl-Cハンドラを設定
@@ -2293,6 +2352,10 @@ struct OnnxPipelineConfig<'a> {
     /// 葉 PV ＝ ONNX が評価する葉局面が NNUE に依存するため、NNUE 差し替えを
     /// marker で検知できるよう fingerprint に path/size/mtime を含める。
     qsearch_nnue_path: Option<&'a std::path::Path>,
+    /// 葉探索 NNUE が LayerStacks の場合の明示 routing 設定。
+    qsearch_ls_bucket_mode: Option<&'a str>,
+    qsearch_ls_progress_buckets: Option<usize>,
+    qsearch_ls_progress_coeff_path: Option<&'a std::path::Path>,
     /// leaf-REPLACEMENT arm の出力パス（`--qsearch-leaf-replacement-output`）。
     /// `qsearch_leaf_label` 併用時のみ Some。葉局面に置換したレコード
     /// （葉 sfen + 葉評価・符号反転なし）をこのパスに書き出す。leaf-LABEL arm
@@ -2350,6 +2413,10 @@ struct RunFingerprint {
     qsearch_nnue_path: Option<PathBuf>,
     qsearch_nnue_size: Option<u64>,
     qsearch_nnue_mtime_ns: Option<u128>,
+    qsearch_ls_bucket_mode: Option<String>,
+    qsearch_ls_progress_buckets: Option<usize>,
+    qsearch_ls_progress_coeff_path: Option<PathBuf>,
+    qsearch_ls_progress_coeff_sha256: Option<String>,
     expand: bool,
     expand_threshold_bits: Option<u32>,
     expand_skip_parent_in_check: Option<bool>,
@@ -2456,6 +2523,18 @@ fn serialize_marker(marker: &DoneMarker) -> String {
             "qsearch_nnue_mtime_ns={}",
             f.qsearch_nnue_mtime_ns.expect("qsearch_leaf_label=true requires nnue mtime")
         );
+        if let Some(mode) = &f.qsearch_ls_bucket_mode {
+            let _ = writeln!(out, "qsearch_ls_bucket_mode={mode}");
+        }
+        if let Some(buckets) = f.qsearch_ls_progress_buckets {
+            let _ = writeln!(out, "qsearch_ls_progress_buckets={buckets}");
+        }
+        if let Some(path) = &f.qsearch_ls_progress_coeff_path {
+            let _ = writeln!(out, "qsearch_ls_progress_coeff_path={}", path.display());
+        }
+        if let Some(sha256) = &f.qsearch_ls_progress_coeff_sha256 {
+            let _ = writeln!(out, "qsearch_ls_progress_coeff_sha256={sha256}");
+        }
     }
     let _ = writeln!(out, "expand={}", f.expand);
     if f.expand {
@@ -2604,6 +2683,15 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
             .get("qsearch_nnue_mtime_ns")
             .map(|v| v.parse().context("invalid qsearch_nnue_mtime_ns"))
             .transpose()?,
+        qsearch_ls_bucket_mode: map.get("qsearch_ls_bucket_mode").cloned(),
+        qsearch_ls_progress_buckets: map
+            .get("qsearch_ls_progress_buckets")
+            .map(|value| value.parse().context("invalid qsearch_ls_progress_buckets"))
+            .transpose()?,
+        qsearch_ls_progress_coeff_path: map
+            .get("qsearch_ls_progress_coeff_path")
+            .map(PathBuf::from),
+        qsearch_ls_progress_coeff_sha256: map.get("qsearch_ls_progress_coeff_sha256").cloned(),
         expand,
         expand_threshold_bits: if expand {
             Some(parse_hex_u32(get("expand_threshold_bits")?)?)
@@ -2948,6 +3036,25 @@ fn build_run_fingerprint(config: &OnnxPipelineConfig<'_>) -> Result<RunFingerpri
     } else {
         (None, None, None)
     };
+    let (qsearch_ls_progress_coeff_path, qsearch_ls_progress_coeff_sha256) =
+        if config.qsearch_leaf_label {
+            match config.qsearch_ls_progress_coeff_path {
+                Some(path) => {
+                    let canonical = path.canonicalize().with_context(|| {
+                        format!("Failed to canonicalize --ls-progress-coeff {}", path.display())
+                    })?;
+                    ensure_marker_safe_path("--ls-progress-coeff", &canonical)?;
+                    let bytes = fs::read(&canonical).with_context(|| {
+                        format!("Failed to read --ls-progress-coeff {}", canonical.display())
+                    })?;
+                    let sha256 = format!("{:x}", Sha256::digest(bytes));
+                    (Some(canonical), Some(sha256))
+                }
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
     Ok(RunFingerprint {
         version: MARKER_VERSION,
         mode: "onnx".to_string(),
@@ -2970,6 +3077,16 @@ fn build_run_fingerprint(config: &OnnxPipelineConfig<'_>) -> Result<RunFingerpri
         qsearch_nnue_path,
         qsearch_nnue_size,
         qsearch_nnue_mtime_ns,
+        qsearch_ls_bucket_mode: config
+            .qsearch_leaf_label
+            .then(|| config.qsearch_ls_bucket_mode.map(str::to_string))
+            .flatten(),
+        qsearch_ls_progress_buckets: config
+            .qsearch_leaf_label
+            .then_some(config.qsearch_ls_progress_buckets)
+            .flatten(),
+        qsearch_ls_progress_coeff_path,
+        qsearch_ls_progress_coeff_sha256,
         expand: config.expand.is_some(),
         expand_threshold_bits: config.expand.map(|e| e.threshold.to_bits()),
         expand_skip_parent_in_check: config.expand.map(|e| e.skip_parent_in_check),
@@ -3126,6 +3243,9 @@ where
         qsearch_max_ply,
         // fingerprint 用。pipeline 本体では使わず build_run_fingerprint(config) で参照する。
         qsearch_nnue_path: _,
+        qsearch_ls_bucket_mode: _,
+        qsearch_ls_progress_buckets: _,
+        qsearch_ls_progress_coeff_path: _,
         replacement_output,
     } = *config;
 
@@ -4437,6 +4557,9 @@ fn process_file_with_onnx(
         qsearch_max_ply: cli.max_ply,
         // leaf-label は dlshogi 限定のため AobaZero では葉探索 NNUE / replacement arm を持たない。
         qsearch_nnue_path: None,
+        qsearch_ls_bucket_mode: None,
+        qsearch_ls_progress_buckets: None,
+        qsearch_ls_progress_coeff_path: None,
         replacement_output: None,
     };
     process_file_with_onnx_pipeline(
@@ -4500,6 +4623,9 @@ fn process_file_with_dlshogi_onnx(
         qsearch_leaf_label: cli.qsearch_leaf_label,
         qsearch_max_ply: cli.max_ply,
         qsearch_nnue_path: cli.nnue.as_deref(),
+        qsearch_ls_bucket_mode: cli.ls_bucket_mode.as_deref(),
+        qsearch_ls_progress_buckets: cli.ls_progress_buckets,
+        qsearch_ls_progress_coeff_path: cli.ls_progress_coeff.as_deref(),
         replacement_output: replacement_output_path,
     };
     process_file_with_onnx_pipeline(
@@ -4603,6 +4729,26 @@ mod marker_tests {
         assert_eq!(m.fingerprint.qsearch_nnue_mtime_ns, Some(789));
         // serialize → parse で一致（max_ply / nnue 行は leaf_label=true 時のみ出力）
         assert_eq!(m, parse_text(&serialize_marker(&m)));
+    }
+
+    #[test]
+    fn layer_stack_leaf_routing_changes_fingerprint() {
+        let n8 = parse_text(&base_marker(&format!(
+            "{LEAF_LABEL_KEYS}qsearch_ls_bucket_mode=progresskpabs\n\
+             qsearch_ls_progress_buckets=8\n\
+             qsearch_ls_progress_coeff_path=/tmp/progress.bin\n\
+             qsearch_ls_progress_coeff_sha256=abc123\n"
+        )));
+        assert_eq!(n8.fingerprint.qsearch_ls_progress_buckets, Some(8));
+        assert_eq!(n8, parse_text(&serialize_marker(&n8)));
+
+        let n9 = parse_text(&base_marker(&format!(
+            "{LEAF_LABEL_KEYS}qsearch_ls_bucket_mode=progresskpabs\n\
+             qsearch_ls_progress_buckets=9\n\
+             qsearch_ls_progress_coeff_path=/tmp/progress.bin\n\
+             qsearch_ls_progress_coeff_sha256=abc123\n"
+        )));
+        assert_ne!(n8.fingerprint, n9.fingerprint);
     }
 
     #[test]

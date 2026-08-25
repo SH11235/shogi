@@ -14,11 +14,13 @@ use rshogi_core::eval::{
     set_pass_right_value_phased,
 };
 use rshogi_core::nnue::{
-    AccumulatorStackVariant, LayerStackBucketMode, clear_nnue, evaluate_dispatch, get_network,
-    init_nnue, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode, parse_nnue_architecture,
-    print_nnue_stats, reset_layer_stack_progress_kpabs_weights, set_fv_scale_override,
-    set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
-    set_nnue_architecture_override,
+    AccumulatorStackVariant, LayerStackBucketMode, MAX_LAYER_STACK_BUCKETS, clear_nnue,
+    configure_layer_stack_routing, evaluate_dispatch, get_network, init_nnue,
+    layer_stack_progress_coeff_required, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
+    parse_nnue_architecture, print_nnue_stats, reset_layer_stack_progress_buckets,
+    reset_layer_stack_progress_kpabs_weights, set_fv_scale_override,
+    set_layer_stack_progress_kpabs_weights, set_nnue_architecture_override,
+    validate_layer_stack_routing_configuration,
 };
 use rshogi_core::position::Position;
 use rshogi_core::search::{
@@ -74,6 +76,12 @@ struct UsiEngine {
     eval_file_explicit: Option<bool>,
     /// 最後に指定された EvalFile パス（NNUE_ARCHITECTURE 変更時の再読込用）
     eval_file_path: Option<String>,
+    /// LayerStacks の bucket routing mode。LayerStacks 利用時は明示指定が必須。
+    ls_bucket_mode: Option<LayerStackBucketMode>,
+    /// progresskpabs の推論 bucket 数。0 は未指定として扱う。
+    ls_progress_buckets: Option<usize>,
+    /// LS_PROGRESS_COEFF の読み込みに成功しているか。
+    ls_progress_coeff_loaded: bool,
     /// SPSAParamsFile の明示指定パス（setoption で設定）
     spsa_params_file: Option<String>,
     /// SPSA params ファイルの読み込み済みフラグ
@@ -116,6 +124,7 @@ impl UsiEngine {
         // グローバルフラグをデフォルト値で初期化
         // （USI GUIがsetoptionを送らない場合に備える）
         set_eval_hash_enabled(use_eval_hash);
+        reset_layer_stack_progress_buckets();
 
         Self {
             // EvalHash は最初の `go` 直前まで遅延確保する。
@@ -137,6 +146,9 @@ impl UsiEngine {
             last_go_cmd: None,
             eval_file_explicit: None,
             eval_file_path: None,
+            ls_bucket_mode: None,
+            ls_progress_buckets: None,
+            ls_progress_coeff_loaded: false,
             spsa_params_file: None,
             spsa_params_loaded: false,
             large_pages_reported: false,
@@ -252,8 +264,10 @@ impl UsiEngine {
         // 水匠5等は24、YaneuraOuデフォルトは16
         println!("option name FV_SCALE type spin default 0 min 0 max 100");
         println!(
-            "option name LS_BUCKET_MODE type combo default {} var progress8kpabs var kingrank9",
-            LayerStackBucketMode::Progress8KPAbs.as_str()
+            "option name LS_BUCKET_MODE type combo default unset var unset var progresskpabs var kingrank9"
+        );
+        println!(
+            "option name LS_PROGRESS_BUCKETS type spin default 0 min 0 max {MAX_LAYER_STACK_BUCKETS}"
         );
         println!("option name LS_PROGRESS_COEFF type string default <empty>");
         println!(
@@ -341,29 +355,37 @@ impl UsiEngine {
                 // EvalFile 未指定だが Material 有効 or NNUE 既ロード → 何もしない
             }
         }
-        // progress8kpabs bucket mode で LS_PROGRESS_COEFF 未指定の場合はエラー。
-        // bucket mode は LayerStacks ネットワーク専用。Simple系アーキ
-        // (HalfKP/HalfKaSplit/HalfKaHmMerged/HalfKaMerged/HalfKaHmSplit) や Material 評価では
-        // 使われないため、ロード済みネットワークが LayerStacks のときだけ検査する。
+        // version は binary layout の判別にだけ使う。LayerStacks の routing semantics は
+        // USI オプションと、ロード済み net の格納 bucket 数を突き合わせて検証する。
+        if let Some(stored_bucket_count) =
+            get_network().as_deref().and_then(|net| net.layer_stack_num_buckets())
         {
-            use rshogi_core::nnue::{
-                get_layer_stack_bucket_mode, get_layer_stack_progress_kpabs_weights,
-            };
-            let is_layer_stacks = get_network().as_deref().is_some_and(|n| n.is_layer_stacks());
-            let weights_all_zero =
-                get_layer_stack_progress_kpabs_weights().iter().all(|&w| w == 0.0);
-            if is_layer_stacks
-                && ls_bucket_mode_requires_progress_coeff(
-                    get_layer_stack_bucket_mode(),
-                    weights_all_zero,
-                )
-            {
-                panic!(
-                    "LS_BUCKET_MODE=progress8kpabs requires LS_PROGRESS_COEFF to be set. \
-                     All weights are zero (progress.bin not loaded). \
-                     Use 'setoption name LS_PROGRESS_COEFF value <path>' before isready."
-                );
+            if let Err(message) = validate_layer_stack_routing(
+                stored_bucket_count,
+                self.ls_bucket_mode,
+                self.ls_progress_buckets,
+                self.ls_progress_coeff_loaded,
+            ) {
+                panic!("Invalid LayerStacks routing configuration: {message}");
             }
+            let mode = self.ls_bucket_mode.expect("validated above");
+            configure_layer_stack_routing(mode, stored_bucket_count, self.ls_progress_buckets)
+                .unwrap_or_else(|message| {
+                    panic!("Invalid LayerStacks routing configuration: {message}")
+                });
+            let routing_bucket_count = match mode {
+                LayerStackBucketMode::KingRank9 => 9,
+                LayerStackBucketMode::ProgressKPAbs => {
+                    self.ls_progress_buckets.expect("validated above")
+                }
+                _ => unreachable!("validated above"),
+            };
+            eprintln!(
+                "info string NNUE LayerStack routing mode={} stored_buckets={} routing_buckets={}",
+                mode.as_str(),
+                stored_bucket_count,
+                routing_bucket_count
+            );
         }
         self.maybe_load_spsa_params();
         self.maybe_report_large_pages();
@@ -749,6 +771,7 @@ impl UsiEngine {
                 if value.is_empty() || value == "<empty>" {
                     // 空 → 明示指定を解除し isready の自動ロードに戻す
                     clear_nnue();
+                    reset_layer_stack_progress_buckets();
                     self.eval_file_explicit = None;
                     self.eval_file_path = None;
                 } else {
@@ -756,13 +779,16 @@ impl UsiEngine {
                     self.eval_file_path = Some(value.to_string());
                     match init_nnue(&value) {
                         Ok(()) => {
+                            // 前 net 向けの routing 数を新 net に引き継がない。次の isready で
+                            // 再検証・再設定されるまで LayerStacks 評価は loud に失敗する。
+                            reset_layer_stack_progress_buckets();
                             self.eval_file_explicit = Some(true);
                             let payload = json!({
                                 "type": "info",
                                 "message": format!("NNUE loaded: {value}"),
                             });
                             eprintln!("info string {payload}");
-                            // LayerStack ネットなら net header の num_buckets を出力
+                            // LayerStack ネットなら net に格納された bucket 数を出力
                             // (file/option desync 検知用、ADR `2026-05-26` §2.8)。
                             if let Some(net) = get_network().as_deref()
                                 && net.is_layer_stacks()
@@ -770,7 +796,9 @@ impl UsiEngine {
                                 #[cfg(feature = "layerstack-arch")]
                                 {
                                     let n = net.as_layer_stacks().num_buckets();
-                                    eprintln!("info string NNUE LayerStack num_buckets={n}");
+                                    eprintln!(
+                                        "info string NNUE LayerStack stored_bucket_count={n}"
+                                    );
                                 }
                             }
                         }
@@ -802,6 +830,7 @@ impl UsiEngine {
                         let was_loaded = get_network().is_some();
                         match init_nnue(path) {
                             Ok(()) => {
+                                reset_layer_stack_progress_buckets();
                                 self.eval_file_explicit = Some(true);
                                 let action = if was_loaded {
                                     "reloaded"
@@ -829,6 +858,7 @@ impl UsiEngine {
                     } else if get_network().is_some() {
                         // EvalFile 未指定で自動ロード済み → クリアして isready に任せる
                         clear_nnue();
+                        reset_layer_stack_progress_buckets();
                         self.eval_file_explicit = None;
                         eprintln!(
                             "info string NNUE_ARCHITECTURE: {} (NNUE cleared, will reload on isready)",
@@ -845,26 +875,56 @@ impl UsiEngine {
                     );
                 }
             },
-            "LS_BUCKET_MODE" => match parse_layer_stack_bucket_mode(&value) {
-                Some(mode) => {
-                    set_layer_stack_bucket_mode(mode);
-                    eprintln!("info string LS_BUCKET_MODE: {}", mode.as_str());
+            "LS_BUCKET_MODE" => {
+                if value.eq_ignore_ascii_case("unset") || value.is_empty() {
+                    self.ls_bucket_mode = None;
+                    eprintln!("info string LS_BUCKET_MODE: unset");
+                } else {
+                    match parse_layer_stack_bucket_mode(&value) {
+                        Some(mode) => {
+                            self.ls_bucket_mode = Some(mode);
+                            eprintln!("info string LS_BUCKET_MODE: {}", mode.as_str());
+                        }
+                        None => {
+                            // 設定済みの正しい mode を typo や旧名 (progress8kpabs) で
+                            // 上書き消去しない。isready の「未設定」エラーは誤診を招く。
+                            eprintln!(
+                                "info string Warning: invalid LS_BUCKET_MODE '{}' ignored, expected progresskpabs or kingrank9",
+                                value
+                            );
+                        }
+                    }
                 }
-                None => {
+            }
+            "LS_PROGRESS_BUCKETS" => match value.parse::<usize>() {
+                Ok(0) => {
+                    self.ls_progress_buckets = None;
+                    eprintln!("info string LS_PROGRESS_BUCKETS: unset");
+                }
+                Ok(v @ 1..=MAX_LAYER_STACK_BUCKETS) => {
+                    self.ls_progress_buckets = Some(v);
+                    eprintln!("info string LS_PROGRESS_BUCKETS: {v}");
+                }
+                _ => {
+                    self.ls_progress_buckets = None;
                     eprintln!(
-                        "info string Warning: invalid LS_BUCKET_MODE '{}', expected progress8kpabs or kingrank9",
-                        value
+                        "info string Warning: invalid LS_PROGRESS_BUCKETS '{}', expected 0..={MAX_LAYER_STACK_BUCKETS}",
+                        value,
                     );
                 }
             },
             "LS_PROGRESS_COEFF" => {
                 if value.is_empty() || value == "<empty>" {
                     reset_layer_stack_progress_kpabs_weights();
-                    eprintln!("info string LS_PROGRESS_COEFF: reset to built-in default");
+                    self.ls_progress_coeff_loaded = false;
+                    eprintln!("info string LS_PROGRESS_COEFF: unset");
                 } else {
+                    self.ls_progress_coeff_loaded = false;
+                    reset_layer_stack_progress_kpabs_weights();
                     match load_progress_coeff_kpabs(&value) {
                         Ok(weights) => match set_layer_stack_progress_kpabs_weights(weights) {
                             Ok(()) => {
+                                self.ls_progress_coeff_loaded = true;
                                 eprintln!("info string LS_PROGRESS_COEFF loaded (kpabs): {value}");
                             }
                             Err(err) => {
@@ -1492,14 +1552,48 @@ impl UsiEngine {
     }
 }
 
-/// LayerStacks ロード時に isready で LS_PROGRESS_COEFF を必須とするか。
-/// 進行度重みを参照するのは progress8kpabs のみで、kingrank9 は玉位置だけから
-/// bucket を決めるため係数不要。
-fn ls_bucket_mode_requires_progress_coeff(
-    mode: rshogi_core::nnue::LayerStackBucketMode,
-    weights_all_zero: bool,
-) -> bool {
-    mode == rshogi_core::nnue::LayerStackBucketMode::Progress8KPAbs && weights_all_zero
+/// LayerStacks の格納 bucket 数と、明示された routing semantics の整合性を検証する。
+///
+/// NNUE version は binary layout の判別にだけ使い、この判断には使わない。
+fn validate_layer_stack_routing(
+    stored_bucket_count: usize,
+    mode: Option<LayerStackBucketMode>,
+    progress_buckets: Option<usize>,
+    progress_coeff_loaded: bool,
+) -> std::result::Result<(), String> {
+    match mode {
+        None => Err(
+            "LS_BUCKET_MODE must be explicitly set to progresskpabs or kingrank9 before isready"
+                .to_string(),
+        ),
+        Some(LayerStackBucketMode::ProgressKPAbs) => {
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::ProgressKPAbs,
+                stored_bucket_count,
+                progress_buckets,
+            )?;
+            if !progress_coeff_loaded && layer_stack_progress_coeff_required(progress_buckets) {
+                return Err("LS_BUCKET_MODE=progresskpabs requires LS_PROGRESS_COEFF to be loaded"
+                    .to_string());
+            }
+            Ok(())
+        }
+        Some(LayerStackBucketMode::KingRank9) => {
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::KingRank9,
+                stored_bucket_count,
+                progress_buckets,
+            )?;
+            if progress_coeff_loaded {
+                return Err(
+                    "LS_BUCKET_MODE=kingrank9 conflicts with LS_PROGRESS_COEFF; leave it unset"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        Some(_) => Err("unsupported LS_BUCKET_MODE".to_string()),
+    }
 }
 
 fn main() -> Result<()> {
@@ -1628,18 +1722,17 @@ mod tests {
 
     #[test]
     #[serial]
-    fn setoption_layerstack_bucket_updates_globals() {
+    fn setoption_layerstack_bucket_updates_pending_configuration() {
         std::thread::Builder::new()
             .stack_size(STACK_SIZE)
             .spawn(|| {
                 use rshogi_core::nnue::{
                     LayerStackBucketMode, SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
-                    get_layer_stack_bucket_mode, get_layer_stack_progress_kpabs_weights,
-                    reset_layer_stack_progress_kpabs_weights, set_layer_stack_bucket_mode,
+                    get_layer_stack_progress_buckets, get_layer_stack_progress_kpabs_weights,
+                    reset_layer_stack_progress_buckets, reset_layer_stack_progress_kpabs_weights,
                 };
 
                 // テスト開始時に既定値へ戻す
-                set_layer_stack_bucket_mode(LayerStackBucketMode::Progress8KPAbs);
                 reset_layer_stack_progress_kpabs_weights();
 
                 let mut engine = UsiEngine::new();
@@ -1648,9 +1741,13 @@ mod tests {
                     "name",
                     "LS_BUCKET_MODE",
                     "value",
-                    "progress8kpabs",
+                    "progresskpabs",
                 ]);
-                assert_eq!(get_layer_stack_bucket_mode(), LayerStackBucketMode::Progress8KPAbs);
+                assert_eq!(engine.ls_bucket_mode, Some(LayerStackBucketMode::ProgressKPAbs));
+
+                engine.cmd_setoption(&["setoption", "name", "LS_PROGRESS_BUCKETS", "value", "8"]);
+                assert_eq!(engine.ls_progress_buckets, Some(8));
+                assert_eq!(get_layer_stack_progress_buckets(), None);
 
                 engine.cmd_setoption(&[
                     "setoption",
@@ -1659,7 +1756,7 @@ mod tests {
                     "value",
                     "kingrank9",
                 ]);
-                assert_eq!(get_layer_stack_bucket_mode(), LayerStackBucketMode::KingRank9);
+                assert_eq!(engine.ls_bucket_mode, Some(LayerStackBucketMode::KingRank9));
 
                 let tmp_path_bin =
                     std::env::temp_dir().join("rshogi_progress_coeff_kpabs_test.bin");
@@ -1688,14 +1785,38 @@ mod tests {
                 assert_eq!(kpabs.len(), SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS);
                 assert_eq!(kpabs[0], 1.25);
                 assert_eq!(kpabs[SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS - 1], -0.75);
+                assert!(engine.ls_progress_coeff_loaded);
                 let _ = std::fs::remove_file(tmp_path_bin);
 
                 // 他テストへの影響を避けるため復元
-                set_layer_stack_bucket_mode(LayerStackBucketMode::Progress8KPAbs);
+                reset_layer_stack_progress_buckets();
                 reset_layer_stack_progress_kpabs_weights();
             })
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn validate_layer_stack_routing_matrix() {
+        use LayerStackBucketMode::{KingRank9, ProgressKPAbs};
+
+        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(8), true).is_ok());
+        assert!(validate_layer_stack_routing(8, Some(ProgressKPAbs), Some(8), true).is_ok());
+        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(9), true).is_ok());
+        assert!(validate_layer_stack_routing(9, Some(KingRank9), None, false).is_ok());
+        // 1 は常に bucket 0 を選ぶ no-op routing (格納 1 bucket net の唯一の設定経路)。
+        // 係数を参照しないため LS_PROGRESS_COEFF 未ロードでも通る (ロード済みも可)。
+        assert!(validate_layer_stack_routing(1, Some(ProgressKPAbs), Some(1), false).is_ok());
+        assert!(validate_layer_stack_routing(1, Some(ProgressKPAbs), Some(1), true).is_ok());
+        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(1), false).is_ok());
+
+        assert!(validate_layer_stack_routing(9, None, None, false).is_err());
+        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), None, true).is_err());
+        assert!(validate_layer_stack_routing(8, Some(ProgressKPAbs), Some(9), true).is_err());
+        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(8), false).is_err());
+        assert!(validate_layer_stack_routing(8, Some(KingRank9), None, false).is_err());
+        assert!(validate_layer_stack_routing(9, Some(KingRank9), Some(8), false).is_err());
+        assert!(validate_layer_stack_routing(9, Some(KingRank9), None, true).is_err());
     }
 }

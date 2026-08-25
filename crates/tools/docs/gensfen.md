@@ -77,12 +77,14 @@ KIF が必要な場合は `tournament` バイナリで対局を回し、その�
 
 デフォルトは **NativeBackend**（`rshogi-core` を直接呼び出すマルチスレッド単一プロセス）。
 `--eval-file` で評価関数ファイルの指定が必須。
-LayerStacks 系ネット（`num_buckets > 1`）を native で使う場合は、`--progress-file` で
-progress8kpabs 係数ファイルを指定する。未指定ならゼロ係数へのサイレントフォールバックを防ぐため
-起動時にエラーにする。指定パスは meta 行の `settings.progress_file` に、内容の SHA-256 は
+LayerStacks 系ネットを native で使う場合は routing を明示する。progresskpabs なら
+`--bucket-mode progresskpabs --progress-buckets <学習時の数> --progress-file <係数>`、
+KingRank9 なら `--bucket-mode kingrank9` を指定する。不足・構造不一致は起動時にエラーにする。
+係数の指定パスは meta 行の `settings.progress_file` に、内容の SHA-256 は
 `settings.progress_file_sha256` に記録され、`--resume` 時はパスと内容の両方を照合する
 （同一パスへの係数差し替えも検出する）。
-native LayerStacks 実行時は stderr に `LayerStacks num_buckets=N` と、ワーカー終了時の
+native LayerStacks 実行時は stderr に
+`NativeBackend: LayerStacks mode=... stored_buckets=... routing_buckets=...` と、ワーカー終了時の
 `progress bucket distribution: [...] (used X/N)` を出力するため、短時間ランでも bucket 使用状況を確認できる。
 
 FV_SCALE は arch 文字列の `fv_scale` トークンから自動判定される。実際の学習スケールと
@@ -92,8 +94,9 @@ FV_SCALE は arch 文字列の `fv_scale` トークンから自動判定され�
 
 USI モードを使う場合は `--native=false --engine-path /path/to/usi-engine` を指定する。
 このとき `--engine-path-black/white` で先後を別エンジンにすることも可能。
-USI モードでは `--progress-file` は使わず、必要な場合は `--usi-option LS_PROGRESS_COEFF=/path/to/progress.bin`
-でエンジン側へ渡す。
+USI モードでは native 用の `--bucket-mode` / `--progress-buckets` / `--progress-file` は使わない。
+LayerStacks では `--usi-option LS_BUCKET_MODE=progresskpabs --usi-option LS_PROGRESS_BUCKETS=8
+--usi-option LS_PROGRESS_COEFF=/path/to/progress.bin` のように、ルーティング設定をエンジン側へ渡す。
 
 ### USI 単一エンジン最適化
 
@@ -130,7 +133,9 @@ TT/履歴が共有されるため棋力評価には不向きだが、教師局�
 |-----------|-----------|------|
 | `--native[=BOOL]` | true | NativeBackend を使用（`--eval-file` 必須） |
 | `--eval-file PATH` | (native 時必須) | NNUE 評価関数ファイル |
-| `--progress-file PATH` | (LS native 時必須) | native LayerStacks 用 progress8kpabs 係数ファイル |
+| `--bucket-mode MODE` | (LS native 時必須) | `progresskpabs` または `kingrank9` |
+| `--progress-buckets N` | (progresskpabs 時必須) | 学習時と同じ routing bucket 数 |
+| `--progress-file PATH` | (progresskpabs 時必須) | native LayerStacks 用 progresskpabs 係数ファイル |
 | `--fv-scale N` | 0（自動判定） | FV_SCALE オーバーライド（NativeBackend 専用）。arch 文字列の fv_scale が実際の学習スケールと食い違うネットで指定する。USI モードでは `--usi-option FV_SCALE=N` を使う |
 | `--keep-tt[=BOOL]` | false | TT を対局間で保持（実験用） |
 | `--engine-path PATH` | (USI 時必須) | エンジンバイナリパス |

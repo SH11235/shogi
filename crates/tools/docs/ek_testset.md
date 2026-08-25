@@ -41,8 +41,12 @@ cargo run -p tools --release --bin ek_testset -- eval \
   --testset runs/ek_testset/band/testset.jsonl \
   --eval-file "$SHOGI_DATA/nnue/model.bin" \
   --progress-file "$SHOGI_DATA/progress/progress.bin" \
+  --progress-buckets 8 \
   --out runs/ek_testset/band/metrics.json
 ```
+
+`--progress-buckets` は学習時の routing bucket 数を指定します。`--progress-buckets 1` は
+常に bucket 0 を選ぶ no-op routing のため、その場合のみ `--progress-file` は省略できます。
 
 標準出力と `--out` に同じ JSON を出します。評価値は手番側視点 cp として扱い、DT は宣言可能局面の
 符号一致率と +600cp 超過率、OC は実対局結果との符号一致率（勝敗のみ）、cross entropy、Brier、

@@ -61,11 +61,15 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     fv_scale: i32,
 
-    /// LayerStacks の bucket mode（例 `progress8kpabs`）。LS ビルドでは既定なので通常は指定不要。
+    /// LayerStacks の bucket mode（`progresskpabs` または `kingrank9`）。LayerStacks では必須。
     #[arg(long)]
     ls_bucket_mode: Option<String>,
 
-    /// progress8kpabs 用の進行度係数ファイル（USI `LS_PROGRESS_COEFF`）。LS + progress8kpabs で必須。
+    /// progresskpabs が推論に使う bucket 数。LayerStacks + progresskpabs では必須。
+    #[arg(long)]
+    ls_progress_buckets: Option<usize>,
+
+    /// progresskpabs 用の進行度係数ファイル（USI `LS_PROGRESS_COEFF`）。LS + progresskpabs で必須。
     #[arg(long)]
     ls_progress_coeff: Option<PathBuf>,
 
@@ -187,6 +191,7 @@ fn run(cli: &Cli) -> Result<()> {
         nnue: &cli.nnue,
         fv_scale: cli.fv_scale,
         ls_bucket_mode: cli.ls_bucket_mode.as_deref(),
+        ls_progress_buckets: cli.ls_progress_buckets,
         ls_progress_coeff: cli.ls_progress_coeff.as_deref(),
     })?;
 
@@ -314,7 +319,7 @@ fn config_fingerprint(cli: &Cli, tune_params: &[(String, i32)]) -> Result<String
     // 各セクションを「タグ + 長さ」で囲んで domain separation する（可変長の連結で境界が曖昧に
     // なり、別々の (net,係数,SPSA) が同一バイト列を産む構造的衝突を防ぐ）。
     let scalars = format!(
-        "depth={};nodes={};fv={};hash={};clip={};skip_in_check={};limit={};bucket={}",
+        "depth={};nodes={};fv={};hash={};clip={};skip_in_check={};limit={};bucket={};progress_buckets={}",
         cli.depth,
         cli.nodes,
         cli.fv_scale,
@@ -323,6 +328,7 @@ fn config_fingerprint(cli: &Cli, tune_params: &[(String, i32)]) -> Result<String
         cli.skip_in_check,
         cli.limit,
         cli.ls_bucket_mode.as_deref().unwrap_or("-"),
+        cli.ls_progress_buckets.map(|value| value.to_string()).as_deref().unwrap_or("-"),
     );
     update_tagged(&mut h, b"scalars", scalars.as_bytes());
     hash_file_tagged(&mut h, b"nnue", &cli.nnue)?;

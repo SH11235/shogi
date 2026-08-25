@@ -301,12 +301,7 @@ impl<
 
     /// 生スコアを計算（スケーリング前）
     pub fn evaluate_raw(&self, bucket_index: usize, input: &[u8; L1]) -> i32 {
-        debug_assert!(bucket_index < self.buckets.len());
-        // SAFETY: bucket_index は progress_sum_to_bucket() で `[0, num_buckets)` に
-        //         clamp 済み (network_layer_stacks 経由)。`self.buckets` は load 時
-        //         に push のみで構築され以後 read-only のため、長さ
-        //         `num_buckets` が保持される。
-        unsafe { self.buckets.get_unchecked(bucket_index) }.propagate(input)
+        self.buckets[bucket_index].propagate(input)
     }
 
     /// 生スコアを計算（診断情報付き）

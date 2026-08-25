@@ -18,10 +18,10 @@ use serde::Serialize;
 
 use rshogi_core::nnue::{
     AccumulatorLayerStacks, LayerStackBucketMode, LsFeatureSpec, LsSaturationCounts, NNUENetwork,
-    NetworkLayerStacks, compute_layer_stack_progress8kpabs_bucket_index,
-    get_layer_stack_progress_kpabs_weights, load_progress_coeff_kpabs, ls_dispatch_ft_size,
-    set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
-    sqr_clipped_relu_transform,
+    NetworkLayerStacks, compute_layer_stack_progresskpabs_bucket_index,
+    configure_layer_stack_routing, get_layer_stack_progress_kpabs_weights,
+    layer_stack_progress_coeff_required, load_progress_coeff_kpabs, ls_dispatch_ft_size,
+    set_layer_stack_progress_kpabs_weights, sqr_clipped_relu_transform,
 };
 use rshogi_core::position::Position;
 use rshogi_core::types::Color;
@@ -40,9 +40,14 @@ struct Cli {
     #[arg(long)]
     sfens: PathBuf,
 
-    /// progress.bin (progress8kpabs 進行度重み) のパス。
+    /// progress.bin (progresskpabs 進行度重み) のパス。
+    /// `--progress-buckets 1` (no-op routing) 以外では必須。
     #[arg(long)]
-    progress_coeff: PathBuf,
+    progress_coeff: Option<PathBuf>,
+
+    /// progresskpabs が推論に使う bucket 数。
+    #[arg(long)]
+    progress_buckets: usize,
 
     /// 読む局面数の上限（省略時は全件）。
     #[arg(long)]
@@ -57,6 +62,8 @@ struct Cli {
 struct SaturationReport {
     nnue: String,
     sfens: String,
+    progress_coeff: Option<String>,
+    progress_buckets: usize,
     positions: u64,
     total: StageRates,
     per_bucket: Vec<BucketReport>,
@@ -167,11 +174,11 @@ fn run_for_network<
         let mut transformed = [0u8; L1];
         sqr_clipped_relu_transform(us_acc, them_acc, &mut transformed);
 
-        let bucket_index = compute_layer_stack_progress8kpabs_bucket_index(
+        let bucket_index = compute_layer_stack_progresskpabs_bucket_index(
             &pos,
             side_to_move,
             get_layer_stack_progress_kpabs_weights(),
-            network.num_buckets,
+            cli.progress_buckets,
         );
         let bc = &mut bucket_counts[bucket_index];
         bc.ft_sat += count_ft_factor_saturation(us_acc) + count_ft_factor_saturation(them_acc);
@@ -188,6 +195,8 @@ fn run_for_network<
     let report = SaturationReport {
         nnue: cli.nnue.display().to_string(),
         sfens: cli.sfens.display().to_string(),
+        progress_coeff: cli.progress_coeff.as_ref().map(|p| p.display().to_string()),
+        progress_buckets: cli.progress_buckets,
         positions: bucket_positions.iter().sum(),
         total: StageRates::from_counts(&total),
         per_bucket: bucket_counts
@@ -223,18 +232,26 @@ fn run_for_network<
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    let weights = load_progress_coeff_kpabs(&cli.progress_coeff)
-        .map_err(|e| anyhow::anyhow!("--progress-coeff を読めません: {e}"))?;
-    set_layer_stack_progress_kpabs_weights(weights)
-        .map_err(|e| anyhow::anyhow!("progress 設定に失敗しました: {e}"))?;
-    set_layer_stack_bucket_mode(LayerStackBucketMode::Progress8KPAbs);
-
+    if let Some(coeff_path) = &cli.progress_coeff {
+        let weights = load_progress_coeff_kpabs(coeff_path)
+            .map_err(|e| anyhow::anyhow!("--progress-coeff を読めません: {e}"))?;
+        set_layer_stack_progress_kpabs_weights(weights)
+            .map_err(|e| anyhow::anyhow!("progress 設定に失敗しました: {e}"))?;
+    } else if layer_stack_progress_coeff_required(Some(cli.progress_buckets)) {
+        anyhow::bail!("--progress-buckets が 2 以上のときは --progress-coeff が必須です");
+    }
     let network = NNUENetwork::load(&cli.nnue)
         .with_context(|| format!("NNUE を読み込めません: {:?}", cli.nnue))?;
     let ls_net = match &network {
         NNUENetwork::LayerStacks(net) => net,
         _ => anyhow::bail!("nnue_saturation は LayerStacks NNUE のみ対応"),
     };
+    configure_layer_stack_routing(
+        LayerStackBucketMode::ProgressKPAbs,
+        ls_net.num_buckets(),
+        Some(cli.progress_buckets),
+    )
+    .map_err(anyhow::Error::msg)?;
 
     ls_dispatch_ft_size!(
         ls_net,
