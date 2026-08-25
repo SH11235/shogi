@@ -17,7 +17,22 @@
 //! # 並列処理（4スレッド）
 //! cargo run -p tools --bin preprocess_psv -- \
 //!   --input data.psv --output processed.psv --threads 4
+//!
+//! # 局面が変わった出力行の bitmap mask も生成
+//! cargo run -p tools --bin preprocess_psv -- \
+//!   --input data.psv --output processed.psv \
+//!   --moved-mask moved.bits
 //! ```
+//!
+//! # moved mask の契約
+//!
+//! `--moved-mask` を指定すると、出力 PSV の packed SFEN（各レコードの先頭32 byte）が
+//! 入力と異なる行を bit 1 とした LSB-first bitmap を出力する。byte `j` の bit `k` は
+//! 出力 record `j * 8 + k` に対応し、サイズは `ceil(出力 records / 8)` byte、最終 byte の
+//! 未使用 bit は 0 になる。処理エラー行は skip 行と同様に出力にも mask にも現れない
+//! (従来どおり破棄。`--moved-mask` の有無で PSV 出力は変わらない)。
+//! `--skip-in-check` で除外した行は PSV にも mask にも出力せず、後続 bit は出力行番号に詰める。
+//! PSV と mask はそれぞれ一時ファイルへ書き、処理成功時だけ最終パスへ rename する。
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -25,7 +40,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::cell::RefCell;
@@ -52,6 +67,10 @@ struct Cli {
     /// 出力PSVファイル
     #[arg(short, long)]
     output: PathBuf,
+
+    /// packed SFEN（先頭32 byte）が変わった出力行を示すLSB-first bitmapの出力先
+    #[arg(long)]
+    moved_mask: Option<PathBuf>,
 
     /// qsearchの最大深さ（ノード制限と併用で爆発防止）
     #[arg(long, default_value_t = 16)]
@@ -115,6 +134,75 @@ enum ProcessResult {
     Skip,
     /// エラー
     Error(anyhow::Error),
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ResultCounts {
+    ok: u64,
+    skipped: u64,
+    errors: u64,
+    written: u64,
+    moved: u64,
+}
+
+/// 出力行に対応する LSB-first bitmap をストリーミングで構築する。
+struct MovedMaskWriter<W> {
+    writer: W,
+    pending: u8,
+    pending_bits: u8,
+}
+
+impl<W: Write> MovedMaskWriter<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            writer,
+            pending: 0,
+            pending_bits: 0,
+        }
+    }
+
+    fn push(&mut self, moved: bool) -> Result<()> {
+        if moved {
+            self.pending |= 1 << self.pending_bits;
+        }
+        self.pending_bits += 1;
+        if self.pending_bits == 8 {
+            self.writer.write_all(&[self.pending])?;
+            self.pending = 0;
+            self.pending_bits = 0;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<W> {
+        if self.pending_bits > 0 {
+            self.writer.write_all(&[self.pending])?;
+        }
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
+}
+
+struct TemporaryFiles {
+    paths: Vec<PathBuf>,
+}
+
+impl TemporaryFiles {
+    fn new() -> Self {
+        Self { paths: Vec::new() }
+    }
+
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+}
+
+impl Drop for TemporaryFiles {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// 処理オプション
@@ -199,6 +287,9 @@ fn main() -> Result<()> {
     eprintln!("STM sign fix: {}", if fix_stm_sign { "enabled" } else { "disabled" });
     eprintln!("Rescore with NNUE: {}", if cli.rescore { "yes" } else { "no" });
     eprintln!("Skip in-check positions: {}", if cli.skip_in_check { "yes" } else { "no" });
+    if let Some(path) = &cli.moved_mask {
+        eprintln!("Moved mask: {}", path.display());
+    }
     if cli.rescore {
         eprintln!("Score clip: ±{}", cli.score_clip);
     }
@@ -216,9 +307,12 @@ fn main() -> Result<()> {
     process_file(&cli, process_count, use_nnue, opts)?;
 
     if INTERRUPTED.load(Ordering::Acquire) {
-        eprintln!("Note: Processing was interrupted, output may be incomplete");
+        eprintln!("Note: Processing was interrupted; output files were not updated");
     } else {
         eprintln!("Output: {}", cli.output.display());
+        if let Some(path) = &cli.moved_mask {
+            eprintln!("Moved mask: {}", path.display());
+        }
     }
 
     Ok(())
@@ -226,57 +320,156 @@ fn main() -> Result<()> {
 
 /// ProcessResult を集計し、出力バッファに書き込む共通ハンドラ
 ///
-/// 戻り値: (ok_count, skip_count, error_count)
-fn collect_results(
+fn collect_results<W: Write, M: Write>(
+    original_records: &[[u8; PackedSfenValue::SIZE]],
     results: &[ProcessResult],
-    writer: &mut BufWriter<File>,
+    writer: &mut W,
+    mut mask_writer: Option<&mut MovedMaskWriter<M>>,
     verbose: bool,
-) -> Result<(u64, u64, u64)> {
-    let mut ok_count = 0u64;
-    let mut skip_count = 0u64;
-    let mut err_count = 0u64;
-    for result in results {
+) -> Result<ResultCounts> {
+    anyhow::ensure!(
+        original_records.len() == results.len(),
+        "Internal error: input/result count mismatch ({} != {})",
+        original_records.len(),
+        results.len()
+    );
+    let mut counts = ResultCounts::default();
+    for (original, result) in original_records.iter().zip(results) {
         match result {
             ProcessResult::Ok(new_record) => {
                 writer.write_all(new_record)?;
-                ok_count += 1;
+                let moved = new_record[..32] != original[..32];
+                if let Some(mask) = mask_writer.as_deref_mut() {
+                    mask.push(moved)?;
+                }
+                counts.ok += 1;
+                counts.written += 1;
+                counts.moved += u64::from(moved);
             }
             ProcessResult::Skip => {
-                skip_count += 1;
+                counts.skipped += 1;
             }
-            ProcessResult::Error(e) => {
-                err_count += 1;
+            ProcessResult::Error(error) => {
+                // エラー行は skip と同様に出力・mask の両方から除外する (mask 有無で
+                // PSV 出力を変えない。bit は出力行番号に対応するため詰める)。
+                counts.errors += 1;
                 if verbose {
-                    eprintln!("Error processing record: {e}");
+                    eprintln!("Error processing record: {error}");
                 }
             }
         }
     }
-    Ok((ok_count, skip_count, err_count))
+    Ok(counts)
+}
+
+fn temporary_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("Output path has no file name: {}", path.display()))?;
+    let mut temporary_name = file_name.to_os_string();
+    temporary_name.push(".tmp");
+    Ok(path.with_file_name(temporary_name))
+}
+
+fn comparable_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return path
+            .canonicalize()
+            .with_context(|| format!("Failed to canonicalize path: {}", path.display()));
+    }
+
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("Path has no file name: {}", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let canonical_parent = parent
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize parent path: {}", parent.display()))?;
+    Ok(canonical_parent.join(file_name))
+}
+
+fn paths_resolve_to_same_file(first: &Path, second: &Path) -> Result<bool> {
+    if first.exists() && second.exists() && same_file::is_same_file(first, second)? {
+        return Ok(true);
+    }
+
+    let first = comparable_path(first)?;
+    let second = comparable_path(second)?;
+    #[cfg(windows)]
+    {
+        Ok(first.to_string_lossy().eq_ignore_ascii_case(&second.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(first == second)
+    }
+}
+
+fn validate_output_paths(cli: &Cli) -> Result<()> {
+    if paths_resolve_to_same_file(&cli.input, &cli.output)? {
+        anyhow::bail!("Input and output paths resolve to the same file: {}", cli.input.display());
+    }
+
+    if let Some(mask) = &cli.moved_mask {
+        if paths_resolve_to_same_file(&cli.input, mask)? {
+            anyhow::bail!(
+                "Input and moved mask paths resolve to the same file: {}",
+                cli.input.display()
+            );
+        }
+        if paths_resolve_to_same_file(&cli.output, mask)? {
+            anyhow::bail!(
+                "Output and moved mask paths resolve to the same file: {}",
+                cli.output.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_temporary_paths(cli: &Cli, tmp_output: &Path, tmp_mask: Option<&Path>) -> Result<()> {
+    let mut final_paths = vec![cli.input.as_path(), cli.output.as_path()];
+    if let Some(mask) = cli.moved_mask.as_deref() {
+        final_paths.push(mask);
+    }
+
+    for final_path in final_paths {
+        if paths_resolve_to_same_file(final_path, tmp_output)? {
+            anyhow::bail!(
+                "Temporary output path conflicts with another path: {}",
+                tmp_output.display()
+            );
+        }
+        if let Some(mask_tmp) = tmp_mask
+            && paths_resolve_to_same_file(final_path, mask_tmp)?
+        {
+            anyhow::bail!(
+                "Temporary moved mask path conflicts with another path: {}",
+                mask_tmp.display()
+            );
+        }
+    }
+    if let Some(mask_tmp) = tmp_mask
+        && paths_resolve_to_same_file(tmp_output, mask_tmp)?
+    {
+        anyhow::bail!("Temporary output and moved mask paths conflict: {}", tmp_output.display());
+    }
+
+    Ok(())
 }
 
 /// ファイルをチャンクストリーミングで処理
 fn process_file(cli: &Cli, process_count: u64, use_nnue: bool, opts: ProcessOptions) -> Result<()> {
-    // 入出力が同一パスならデータ消失を防ぐためエラーにする
-    let in_canonical = cli
-        .input
-        .canonicalize()
-        .with_context(|| format!("Failed to canonicalize input path: {}", cli.input.display()))?;
-    let out_canonical = if cli.output.exists() {
-        Some(cli.output.canonicalize().with_context(|| {
-            format!("Failed to canonicalize output path: {}", cli.output.display())
-        })?)
-    } else {
-        None
-    };
-    if let Some(ref out_path) = out_canonical
-        && in_canonical == *out_path
-    {
-        anyhow::bail!(
-            "Input and output paths resolve to the same file: {}",
-            in_canonical.display()
-        );
-    }
+    validate_output_paths(cli)?;
+
+    let tmp_output = temporary_path(&cli.output)?;
+    let tmp_mask = cli.moved_mask.as_deref().map(temporary_path).transpose()?;
+    validate_temporary_paths(cli, &tmp_output, tmp_mask.as_deref())?;
+    let mut temporary_files = TemporaryFiles::new();
 
     // 進捗バー設定
     let progress = ProgressBar::new(process_count);
@@ -292,10 +485,18 @@ fn process_file(cli: &Cli, process_count: u64, use_nnue: bool, opts: ProcessOpti
     let mut reader = BufReader::with_capacity(IO_BUF_SIZE, in_file);
 
     // 一時ファイルに書き込み、正常完了時のみ最終出力パスに rename する
-    let tmp_output = cli.output.with_extension("tmp");
     let out_file = File::create(&tmp_output)
         .with_context(|| format!("Failed to create {}", tmp_output.display()))?;
+    temporary_files.track(tmp_output.clone());
     let mut writer = BufWriter::with_capacity(IO_BUF_SIZE, out_file);
+    let mut mask_writer = if let Some(path) = &tmp_mask {
+        let file =
+            File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
+        temporary_files.track(path.clone());
+        Some(MovedMaskWriter::new(BufWriter::with_capacity(IO_BUF_SIZE, file)))
+    } else {
+        None
+    };
 
     if use_nnue {
         eprintln!("Using NNUE evaluation (with incremental updates)");
@@ -306,6 +507,7 @@ fn process_file(cli: &Cli, process_count: u64, use_nnue: bool, opts: ProcessOpti
     // カウンタ（メインスレッドのみで加算するため通常の u64）
     let mut error_count = 0u64;
     let mut skipped_count = 0u64;
+    let mut moved_count = 0u64;
 
     let verbose = cli.verbose;
     let mut remaining = process_count as usize;
@@ -321,8 +523,6 @@ fn process_file(cli: &Cli, process_count: u64, use_nnue: bool, opts: ProcessOpti
         if INTERRUPTED.load(Ordering::Acquire) {
             progress.abandon_with_message("Interrupted");
             drop(writer);
-            // 中断時は不完全な一時ファイルを削除
-            let _ = std::fs::remove_file(&tmp_output);
             return Ok(());
         }
 
@@ -380,22 +580,42 @@ fn process_file(cli: &Cli, process_count: u64, use_nnue: bool, opts: ProcessOpti
 
         // 結果を集計・書き出し
         let chunk_count = results.len() as u64;
-        let (ok, skip, err) = collect_results(&results, &mut writer, verbose)?;
-        total_written += ok;
-        error_count += err;
-        skipped_count += skip;
+        let counts = collect_results(&chunk, &results, &mut writer, mask_writer.as_mut(), verbose)?;
+        total_written += counts.written;
+        error_count += counts.errors;
+        skipped_count += counts.skipped;
+        moved_count += counts.moved;
         total_processed += chunk_count;
 
         // チャンク処理完了後にまとめて進捗更新
         progress.inc(chunk_count);
     }
 
+    // 最終チャンクの並列処理中に割り込まれた場合も成果物を確定しない。
+    if INTERRUPTED.load(Ordering::Acquire) {
+        progress.abandon_with_message("Interrupted");
+        return Ok(());
+    }
+
     writer.flush()?;
     drop(writer);
+    if let Some(mask) = mask_writer {
+        drop(mask.finish()?);
+    }
+    // flush 中に割り込まれた場合も rename 前なら公開を止める。
+    if INTERRUPTED.load(Ordering::Acquire) {
+        progress.abandon_with_message("Interrupted");
+        return Ok(());
+    }
     // 正常完了: 一時ファイルを最終出力パスに移動
     std::fs::rename(&tmp_output, &cli.output).with_context(|| {
         format!("Failed to rename {} -> {}", tmp_output.display(), cli.output.display())
     })?;
+    if let (Some(tmp), Some(output)) = (&tmp_mask, &cli.moved_mask) {
+        std::fs::rename(tmp, output).with_context(|| {
+            format!("Failed to rename {} -> {}", tmp.display(), output.display())
+        })?;
+    }
     // EOF で早期終了した場合でも進捗バーが100%になるよう実処理件数に合わせる
     progress.set_length(total_processed);
     progress.finish_with_message("Done");
@@ -421,6 +641,15 @@ fn process_file(cli: &Cli, process_count: u64, use_nnue: bool, opts: ProcessOpti
         }
     }
 
+    if total_written > 0 {
+        eprintln!(
+            "Moved: {} ({:.2}%)",
+            moved_count,
+            moved_count as f64 / total_written as f64 * 100.0
+        );
+    } else {
+        eprintln!("Moved: {moved_count}");
+    }
     eprintln!("Wrote {} records", total_written);
 
     Ok(())
@@ -436,13 +665,17 @@ fn process_record_material(
     // PackedSfenValueを読み込み
     let psv = match PackedSfenValue::from_bytes(record) {
         Some(p) => p,
-        None => return ProcessResult::Error(anyhow::anyhow!("Failed to parse PackedSfenValue")),
+        None => {
+            return ProcessResult::Error(anyhow::anyhow!("Failed to parse PackedSfenValue"));
+        }
     };
 
     // PackedSfen → SFEN → Position
     let sfen = match unpack_sfen(&psv.sfen) {
         Ok(s) => s,
-        Err(e) => return ProcessResult::Error(anyhow::anyhow!("Failed to unpack SFEN: {e}")),
+        Err(e) => {
+            return ProcessResult::Error(anyhow::anyhow!("Failed to unpack SFEN: {e}"));
+        }
     };
 
     let mut pos = Position::new();
@@ -485,13 +718,17 @@ fn process_record_nnue(
     // PackedSfenValueを読み込み
     let psv = match PackedSfenValue::from_bytes(record) {
         Some(p) => p,
-        None => return ProcessResult::Error(anyhow::anyhow!("Failed to parse PackedSfenValue")),
+        None => {
+            return ProcessResult::Error(anyhow::anyhow!("Failed to parse PackedSfenValue"));
+        }
     };
 
     // PackedSfen → SFEN → Position
     let sfen = match unpack_sfen(&psv.sfen) {
         Ok(s) => s,
-        Err(e) => return ProcessResult::Error(anyhow::anyhow!("Failed to unpack SFEN: {e}")),
+        Err(e) => {
+            return ProcessResult::Error(anyhow::anyhow!("Failed to unpack SFEN: {e}"));
+        }
     };
 
     let mut pos = Position::new();
@@ -609,4 +846,252 @@ fn finalize_result(
     };
 
     ProcessResult::Ok(new_psv.to_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static PROCESS_FILE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_cli(input: PathBuf, output: PathBuf, moved_mask: Option<PathBuf>) -> Cli {
+        Cli {
+            input,
+            output,
+            moved_mask,
+            max_ply: 16,
+            threads: 1,
+            nnue: None,
+            limit: 0,
+            verbose: false,
+            no_fix_stm_sign: false,
+            rescore: false,
+            skip_in_check: false,
+            score_clip: 10000,
+        }
+    }
+
+    #[test]
+    fn moved_mask_is_lsb_first_and_clears_unused_bits() {
+        let mut mask = MovedMaskWriter::new(Vec::new());
+        for moved in [
+            true, false, false, false, false, false, false, true, true, false,
+        ] {
+            mask.push(moved).unwrap();
+        }
+
+        let bytes = mask.finish().unwrap();
+        assert_eq!(bytes, [0b1000_0001, 0b0000_0001]);
+    }
+
+    #[test]
+    fn collect_results_uses_only_packed_sfen_and_drops_error_rows() {
+        let unchanged = [0x11; PackedSfenValue::SIZE];
+        let mut metadata_only = unchanged;
+        metadata_only[32] = 0x22;
+        let error_original = [0x66; PackedSfenValue::SIZE];
+        let mut moved_original = [0x33; PackedSfenValue::SIZE];
+        moved_original[32] = 0x44;
+        let mut moved = moved_original;
+        moved[31] = 0x55;
+        // エラー行を moved 行より前に置き、bit が出力行番号へ詰まることを確認する
+        let originals = [unchanged, error_original, moved_original];
+        let results = [
+            ProcessResult::Ok(metadata_only),
+            ProcessResult::Error(anyhow::anyhow!("test error")),
+            ProcessResult::Ok(moved),
+        ];
+        let mut output = Vec::new();
+        let mut mask = MovedMaskWriter::new(Vec::new());
+
+        let counts =
+            collect_results(&originals, &results, &mut output, Some(&mut mask), false).unwrap();
+        let mask = mask.finish().unwrap();
+
+        assert_eq!(
+            counts,
+            ResultCounts {
+                ok: 2,
+                errors: 1,
+                written: 2,
+                moved: 1,
+                ..Default::default()
+            }
+        );
+        // エラー行は出力にも mask にも現れない: 出力 2 行、moved は出力 row 1
+        assert_eq!(mask, [0b0000_0010]);
+        assert_eq!(output.len(), PackedSfenValue::SIZE * 2);
+        assert_eq!(&output[..PackedSfenValue::SIZE], &metadata_only);
+        assert_eq!(&output[PackedSfenValue::SIZE..], &moved);
+    }
+
+    #[test]
+    fn generated_mask_passes_consumer_validate_mask_contract() {
+        // 8 の倍数でない出力件数 (10 行) の mask が、consumer 側
+        // (psv_select_by_mask / psv_scatter_by_mask) の契約検証をそのまま通ること。
+        let dir = tempfile::tempdir().unwrap();
+        let mask_path = dir.path().join("moved.bits");
+        let mut mask = MovedMaskWriter::new(Vec::new());
+        for i in 0..10 {
+            mask.push(i % 3 == 0).unwrap();
+        }
+        std::fs::write(&mask_path, mask.finish().unwrap()).unwrap();
+        tools::mask_io::validate_mask(&mask_path, 10).unwrap();
+        // サイズ不一致 (7 件なら ceil(7/8)=1 byte のはず) は拒否される
+        assert!(tools::mask_io::validate_mask(&mask_path, 7).is_err());
+    }
+
+    #[test]
+    fn error_rows_are_dropped_identically_without_mask() {
+        let ok_record = [0x11; PackedSfenValue::SIZE];
+        let error_original = [0x66; PackedSfenValue::SIZE];
+        let originals = [error_original, ok_record];
+        let results = [
+            ProcessResult::Error(anyhow::anyhow!("test error")),
+            ProcessResult::Ok(ok_record),
+        ];
+        let mut output = Vec::new();
+
+        let counts = collect_results(
+            &originals,
+            &results,
+            &mut output,
+            None::<&mut MovedMaskWriter<Vec<u8>>>,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            counts,
+            ResultCounts {
+                ok: 1,
+                errors: 1,
+                written: 1,
+                moved: 0,
+                ..Default::default()
+            }
+        );
+        assert_eq!(output, ok_record);
+    }
+
+    #[test]
+    fn skipped_rows_do_not_shift_output_mask_indices() {
+        let skipped = [0x10; PackedSfenValue::SIZE];
+        let moved_original = [0x20; PackedSfenValue::SIZE];
+        let mut moved = moved_original;
+        moved[0] = 0x21;
+        let unchanged = [0x30; PackedSfenValue::SIZE];
+        let originals = [skipped, moved_original, unchanged];
+        let results = [
+            ProcessResult::Skip,
+            ProcessResult::Ok(moved),
+            ProcessResult::Ok(unchanged),
+        ];
+        let mut output = Vec::new();
+        let mut mask = MovedMaskWriter::new(Vec::new());
+
+        let counts =
+            collect_results(&originals, &results, &mut output, Some(&mut mask), false).unwrap();
+        let mask = mask.finish().unwrap();
+
+        assert_eq!(counts.skipped, 1);
+        assert_eq!(counts.written, 2);
+        assert_eq!(mask, [0b0000_0001]);
+        assert_eq!(output.len(), PackedSfenValue::SIZE * 2);
+    }
+
+    #[test]
+    fn moved_mask_rejects_input_or_output_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.psv");
+        std::fs::write(&input, []).unwrap();
+        let output = dir.path().join("output.psv");
+
+        let input_collision = test_cli(input.clone(), output.clone(), Some(input.clone()));
+        assert!(validate_output_paths(&input_collision).is_err());
+
+        let output_collision = test_cli(input, output.clone(), Some(output));
+        assert!(validate_output_paths(&output_collision).is_err());
+    }
+
+    #[test]
+    fn successful_processing_renames_both_temporary_files() {
+        let _lock = PROCESS_FILE_TEST_LOCK.lock().unwrap();
+        INTERRUPTED.store(false, Ordering::Release);
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.psv");
+        let output = dir.path().join("output.psv");
+        let moved_mask = dir.path().join("moved.bits");
+        std::fs::write(&input, []).unwrap();
+        let cli = test_cli(input, output.clone(), Some(moved_mask.clone()));
+        let opts = ProcessOptions {
+            max_ply: 16,
+            fix_stm_sign: true,
+            rescore: false,
+            skip_in_check: false,
+            score_clip: 10000,
+        };
+
+        process_file(&cli, 0, false, opts).unwrap();
+
+        assert!(std::fs::read(&output).unwrap().is_empty());
+        assert!(std::fs::read(&moved_mask).unwrap().is_empty());
+        assert!(!temporary_path(&output).unwrap().exists());
+        assert!(!temporary_path(&moved_mask).unwrap().exists());
+    }
+
+    #[test]
+    fn failed_processing_leaves_no_final_or_partial_files() {
+        let _lock = PROCESS_FILE_TEST_LOCK.lock().unwrap();
+        INTERRUPTED.store(false, Ordering::Release);
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.psv");
+        let output = dir.path().join("output.psv");
+        let moved_mask = dir.path().join("moved.bits");
+        std::fs::write(&input, []).unwrap();
+        std::fs::create_dir(temporary_path(&moved_mask).unwrap()).unwrap();
+        let cli = test_cli(input, output.clone(), Some(moved_mask.clone()));
+        let opts = ProcessOptions {
+            max_ply: 16,
+            fix_stm_sign: true,
+            rescore: false,
+            skip_in_check: false,
+            score_clip: 10000,
+        };
+
+        assert!(process_file(&cli, 0, false, opts).is_err());
+
+        assert!(!output.exists());
+        assert!(!moved_mask.exists());
+        assert!(!temporary_path(&output).unwrap().exists());
+    }
+
+    #[test]
+    fn interruption_before_publish_removes_both_temporary_files() {
+        let _lock = PROCESS_FILE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.psv");
+        let output = dir.path().join("output.psv");
+        let moved_mask = dir.path().join("moved.bits");
+        std::fs::write(&input, []).unwrap();
+        let cli = test_cli(input, output.clone(), Some(moved_mask.clone()));
+        let opts = ProcessOptions {
+            max_ply: 16,
+            fix_stm_sign: true,
+            rescore: false,
+            skip_in_check: false,
+            score_clip: 10000,
+        };
+        INTERRUPTED.store(true, Ordering::Release);
+
+        let result = process_file(&cli, 0, false, opts);
+        INTERRUPTED.store(false, Ordering::Release);
+
+        result.unwrap();
+        assert!(!output.exists());
+        assert!(!moved_mask.exists());
+        assert!(!temporary_path(&output).unwrap().exists());
+        assert!(!temporary_path(&moved_mask).unwrap().exists());
+    }
 }

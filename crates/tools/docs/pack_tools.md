@@ -110,22 +110,81 @@ cargo run -p tools --release --bin rescore_psv -- \
 
 ### preprocess_psv
 
-qsearch leaf置換を適用。局面をqsearchのPV末端に置換。
+qsearch leaf置換を適用し、局面を qsearch の PV 末端に置換します。`--moved-mask` を指定すると、
+局面が変わった出力行だけを後段の `psv_select_by_mask` で抽出できる bitmap も同時に生成します。
 
 ```bash
 cargo run -p tools --release --bin preprocess_psv -- \
   --input data.psv --output processed.psv \
-  --nnue model.nnue --rescore
+  --nnue model.nnue --rescore \
+  --moved-mask moved.bits
 ```
 
 | オプション | 説明 | デフォルト |
 |------------|------|------------|
 | `-i, --input` | 入力ファイル | 必須 |
 | `-o, --output` | 出力ファイル | 必須 |
-| `--nnue` | NNUEモデルファイル | - |
+| `--moved-mask` | packed SFEN が変わった出力行の LSB-first bitmap 出力先 | なし |
+| `--max-ply` | qsearch の最大深さ | 16 |
+| `-t, --threads` | 並列処理スレッド数（0=自動） | 1 |
+| `--nnue` | NNUEモデルファイル（省略時は Material 評価、`--rescore` には必須） | なし |
+| `--limit` | 処理するレコード数の上限（0=無制限） | 0 |
+| `-v, --verbose` | レコード処理エラーの詳細を表示 | false |
+| `--no-fix-stm-sign` | 手番反転時の score / game_result 符号補正を無効化 | false |
 | `--rescore` | 置換後にNNUEで再評価（推奨） | false |
 | `--skip-in-check` | 王手局面をスキップ | false |
-| `-t, --threads` | スレッド数（0=自動） | 1 |
+| `--score-clip` | `--rescore` 時の score クリップ範囲（±指定値） | 10000 |
+
+mask の byte `j` の bit `k`（LSB が bit 0）は、出力 PSV の record `j * 8 + k` に対応します。
+サイズは `ceil(出力 records / 8)` byte で、最終 byte の未使用 bit は 0 です。bit 1 の条件は
+出力レコードの先頭 32 byte（packed SFEN）が入力レコードと異なることです。score、move16、
+game_ply、game_result だけが変わった行は bit 0 です。
+
+`--skip-in-check` で除外した入力行と、処理エラーの行（パース・unpack 失敗など。従来どおり
+破棄）は PSV にも mask にも行を作りません。`--moved-mask` の有無で PSV 出力は変わりません。
+後続の bit index は
+入力行番号ではなく、実際の出力行番号に詰められます。出力 PSV と mask は `.tmp` へ書き、
+正常完了時だけ最終パスへ rename します。input、output、moved mask に同じパスまたは同一実体は
+指定できません。派生する `.tmp` パスがこれらのパスや互いに衝突する場合も拒否します。
+
+2 ファイルの確定は PSV、mask の順に行うため、両方をまとめたトランザクションではありません。
+mask の rename だけが失敗した場合は PSV のみ確定することがありますが、不完全な mask を最終パスへ
+公開することはありません。処理・書き込み中のエラーや中断ではどちらも確定せず、`.tmp` を削除します。
+
+完了時の `Moved: <件数> (<率>%)` は、実際に書き出した PSV レコード数を分母とします。
+`--moved-mask` を省略した場合も統計は表示されます。
+
+#### 変更行だけ DL 再スコアして書き戻す
+
+`psv_select_by_mask` と `psv_scatter_by_mask` を組み合わせる場合、mask の基準は原本
+`shard.psv` ではなく `preprocess_psv` の出力 `leaf.psv` です。途中で compact PSV の順序を
+変更しないでください。
+
+```bash
+# 1. qsearch 葉置換と同時に変更行 mask を生成
+cargo run --release -p tools --bin preprocess_psv -- \
+  --input shard.psv --output leaf.psv --nnue qsearch.nnue \
+  --moved-mask moved.bits
+
+# 2. leaf.psv から変更行だけを入力順に抽出
+cargo run --release -p tools --bin psv_select_by_mask -- \
+  --input leaf.psv --mask moved.bits --out moved.psv
+
+# 3. compact PSV を DL モデルで再スコア（出力は rescored/moved.psv）
+cargo run --release -p tools --bin rescore_psv -- \
+  --input moved.psv --output-dir rescored \
+  --dlshogi-onnx-model model.onnx
+
+# 4. 同じ mask で score を leaf.psv の対応行へ書き戻す
+cargo run --release -p tools --bin psv_scatter_by_mask -- \
+  --input leaf.psv --mask moved.bits \
+  --compact rescored/moved.psv --out final.psv
+```
+
+mask の検証条件と書き戻し時の packed SFEN 照合は
+[`psv_select_by_mask`](psv_select_by_mask.md) と
+[`psv_scatter_by_mask`](psv_scatter_by_mask.md) を参照してください。DL 推論のセットアップと
+高速化オプションは [`rescore_psv`](rescore_psv.md) にあります。
 
 ### validate_psv
 
