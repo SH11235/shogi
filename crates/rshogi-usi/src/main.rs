@@ -1797,10 +1797,12 @@ mod tests {
         assert!(validate_layer_stack_routing(8, Some(ProgressKPAbs), Some(8), true).is_ok());
         assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(9), true).is_ok());
         assert!(validate_layer_stack_routing(9, Some(KingRank9), None, false).is_ok());
+        // 1 は常に bucket 0 を選ぶ no-op routing (格納 1 bucket net の唯一の設定経路)
+        assert!(validate_layer_stack_routing(1, Some(ProgressKPAbs), Some(1), true).is_ok());
+        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(1), true).is_ok());
 
         assert!(validate_layer_stack_routing(9, None, None, false).is_err());
         assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), None, true).is_err());
-        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(1), true).is_err());
         assert!(validate_layer_stack_routing(8, Some(ProgressKPAbs), Some(9), true).is_err());
         assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(8), false).is_err());
         assert!(validate_layer_stack_routing(8, Some(KingRank9), None, false).is_err());

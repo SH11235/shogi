@@ -299,9 +299,12 @@ pub fn validate_layer_stack_routing_configuration(
             let routing_bucket_count = progress_bucket_count.ok_or_else(|| {
                 "progresskpabs requires an explicit progress bucket count".to_string()
             })?;
-            if routing_bucket_count < 2 {
+            // 1 は常に bucket 0 を選ぶ no-op routing として許可する。loader は
+            // 格納 1 bucket の net を受理するため、拒否すると routing を設定できる
+            // mode が存在しなくなる (kingrank9 は格納 9 固定)。
+            if routing_bucket_count == 0 {
                 return Err(format!(
-                    "progress bucket count {routing_bucket_count} is invalid; at least 2 buckets are required"
+                    "progress bucket count {routing_bucket_count} is invalid; at least 1 bucket is required"
                 ));
             }
             if routing_bucket_count > MAX_LAYER_STACK_BUCKETS {
@@ -2401,6 +2404,30 @@ mod tests {
         assert!(
             validate_layer_stack_routing_configuration(LayerStackBucketMode::KingRank9, 9, None,)
                 .is_ok()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::ProgressKPAbs,
+                1,
+                Some(1),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::ProgressKPAbs,
+                9,
+                Some(1),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_layer_stack_routing_configuration(
+                LayerStackBucketMode::ProgressKPAbs,
+                1,
+                Some(0),
+            )
+            .is_err()
         );
         assert!(
             validate_layer_stack_routing_configuration(
