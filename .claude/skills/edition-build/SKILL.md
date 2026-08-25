@@ -122,7 +122,8 @@ ckpt 作成時点の rshogi commit より engine build commit が古ければ re
 echo -e 'usi
 setoption name EvalFile value <ckpt.bin>
 setoption name FV_SCALE value 28
-setoption name LS_BUCKET_MODE value progress8kpabs
+setoption name LS_BUCKET_MODE value progresskpabs
+setoption name LS_PROGRESS_BUCKETS value 8
 setoption name LS_PROGRESS_COEFF value <progress.bin>
 isready
 quit' | timeout 30 engines/<binary> 2>&1 | grep -E 'readyok|Error|Unknown NNUE version|panic'

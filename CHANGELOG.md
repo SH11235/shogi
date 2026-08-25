@@ -24,6 +24,10 @@ core 変更を公開する PR では `crates/rshogi-core/Cargo.toml` のバー�
   特に旧 F20 の格納9 bucket モデルを `floor(p×8)` で学習した場合は
   `LS_PROGRESS_BUCKETS=8` を指定する。未指定、格納数超過、KingRank9 と格納数9以外の組合せは
   `isready` / native tool 初期化時にエラーになる。
+- `LS_PROGRESS_BUCKETS=1` は常に bucket 0 を選ぶ no-op routing として許可する
+  (格納 1 bucket net の設定経路)。この場合のみ `LS_PROGRESS_COEFF` は不要。
+- 公開 API の破壊的 rename (`Progress8KPAbs` → `ProgressKPAbs` 等) に伴い
+  `rshogi-core` を 0.6.0 へ bump。
 
 ## v1.4.0 — 2026-08-13
 

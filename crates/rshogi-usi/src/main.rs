@@ -16,9 +16,10 @@ use rshogi_core::eval::{
 use rshogi_core::nnue::{
     AccumulatorStackVariant, LayerStackBucketMode, MAX_LAYER_STACK_BUCKETS, clear_nnue,
     configure_layer_stack_routing, evaluate_dispatch, get_network, init_nnue,
-    load_progress_coeff_kpabs, parse_layer_stack_bucket_mode, parse_nnue_architecture,
-    print_nnue_stats, reset_layer_stack_progress_buckets, reset_layer_stack_progress_kpabs_weights,
-    set_fv_scale_override, set_layer_stack_progress_kpabs_weights, set_nnue_architecture_override,
+    layer_stack_progress_coeff_required, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
+    parse_nnue_architecture, print_nnue_stats, reset_layer_stack_progress_buckets,
+    reset_layer_stack_progress_kpabs_weights, set_fv_scale_override,
+    set_layer_stack_progress_kpabs_weights, set_nnue_architecture_override,
     validate_layer_stack_routing_configuration,
 };
 use rshogi_core::position::Position;
@@ -1564,7 +1565,7 @@ fn validate_layer_stack_routing(
                 stored_bucket_count,
                 progress_buckets,
             )?;
-            if !progress_coeff_loaded {
+            if !progress_coeff_loaded && layer_stack_progress_coeff_required(progress_buckets) {
                 return Err("LS_BUCKET_MODE=progresskpabs requires LS_PROGRESS_COEFF to be loaded"
                     .to_string());
             }
@@ -1797,9 +1798,11 @@ mod tests {
         assert!(validate_layer_stack_routing(8, Some(ProgressKPAbs), Some(8), true).is_ok());
         assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(9), true).is_ok());
         assert!(validate_layer_stack_routing(9, Some(KingRank9), None, false).is_ok());
-        // 1 は常に bucket 0 を選ぶ no-op routing (格納 1 bucket net の唯一の設定経路)
+        // 1 は常に bucket 0 を選ぶ no-op routing (格納 1 bucket net の唯一の設定経路)。
+        // 係数を参照しないため LS_PROGRESS_COEFF 未ロードでも通る (ロード済みも可)。
+        assert!(validate_layer_stack_routing(1, Some(ProgressKPAbs), Some(1), false).is_ok());
         assert!(validate_layer_stack_routing(1, Some(ProgressKPAbs), Some(1), true).is_ok());
-        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(1), true).is_ok());
+        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(1), false).is_ok());
 
         assert!(validate_layer_stack_routing(9, None, None, false).is_err());
         assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), None, true).is_err());

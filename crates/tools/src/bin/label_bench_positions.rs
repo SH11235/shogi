@@ -30,8 +30,8 @@ use serde_json::{Value as JsonValue, json};
 
 use rshogi_core::nnue::{
     LayerStackBucketMode, configure_layer_stack_routing, get_network, init_nnue,
-    load_progress_coeff_kpabs, parse_layer_stack_bucket_mode, set_fv_scale_override,
-    set_layer_stack_progress_kpabs_weights,
+    layer_stack_progress_coeff_required, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
+    set_fv_scale_override, set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::Position;
 use rshogi_core::search::{LimitsType, Search, SearchInfo};
@@ -433,7 +433,10 @@ fn configure_eval(cli: &Cli) -> Result<()> {
     match stored_buckets {
         Some(stored) => {
             let mode = mode.context("LayerStacks requires --ls-bucket-mode")?;
-            if mode == LayerStackBucketMode::ProgressKPAbs && !coeff_loaded {
+            if mode == LayerStackBucketMode::ProgressKPAbs
+                && !coeff_loaded
+                && layer_stack_progress_coeff_required(cli.ls_progress_buckets)
+            {
                 bail!("--ls-bucket-mode progresskpabs requires --ls-progress-coeff");
             }
             if mode == LayerStackBucketMode::KingRank9 && cli.ls_progress_coeff.is_some() {

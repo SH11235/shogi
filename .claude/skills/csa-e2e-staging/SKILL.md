@@ -60,9 +60,10 @@ test 側で済んでいる前提で、本 skill は実機しか取れない通�
   |---|---|---|
   | engine path | `/path/to/YaneuraOu-sfnnwop1536-...-tournament` | release 版 USI engine binary |
   | `EvalDir` | `/path/to/eval_v100_300` | NNUE 評価関数ディレクトリ |
-  | `LS_PROGRESS_COEFF` | `/path/to/progress_hao_full_cuda.e1.bin` | progress8kpabs 係数ファイル |
+  | `LS_PROGRESS_COEFF` | `/path/to/progress_hao_full_cuda.e1.bin` | progresskpabs 係数ファイル |
   | `FV_SCALE` | `28` | 評価値スケール |
-  | `LS_BUCKET_MODE` | `progress8kpabs` | LayerStack bucket 選択 |
+  | `LS_BUCKET_MODE` | `progresskpabs` | LayerStack bucket 選択 (明示必須) |
+  | `LS_PROGRESS_BUCKETS` | `8` | progresskpabs の routing bucket 数 (学習時の値。明示必須) |
   | `BookFile` | `no_book` | 定跡無効化 (E2E では決定論性を上げる) |
   | `NetworkDelay` / `NetworkDelay2` | `0` | ネット遅延補正 OFF |
   | `MinimumThinkingTime` | `1000` (本番) / `100` (短時間 preset 向け) | 1 手最低思考時間 ms |
@@ -73,11 +74,10 @@ test 側で済んでいる前提で、本 skill は実機しか取れない通�
   HalfKP 系 (suisho5 等) を使う場合は `EvalDir` の代わりに `EvalFile` を渡し、
   `LS_*` / `FV_SCALE` 系は engine が無視するか必須でないかを user に確認する。
 
-  **`target/release/rshogi-usi` を engine に使う場合の注意**: rshogi-usi の
-  `LS_BUCKET_MODE` のデフォルトは `progress8kpabs` で、`LS_PROGRESS_COEFF` を
-  渡さないと `isready` 段階で panic する (`All weights are zero (progress.bin
-  not loaded)`)。HalfKP suisho5 を使う smoke でも **必ず `LS_PROGRESS_COEFF` を
-  指定** すること:
+  **`target/release/rshogi-usi` を engine に使う場合の注意**: LayerStacks モデルでは
+  `LS_BUCKET_MODE` の既定は無く明示必須。progresskpabs なら `LS_PROGRESS_BUCKETS` と
+  `LS_PROGRESS_COEFF` も併せて指定しないと `isready` 段階で panic する。
+  HalfKP suisho5 等の非 LayerStacks モデルでは `LS_*` は不要 (指定不可):
 
   ```text
   EvalFile=/abs/path/to/halfkp_256x2-32-32_crelu/suisho5.bin,
@@ -126,7 +126,7 @@ ROOM=e2e-$(date +%Y%m%d%H%M%S)
 PRESET=floodgate-600-10
 ENGINE=/path/to/your/usi-engine
 # YaneuraOu sfnnwop1536 用 options 例 (HalfKP 系なら EvalFile に置き換え):
-OPTS="EvalDir=/path/to/eval_v100_300,FV_SCALE=28,LS_BUCKET_MODE=progress8kpabs,LS_PROGRESS_COEFF=/path/to/progress.bin,BookFile=no_book,NetworkDelay=0,NetworkDelay2=0,MinimumThinkingTime=1000,PvInterval=0,Threads=1,USI_Hash=512"
+OPTS="EvalDir=/path/to/eval_v100_300,FV_SCALE=28,LS_BUCKET_MODE=progresskpabs,LS_PROGRESS_BUCKETS=8,LS_PROGRESS_COEFF=/path/to/progress.bin,BookFile=no_book,NetworkDelay=0,NetworkDelay2=0,MinimumThinkingTime=1000,PvInterval=0,Threads=1,USI_Hash=512"
 
 # 黒
 target/release/csa_client \
@@ -472,7 +472,7 @@ helper script ファイルに切り出して `nohup bash run.sh & echo $!` で P
 | 双方接続するも対局が始まらない | `room_id` が黒/白で不一致 | URL `/ws/<room_id>` が両 toml で完全一致しているか確認 |
 | 対局終局後も R2 に書き込まれない | 終局イベントが落ちた | `vp exec wrangler tail` で error 確認 |
 | `#TIME_UP` で対局終了 (通常実行で意図せず) | engine 応答が server byoyomi に間に合わない | csa_client の `[time] margin_msec` を上げる (engine 渡し byoyomi がその分減り余裕生まれる) |
-| `rshogi-usi` が `LS_BUCKET_MODE=progress8kpabs requires LS_PROGRESS_COEFF` で panic | `LS_PROGRESS_COEFF` 未指定 (rshogi-usi 既定 mode は progress8kpabs) | options に `LS_PROGRESS_COEFF=/path/to/progress.bin` を追加。詳細は §0 engine 表下のメモ |
+| `rshogi-usi` が `LS_BUCKET_MODE must be explicitly set` / `requires LS_PROGRESS_COEFF` で panic | LayerStacks routing 未指定 (既定なし) | options に `LS_BUCKET_MODE=progresskpabs,LS_PROGRESS_BUCKETS=<学習時 bucket 数>,LS_PROGRESS_COEFF=/path/to/progress.bin` を追加。詳細は §0 engine 表下のメモ |
 | AGREE timeout を `csa_client` で再現できない | csa_client は LOGIN→Game_Summary→自動 AGREE まで一気通貫 | 別ツール (Node.js + `ws`) で LOGIN だけ送る。§7 `agree_timeout` sub-case 参照 |
 
 ## 関連実装 / doc

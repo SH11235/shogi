@@ -25,7 +25,8 @@ use rshogi_core::movegen::{MoveList, generate_legal_all};
 use rshogi_core::nnue::{
     AccumulatorLayerStacks, LayerStackBucketMode, LayerStacksNetwork, LsFeatureSpec, NNUENetwork,
     NetworkLayerStacks, SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, configure_layer_stack_routing,
-    ls_dispatch_ft_size, parse_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
+    layer_stack_progress_coeff_required, ls_dispatch_ft_size, parse_layer_stack_bucket_mode,
+    set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::Position;
 
@@ -193,7 +194,9 @@ pub fn run() -> Result<()> {
             set_layer_stack_progress_kpabs_weights(weights).map_err(anyhow::Error::msg)?;
         }
         (LayerStackBucketMode::ProgressKPAbs, None) => {
-            bail!("progresskpabs requires --ls-progress-coeff")
+            if layer_stack_progress_coeff_required(cli.ls_progress_buckets) {
+                bail!("progresskpabs requires --ls-progress-coeff")
+            }
         }
         (LayerStackBucketMode::KingRank9, Some(_)) => {
             bail!("kingrank9 does not use --ls-progress-coeff")

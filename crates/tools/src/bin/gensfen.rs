@@ -19,8 +19,9 @@ use rshogi_core::movegen::{MoveList, generate_legal, is_legal_with_pass};
 use rshogi_core::nnue::{
     LayerStackBucketMode, compute_layer_stack_progresskpabs_bucket_index,
     configure_layer_stack_routing, get_layer_stack_progress_kpabs_weights, get_network,
-    init_nnue_from_bytes, load_progress_coeff_kpabs_from_bytes, parse_layer_stack_bucket_mode,
-    set_fv_scale_override, set_layer_stack_progress_kpabs_weights,
+    init_nnue_from_bytes, layer_stack_progress_coeff_required,
+    load_progress_coeff_kpabs_from_bytes, parse_layer_stack_bucket_mode, set_fv_scale_override,
+    set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::{EnteringKingPointInfo, Position};
 use rshogi_core::types::{Color, EnteringKingRule, Move};
@@ -5965,7 +5966,9 @@ fn initialize_native_backend(
                     eprintln!("NativeBackend: progress file loaded from {}", path.display());
                 }
                 (LayerStackBucketMode::ProgressKPAbs, None) => {
-                    bail!("--bucket-mode progresskpabs requires --progress-file")
+                    if layer_stack_progress_coeff_required(progress_buckets) {
+                        bail!("--bucket-mode progresskpabs requires --progress-file")
+                    }
                 }
                 (LayerStackBucketMode::KingRank9, Some(_)) => {
                     bail!("--bucket-mode kingrank9 does not use --progress-file")

@@ -27,9 +27,9 @@ use rshogi_core::nnue::{
     LsFeatureSpec, NNUEEvaluator, NNUENetwork, NetworkLayerStacks,
     SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, compute_layer_stack_kingrank9_bucket_index,
     compute_layer_stack_progresskpabs_bucket_index, configure_layer_stack_routing,
-    get_layer_stack_progress_buckets, get_layer_stack_progress_kpabs_weights, ls_dispatch_ft_size,
-    parse_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
-    sqr_clipped_relu_transform,
+    get_layer_stack_progress_buckets, get_layer_stack_progress_kpabs_weights,
+    layer_stack_progress_coeff_required, ls_dispatch_ft_size, parse_layer_stack_bucket_mode,
+    set_layer_stack_progress_kpabs_weights, sqr_clipped_relu_transform,
 };
 use rshogi_core::position::Position;
 use rshogi_core::types::{Color, PieceType};
@@ -368,11 +368,16 @@ fn configure_layer_stack_bucket(
     })?;
 
     if mode == LayerStackBucketMode::ProgressKPAbs {
-        let weights = progress_weights.context(
-            "--ls-bucket-mode progresskpabs requires --ls-progress-coeff <progress.bin>",
-        )?;
-        set_layer_stack_progress_kpabs_weights(weights.to_vec().into_boxed_slice())
-            .map_err(|e| anyhow!("failed to set progresskpabs weights: {e}"))?;
+        match progress_weights {
+            Some(weights) => {
+                set_layer_stack_progress_kpabs_weights(weights.to_vec().into_boxed_slice())
+                    .map_err(|e| anyhow!("failed to set progresskpabs weights: {e}"))?;
+            }
+            None if layer_stack_progress_coeff_required(cli.ls_progress_buckets) => {
+                bail!("--ls-bucket-mode progresskpabs requires --ls-progress-coeff <progress.bin>")
+            }
+            None => {}
+        }
     } else if cli.ls_progress_coeff.is_some() {
         bail!("--ls-bucket-mode kingrank9 does not use --ls-progress-coeff");
     }

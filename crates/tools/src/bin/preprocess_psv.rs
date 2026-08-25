@@ -32,7 +32,7 @@ use std::cell::RefCell;
 
 use rshogi_core::nnue::{
     LayerStackBucketMode, configure_layer_stack_routing, get_network, init_nnue,
-    load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
+    layer_stack_progress_coeff_required, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
     set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::Position;
@@ -181,7 +181,9 @@ fn main() -> Result<()> {
                             .map_err(anyhow::Error::msg)?;
                     }
                     (LayerStackBucketMode::ProgressKPAbs, None) => {
-                        anyhow::bail!("progresskpabs requires --ls-progress-coeff")
+                        if layer_stack_progress_coeff_required(cli.ls_progress_buckets) {
+                            anyhow::bail!("progresskpabs requires --ls-progress-coeff")
+                        }
                     }
                     (LayerStackBucketMode::KingRank9, Some(_)) => {
                         anyhow::bail!("kingrank9 does not use --ls-progress-coeff")

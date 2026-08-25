@@ -19,8 +19,8 @@ use anyhow::{Context, Result, bail};
 
 use rshogi_core::nnue::{
     LayerStackBucketMode, configure_layer_stack_routing, get_network, init_nnue,
-    load_progress_coeff_kpabs, parse_layer_stack_bucket_mode, set_fv_scale_override,
-    set_layer_stack_progress_kpabs_weights,
+    layer_stack_progress_coeff_required, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
+    set_fv_scale_override, set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::Position;
 use rshogi_core::search::{LimitsType, Search, SearchInfo};
@@ -47,7 +47,8 @@ pub struct LabelerEvalConfig<'a> {
 }
 
 /// 評価器（NNUE + LayerStacks bucket 設定）を USI エンジンと同じ手順で構成する。
-/// `label_bench_positions::configure_eval` と同じく progresskpabs で係数未指定なら弾く。
+/// `label_bench_positions::configure_eval` と同じく progresskpabs で係数未指定なら弾く
+/// (routing bucket 数 1 の no-op routing は係数を参照しないため除く)。
 ///
 /// # 注意（グローバル状態）
 /// `set_fv_scale_override` / `configure_layer_stack_routing` /
@@ -87,7 +88,10 @@ pub fn configure_eval(cfg: &LabelerEvalConfig) -> Result<()> {
     match stored_buckets {
         Some(stored) => {
             let mode = mode.context("LayerStacks requires --ls-bucket-mode")?;
-            if mode == LayerStackBucketMode::ProgressKPAbs && !coeff_loaded {
+            if mode == LayerStackBucketMode::ProgressKPAbs
+                && !coeff_loaded
+                && layer_stack_progress_coeff_required(cfg.ls_progress_buckets)
+            {
                 bail!("--ls-bucket-mode progresskpabs requires --ls-progress-coeff");
             }
             if mode == LayerStackBucketMode::KingRank9 && cfg.ls_progress_coeff.is_some() {

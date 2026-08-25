@@ -10,7 +10,7 @@ use rshogi_core::eval::{MaterialLevel, set_eval_hash_enabled, set_material_level
 use rshogi_core::eval::{eval_hash_stats, reset_eval_hash_stats};
 use rshogi_core::nnue::{
     LayerStackBucketMode, configure_layer_stack_routing, get_network, init_nnue,
-    load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
+    layer_stack_progress_coeff_required, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
     set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::Position;
@@ -108,7 +108,9 @@ fn setup_eval(config: &BenchmarkConfig) -> Result<()> {
                             .map_err(anyhow::Error::msg)?;
                     }
                     (LayerStackBucketMode::ProgressKPAbs, None) => {
-                        anyhow::bail!("progresskpabs requires LS_PROGRESS_COEFF")
+                        if layer_stack_progress_coeff_required(progress_buckets) {
+                            anyhow::bail!("progresskpabs requires LS_PROGRESS_COEFF")
+                        }
                     }
                     (LayerStackBucketMode::KingRank9, Some(_)) => {
                         anyhow::bail!("kingrank9 does not use LS_PROGRESS_COEFF")

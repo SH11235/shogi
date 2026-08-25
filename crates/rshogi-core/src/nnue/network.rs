@@ -335,6 +335,14 @@ pub fn validate_layer_stack_routing_configuration(
     }
 }
 
+/// progresskpabs routing が progress 係数を実際に参照するか。
+///
+/// routing bucket 数 1 は常に bucket 0 を選ぶ no-op routing のため係数を参照しない。
+/// 係数必須チェックはこの述語で判定を統一する。
+pub fn layer_stack_progress_coeff_required(progress_bucket_count: Option<usize>) -> bool {
+    progress_bucket_count != Some(1)
+}
+
 /// LayerStacks の progress routing bucket 数を未設定へ戻す。
 pub fn reset_layer_stack_progress_buckets() {
     LAYER_STACK_PROGRESS_BUCKETS.store(0, Ordering::Relaxed);
@@ -2518,6 +2526,11 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         assert_eq!(b, 4, "zero-weight progresskpabs at N=9 should map to bucket 4");
+
+        // routing N=1 (no-op routing): 係数未ロード (ゼロ重み) でも常に bucket 0。
+        let b1 =
+            compute_layer_stack_progresskpabs_bucket_index(&pos, pos.side_to_move(), &weights, 1);
+        assert_eq!(b1, 0, "N=1 no-op routing should always map to bucket 0");
     }
 
     #[test]
