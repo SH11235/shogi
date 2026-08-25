@@ -482,6 +482,26 @@ fn validate_output_paths(cli: &Cli) -> Result<()> {
         }
     }
 
+    // NNUE モデルは読み込み後もディスク上の実体が残る前提のファイルなので、
+    // 出力の rename で置換されないよう書き込み先とは衝突検査する
+    // (入力とは read-read なので共有可)。
+    if let Some(nnue) = &cli.nnue {
+        if paths_resolve_to_same_file(&cli.output, nnue)? {
+            anyhow::bail!(
+                "Output and NNUE model paths resolve to the same file: {}",
+                cli.output.display()
+            );
+        }
+        if let Some(mask) = &cli.moved_mask
+            && paths_resolve_to_same_file(mask, nnue)?
+        {
+            anyhow::bail!(
+                "Moved mask and NNUE model paths resolve to the same file: {}",
+                mask.display()
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -489,6 +509,11 @@ fn validate_temporary_paths(cli: &Cli, tmp_output: &Path, tmp_mask: Option<&Path
     let mut final_paths = vec![cli.input.as_path(), cli.output.as_path()];
     if let Some(mask) = cli.moved_mask.as_deref() {
         final_paths.push(mask);
+    }
+    // `.tmp` の作成 (truncate) や終了時削除が NNUE モデルを壊さないよう、
+    // 一時パスは NNUE モデルとも衝突検査する。
+    if let Some(nnue) = cli.nnue.as_deref() {
+        final_paths.push(nnue);
     }
 
     for final_path in final_paths {
@@ -917,6 +942,9 @@ mod tests {
             max_ply: 16,
             threads: 1,
             nnue: None,
+            ls_bucket_mode: None,
+            ls_progress_buckets: None,
+            ls_progress_coeff: None,
             limit: 0,
             verbose: false,
             no_fix_stm_sign: false,
@@ -1067,6 +1095,41 @@ mod tests {
 
         let output_collision = test_cli(input, output.clone(), Some(output));
         assert!(validate_output_paths(&output_collision).is_err());
+    }
+
+    #[test]
+    fn nnue_model_path_is_rejected_as_write_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.psv");
+        let nnue = dir.path().join("model.nnue");
+        std::fs::write(&input, []).unwrap();
+        std::fs::write(&nnue, [0u8]).unwrap();
+
+        // 出力 / mask が NNUE モデルと同一実体なら拒否する。
+        let mut mask_collision =
+            test_cli(input.clone(), dir.path().join("output.psv"), Some(nnue.clone()));
+        mask_collision.nnue = Some(nnue.clone());
+        assert!(validate_output_paths(&mask_collision).is_err());
+
+        let mut output_collision =
+            test_cli(input.clone(), nnue.clone(), Some(dir.path().join("moved.bits")));
+        output_collision.nnue = Some(nnue.clone());
+        assert!(validate_output_paths(&output_collision).is_err());
+
+        // `.tmp` が NNUE モデルと同一実体でも拒否する (truncate / 終了時削除を防ぐ)。
+        let output = dir.path().join("output.psv");
+        let mask = dir.path().join("moved.bits");
+        let mut cli = test_cli(input, output.clone(), Some(mask.clone()));
+        cli.nnue = Some(temporary_path(&mask).unwrap());
+        std::fs::write(cli.nnue.as_ref().unwrap(), [0u8]).unwrap();
+        assert!(
+            validate_temporary_paths(
+                &cli,
+                &temporary_path(&output).unwrap(),
+                Some(&temporary_path(&mask).unwrap())
+            )
+            .is_err()
+        );
     }
 
     #[test]
