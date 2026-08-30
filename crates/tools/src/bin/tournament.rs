@@ -146,6 +146,10 @@ struct Cli {
     #[arg(long)]
     startpos_file: Option<PathBuf>,
 
+    /// 開始局面選択用の乱数 seed。省略時は entropy から生成して起動ログに表示する。
+    #[arg(long)]
+    seed: Option<u64>,
+
     /// Report progress every N games
     #[arg(long, default_value_t = 10)]
     report_interval: u32,
@@ -303,6 +307,7 @@ struct MetaLogEntry {
 #[derive(Serialize)]
 struct MetaSettings {
     games: u32,
+    seed: u64,
     max_moves: u32,
     byoyomi: u64,
     #[serde(skip_serializing_if = "is_zero_u64")]
@@ -825,6 +830,8 @@ fn spawn_worker(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let seed = cli.seed.unwrap_or_else(|| rand::rng().random());
+    eprintln!("startpos seed: {seed}");
 
     if cli.engines.len() < 2 {
         bail!("at least 2 engines are required");
@@ -1026,6 +1033,7 @@ fn main() -> Result<()> {
             timestamp: timestamp.to_rfc3339(),
             settings: MetaSettings {
                 games: cli.games * 2,
+                seed,
                 max_moves: cli.max_moves,
                 byoyomi: cli.byoyomi,
                 btime: cli.btime,
@@ -1112,7 +1120,7 @@ fn main() -> Result<()> {
     // cli.games は「各方向の対局数」。1 ペアあたり cli.games * 2 局。
     let target_per_dir = Arc::new(AtomicU32::new(cli.games));
     let mut source =
-        TicketSource::new(pair_indices.clone(), start_defs.len(), target_per_dir.clone());
+        TicketSource::new(pair_indices.clone(), start_defs.len(), target_per_dir.clone(), seed);
 
     let mode_label = if base_idx.is_some() {
         "base-vs-N"
@@ -1165,6 +1173,7 @@ fn main() -> Result<()> {
                 timestamp: timestamp.to_rfc3339(),
                 settings: MetaSettings {
                     games: cli.games * 2, // 各方向 cli.games 局、双方向で合計
+                    seed,
                     max_moves: cli.max_moves,
                     byoyomi: cli.byoyomi,
                     btime: cli.btime,
@@ -1567,11 +1576,10 @@ struct TicketSource {
     pair_indices: Vec<(usize, usize)>,
     start_defs_len: usize,
     target_per_dir: Arc<AtomicU32>,
+    seed: u64,
     /// ペアごとの発行済みゲーム数。
     emitted: Vec<u32>,
     next_id: u64,
-    /// 直前に発行したチケットの開始局面 index。先後入替の 2 局目で再利用する。
-    last_startpos_idx: usize,
 }
 
 impl TicketSource {
@@ -1579,15 +1587,16 @@ impl TicketSource {
         pair_indices: Vec<(usize, usize)>,
         start_defs_len: usize,
         target_per_dir: Arc<AtomicU32>,
+        seed: u64,
     ) -> Self {
         let pair_count = pair_indices.len();
         TicketSource {
             pair_indices,
             start_defs_len,
             target_per_dir,
+            seed,
             emitted: vec![0; pair_count],
             next_id: 0,
-            last_startpos_idx: 0,
         }
     }
 
@@ -1633,23 +1642,15 @@ impl TicketSource {
         } else {
             (j, i)
         };
-        let startpos_idx = if self.start_defs_len <= 1 {
-            0
-        } else if game_idx.is_multiple_of(2) {
-            rand::rng().random_range(0..self.start_defs_len)
-        } else {
-            // 2 局目は 1 局目と同じ開始局面を先後入替で使う。
-            self.last_startpos_idx
-        };
-
         let id = self.next_id;
+        let pair_index = (id / 2) as u32;
         Some(MatchTicket {
             id,
             black_idx,
             white_idx,
-            startpos_idx,
+            startpos_idx: deterministic_startpos_index(self.seed, pair_index, self.start_defs_len),
             pair_slot: (id % 2) as u32,
-            pair_index: (id / 2) as u32,
+            pair_index,
         })
     }
 
@@ -1658,7 +1659,6 @@ impl TicketSource {
     /// `pair_indices` は `(min, max)` 正規化済み前提。チケットの先後 idx を同じく
     /// `(min, max)` に正規化して該当ペアを引き、その発行数を 1 進める。
     fn commit_sent(&mut self, ticket: &MatchTicket) {
-        self.last_startpos_idx = ticket.startpos_idx;
         self.next_id = ticket.id + 1;
         let pair = (ticket.black_idx.min(ticket.white_idx), ticket.black_idx.max(ticket.white_idx));
         if let Some(pos) = self.pair_indices.iter().position(|&p| p == pair) {
@@ -1681,6 +1681,23 @@ impl TicketSource {
             None => false,
         }
     }
+}
+
+fn deterministic_startpos_index(seed: u64, pair_index: u32, startpos_count: usize) -> usize {
+    if startpos_count <= 1 {
+        return 0;
+    }
+
+    let stream_value =
+        seed.wrapping_add((u64::from(pair_index) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    (splitmix64(stream_value) % startpos_count as u64) as usize
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 // ---------------------------------------------------------------------------
@@ -1993,8 +2010,8 @@ fn ensure_node_coverage(
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlFile, TicketSource, build_engine_usi_options, ensure_node_coverage,
-        resolve_engine_nodes,
+        ControlFile, TicketSource, build_engine_usi_options, deterministic_startpos_index,
+        ensure_node_coverage, resolve_engine_nodes, splitmix64,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2036,13 +2053,40 @@ mod tests {
                 (t.black_idx.min(t.white_idx), t.black_idx.max(t.white_idx))
             };
             assert_eq!(norm(group[0]), norm(group[1]), "pair_index {pi} は同一エンジンペア");
+            assert_eq!(
+                group[0].startpos_idx, group[1].startpos_idx,
+                "pair_index {pi} は同一開始局面"
+            );
         }
+    }
+
+    #[test]
+    fn startpos_selection_is_deterministic_for_seed_and_pair_index() {
+        let sequence = |seed| {
+            (0..256)
+                .map(|pair_index| deterministic_startpos_index(seed, pair_index, 65_521))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(sequence(42), sequence(42));
+
+        let mut seed_42 = sequence(42);
+        let mut seed_43 = sequence(43);
+        seed_42.sort_unstable();
+        seed_43.sort_unstable();
+        assert_ne!(seed_42, seed_43, "隣接 seed の選択多重集合は一致しない");
+    }
+
+    #[test]
+    fn splitmix64_matches_reference_vectors() {
+        assert_eq!(splitmix64(0), 0xE220_A839_7B1D_CDAF);
+        assert_eq!(splitmix64(0x9E37_79B9_7F4A_7C15), 0x6E78_9E6A_A1B9_65F4);
     }
 
     #[test]
     fn ticket_source_single_pair_emits_expected_pairs() {
         let target = Arc::new(AtomicU32::new(2)); // 各方向 2 局 = 1 ペアあたり 4 局
-        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone());
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone(), 0);
         assert_eq!(source.current_target_total(), 4);
 
         let tickets = drain_source(&mut source);
@@ -2060,7 +2104,7 @@ mod tests {
     #[test]
     fn ticket_source_target_increase_continues_consistently() {
         let target = Arc::new(AtomicU32::new(1)); // 1 ペアあたり 2 局
-        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone());
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone(), 0);
         let first = drain_source(&mut source);
         assert_eq!(first.len(), 2);
         assert!(!source.has_next());
@@ -2082,7 +2126,7 @@ mod tests {
     #[test]
     fn ticket_source_target_decrease_stops_feeding() {
         let target = Arc::new(AtomicU32::new(3)); // 1 ペアあたり 6 局
-        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone());
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone(), 0);
         // 2 局だけ発行
         assert!(pull(&mut source).is_some());
         assert!(pull(&mut source).is_some());
@@ -2096,7 +2140,7 @@ mod tests {
     fn ticket_source_round_robin_keeps_pairs_within_engine_pair() {
         let target = Arc::new(AtomicU32::new(1)); // 各ペア 2 局
         let pairs = vec![(0, 1), (0, 2), (1, 2)];
-        let mut source = TicketSource::new(pairs.clone(), 1, target.clone());
+        let mut source = TicketSource::new(pairs.clone(), 1, target.clone(), 0);
         assert_eq!(source.current_target_total(), 6);
         let tickets = drain_source(&mut source);
         assert_eq!(tickets.len(), 6);
@@ -2108,7 +2152,7 @@ mod tests {
         use std::collections::HashMap;
         let target = Arc::new(AtomicU32::new(1)); // 各ペア 2 局
         let pairs = vec![(0, 1), (0, 2), (1, 2)];
-        let mut source = TicketSource::new(pairs.clone(), 1, target.clone());
+        let mut source = TicketSource::new(pairs.clone(), 1, target.clone(), 0);
         let first = drain_source(&mut source);
         assert_eq!(first.len(), 6);
 
@@ -2137,7 +2181,7 @@ mod tests {
     fn ticket_source_decrease_mid_pair_completes_pair() {
         // ペアの 1 局目だけ発行した状態で target を下げても、2 局目を発行してペアを完結させる。
         let target = Arc::new(AtomicU32::new(3)); // 1 ペアあたり 6 局
-        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone());
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone(), 0);
         let slot0 = pull(&mut source).unwrap();
         assert_eq!(slot0.pair_slot, 0);
 
@@ -2157,7 +2201,7 @@ mod tests {
     #[test]
     fn ticket_source_peek_does_not_advance_state() {
         let target = Arc::new(AtomicU32::new(2));
-        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone());
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone(), 0);
         let a = source.peek_ticket().unwrap();
         let b = source.peek_ticket().unwrap();
         assert_eq!(a.id, b.id, "peek は状態を進めない");
@@ -2169,7 +2213,7 @@ mod tests {
     #[test]
     fn ticket_source_still_wanted_reflects_target_decrease() {
         let target = Arc::new(AtomicU32::new(2)); // 各ペア 4 局
-        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone());
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone(), 0);
 
         // 未コミットの 1 局目（偶数 slot）は、target を下げると不要になる。
         let fresh = source.peek_ticket().unwrap();
@@ -2237,7 +2281,7 @@ mod tests {
     fn ticket_source_swap_game_reuses_start_position() {
         // 複数開始局面でも、ペアの 2 局目は 1 局目と同じ開始局面を使う。
         let target = Arc::new(AtomicU32::new(1));
-        let mut source = TicketSource::new(vec![(0, 1)], 8, target.clone());
+        let mut source = TicketSource::new(vec![(0, 1)], 8, target.clone(), 0);
         let tickets = drain_source(&mut source);
         assert_eq!(tickets.len(), 2);
         assert_eq!(

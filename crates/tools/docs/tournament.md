@@ -26,6 +26,7 @@ cargo build -p tools --bin tournament --release
   --engine target/release/rshogi-usi-v1 --engine-label v1 \
   --engine target/release/rshogi-usi-v2 --engine-label v2 \
   --games 100 --byoyomi 1000 --hash-mb 256 --threads 1 --concurrency 8 \
+  --seed 42 \
   --startpos-file data/startpos/start_sfens_ply32.txt \
   --out-dir runs/selfplay/$(date +%Y%m%d_%H%M%S)-v1-vs-v2
 ```
@@ -93,12 +94,13 @@ test エンジンが base より +5 nelo 以上強いかを有意水準 95% で�
 | オプション | 説明 |
 |-----------|------|
 | `--startpos-file FILE` | 開始局面ファイル（1 行 1 局面、USI position 形式）。省略時は平手初期局面 1 局面のみ使用（全対局が同一局面になるため棋力評価には不向き）。**棋力評価では必須** |
+| `--seed N` | 開始局面選択の seed。同じ seed と開始局面ファイルでは同じペアに同じ局面を割り当てる。省略時は entropy から生成し、起動ログへ表示する |
 
 ### 出力
 
 | オプション | 説明 |
 |-----------|------|
-| `--out-dir DIR` | (必須) 出力ディレクトリ。`{label_i}-vs-{label_j}.jsonl` と `meta.json` が生成される |
+| `--out-dir DIR` | (必須) 出力ディレクトリ。`{label_i}-vs-{label_j}.jsonl` と、開始局面選択の seed を含む `meta.json` が生成される |
 
 ### base-vs-N モード
 

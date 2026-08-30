@@ -2052,6 +2052,20 @@ mod tests {
     use std::io::Write as _;
 
     #[test]
+    fn meta_accepts_settings_with_and_without_seed() {
+        let meta_json = |settings| {
+            format!(
+                r#"{{"settings":{settings},"engine_cmd":{{"path_black":"/b","path_white":"/w"}}}}"#
+            )
+        };
+
+        for settings in [r#"{"games":2}"#, r#"{"games":2,"seed":42}"#] {
+            let meta: MetaLog = serde_json::from_str(&meta_json(settings)).unwrap();
+            assert_eq!(meta.settings.games, 2);
+        }
+    }
+
+    #[test]
     fn h2h_places_sprt_test_on_the_left() {
         assert!(should_show_right_first("base", "test", Some("test"), Some("base")));
         assert!(!should_show_right_first("test", "base", Some("test"), Some("base")));
