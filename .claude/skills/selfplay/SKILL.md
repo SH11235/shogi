@@ -6,6 +6,9 @@ user-invocable: true
 # 自己対局評価スキル
 
 以下の指示に従い、指定されたエンジン間の対局を実行し結果を集計する。
+統計規範 (SPRT bounds・試行規律・採否判定) の正典は rshogi-notes
+`rshogi/testing_policy.md`。本 SKILL はそれを実行手順に翻訳したもので、
+規範から逸脱する場合は実験 doc に理由を事前登録する。
 モードは主に 3 つ:
 
 1. **総当たり (round-robin)** — 固定局数で全ペアを対局させて Elo 差・勝率を測る。デフォルト。
@@ -57,13 +60,31 @@ user-invocable: true
 
 #### (c) SPRT 仮説と上限局数
 
-- `--sprt-nelo0 / --sprt-nelo1 / --sprt-alpha / --sprt-beta`: 検出したい最小 Elo 差と
-  許容誤り率。デフォルト (H0=0 / H1=+5 / α=β=0.05) は出発点だが、解像度を上げたい /
-  下げたい場合は別の値が必要。
-- `--games`: 上限局数。境界に達しなかった場合の打ち切り基準。長時間 run になり得る
-  ので CPU 占有見積もりとともに確認。
+- 標準 bounds は testing_policy の用途別 2 種 (α=β=0.05):
+  - **gainer (強くする変更)**: `--sprt-nelo0 0 --sprt-nelo1 10`
+  - **simplification / non-regression**: `--sprt-nelo0 -10 --sprt-nelo1 0`
+- **4 パラメータ (`--sprt-nelo0 / --sprt-nelo1 / --sprt-alpha / --sprt-beta`) は常に明示する**。
+  CLI 既定値 (H0=0 / H1=+5) は規約標準と異なるため、省略すると別の検定が走る。
+  標準以外の bounds を使う場合は実験 doc に理由を事前登録した上で。
+- `--games`: 上限局数。**各方向の局数**であり、標準上限は `--games 5000` = 総 10,000 局。
+  上限到達で境界未達なら inconclusive = **その patch は採用しない** (ただし accept_h0 と
+  異なりアイデア族の終了ではない。再挑戦の条件は testing_policy §2)。上限延長は事前宣言
+  した場合のみ、**到達前に** `control.json` の `target_games` で行う (到達後は延長不能)。
+- **走行中の SPRT を途中停止しない** (LLR の途中値は停止理由にならない。例外 3 種は
+  testing_policy §2 参照)。
+- **試行規律のチェック** (詳細は testing_policy §2): 正式 SPRT は同一アイデア族で
+  最大 3 回 / 同一 patch・同一条件の引き直し禁止 / `accept_h0` でそのアイデア族は終了 /
+  全試行を実験 doc に記録 (採用 run だけ残さない)。
 
-#### (d) startpos / engine USI option
+#### (d) 開始局面選択の seed (`--seed`)
+
+棋力評価では `--seed` の明示指定を必須とし、値を実験 doc の事前登録節に記録する
+(再現性要件、testing_policy §4)。省略時に entropy 生成値が起動ログと `meta.json` に
+出るのは、デバッグ等の非採用 run 向けの挙動であり、採否判定に使う run では
+省略しない。独立 seed での再確認 (SPSA endpoint 等) では過去 run と異なる seed を
+明示的に選ぶ。
+
+#### (e) startpos / engine USI option
 
 これらはモデル / 評価目的に依存。startpos は `data/startpos/start_sfens_ply32.txt`
 が default だが他にもある。USI option (FV_SCALE / LS_BUCKET_MODE / LS_PROGRESS_COEFF 等)
@@ -170,6 +191,7 @@ cargo run -p tools --release --bin tournament -- \
   --engine {ENGINE_A} --engine {ENGINE_B} [--engine {ENGINE_C} ...] \
   --games {GAMES} --byoyomi {BYOYOMI} --hash-mb {HASH} --threads {THREADS} \
   --concurrency {CONCURRENCY} \
+  --seed {SEED} \
   --usi-option {NNUE} \
   --out-dir "$OUT"
 ```
@@ -265,19 +287,24 @@ nElo はペア単位 (同一開始局面・先後入替) で集計し、開始�
 drain する。ライブで判定が走るので、従来の固定 `--games` より**大幅に時間を節約できる**
 ケースが多い（一方で、差が微妙な場合は `--games` 上限まで走る）。
 
-典型例: `base` エンジンと `test` エンジンで、H0 = 差なし / H1 = +5 nelo、α=β=0.05。
+典型例 (gainer 標準): `base` エンジンと `test` エンジンで、H0=0 / H1=+10 nelo、
+α=β=0.05、上限 `--games 5000` (総 10,000 局)。TC は比較軸選択則 (上記 (b)) に従い
+固定ノードか固定時間を選ぶ。
 
 ```
 cargo run -p tools --release --bin tournament -- \
   --engine target/release/rshogi-usi-{BASE_HASH} --engine-label base \
   --engine target/release/rshogi-usi-{TEST_HASH} --engine-label test \
-  --games 5000 --byoyomi 1000 --concurrency 8 \
+  --games 5000 {--nodes N | --byoyomi MS} --concurrency 8 \
   --startpos-file data/startpos/start_sfens_ply32.txt \
+  --seed {SEED} \
   --base-label base \
   --sprt --sprt-base-label base --sprt-test-label test \
-  --sprt-nelo0 0 --sprt-nelo1 5 --sprt-alpha 0.05 --sprt-beta 0.05 \
+  --sprt-nelo0 0 --sprt-nelo1 10 --sprt-alpha 0.05 --sprt-beta 0.05 \
   --out-dir "$OUT"
 ```
+
+simplification / non-regression の検定は `--sprt-nelo0 -10 --sprt-nelo1 0` に差し替える。
 
 ポイント:
 
@@ -292,21 +319,31 @@ cargo run -p tools --release --bin tournament -- \
   `analyze_selfplay --sprt` で再判定できる。
 - 走らせている最中に並列度を変えたい / `--games` 上限を増減したいときは、再起動せず
   `<out-dir>/control.json` で調整できる（上記「実行中の動的制御」を参照）。SPRT の
-  途中有効化のみ未対応。
+  途中有効化のみ未対応。上限延長は事前宣言した場合のみ (testing_policy §2)。
+- **run 終了時に error ペアの状況を確認する**: 最終サマリと `meta.json` の
+  `error_pairs` / `retried_pairs` / `exhausted_pairs` を見る。`exhausted_pairs > 0`
+  (meta の `invalid: true`) の run は**統計を採用しない** (統計的敗北にも変換しない)。
+  invalid は「再試行 2 回でも error が残った」という機械判定であり原因分類ではないので、
+  ログから error の帰属 (インフラ / candidate・base の crash / 原因不明) を調査して
+  testing_policy §3 の分類に従って扱う。**candidate の決定的 crash は品質 gate 失敗**
+  なので、run 中に気付いたら枯渇を待たず中断して調査する。
+- **二段検定は例外運用**: 標準は単段。release-critical な変更や SPSA endpoint 等の
+  選抜結果のみ、**独立 seed** (過去 run と異なる `--seed`) で同 bounds を再確認する。
+  詳細は testing_policy §1。
 
 境界到達時の標準出力例:
 
 ```
-[SPRT pair=240 | test vs base] LLR=+2.941 (bounds -2.94..+2.94)  nelo=+4.12 ± 1.85  penta=[3, 18, 140, 61, 18]  state=accept_h1
+[SPRT pair=2000 | test vs base] LLR=+2.979 (bounds -2.94..+2.94)  nelo=+14.01 ± 10.77  penta=[438, 20, 1000, 30, 512]  state=accept_h1
 [SPRT] terminal decision reached; draining 6 in-flight game(s)...
 ...
 === SPRT Summary (test vs base) ===
 bounds: LLR ∈ [-2.944, +2.944]  (alpha=0.05, beta=0.05)
-nelo hypotheses: H0=+0.0  H1=+5.0
-stopped_at:  pairs=240, LLR=+2.941, decision=accept_h1
-             nelo=+4.12 ± 1.85  penta=[3, 18, 140, 61, 18]
-final:       pairs=246, LLR=+3.002, decision=accept_h1
-             nelo=+4.15 ± 1.83  penta=[3, 18, 143, 64, 18]
+nelo hypotheses: H0=+0.0  H1=+10.0
+stopped_at:  pairs=2000, LLR=+2.979, decision=accept_h1
+             nelo=+14.01 ± 10.77  penta=[438, 20, 1000, 30, 512]
+final:       pairs=2006, LLR=+2.977, decision=accept_h1
+             nelo=+13.98 ± 10.75  penta=[439, 20, 1004, 30, 513]
 ================================
 ```
 
@@ -332,12 +369,16 @@ base/test のラベルは以下の順で自動推定され、推定時は根拠�
 推定された役割が逆だったらラベルを明示して再実行する。レポートには
 `{test} (test) vs {base} (base)` と nelo/elo の視点が明記されるので、
 取り違えはレポート自体から判別できる。Wald パラメータは
-CLI → meta → 既定値 (nelo0=0, nelo1=5, α=β=0.05) の順で解決される。
+CLI → meta → 既定値 (nelo0=0, nelo1=5, α=β=0.05) の順で解決される
+(この既定値は規約標準の bounds と異なるので、meta に SPRT 情報が無いログの
+再判定では 4 パラメータを明示する)。
 
 通常の集計出力の末尾に SPRT レポートが追加される（`--json` 併用時は JSON 出力に
 `sprt` フィールドが追加される）。
 
-閾値を後から振り直して「どこで打ち切れたか」を検証するのにも使える。
+閾値を後から振り直して「どこで打ち切れたか」を検証するのにも使える (これは
+診断・探索専用。採否判定は事前登録した bounds で行い、post-hoc の振り直しで
+覆さない)。
 
 ## 入力例
 
