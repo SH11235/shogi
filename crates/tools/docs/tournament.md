@@ -149,6 +149,8 @@ final:       pairs=1022, LLR=+2.889, decision=running
 などの game error になった場合、その世代の 2 局は統計から除外される。同じ
 `pair_index`、開始局面、先後割当のまま最大 2 回再対局し、再対局は目標局数を消化しない。
 JSONL の result 行には初回 0 の `attempt` が記録される。
+通信・`usinewgame`・worker panic の error 後はその worker を退役させ、再対局は新しく
+起動した engine process で行う。
 
 最終サマリと `meta.json` の `error_pairs`、`retried_pairs`、`exhausted_pairs` で状況を
 確認できる。2 回の再試行後も error を含むペアがあれば `invalid: true` となり、SPRT

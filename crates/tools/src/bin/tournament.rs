@@ -734,8 +734,21 @@ fn worker_main(
             (&mut right[0], &mut left[ticket.white_idx])
         };
 
-        let _ = black.new_game();
-        let _ = white.new_game();
+        // usinewgame/isready が失敗した EngineProcess は同期状態を保証できない。
+        // error 結果を 1 件返して worker ごと退役し、再試行は新しいプロセスへ渡す。
+        if let Err(e) = black.new_game().and_then(|_| white.new_game()) {
+            eprintln!("worker: new game error: {e}; retiring worker");
+            let _ = tx.send(MatchResult {
+                ticket,
+                outcome: GameOutcome::Draw,
+                reason: format!("error: new game: {e}"),
+                plies: 0,
+                move_logs: Vec::new(),
+                error: true,
+                worker_retired: true,
+            });
+            return;
+        }
 
         let start_pos = &start_positions[ticket.startpos_idx];
         let tc = TimeControl::new(btime, btime, binc, binc, byoyomi);
@@ -787,7 +800,7 @@ fn worker_main(
                 });
             }
             Ok(Err(e)) => {
-                eprintln!("worker: game error: {e}");
+                eprintln!("worker: game error: {e}; retiring worker");
                 let _ = tx.send(MatchResult {
                     ticket,
                     outcome: GameOutcome::Draw,
@@ -795,8 +808,9 @@ fn worker_main(
                     plies: 0,
                     move_logs,
                     error: true,
-                    worker_retired: false,
+                    worker_retired: true,
                 });
+                return;
             }
             Err(_) => {
                 eprintln!("worker: game {game_id} panicked; retiring worker");
