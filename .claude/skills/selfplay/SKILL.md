@@ -46,8 +46,10 @@ user-invocable: true
 
 Linux / WSL2 で複数プロセスを並走させる場合は、開始前に `df -h /dev/shm` で空き容量も
 確認する。NNUE 共有重みの確保失敗は local heap へ無言でフォールバックし、片側だけの
-fallback が A/B の偽差を生み得るため、満杯・僅少なら解消するまで起動しない。終了後の
-両 engine log 確認は「完了待ち・結果集計」の必須チェックに含める。
+fallback が A/B の偽差を生み得るため、満杯・僅少なら解消するまで起動しない。正常時の
+engine stderr は `tournament` が内部 buffer に取り込むだけで永続化しないため、下記の
+side 別 wrapper で rshogi の stderr を保存する。終了後の marker 確認は
+「完了待ち・結果集計」の必須チェックに含める。
 
 #### (b) time control: `--byoyomi` vs `--nodes`
 
@@ -195,10 +197,66 @@ mkdir -p "$OUT"
 - `{PURPOSE}` はユーザーの実験目的を短く要約したもの（例: `tt-16bit`, `lmr-tuning`）
 - 検証済みの絶対パス `$OUT` を以降の `--out-dir` オプションで使用する
 
+#### Linux / WSL2: rshogi engine stderr の永続化
+
+複数の rshogi process を起動する run では、各 side の実 binary を `exec` する wrapper を
+起動前に生成し、`tournament --engine` には実 binary でなく wrapper を渡す。wrapper は
+process ごとに `$OUT/engine-stderr/<side>-<pid>.log` を作るので、正常終了した process の
+共有重み marker も失われない。既存 process log が 1 件でもある `$OUT` では生成を拒否する。
+その場合は旧 run を再利用せず、新しい run directory を作る。
+
+```bash
+make_rshogi_wrapper() {
+  side=$1
+  case "$side" in
+    '' | *[!A-Za-z0-9._-]*)
+      printf 'invalid engine side: %s\n' "$side" >&2
+      return 1
+      ;;
+  esac
+  for old_log in "$OUT"/engine-stderr/*.log; do
+    if test -e "$old_log"; then
+      printf 'existing engine stderr log found; use a fresh OUT: %s\n' "$OUT" >&2
+      return 1
+    fi
+  done
+  if ! real_bin=$(readlink -f -- "$2") || ! test -x "$real_bin"; then
+    printf 'rshogi binary is not executable: %s\n' "$2" >&2
+    return 1
+  fi
+  side_dir="$OUT/engine-stderr/$side"
+  mkdir -p "$side_dir" || return 1
+  printf '%s\n' "$real_bin" > "$side_dir/real-bin" || return 1
+  cat > "$side_dir/run" <<'SH' || return 1
+#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+log_dir=$(dirname -- "$script_dir")
+side=$(basename -- "$script_dir")
+IFS= read -r real_bin < "$script_dir/real-bin"
+exec "$real_bin" "$@" 2>> "$log_dir/$side-$$.log"
+SH
+  chmod 700 "$side_dir/run" || return 1
+  printf '%s\n' "$side_dir/run"
+}
+
+BASE_REAL="$PWD/engines/rshogi-usi-{BASE_EDITION}"
+TEST_REAL="$PWD/engines/rshogi-usi-{TEST_EDITION}"
+BASE_ENGINE=$(make_rshogi_wrapper base "$BASE_REAL") || exit 1
+TEST_ENGINE=$(make_rshogi_wrapper test "$TEST_REAL") || exit 1
+```
+
+side 名は `base` / `test` に限らず engine label と対応する一意な名前にする。YaneuraOu など
+`nnue shared weights` marker を実装しない外部 engine は wrapper / marker 検査の対象外で、
+そのまま実 binary を `--engine` に渡す。Linux / WSL2 以外で wrapper が不要な場合は、
+`BASE_ENGINE=engines/rshogi-usi-{BASE_EDITION}` のように xtask 成果物を直接指定する。
+
 ### 3. tournament バイナリで総当たり自己対局を実行
 
 `tournament` バイナリ1コマンドで、全ペアの総当たり対局を並列実行する。
 `--engine` を複数指定すると自動で C(N,2) ペアの対局を生成する。
+Linux / WSL2 で複数の rshogi process を使う場合、`{ENGINE_A}` 等には上で生成した
+side 別 wrapper のパスを指定する。
 
 ```
 cargo run -p tools --release --bin tournament -- \
@@ -261,7 +319,7 @@ rshogi と YaneuraOu のように異なるエンジンを対局させる場合�
 
 ```
 cargo run -p tools --release --bin tournament -- \
-  --engine target/rshogi-usi-{HASH} --engine-label base \
+  --engine "$BASE_ENGINE" --engine-label base \
   --engine /path/to/YaneuraOu-binary --engine-label test \
   --engine-usi-option "0:EvalFile=eval/halfkp_256x2-32-32_crelu/suisho5.bin" \
   --engine-usi-option "1:EvalDir=/path/to/eval" \
@@ -303,9 +361,35 @@ nElo はペア単位 (同一開始局面・先後入替) で集計し、開始�
 - **`max_moves` 到達率**: `analyze_selfplay` の専用計数が未実装の間は、JSONL の
   `reason="max_moves"` を直接集計する。到達率 0.1% 未満は現状維持、0.1% 以上は長手数局を
   調査し、1% 以上は bounds の解釈より先に上限または千日手等のルール処理を見直す。
-- **NNUE 共有重み** (Linux / WSL2 の複数プロセス run): 両 engine log の
-  `nnue shared weights` 行がすべて `shared` であることを確認する。片側だけ `local` なら
-  結果を suspect 扱いにし、原因を解消して再走する。
+- **NNUE 共有重み** (Linux / WSL2 の複数 rshogi process run): wrapper を使った各 rshogi
+  side について、全 process log に `nnue shared weights [...]` の `shared` marker があり、
+  `local` marker が無いことを確認する。missing / `local` が 1 件でもあれば結果を suspect
+  扱いにし、原因を解消して再走する。marker 非対応の外部 engine は対象に含めない。
+
+  ```bash
+  check_rshogi_shared_weights() {
+    side=$1
+    found=0
+    for log in "$OUT"/engine-stderr/"$side"-*.log; do
+      test -e "$log" || continue
+      found=1
+      if ! grep -Eq 'nnue shared weights( \[[^]]+\])?: shared' "$log" ||
+        grep -Eq 'nnue shared weights( \[[^]]+\])?: local' "$log"; then
+        printf 'suspect shared weights log: %s\n' "$log" >&2
+        return 1
+      fi
+    done
+    if test "$found" -ne 1; then
+      printf 'missing shared weights log for side: %s\n' "$side" >&2
+      return 1
+    fi
+  }
+
+  check_rshogi_shared_weights base || exit 1
+  check_rshogi_shared_weights test || exit 1
+  ```
+
+  外部 engine との例では rshogi 側だけ（例: `base`）を検査する。
 
 ### 5. SPRT モード（逐次確率比検定）
 
@@ -320,8 +404,8 @@ drain する。ライブで判定が走るので、従来の固定 `--games` よ
 
 ```
 cargo run -p tools --release --bin tournament -- \
-  --engine target/release/rshogi-usi-{BASE_HASH} --engine-label base \
-  --engine target/release/rshogi-usi-{TEST_HASH} --engine-label test \
+  --engine "$BASE_ENGINE" --engine-label base \
+  --engine "$TEST_ENGINE" --engine-label test \
   --games 5000 {--nodes N | --byoyomi MS} --concurrency 8 \
   --startpos-file data/startpos/start_sfens_ply32.txt \
   --seed {SEED} \
@@ -411,10 +495,10 @@ CLI → meta → 既定値 (nelo0=0, nelo1=5, α=β=0.05) の順で解決され�
 
 ```
 /selfplay エンジン:
-- A: 3526b075 target/rshogi-usi-3526b075 ベースライン
-- B: 232d847d target/rshogi-usi-232d847d move ordering完了
-- D: 4778e1c6 target/rshogi-usi-4778e1c6 LMR修正（TT変更前）
-- E: 5806777e target/rshogi-usi-5806777e TT 16bit（最新）
+- A: 3526b075 engines/rshogi-usi-{A_EDITION} ベースライン
+- B: 232d847d engines/rshogi-usi-{B_EDITION} move ordering完了
+- D: 4778e1c6 engines/rshogi-usi-{D_EDITION} LMR修正（TT変更前）
+- E: 5806777e engines/rshogi-usi-{E_EDITION} TT 16bit（最新）
 
 確認ポイント:
 1. E vs D: TT 16bit の棋力効果
