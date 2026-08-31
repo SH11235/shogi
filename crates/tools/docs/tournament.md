@@ -49,6 +49,7 @@ test エンジンが base より +5 nelo 以上強いかを有意水準 95% で�
   --engine /path/to/base-engine --engine-label base \
   --engine /path/to/test-engine --engine-label test \
   --games 5000 --byoyomi 1000 --hash-mb 256 --threads 1 --concurrency 16 \
+  --seed 42 \
   --startpos-file data/startpos/start_sfens_ply32.txt \
   --base-label base \
   --sprt --sprt-test-label test \
@@ -167,6 +168,7 @@ rshogi と YaneuraOu のようにエンジンごとに USI オプションが異
   --engine-usi-option "1:FV_SCALE=28" \
   --engine-usi-option "1:BookFile=no_book" \
   --games 100 --byoyomi 1000 --concurrency 8 \
+  --seed 42 \
   --out-dir runs/selfplay/$(date +%Y%m%d_%H%M%S)-rshogi-vs-yo
 ```
 
