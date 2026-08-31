@@ -44,6 +44,11 @@ user-invocable: true
 かかる。確認時は「現在の CPU 負荷状況 (同時稼働中の学習/ベンチの有無とスレッド数)」を
 添えて尋ねる。
 
+Linux / WSL2 で複数プロセスを並走させる場合は、開始前に `df -h /dev/shm` で空き容量も
+確認する。NNUE 共有重みの確保失敗は local heap へ無言でフォールバックし、片側だけの
+fallback が A/B の偽差を生み得るため、満杯・僅少なら解消するまで起動しない。終了後の
+両 engine log 確認は「完了待ち・結果集計」の必須チェックに含める。
+
 #### (b) time control: `--byoyomi` vs `--nodes`
 
 **比較するエンジン構成によって選択則が異なる**:
@@ -51,10 +56,10 @@ user-invocable: true
 | 比較軸 | 推奨 time control | 理由 |
 |---|---|---|
 | **同 FS 同 arch、重み差のみ (recipe / 量子化 / SPSA 差等)** | **`--nodes <N>`** (固定ノード) | NPS 差なし、CPU 競合の影響も排除して clean に重み差を抽出 |
-| **異 FS / 異 arch (feature-set 差、dim 差、PSQT 有無差等)** | **`--byoyomi <ms>`** (固定時間) | 実戦強度 = eval 品質 × NPS。NPS 差を含めた total strength を測る |
+| **search / 異 FS / 異 arch / 速度が変わる変更** (探索変更、feature-set 差、dim 差、PSQT 有無差等) | **`--byoyomi <ms>`** (固定時間) | 実戦強度 = eval 品質 × NPS。NPS 差を含めた total strength を測る |
 | (補助) 異 FS で eval 品質を切り分けて測りたい | 両方 (固定時間 + 固定ノード) | featureset-sweep 実験ログ (rshogi-nnue docs/experiments) §10-F / §10-E pattern |
 
-異 FS 対局を固定ノードでやると、本来実戦強度に効く NPS 差 (例: HalfKP の avg_nodes
+search / FS / arch / 速度が変わる対局を固定ノードでやると、本来実戦強度に効く NPS 差 (例: HalfKP の avg_nodes
 は HalfKA_HM_merged より +6-14% 多い) を切り捨ててしまい、デプロイ実態と乖離する。
 **「前回固定ノードだったから今回も」と暗黙踏襲は禁止**、比較軸ごとに毎回相談する。
 
@@ -63,6 +68,8 @@ user-invocable: true
 - 標準 bounds は testing_policy の用途別 2 種 (α=β=0.05):
   - **gainer (強くする変更)**: `--sprt-nelo0 0 --sprt-nelo1 10`
   - **simplification / non-regression**: `--sprt-nelo0 -10 --sprt-nelo1 0`
+- simplification の `<-10, 0>` は -5 nElo 級の退行を検出せず通し得る。簡略化 SPRT を
+  乱発せず、保守性が必要なら期待局数を見積もり、より狭い bounds を事前登録する。
 - **4 パラメータ (`--sprt-nelo0 / --sprt-nelo1 / --sprt-alpha / --sprt-beta`) は常に明示する**。
   CLI 既定値 (H0=0 / H1=+5) は規約標準と異なるため、省略すると別の検定が走る。
   標準以外の bounds を使う場合は実験 doc に理由を事前登録した上で。
@@ -84,7 +91,14 @@ user-invocable: true
 省略しない。独立 seed での再確認 (SPSA endpoint 等) では過去 run と異なる seed を
 明示的に選ぶ。
 
-#### (e) startpos / engine USI option
+#### (e) 実験 doc の事前登録
+
+正式な棋力評価は、起動前に以下を実験 doc へ記録する: engine SHA、NNUE (ファイルと
+FV_SCALE)、USI options、startpos ファイルと hash、seed、TC (nodes / byoyomi)、threads、
+hash、SPRT bounds と上限局数。加えて rshogi-notes `rshogi/standing_rules.md` の実行機・
+backend・raw log 所在の記録要件を満たす。
+
+#### (f) startpos / engine USI option
 
 これらはモデル / 評価目的に依存。startpos は `data/startpos/start_sfens_ply32.txt`
 が default だが他にもある。USI option (FV_SCALE / LS_BUCKET_MODE / LS_PROGRESS_COEFF 等)
@@ -246,12 +260,15 @@ rshogi と YaneuraOu のように異なるエンジンを対局させる場合�
 
 ```
 cargo run -p tools --release --bin tournament -- \
-  --engine target/rshogi-usi-{HASH} \
-  --engine /path/to/YaneuraOu-binary \
+  --engine target/rshogi-usi-{HASH} --engine-label base \
+  --engine /path/to/YaneuraOu-binary --engine-label test \
   --engine-usi-option "0:EvalFile=eval/halfkp_256x2-32-32_crelu/suisho5.bin" \
   --engine-usi-option "1:EvalDir=/path/to/eval" \
   --engine-usi-option "1:BookFile=no_book" \
-  --games 100 --byoyomi 3000 --concurrency 5 \
+  --games 100 --byoyomi 3000 --hash-mb 256 --threads 1 \
+  --concurrency 5 --seed {SEED} \
+  --startpos-file data/startpos/start_sfens_ply32.txt \
+  --base-label base \
   --out-dir "$OUT"
 ```
 
@@ -279,6 +296,15 @@ nElo はペア単位 (同一開始局面・先後入替) で集計し、開始�
 2. **総合結果表**: 各カードの勝敗・勝率・Elo差
 3. **確認ポイントの評価**: ユーザーが指定した比較ポイントについての分析
 4. **総括**: 全体的な傾向と推奨事項
+
+採否判定の前に以下も確認する:
+
+- **`max_moves` 到達率**: `analyze_selfplay` の専用計数が未実装の間は、JSONL の
+  `reason="max_moves"` を直接集計する。到達率 0.1% 未満は現状維持、0.1% 以上は長手数局を
+  調査し、1% 以上は bounds の解釈より先に上限または千日手等のルール処理を見直す。
+- **NNUE 共有重み** (Linux / WSL2 の複数プロセス run): 両 engine log の
+  `nnue shared weights` 行がすべて `shared` であることを確認する。片側だけ `local` なら
+  結果を suspect 扱いにし、原因を解消して再走する。
 
 ### 5. SPRT モード（逐次確率比検定）
 
