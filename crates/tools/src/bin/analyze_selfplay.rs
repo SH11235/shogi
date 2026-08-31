@@ -9,7 +9,7 @@
 ///
 ///   # JSON出力モード
 ///   analyze_selfplay --json file1.jsonl file2.jsonl
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-use tools::sprt::{GameSide, Penta, SprtMetaLog, SprtParameters, judge};
+use tools::sprt::{Penta, SprtMetaLog, SprtParameters, collect_sprt_penta, judge};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -101,7 +101,7 @@ struct EngineCommandMeta {
 }
 
 /// 通常JSONLのresult行
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ResultLog {
     outcome: String,
     /// 勝者のエンジンラベル（tournament.rs が出力、旧形式では None）
@@ -114,6 +114,8 @@ struct ResultLog {
     pair_index: Option<u32>,
     #[serde(default)]
     pair_slot: Option<u32>,
+    #[serde(default)]
+    attempt: u32,
     #[serde(default)]
     error: Option<bool>,
 }
@@ -179,7 +181,16 @@ struct FileResult {
     /// meta.white エンジンが先手として対局した数・勝数
     b_sente_games: u32,
     b_sente_wins: u32,
+    retry: RetryAnalysisStats,
     extra: FileExtraStats,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RetryAnalysisStats {
+    error_games: u32,
+    error_pairs: u32,
+    retried_pairs: u32,
+    exhausted_pairs: u32,
 }
 
 /// 対戦カード（先手, 後手）ごとの集計
@@ -240,6 +251,79 @@ struct FileExtraStats {
 }
 
 #[derive(Default)]
+struct ParsedGameStats {
+    black_wins: u32,
+    white_wins: u32,
+    draws: u32,
+    a_sente_games: u32,
+    a_sente_wins: u32,
+    b_sente_games: u32,
+    b_sente_wins: u32,
+    extra: FileExtraStats,
+}
+
+fn record_valid_result(
+    result: &ResultLog,
+    black: &str,
+    white: &str,
+    meta_parsed: bool,
+    stats: &mut ParsedGameStats,
+) {
+    stats.extra.completed_games += 1;
+    stats.extra.total_plies += result.plies as u64;
+    if let Some(winner) = result.winner.as_ref() {
+        let winner_id = if meta_parsed && (black == winner || white == winner) {
+            winner.clone()
+        } else {
+            extract_engine_id(winner)
+        };
+        if winner_id == black {
+            stats.black_wins += 1;
+        } else if winner_id == white {
+            stats.white_wins += 1;
+        }
+        match result.outcome.as_str() {
+            "black_win" => {
+                stats.extra.black_wins += 1;
+                if winner_id == black {
+                    stats.a_sente_games += 1;
+                    stats.a_sente_wins += 1;
+                } else if winner_id == white {
+                    stats.b_sente_games += 1;
+                    stats.b_sente_wins += 1;
+                }
+            }
+            "white_win" => {
+                stats.extra.white_wins += 1;
+                if winner_id == black {
+                    stats.b_sente_games += 1;
+                } else if winner_id == white {
+                    stats.a_sente_games += 1;
+                }
+            }
+            "draw" => stats.extra.draws += 1,
+            _ => {}
+        }
+    } else {
+        match result.outcome.as_str() {
+            "black_win" => {
+                stats.black_wins += 1;
+                stats.extra.black_wins += 1;
+            }
+            "white_win" => {
+                stats.white_wins += 1;
+                stats.extra.white_wins += 1;
+            }
+            "draw" => {
+                stats.draws += 1;
+                stats.extra.draws += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Default)]
 struct EngineMoveStats {
     moves: u64,
     elapsed_ms_sum: u64,
@@ -270,6 +354,7 @@ struct AggregatedExtraStats {
     black_wins: u32,
     white_wins: u32,
     draws: u32,
+    retry: RetryAnalysisStats,
     engine_moves: BTreeMap<String, EngineMoveStats>,
 }
 
@@ -335,6 +420,11 @@ struct JsonExtra {
     white_win_rate_decisive: f64,
     completed_games: u32,
     draws: u32,
+    error_games: u32,
+    error_pairs: u32,
+    retried_pairs: u32,
+    exhausted_pairs: u32,
+    invalid: bool,
     engine_timing: Vec<JsonEngineTiming>,
 }
 
@@ -465,6 +555,7 @@ fn parse_summary_file(path: &str) -> Result<FileResult> {
             a_sente_wins: 0,
             b_sente_games: 0,
             b_sente_wins: 0,
+            retry: RetryAnalysisStats::default(),
             extra: FileExtraStats::default(),
         });
     }
@@ -479,16 +570,15 @@ fn parse_normal_file(path: &str) -> Result<FileResult> {
     let mut games: u32 = 0;
     let mut black = String::new();
     let mut white = String::new();
-    let mut black_wins: u32 = 0;
-    let mut white_wins: u32 = 0;
-    let mut draws: u32 = 0;
     let mut meta_parsed = false;
-    // per-engine sente/gote stats (a = meta.black engine, b = meta.white engine)
-    let mut a_sente_games: u32 = 0;
-    let mut a_sente_wins: u32 = 0;
-    let mut b_sente_games: u32 = 0;
-    let mut b_sente_wins: u32 = 0;
-    let mut extra = FileExtraStats::default();
+    let mut stats = ParsedGameStats::default();
+    let mut pair_buffer: BTreeMap<(u32, u32), [Option<ResultLog>; 2]> = BTreeMap::new();
+    let mut completed_pairs: HashSet<(u32, u32)> = HashSet::new();
+    let mut seq = 0u32;
+    let mut error_pairs = HashSet::new();
+    let mut retried_pairs = HashSet::new();
+    let mut exhausted_pairs = HashSet::new();
+    let mut error_games = 0u32;
 
     for line in reader.lines() {
         let line = line?;
@@ -516,7 +606,7 @@ fn parse_normal_file(path: &str) -> Result<FileResult> {
                 .with_context(|| format!("moveパースエラー: {path}"))?;
             let _ = mv.game_id;
             let engine_name = normalize_engine_name(&mv.engine, &black, &white, meta_parsed);
-            let engine_stats = extra.engine_moves.entry(engine_name).or_default();
+            let engine_stats = stats.extra.engine_moves.entry(engine_name).or_default();
             engine_stats.moves += 1;
             engine_stats.elapsed_ms_sum += mv.elapsed_ms;
             engine_stats.think_limit_ms_sum += mv.think_limit_ms;
@@ -552,91 +642,80 @@ fn parse_normal_file(path: &str) -> Result<FileResult> {
         } else if trimmed.contains("\"type\":\"result\"") {
             let result: ResultLog = serde_json::from_str(trimmed)
                 .with_context(|| format!("resultパースエラー: {path}"))?;
-            extra.completed_games += 1;
-            extra.total_plies += result.plies as u64;
-            if let Some(ref winner) = result.winner {
-                // winner フィールドあり: エンジン名で集計（tournament.rs 形式）
-                // meta にラベルがある場合は winner もラベルそのままなので正規化不要。
-                // 旧形式（ラベルなし）では winner がパス由来なので extract_engine_id で正規化。
-                let winner_id = if meta_parsed && (black == *winner || white == *winner) {
-                    winner.clone()
+            let pair_index = result.pair_index.unwrap_or(seq / 2);
+            let slot = result.pair_slot.unwrap_or(seq % 2).min(1) as usize;
+            seq += 1;
+            if result.error.unwrap_or(false) {
+                error_games += 1;
+                error_pairs.insert(pair_index);
+            }
+            if result.attempt > 0 {
+                retried_pairs.insert(pair_index);
+            }
+            let key = (pair_index, result.attempt);
+            if completed_pairs.contains(&key) {
+                eprintln!(
+                    "警告: {path} — 直接対決の pair_index={pair_index}, attempt={}, slot={slot} は既に集計済みです。重複結果を除外します。",
+                    result.attempt
+                );
+                continue;
+            }
+            let entry = pair_buffer.entry(key).or_insert([None, None]);
+            if entry[slot].is_some() {
+                eprintln!(
+                    "警告: {path} — 直接対決の pair_index={pair_index}, attempt={}, slot={slot} が重複しています。重複結果を除外します。",
+                    result.attempt
+                );
+                continue;
+            }
+            entry[slot] = Some(result);
+            if entry.iter().all(Option::is_some) {
+                let completed = pair_buffer
+                    .remove(&key)
+                    .with_context(|| format!("ペア集計状態が失われました: {path}"))?;
+                let has_error = completed.iter().flatten().any(|game| game.error.unwrap_or(false));
+                if has_error {
+                    if key.1 >= 2 {
+                        exhausted_pairs.insert(pair_index);
+                    }
                 } else {
-                    extract_engine_id(winner)
-                };
-                if winner_id == black {
-                    black_wins += 1;
-                } else if winner_id == white {
-                    white_wins += 1;
+                    for game in completed.iter().flatten() {
+                        record_valid_result(game, &black, &white, meta_parsed, &mut stats);
+                    }
                 }
-                // outcome + winner から各対局の先手/後手を判定
-                // outcome="black_win" → 先手が勝ち → winner が先手だった
-                // outcome="white_win" → 後手が勝ち → winner が後手だった
-                match result.outcome.as_str() {
-                    "black_win" => {
-                        extra.black_wins += 1;
-                        // winner が先手
-                        if winner_id == black {
-                            a_sente_games += 1;
-                            a_sente_wins += 1;
-                        } else if winner_id == white {
-                            b_sente_games += 1;
-                            b_sente_wins += 1;
-                        }
-                        // 敗者は後手
-                        // (後手 games は done - sente_games で算出)
-                    }
-                    "white_win" => {
-                        extra.white_wins += 1;
-                        // winner が後手 → 敗者が先手
-                        if winner_id == black {
-                            // black engine が後手で勝ち → white engine が先手で負け
-                            b_sente_games += 1;
-                        } else if winner_id == white {
-                            // white engine が後手で勝ち → black engine が先手で負け
-                            a_sente_games += 1;
-                        }
-                    }
-                    "draw" => {
-                        extra.draws += 1;
-                    }
-                    _ => {}
-                }
-            } else {
-                // winner なし: 旧形式または引分
-                match result.outcome.as_str() {
-                    "black_win" => {
-                        black_wins += 1;
-                        extra.black_wins += 1;
-                    }
-                    "white_win" => {
-                        white_wins += 1;
-                        extra.white_wins += 1;
-                    }
-                    "draw" => {
-                        draws += 1;
-                        extra.draws += 1;
-                    }
-                    _ => {}
-                }
+                completed_pairs.insert(key);
             }
         }
         // move行・metrics行等はスキップ
     }
 
-    let done = black_wins + white_wins + draws;
+    if !pair_buffer.is_empty() {
+        eprintln!(
+            "情報: {path} — {} ペアが未完了（片スロット欠け）のため直接対決集計から除外されました",
+            pair_buffer.len()
+        );
+    }
+
+    let done = stats.black_wins + stats.white_wins + stats.draws;
     Ok(FileResult {
         black,
         white,
         games,
-        black_wins,
-        white_wins,
-        draws,
+        black_wins: stats.black_wins,
+        white_wins: stats.white_wins,
+        draws: stats.draws,
         done,
-        a_sente_games,
-        a_sente_wins,
-        b_sente_games,
-        b_sente_wins,
-        extra,
+        a_sente_games: stats.a_sente_games,
+        a_sente_wins: stats.a_sente_wins,
+        b_sente_games: stats.b_sente_games,
+        b_sente_wins: stats.b_sente_wins,
+        retry: RetryAnalysisStats {
+            error_games,
+            error_pairs: error_pairs.len() as u32,
+            retried_pairs: retried_pairs.len() as u32,
+            exhausted_pairs: exhausted_pairs.len() as u32,
+        },
+        extra: stats.extra,
     })
 }
 
@@ -936,173 +1015,6 @@ fn infer_labels_from_meta(
     Ok(Some(inferred))
 }
 
-/// 単一 JSONL ファイルから base/test ペアに該当する Penta を集計する。
-///
-/// - ファイルの meta が base/test 両方のラベルを含まなければ `Penta::ZERO`
-/// - `pair_index` が無い旧ログは `seq / 2` / `seq % 2` でペアリング
-/// - `error=true` の結果は除外
-/// - 破損 meta/result 行があれば `Err` を返す。呼び出し側（main の for ループ）は
-///   これを `eprintln!` の警告に降格してそのファイル分だけ統計から除外するため、
-///   破損ファイルが混ざると Penta が無告知で過小集計される点に注意
-///   （`--strict` フラグ等は未実装。破損を絶対に見逃したくない場合は事前に jsonl を検証すること）
-fn collect_sprt_penta(path: &str, base: &str, test: &str) -> Result<Penta> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("ファイルを開けません: {path}"))?;
-    let reader = BufReader::new(file);
-
-    let mut meta_labels: Option<(String, String)> = None;
-    let mut pair_buffer: BTreeMap<u32, [Option<GameSide>; 2]> = BTreeMap::new();
-    // ペア完成後にバッファから remove するので、`pair_buffer` だけでは
-    // 「その pair_index は既に集計済み」かどうか判定できない。
-    // 3 件目以降の重複到着を正しく検出するため、処理済み pair_index を別に保持する。
-    let mut completed_pairs: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut total = Penta::ZERO;
-    let mut seq: u32 = 0;
-    let mut warned_missing_pair_index = false;
-
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // 高速パス: 軽量 contains で meta/result 候補行だけ絞り込み、
-        // 絞り込んだ行は直接ターゲット型にパースして失敗時は bail（破損検知）。
-        // 全行を `serde_json::Value` へ変換するとホット move 行で重いため避ける。
-        // tournament.rs はコンパクト JSON を書き出すので contains で十分機能する。
-        // 注: 外部ツールで整形された jsonl（`"type": "meta"` のようにスペース入り）は
-        // ここでヒットせず SPRT 集計から無告知で外れる。現状は tournament.rs 出力のみ
-        // 想定の割り切り。整形済み jsonl を扱う要求が出たら JSON Value 判定に切り替える。
-        if meta_labels.is_none() && trimmed.contains("\"type\":\"meta\"") {
-            let meta: MetaLog = serde_json::from_str(trimmed)
-                .with_context(|| format!("metaパースエラー: {path}"))?;
-            let black = meta
-                .engine_cmd
-                .label_black
-                .clone()
-                .unwrap_or_else(|| extract_engine_id(&meta.engine_cmd.path_black));
-            let white = meta
-                .engine_cmd
-                .label_white
-                .clone()
-                .unwrap_or_else(|| extract_engine_id(&meta.engine_cmd.path_white));
-            let match_pair = (black == base && white == test) || (black == test && white == base);
-            if !match_pair {
-                return Ok(Penta::ZERO);
-            }
-            meta_labels = Some((black, white));
-        } else if trimmed.contains("\"type\":\"result\"") {
-            let Some((label_black_meta, label_white_meta)) = meta_labels.as_ref() else {
-                continue;
-            };
-            let result: ResultLog = serde_json::from_str(trimmed)
-                .with_context(|| format!("resultパースエラー: {path}"))?;
-            if result.error.unwrap_or(false) {
-                continue;
-            }
-            if result.pair_index.is_none() && !warned_missing_pair_index {
-                eprintln!(
-                    "警告: {path} は pair_index を含まない旧形式ログです。\n\
-                     SPRT ペアリングは result の出現順 (seq / 2, seq % 2) でフォールバックしますが、\n\
-                     並列対局ログでは完了順がずれている可能性があるため結果は正確でない場合があります。"
-                );
-                warned_missing_pair_index = true;
-            }
-            let pair_idx = result.pair_index.unwrap_or(seq / 2);
-            let slot_hint = result.pair_slot.unwrap_or(seq % 2);
-            seq += 1;
-            let slot = slot_hint.min(1) as usize;
-
-            // 既に集計済みの pair_index に 3 件目以降が到着した場合は除外する。
-            // test_side 決定より前に診断することで、ログ破損 (winner/outcome 不正) で
-            // test_side の match が `continue` に落ちても警告は確実に出る。
-            if completed_pairs.contains(&pair_idx) {
-                eprintln!(
-                    "警告: {path} — pair_index={pair_idx} は既に集計済みです。\
-                     余剰データを除外します。"
-                );
-                continue;
-            }
-
-            // test 視点の Win/Draw/Loss を決定する。
-            //
-            // 優先: tournament.rs が書く `winner` フィールド (エンジンラベルそのもの)。
-            // 旧ログ (winner なし) は pair_slot から実黒を推定:
-            //   slot == 0 → meta.label_black が実際の黒
-            //   slot == 1 → meta.label_white が実際の黒（先後入替）
-            let test_side = if let Some(winner) = result.winner.as_deref() {
-                match result.outcome.as_str() {
-                    "black_win" | "white_win" => {
-                        if winner == test {
-                            GameSide::Win
-                        } else if winner == base {
-                            GameSide::Loss
-                        } else {
-                            continue;
-                        }
-                    }
-                    "draw" => GameSide::Draw,
-                    _ => continue,
-                }
-            } else {
-                let actual_black = if slot == 0 {
-                    label_black_meta.as_str()
-                } else {
-                    label_white_meta.as_str()
-                };
-                let test_is_black = actual_black == test;
-                match result.outcome.as_str() {
-                    "black_win" => {
-                        if test_is_black {
-                            GameSide::Win
-                        } else {
-                            GameSide::Loss
-                        }
-                    }
-                    "white_win" => {
-                        if test_is_black {
-                            GameSide::Loss
-                        } else {
-                            GameSide::Win
-                        }
-                    }
-                    "draw" => GameSide::Draw,
-                    _ => continue,
-                }
-            };
-
-            let entry = pair_buffer.entry(pair_idx).or_insert([None, None]);
-            if entry[slot].is_none() {
-                entry[slot] = Some(test_side);
-            } else if entry[1 - slot].is_none() {
-                // 同 slot が 2 度到着するのは通常の tournament 出力では起き得ない。
-                // 空きスロットに入れつつ警告する。
-                eprintln!(
-                    "警告: {path} — pair_index={pair_idx} の slot={slot} が重複しています。\
-                     空きスロットに配置しますが、結果は正確でない可能性があります。"
-                );
-                entry[1 - slot] = Some(test_side);
-            }
-            // else: entry[slot] も entry[1-slot] も埋まっているケースは
-            // 上の `completed_pairs` チェックで弾かれるため到達しない。
-
-            if let [Some(a), Some(b)] = *entry {
-                total += Penta::from_pair(a, b);
-                pair_buffer.remove(&pair_idx);
-                completed_pairs.insert(pair_idx);
-            }
-        }
-    }
-    if !pair_buffer.is_empty() {
-        eprintln!(
-            "情報: {path} — {} ペアが未完了（片スロット欠け）のため SPRT 集計から除外されました",
-            pair_buffer.len()
-        );
-    }
-    Ok(total)
-}
-
 fn build_sprt_json(
     penta: Penta,
     base_label: &str,
@@ -1324,6 +1236,10 @@ fn main() -> Result<()> {
                 extra.black_wins += result.extra.black_wins;
                 extra.white_wins += result.extra.white_wins;
                 extra.draws += result.extra.draws;
+                extra.retry.error_games += result.retry.error_games;
+                extra.retry.error_pairs += result.retry.error_pairs;
+                extra.retry.retried_pairs += result.retry.retried_pairs;
+                extra.retry.exhausted_pairs += result.retry.exhausted_pairs;
                 for (engine, move_stats) in result.extra.engine_moves {
                     merge_engine_move_stats(
                         extra.engine_moves.entry(engine).or_default(),
@@ -1773,7 +1689,7 @@ fn print_text(
         }
     }
 
-    if extra.completed_games > 0 {
+    if extra.completed_games > 0 || extra.retry.error_games > 0 {
         println!();
         println!("追加統計");
         println!("{}", "=".repeat(75));
@@ -1790,12 +1706,28 @@ fn print_text(
         };
         println!(
             "  平均手数: {:.1} plies ({}局)",
-            extra.total_plies as f64 / extra.completed_games as f64,
+            if extra.completed_games > 0 {
+                extra.total_plies as f64 / extra.completed_games as f64
+            } else {
+                0.0
+            },
             extra.completed_games
         );
         println!(
             "  先手勝率: {:.1}% ({}/{} 決着局), 後手勝率: {:.1}% ({}/{} 決着局), 引分: {}",
             black_wr, extra.black_wins, decisive, white_wr, extra.white_wins, decisive, extra.draws
+        );
+        println!(
+            "  error局: {}, errorペア: {}, 再試行ペア: {}, 枯渇ペア: {}{}",
+            extra.retry.error_games,
+            extra.retry.error_pairs,
+            extra.retry.retried_pairs,
+            extra.retry.exhausted_pairs,
+            if extra.retry.exhausted_pairs > 0 {
+                " (invalid)"
+            } else {
+                ""
+            },
         );
         let mut move_stats: Vec<_> = extra.engine_moves.iter().collect();
         move_stats.sort_by(|(id_a, _), (id_b, _)| {
@@ -2037,6 +1969,11 @@ fn print_json(
             },
             completed_games: extra.completed_games,
             draws: extra.draws,
+            error_games: extra.retry.error_games,
+            error_pairs: extra.retry.error_pairs,
+            retried_pairs: extra.retry.retried_pairs,
+            exhausted_pairs: extra.retry.exhausted_pairs,
+            invalid: extra.retry.exhausted_pairs > 0,
             engine_timing: json_engine_timing,
         },
         sprt,
@@ -2050,6 +1987,20 @@ fn print_json(
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn meta_accepts_settings_with_and_without_seed() {
+        let meta_json = |settings| {
+            format!(
+                r#"{{"settings":{settings},"engine_cmd":{{"path_black":"/b","path_white":"/w"}}}}"#
+            )
+        };
+
+        for settings in [r#"{"games":2}"#, r#"{"games":2,"seed":42}"#] {
+            let meta: MetaLog = serde_json::from_str(&meta_json(settings)).unwrap();
+            assert_eq!(meta.settings.games, 2);
+        }
+    }
 
     #[test]
     fn h2h_places_sprt_test_on_the_left() {
@@ -2221,6 +2172,85 @@ mod tests {
 
         let err = collect_sprt_penta(&path.display().to_string(), "a", "b").unwrap_err();
         assert!(err.to_string().contains("resultパースエラー"));
+    }
+
+    fn write_retry_log(lines: &[&str]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{{\"type\":\"meta\",\"settings\":{{\"games\":2}},\
+             \"engine_cmd\":{{\"path_black\":\"/base\",\"path_white\":\"/test\",\
+             \"label_black\":\"base\",\"label_white\":\"test\"}}}}"
+        )
+        .unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        (dir, path.display().to_string())
+    }
+
+    #[test]
+    fn retry_generation_replaces_error_generation_for_direct_and_penta() {
+        let (_dir, path) = write_retry_log(&[
+            r#"{"type":"result","outcome":"white_win","winner":"test","plies":20,"pair_index":0,"pair_slot":0}"#,
+            r#"{"type":"result","outcome":"draw","plies":0,"pair_index":0,"pair_slot":1,"error":true}"#,
+            r#"{"type":"result","outcome":"white_win","winner":"test","plies":30,"pair_index":0,"pair_slot":0,"attempt":1}"#,
+            r#"{"type":"result","outcome":"black_win","winner":"test","plies":40,"pair_index":0,"pair_slot":1,"attempt":1}"#,
+        ]);
+
+        let parsed = parse_normal_file(&path).unwrap();
+        assert_eq!(parsed.done, 2);
+        assert_eq!(parsed.black_wins, 0);
+        assert_eq!(parsed.white_wins, 2);
+        assert_eq!(parsed.draws, 0);
+        assert_eq!(parsed.retry.error_games, 1);
+        assert_eq!(parsed.retry.error_pairs, 1);
+        assert_eq!(parsed.retry.retried_pairs, 1);
+        assert_eq!(parsed.retry.exhausted_pairs, 0);
+
+        let penta = collect_sprt_penta(&path, "base", "test").unwrap();
+        assert_eq!(
+            penta,
+            Penta {
+                ww: 1,
+                ..Penta::ZERO
+            },
+            "live SPRT と同じ世代入力は retry 世代の WW 1 ペアだけになる"
+        );
+    }
+
+    #[test]
+    fn direct_aggregation_keeps_first_result_for_duplicate_slot() {
+        let (_dir, path) = write_retry_log(&[
+            r#"{"type":"result","outcome":"black_win","winner":"base","plies":20,"pair_index":0,"pair_slot":0}"#,
+            r#"{"type":"result","outcome":"white_win","winner":"test","plies":30,"pair_index":0,"pair_slot":0}"#,
+            r#"{"type":"result","outcome":"white_win","winner":"base","plies":40,"pair_index":0,"pair_slot":1}"#,
+        ]);
+
+        let parsed = parse_normal_file(&path).unwrap();
+        assert_eq!(parsed.done, 2);
+        assert_eq!(parsed.black_wins, 2);
+        assert_eq!(parsed.white_wins, 0);
+    }
+
+    #[test]
+    fn attempt_defaults_to_zero_and_exhausted_pair_is_excluded() {
+        let legacy: ResultLog =
+            serde_json::from_str(r#"{"outcome":"draw","pair_index":7,"pair_slot":0}"#).unwrap();
+        assert_eq!(legacy.attempt, 0);
+
+        let (_dir, path) = write_retry_log(&[
+            r#"{"type":"result","outcome":"draw","pair_index":0,"pair_slot":0,"attempt":2,"error":true}"#,
+            r#"{"type":"result","outcome":"white_win","winner":"base","pair_index":0,"pair_slot":1,"attempt":2}"#,
+        ]);
+        let parsed = parse_normal_file(&path).unwrap();
+        assert_eq!(parsed.done, 0);
+        assert_eq!(parsed.retry.error_pairs, 1);
+        assert_eq!(parsed.retry.retried_pairs, 1);
+        assert_eq!(parsed.retry.exhausted_pairs, 1);
+        assert_eq!(collect_sprt_penta(&path, "base", "test").unwrap(), Penta::ZERO);
     }
 
     fn write_meta_jsonl_labels(

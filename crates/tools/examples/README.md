@@ -16,7 +16,7 @@ cargo run -p tools --release --bin tournament -- \
   --engine target/release/rshogi-usi --engine-label dev \
   --engine target/release/rshogi-usi --engine-label base \
   --games 200 --byoyomi 1000 --threads 1 --hash-mb 256 \
-  --concurrency 8 \
+  --concurrency 8 --seed 42 \
   --engine-usi-option "0:EvalFile=eval/new_model.bin" \
   --engine-usi-option "1:EvalFile=eval/base_model.bin" \
   --startpos-file start_sfens_ply24.txt \
@@ -30,7 +30,7 @@ cargo run -p tools --release --bin tournament -- \
   --engine target/release/rshogi-usi --engine-label rshogi \
   --engine /path/to/YaneuraOu-by-gcc --engine-label yaneuraou \
   --games 100 --byoyomi 500 --threads 1 --hash-mb 256 \
-  --concurrency 8 \
+  --concurrency 8 --seed 42 \
   --usi-option "EvalFile=eval/halfkp_256x2-32-32_crelu/suisho5.bin" \
   --engine-usi-option "1:FV_SCALE=24" \
   --engine-usi-option "1:PvInterval=0" \
@@ -45,7 +45,7 @@ cargo run -p tools --release --bin tournament -- \
   --engine target/release/rshogi-usi --engine-label dev \
   --engine target/release/rshogi-usi --engine-label base \
   --games 100 --depth 10 --threads 1 --hash-mb 256 \
-  --concurrency 8 \
+  --concurrency 8 --seed 42 \
   --out-dir "runs/selfplay/$(date +%Y%m%d_%H%M%S)_depth10"
 ```
 
