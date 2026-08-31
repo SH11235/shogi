@@ -201,7 +201,7 @@ mkdir -p "$OUT"
 
 複数の rshogi process を起動する run では、各 side の実 binary を `exec` する wrapper を
 起動前に生成し、`tournament --engine` には実 binary でなく wrapper を渡す。wrapper は
-process ごとに `$OUT/engine-stderr/<side>-<pid>.log` を作るので、正常終了した process の
+process ごとに `$OUT/engine-stderr/<side>-<unique>.log` を作るので、正常終了した process の
 共有重み marker も失われない。既存 process log が 1 件でもある `$OUT` では生成を拒否する。
 その場合は旧 run を再利用せず、新しい run directory を作る。
 
@@ -209,7 +209,7 @@ process ごとに `$OUT/engine-stderr/<side>-<pid>.log` を作るので、正常
 make_rshogi_wrapper() {
   side=$1
   case "$side" in
-    '' | *[!A-Za-z0-9._-]*)
+    '' | . | .. | *[!A-Za-z0-9._-]*)
       printf 'invalid engine side: %s\n' "$side" >&2
       return 1
       ;;
@@ -234,7 +234,8 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 log_dir=$(dirname -- "$script_dir")
 side=$(basename -- "$script_dir")
 IFS= read -r real_bin < "$script_dir/real-bin"
-exec "$real_bin" "$@" 2>> "$log_dir/$side-$$.log"
+log_file=$(mktemp "$log_dir/$side-XXXXXX.log")
+exec "$real_bin" "$@" 2>> "$log_file"
 SH
   chmod 700 "$side_dir/run" || return 1
   printf '%s\n' "$side_dir/run"
@@ -260,7 +261,9 @@ side 別 wrapper のパスを指定する。
 
 ```
 cargo run -p tools --release --bin tournament -- \
-  --engine {ENGINE_A} --engine {ENGINE_B} [--engine {ENGINE_C} ...] \
+  --engine {ENGINE_A} --engine-label {SIDE_A} \
+  --engine {ENGINE_B} --engine-label {SIDE_B} \
+  [--engine {ENGINE_C} --engine-label {SIDE_C} ...] \
   --games {GAMES} --byoyomi {BYOYOMI} --hash-mb {HASH} --threads {THREADS} \
   --concurrency {CONCURRENCY} \
   --seed {SEED} \
