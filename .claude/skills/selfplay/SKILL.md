@@ -6,6 +6,9 @@ user-invocable: true
 # 自己対局評価スキル
 
 以下の指示に従い、指定されたエンジン間の対局を実行し結果を集計する。
+統計規範 (SPRT bounds・試行規律・採否判定) の正典は rshogi-notes
+`rshogi/testing_policy.md`。本 SKILL はそれを実行手順に翻訳したもので、
+規範から逸脱する場合は実験 doc に理由を事前登録する。
 モードは主に 3 つ:
 
 1. **総当たり (round-robin)** — 固定局数で全ペアを対局させて Elo 差・勝率を測る。デフォルト。
@@ -41,6 +44,13 @@ user-invocable: true
 かかる。確認時は「現在の CPU 負荷状況 (同時稼働中の学習/ベンチの有無とスレッド数)」を
 添えて尋ねる。
 
+Linux / WSL2 で複数プロセスを並走させる場合は、開始前に `df -h /dev/shm` で空き容量も
+確認する。NNUE 共有重みの確保失敗は local heap へ無言でフォールバックし、片側だけの
+fallback が A/B の偽差を生み得るため、満杯・僅少なら解消するまで起動しない。正常時の
+engine stderr は `tournament` が内部 buffer に取り込むだけで永続化しないため、下記の
+side 別 wrapper で rshogi の stderr を保存する。終了後の marker 確認は
+「完了待ち・結果集計」の必須チェックに含める。
+
 #### (b) time control: `--byoyomi` vs `--nodes`
 
 **比較するエンジン構成によって選択則が異なる**:
@@ -48,22 +58,49 @@ user-invocable: true
 | 比較軸 | 推奨 time control | 理由 |
 |---|---|---|
 | **同 FS 同 arch、重み差のみ (recipe / 量子化 / SPSA 差等)** | **`--nodes <N>`** (固定ノード) | NPS 差なし、CPU 競合の影響も排除して clean に重み差を抽出 |
-| **異 FS / 異 arch (feature-set 差、dim 差、PSQT 有無差等)** | **`--byoyomi <ms>`** (固定時間) | 実戦強度 = eval 品質 × NPS。NPS 差を含めた total strength を測る |
+| **search / 異 FS / 異 arch / 速度が変わる変更** (探索変更、feature-set 差、dim 差、PSQT 有無差等) | **`--byoyomi <ms>`** (固定時間) | 実戦強度 = eval 品質 × NPS。NPS 差を含めた total strength を測る |
 | (補助) 異 FS で eval 品質を切り分けて測りたい | 両方 (固定時間 + 固定ノード) | featureset-sweep 実験ログ (rshogi-nnue docs/experiments) §10-F / §10-E pattern |
 
-異 FS 対局を固定ノードでやると、本来実戦強度に効く NPS 差 (例: HalfKP の avg_nodes
+search / FS / arch / 速度が変わる対局を固定ノードでやると、本来実戦強度に効く NPS 差 (例: HalfKP の avg_nodes
 は HalfKA_HM_merged より +6-14% 多い) を切り捨ててしまい、デプロイ実態と乖離する。
 **「前回固定ノードだったから今回も」と暗黙踏襲は禁止**、比較軸ごとに毎回相談する。
 
 #### (c) SPRT 仮説と上限局数
 
-- `--sprt-nelo0 / --sprt-nelo1 / --sprt-alpha / --sprt-beta`: 検出したい最小 Elo 差と
-  許容誤り率。デフォルト (H0=0 / H1=+5 / α=β=0.05) は出発点だが、解像度を上げたい /
-  下げたい場合は別の値が必要。
-- `--games`: 上限局数。境界に達しなかった場合の打ち切り基準。長時間 run になり得る
-  ので CPU 占有見積もりとともに確認。
+- 標準 bounds は testing_policy の用途別 2 種 (α=β=0.05):
+  - **gainer (強くする変更)**: `--sprt-nelo0 0 --sprt-nelo1 10`
+  - **simplification / non-regression**: `--sprt-nelo0 -10 --sprt-nelo1 0`
+- simplification の `<-10, 0>` は -5 nElo 級の退行を検出せず通し得る。簡略化 SPRT を
+  乱発せず、保守性が必要なら期待局数を見積もり、より狭い bounds を事前登録する。
+- **4 パラメータ (`--sprt-nelo0 / --sprt-nelo1 / --sprt-alpha / --sprt-beta`) は常に明示する**。
+  CLI 既定値 (H0=0 / H1=+5) は規約標準と異なるため、省略すると別の検定が走る。
+  標準以外の bounds を使う場合は実験 doc に理由を事前登録した上で。
+- `--games`: 上限局数。**各方向の局数**であり、標準上限は `--games 5000` = 総 10,000 局。
+  上限到達で境界未達なら inconclusive = **その patch は採用しない** (ただし accept_h0 と
+  異なりアイデア族の終了ではない。再挑戦の条件は testing_policy §2)。上限延長は事前宣言
+  した場合のみ、**到達前に** `control.json` の `target_games` で行う (到達後は延長不能)。
+- **走行中の SPRT を途中停止しない** (LLR の途中値は停止理由にならない。例外 3 種は
+  testing_policy §2 参照)。
+- **試行規律のチェック** (詳細は testing_policy §2): 正式 SPRT は同一アイデア族で
+  最大 3 回 / 同一 patch・同一条件の引き直し禁止 / `accept_h0` でそのアイデア族は終了 /
+  全試行を実験 doc に記録 (採用 run だけ残さない)。
 
-#### (d) startpos / engine USI option
+#### (d) 開始局面選択の seed (`--seed`)
+
+棋力評価では `--seed` の明示指定を必須とし、値を実験 doc の事前登録節に記録する
+(再現性要件、testing_policy §4)。省略時に entropy 生成値が起動ログと `meta.json` に
+出るのは、デバッグ等の非採用 run 向けの挙動であり、採否判定に使う run では
+省略しない。独立 seed での再確認 (SPSA endpoint 等) では過去 run と異なる seed を
+明示的に選ぶ。
+
+#### (e) 実験 doc の事前登録
+
+正式な棋力評価は、起動前に以下を実験 doc へ記録する: engine SHA、NNUE (ファイルと
+FV_SCALE)、USI options、startpos ファイルと hash、seed、TC (nodes / byoyomi)、threads、
+hash、SPRT bounds と上限局数。加えて rshogi-notes `rshogi/standing_rules.md` の実行機・
+backend・raw log 所在の記録要件を満たす。
+
+#### (f) startpos / engine USI option
 
 これらはモデル / 評価目的に依存。startpos は `data/startpos/start_sfens_ply32.txt`
 が default だが他にもある。USI option (FV_SCALE / LS_BUCKET_MODE / LS_PROGRESS_COEFF 等)
@@ -160,16 +197,82 @@ mkdir -p "$OUT"
 - `{PURPOSE}` はユーザーの実験目的を短く要約したもの（例: `tt-16bit`, `lmr-tuning`）
 - 検証済みの絶対パス `$OUT` を以降の `--out-dir` オプションで使用する
 
+#### Linux / WSL2: rshogi engine stderr の永続化
+
+複数の rshogi process を起動する run では、各 side の実 binary を `exec` する wrapper を
+起動前に生成し、`tournament --engine` には実 binary でなく wrapper を渡す。wrapper は
+process ごとに `$OUT/engine-stderr/<side>-<unique>.log` を作るので、正常終了した process の
+共有重み marker も失われない。既存 process log が 1 件でもある `$OUT` では生成を拒否する。
+その場合は旧 run を再利用せず、新しい run directory を作る。
+
+```bash
+make_rshogi_wrapper() {
+  side=$1
+  case "$side" in
+    '' | . | .. | *[!A-Za-z0-9._-]*)
+      printf 'invalid engine side: %s\n' "$side" >&2
+      return 1
+      ;;
+  esac
+  for old_log in "$OUT"/engine-stderr/*.log; do
+    if test -e "$old_log"; then
+      printf 'existing engine stderr log found; use a fresh OUT: %s\n' "$OUT" >&2
+      return 1
+    fi
+  done
+  if ! real_bin=$(readlink -f -- "$2") || ! test -x "$real_bin"; then
+    printf 'rshogi binary is not executable: %s\n' "$2" >&2
+    return 1
+  fi
+  side_dir="$OUT/engine-stderr/$side"
+  mkdir -p "$OUT/engine-stderr" || return 1
+  if ! mkdir "$side_dir"; then
+    printf 'engine side already exists or cannot be created (%s); use a fresh OUT: %s\n' \
+      "$side" "$OUT" >&2
+    return 1
+  fi
+  printf '%s\n' "$real_bin" > "$side_dir/real-bin" || return 1
+  cat > "$side_dir/run" <<'SH' || return 1
+#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+log_dir=$(dirname -- "$script_dir")
+side=$(basename -- "$script_dir")
+IFS= read -r real_bin < "$script_dir/real-bin"
+log_file=$(mktemp "$log_dir/$side-XXXXXX.log")
+exec "$real_bin" "$@" 2>> "$log_file"
+SH
+  chmod 700 "$side_dir/run" || return 1
+  printf '%s\n' "$side_dir/run"
+}
+
+BASE_REAL="$PWD/engines/rshogi-usi-{BASE_EDITION}"
+TEST_REAL="$PWD/engines/rshogi-usi-{TEST_EDITION}"
+BASE_ENGINE=$(make_rshogi_wrapper base "$BASE_REAL") || exit 1
+TEST_ENGINE=$(make_rshogi_wrapper test "$TEST_REAL") || exit 1
+```
+
+side 名は `base` / `test` に限らず engine label と対応する一意な名前にする。YaneuraOu など
+`nnue shared weights` marker を実装しない外部 engine は wrapper / marker 検査の対象外で、
+そのまま実 binary を `--engine` に渡す。Linux / WSL2 以外で wrapper が不要な場合は、
+`BASE_ENGINE=engines/rshogi-usi-{BASE_EDITION}` のように xtask 成果物を直接指定する。
+
 ### 3. tournament バイナリで総当たり自己対局を実行
 
 `tournament` バイナリ1コマンドで、全ペアの総当たり対局を並列実行する。
 `--engine` を複数指定すると自動で C(N,2) ペアの対局を生成する。
+Linux / WSL2 で複数の rshogi process を使う場合、`{ENGINE_A}` 等には上で生成した
+side 別 wrapper のパスを指定する。
 
 ```
 cargo run -p tools --release --bin tournament -- \
-  --engine {ENGINE_A} --engine {ENGINE_B} [--engine {ENGINE_C} ...] \
+  --engine {ENGINE_A} --engine-label {SIDE_A} \
+  --engine {ENGINE_B} --engine-label {SIDE_B} \
+  [--engine {ENGINE_C} --engine-label {SIDE_C} ...] \
   --games {GAMES} --byoyomi {BYOYOMI} --hash-mb {HASH} --threads {THREADS} \
   --concurrency {CONCURRENCY} \
+  --seed {SEED} \
+  --startpos-file data/startpos/start_sfens_ply32.txt \
   --usi-option {NNUE} \
   --out-dir "$OUT"
 ```
@@ -224,12 +327,15 @@ rshogi と YaneuraOu のように異なるエンジンを対局させる場合�
 
 ```
 cargo run -p tools --release --bin tournament -- \
-  --engine target/rshogi-usi-{HASH} \
-  --engine /path/to/YaneuraOu-binary \
+  --engine "$BASE_ENGINE" --engine-label base \
+  --engine /path/to/YaneuraOu-binary --engine-label test \
   --engine-usi-option "0:EvalFile=eval/halfkp_256x2-32-32_crelu/suisho5.bin" \
   --engine-usi-option "1:EvalDir=/path/to/eval" \
   --engine-usi-option "1:BookFile=no_book" \
-  --games 100 --byoyomi 3000 --concurrency 5 \
+  --games 100 --byoyomi 3000 --hash-mb 256 --threads 1 \
+  --concurrency 5 --seed {SEED} \
+  --startpos-file data/startpos/start_sfens_ply32.txt \
+  --base-label base \
   --out-dir "$OUT"
 ```
 
@@ -258,6 +364,41 @@ nElo はペア単位 (同一開始局面・先後入替) で集計し、開始�
 3. **確認ポイントの評価**: ユーザーが指定した比較ポイントについての分析
 4. **総括**: 全体的な傾向と推奨事項
 
+採否判定の前に以下も確認する:
+
+- **`max_moves` 到達率**: `analyze_selfplay` の専用計数が未実装の間は、JSONL の
+  `reason="max_moves"` を直接集計する。到達率 0.1% 未満は現状維持、0.1% 以上は長手数局を
+  調査し、1% 以上は bounds の解釈より先に上限または千日手等のルール処理を見直す。
+- **NNUE 共有重み** (Linux / WSL2 の複数 rshogi process run): wrapper を使った各 rshogi
+  side について、全 process log に `nnue shared weights [...]` の `shared` marker があり、
+  `local` marker が無いことを確認する。missing / `local` が 1 件でもあれば結果を suspect
+  扱いにし、原因を解消して再走する。marker 非対応の外部 engine は対象に含めない。
+
+  ```bash
+  check_rshogi_shared_weights() {
+    side=$1
+    found=0
+    for log in "$OUT"/engine-stderr/"$side"-*.log; do
+      test -e "$log" || continue
+      found=1
+      if ! grep -Eq 'nnue shared weights( \[[^]]+\])?: shared' "$log" ||
+        grep -Eq 'nnue shared weights( \[[^]]+\])?: local' "$log"; then
+        printf 'suspect shared weights log: %s\n' "$log" >&2
+        return 1
+      fi
+    done
+    if test "$found" -ne 1; then
+      printf 'missing shared weights log for side: %s\n' "$side" >&2
+      return 1
+    fi
+  }
+
+  check_rshogi_shared_weights base || exit 1
+  check_rshogi_shared_weights test || exit 1
+  ```
+
+  外部 engine との例では rshogi 側だけ（例: `base`）を検査する。
+
 ### 5. SPRT モード（逐次確率比検定）
 
 2 エンジン間で「有意差があるか」を早期判定したい場合は、`tournament --sprt`
@@ -265,19 +406,24 @@ nElo はペア単位 (同一開始局面・先後入替) で集計し、開始�
 drain する。ライブで判定が走るので、従来の固定 `--games` より**大幅に時間を節約できる**
 ケースが多い（一方で、差が微妙な場合は `--games` 上限まで走る）。
 
-典型例: `base` エンジンと `test` エンジンで、H0 = 差なし / H1 = +5 nelo、α=β=0.05。
+典型例 (gainer 標準): `base` エンジンと `test` エンジンで、H0=0 / H1=+10 nelo、
+α=β=0.05、上限 `--games 5000` (総 10,000 局)。TC は比較軸選択則 (上記 (b)) に従い
+固定ノードか固定時間を選ぶ。
 
 ```
 cargo run -p tools --release --bin tournament -- \
-  --engine target/release/rshogi-usi-{BASE_HASH} --engine-label base \
-  --engine target/release/rshogi-usi-{TEST_HASH} --engine-label test \
-  --games 5000 --byoyomi 1000 --concurrency 8 \
+  --engine "$BASE_ENGINE" --engine-label base \
+  --engine "$TEST_ENGINE" --engine-label test \
+  --games 5000 {--nodes N | --byoyomi MS} --concurrency 8 \
   --startpos-file data/startpos/start_sfens_ply32.txt \
+  --seed {SEED} \
   --base-label base \
   --sprt --sprt-base-label base --sprt-test-label test \
-  --sprt-nelo0 0 --sprt-nelo1 5 --sprt-alpha 0.05 --sprt-beta 0.05 \
+  --sprt-nelo0 0 --sprt-nelo1 10 --sprt-alpha 0.05 --sprt-beta 0.05 \
   --out-dir "$OUT"
 ```
+
+simplification / non-regression の検定は `--sprt-nelo0 -10 --sprt-nelo1 0` に差し替える。
 
 ポイント:
 
@@ -292,21 +438,31 @@ cargo run -p tools --release --bin tournament -- \
   `analyze_selfplay --sprt` で再判定できる。
 - 走らせている最中に並列度を変えたい / `--games` 上限を増減したいときは、再起動せず
   `<out-dir>/control.json` で調整できる（上記「実行中の動的制御」を参照）。SPRT の
-  途中有効化のみ未対応。
+  途中有効化のみ未対応。上限延長は事前宣言した場合のみ (testing_policy §2)。
+- **run 終了時に error ペアの状況を確認する**: 最終サマリと `meta.json` の
+  `error_pairs` / `retried_pairs` / `exhausted_pairs` を見る。`exhausted_pairs > 0`
+  (meta の `invalid: true`) の run は**統計を採用しない** (統計的敗北にも変換しない)。
+  invalid は「再試行 2 回でも error が残った」という機械判定であり原因分類ではないので、
+  ログから error の帰属 (インフラ / candidate・base の crash / 原因不明) を調査して
+  testing_policy §3 の分類に従って扱う。**candidate の決定的 crash は品質 gate 失敗**
+  なので、run 中に気付いたら枯渇を待たず中断して調査する。
+- **二段検定は例外運用**: 標準は単段。release-critical な変更や SPSA endpoint 等の
+  選抜結果のみ、**独立 seed** (過去 run と異なる `--seed`) で同 bounds を再確認する。
+  詳細は testing_policy §1。
 
 境界到達時の標準出力例:
 
 ```
-[SPRT pair=240 | test vs base] LLR=+2.941 (bounds -2.94..+2.94)  nelo=+4.12 ± 1.85  penta=[3, 18, 140, 61, 18]  state=accept_h1
+[SPRT pair=2000 | test vs base] LLR=+2.979 (bounds -2.94..+2.94)  nelo=+14.01 ± 10.77  penta=[438, 20, 1000, 30, 512]  state=accept_h1
 [SPRT] terminal decision reached; draining 6 in-flight game(s)...
 ...
 === SPRT Summary (test vs base) ===
 bounds: LLR ∈ [-2.944, +2.944]  (alpha=0.05, beta=0.05)
-nelo hypotheses: H0=+0.0  H1=+5.0
-stopped_at:  pairs=240, LLR=+2.941, decision=accept_h1
-             nelo=+4.12 ± 1.85  penta=[3, 18, 140, 61, 18]
-final:       pairs=246, LLR=+3.002, decision=accept_h1
-             nelo=+4.15 ± 1.83  penta=[3, 18, 143, 64, 18]
+nelo hypotheses: H0=+0.0  H1=+10.0
+stopped_at:  pairs=2000, LLR=+2.979, decision=accept_h1
+             nelo=+14.01 ± 10.77  penta=[438, 20, 1000, 30, 512]
+final:       pairs=2006, LLR=+2.977, decision=accept_h1
+             nelo=+13.98 ± 10.75  penta=[439, 20, 1004, 30, 513]
 ================================
 ```
 
@@ -332,21 +488,25 @@ base/test のラベルは以下の順で自動推定され、推定時は根拠�
 推定された役割が逆だったらラベルを明示して再実行する。レポートには
 `{test} (test) vs {base} (base)` と nelo/elo の視点が明記されるので、
 取り違えはレポート自体から判別できる。Wald パラメータは
-CLI → meta → 既定値 (nelo0=0, nelo1=5, α=β=0.05) の順で解決される。
+CLI → meta → 既定値 (nelo0=0, nelo1=5, α=β=0.05) の順で解決される
+(この既定値は規約標準の bounds と異なるので、meta に SPRT 情報が無いログの
+再判定では 4 パラメータを明示する)。
 
 通常の集計出力の末尾に SPRT レポートが追加される（`--json` 併用時は JSON 出力に
 `sprt` フィールドが追加される）。
 
-閾値を後から振り直して「どこで打ち切れたか」を検証するのにも使える。
+閾値を後から振り直して「どこで打ち切れたか」を検証するのにも使える (これは
+診断・探索専用。採否判定は事前登録した bounds で行い、post-hoc の振り直しで
+覆さない)。
 
 ## 入力例
 
 ```
 /selfplay エンジン:
-- A: 3526b075 target/rshogi-usi-3526b075 ベースライン
-- B: 232d847d target/rshogi-usi-232d847d move ordering完了
-- D: 4778e1c6 target/rshogi-usi-4778e1c6 LMR修正（TT変更前）
-- E: 5806777e target/rshogi-usi-5806777e TT 16bit（最新）
+- A: 3526b075 engines/rshogi-usi-{A_EDITION} ベースライン
+- B: 232d847d engines/rshogi-usi-{B_EDITION} move ordering完了
+- D: 4778e1c6 engines/rshogi-usi-{D_EDITION} LMR修正（TT変更前）
+- E: 5806777e engines/rshogi-usi-{E_EDITION} TT 16bit（最新）
 
 確認ポイント:
 1. E vs D: TT 16bit の棋力効果
