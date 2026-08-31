@@ -206,6 +206,7 @@ cargo run -p tools --release --bin tournament -- \
   --games {GAMES} --byoyomi {BYOYOMI} --hash-mb {HASH} --threads {THREADS} \
   --concurrency {CONCURRENCY} \
   --seed {SEED} \
+  --startpos-file data/startpos/start_sfens_ply32.txt \
   --usi-option {NNUE} \
   --out-dir "$OUT"
 ```
