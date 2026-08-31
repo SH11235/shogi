@@ -47,7 +47,7 @@
 ///
 /// 変更は `<out-dir>/control_history.jsonl` に追記され、`pair_index` 整合は維持されるため
 /// `analyze_selfplay` の集計と矛盾しない。
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -230,6 +230,8 @@ struct MatchTicket {
     pair_index: u32,
     /// ペア内のスロット: 0 = 1 局目, 1 = 2 局目（先後入替）
     pair_slot: u32,
+    /// 同じ論理ペアを再対局した世代。初回は 0。
+    attempt: u32,
 }
 
 struct MatchResult {
@@ -241,6 +243,8 @@ struct MatchResult {
     /// エンジン起動失敗・通信エラー等で対局が成立しなかった場合 true。
     /// SPRT 集計からは除外される。
     error: bool,
+    /// この結果送信後に worker が終了する場合 true。
+    worker_retired: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -279,6 +283,7 @@ struct ResultLogEntry<'a> {
     pair_index: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pair_slot: Option<u32>,
+    attempt: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     startpos_idx: Option<u32>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -350,6 +355,16 @@ struct TournamentMeta {
     engines: Vec<EngineMetaEntry>,
     start_positions: Vec<String>,
     output_dir: String,
+    #[serde(flatten)]
+    retry: RetrySummary,
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+struct RetrySummary {
+    error_pairs: u32,
+    retried_pairs: u32,
+    exhausted_pairs: u32,
+    invalid: bool,
 }
 
 #[derive(Serialize)]
@@ -371,14 +386,16 @@ struct EngineMetaEntry {
 /// SPRT 逐次判定のランタイム状態。
 ///
 /// 視点は常に challenger (test) 側で固定される。pair 単位で集計するため、
-/// 並列ワーカーから結果が順不同に到着しても `pair_index` 経由でバッファして
+/// 並列ワーカーから結果が順不同に到着しても `(pair_index, attempt)` でバッファして
 /// 2 ゲームが揃った時点で Penta に反映する。
 struct SprtState {
     params: SprtParameters,
     base_idx: usize,
     test_idx: usize,
-    /// pair_index → そのペアの 2 スロット分の結果（test 視点）
-    buffer: HashMap<u32, [Option<GameSide>; 2]>,
+    /// (pair_index, attempt) → 同世代 2 スロット分の結果（test 視点）
+    buffer: HashMap<(u32, u32), PairObservation>,
+    /// 集計済みの (pair_index, attempt)。完成後の重複到着を除外する。
+    completed_pairs: HashSet<(u32, u32)>,
     /// 集計済みの Pentanomial
     penta: Penta,
     report_interval: u32,
@@ -390,6 +407,13 @@ struct SprtState {
     stopped_at: Option<SprtSnapshot>,
     test_label: String,
     base_label: String,
+}
+
+#[derive(Default)]
+struct PairObservation {
+    sides: [Option<GameSide>; 2],
+    received: [bool; 2],
+    error: bool,
 }
 
 #[derive(Clone)]
@@ -415,6 +439,7 @@ impl SprtState {
             base_idx,
             test_idx,
             buffer: HashMap::new(),
+            completed_pairs: HashSet::new(),
             penta: Penta::ZERO,
             report_interval: report_interval.max(1),
             last_reported_pairs: 0,
@@ -426,14 +451,11 @@ impl SprtState {
 
     /// ゲーム結果を 1 つ取り込む。
     ///
-    /// - base と test のペアでない、または error なら無視
-    /// - 両スロットが揃ったら Penta に反映し、判定を更新
+    /// - base と test のペアでなければ無視
+    /// - 同世代の両スロットが揃い、error が無ければ Penta に反映して判定を更新
     ///
     /// 戻り値: 今回の取り込みで初めて terminal に到達したら `Some(Decision)`。
     fn observe(&mut self, result: &MatchResult) -> Option<Decision> {
-        if result.error {
-            return None;
-        }
         let bi = result.ticket.black_idx;
         let wi = result.ticket.white_idx;
         let (a, b) = if bi < wi { (bi, wi) } else { (wi, bi) };
@@ -451,14 +473,36 @@ impl SprtState {
             _ => return None,
         };
 
+        let key = (result.ticket.pair_index, result.ticket.attempt);
         let slot = result.ticket.pair_slot.min(1) as usize;
-        let entry = self.buffer.entry(result.ticket.pair_index).or_insert([None, None]);
-        entry[slot] = Some(test_side);
+        if self.completed_pairs.contains(&key) {
+            eprintln!(
+                "警告: live SPRT — pair_index={}, attempt={}, slot={slot} は既に集計済みです。重複結果を除外します。",
+                key.0, key.1
+            );
+            return None;
+        }
+        let entry = self.buffer.entry(key).or_default();
+        if entry.received[slot] {
+            eprintln!(
+                "警告: live SPRT — pair_index={}, attempt={}, slot={slot} が重複しています。重複結果を除外します。",
+                key.0, key.1
+            );
+            return None;
+        }
+        entry.received[slot] = true;
+        entry.error |= result.error;
+        if !result.error {
+            entry.sides[slot] = Some(test_side);
+        }
 
-        if let ([Some(a), Some(b)], _) = (*entry, ()) {
-            let delta = Penta::from_pair(a, b);
-            self.penta += delta;
-            self.buffer.remove(&result.ticket.pair_index);
+        if entry.received.into_iter().all(|received| received) {
+            let completed = self.buffer.remove(&key)?;
+            self.completed_pairs.insert(key);
+            let (a, b) = (!completed.error)
+                .then(|| completed.sides[0].zip(completed.sides[1]))
+                .flatten()?;
+            self.penta += Penta::from_pair(a, b);
 
             if self.stopped_at.is_none() {
                 let decision = judge(&self.params, self.penta);
@@ -527,7 +571,7 @@ impl SprtState {
     }
 }
 
-fn print_sprt_final(state: &SprtState) {
+fn print_sprt_final(state: &SprtState, retry: RetrySummary) {
     let (lo, hi) = state.params.llr_bounds();
     let current_llr = state.params.llr(state.penta);
     let current_decision = judge(&state.params, state.penta);
@@ -567,6 +611,9 @@ fn print_sprt_final(state: &SprtState) {
         println!("             nelo=n/a  penta={}", state.penta);
     }
     println!("================================");
+    if retry.invalid {
+        println!("WARNING: invalid test — exhausted error pairs: {}", retry.exhausted_pairs);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -687,8 +734,21 @@ fn worker_main(
             (&mut right[0], &mut left[ticket.white_idx])
         };
 
-        let _ = black.new_game();
-        let _ = white.new_game();
+        // usinewgame/isready が失敗した EngineProcess は同期状態を保証できない。
+        // error 結果を 1 件返して worker ごと退役し、再試行は新しいプロセスへ渡す。
+        if let Err(e) = black.new_game().and_then(|_| white.new_game()) {
+            eprintln!("worker: new game error: {e}; retiring worker");
+            let _ = tx.send(MatchResult {
+                ticket,
+                outcome: GameOutcome::Draw,
+                reason: format!("error: new game: {e}"),
+                plies: 0,
+                move_logs: Vec::new(),
+                error: true,
+                worker_retired: true,
+            });
+            return;
+        }
 
         let start_pos = &start_positions[ticket.startpos_idx];
         let tc = TimeControl::new(btime, btime, binc, binc, byoyomi);
@@ -736,10 +796,11 @@ fn worker_main(
                     plies: result.plies,
                     move_logs,
                     error: false,
+                    worker_retired: false,
                 });
             }
             Ok(Err(e)) => {
-                eprintln!("worker: game error: {e}");
+                eprintln!("worker: game error: {e}; retiring worker");
                 let _ = tx.send(MatchResult {
                     ticket,
                     outcome: GameOutcome::Draw,
@@ -747,7 +808,9 @@ fn worker_main(
                     plies: 0,
                     move_logs,
                     error: true,
+                    worker_retired: true,
                 });
+                return;
             }
             Err(_) => {
                 eprintln!("worker: game {game_id} panicked; retiring worker");
@@ -758,6 +821,7 @@ fn worker_main(
                     plies: 0,
                     move_logs,
                     error: true,
+                    worker_retired: true,
                 });
                 return;
             }
@@ -1027,35 +1091,36 @@ fn main() -> Result<()> {
         .ok();
     }
 
+    let mut tournament_meta = TournamentMeta {
+        timestamp: timestamp.to_rfc3339(),
+        settings: MetaSettings {
+            games: cli.games * 2,
+            seed,
+            max_moves: cli.max_moves,
+            byoyomi: cli.byoyomi,
+            btime: cli.btime,
+            binc: cli.binc,
+            timeout_margin_ms: cli.timeout_margin_ms,
+            threads: cli.threads,
+            hash_mb: cli.hash_mb,
+            depth: cli.depth,
+            nodes: cli.nodes,
+        },
+        engines: (0..n)
+            .map(|i| EngineMetaEntry {
+                index: i,
+                label: engine_labels[i].clone(),
+                path: cli.engines[i].display().to_string(),
+                usi_options: engine_usi_options[i].clone(),
+                nodes: engine_nodes[i],
+            })
+            .collect(),
+        start_positions: start_commands.clone(),
+        output_dir: cli.out_dir.display().to_string(),
+        retry: RetrySummary::default(),
+    };
     // meta.json 書き出し
     {
-        let tournament_meta = TournamentMeta {
-            timestamp: timestamp.to_rfc3339(),
-            settings: MetaSettings {
-                games: cli.games * 2,
-                seed,
-                max_moves: cli.max_moves,
-                byoyomi: cli.byoyomi,
-                btime: cli.btime,
-                binc: cli.binc,
-                timeout_margin_ms: cli.timeout_margin_ms,
-                threads: cli.threads,
-                hash_mb: cli.hash_mb,
-                depth: cli.depth,
-                nodes: cli.nodes,
-            },
-            engines: (0..n)
-                .map(|i| EngineMetaEntry {
-                    index: i,
-                    label: engine_labels[i].clone(),
-                    path: cli.engines[i].display().to_string(),
-                    usi_options: engine_usi_options[i].clone(),
-                    nodes: engine_nodes[i],
-                })
-                .collect(),
-            start_positions: start_commands.clone(),
-            output_dir: cli.out_dir.display().to_string(),
-        };
         let meta_file = File::create(cli.out_dir.join("meta.json"))?;
         serde_json::to_writer_pretty(BufWriter::new(meta_file), &tournament_meta)?;
     }
@@ -1247,7 +1312,10 @@ fn main() -> Result<()> {
         pair_writers,
         pair_stats,
         pair_game_count,
+        direct_buffer: HashMap::new(),
+        direct_completed_pairs: HashSet::new(),
         completed: 0,
+        valid_completed: 0,
         sprt_state,
         stop_feeding: false,
         // 0 だと進捗が一切出ないため最低 1 に丸める。
@@ -1307,9 +1375,12 @@ fn main() -> Result<()> {
         // 送信前に target が下がった場合は `still_wanted` で再評価して破棄する。
         let offer: Option<Option<MatchTicket>> = if live_workers > desired_workers {
             Some(None)
-        } else if agg.stop_feeding {
+        } else if agg.stop_feeding && source.retry_queue.is_empty() {
             None
         } else {
+            if agg.stop_feeding && pending.as_ref().is_some_and(|ticket| ticket.attempt == 0) {
+                pending = None;
+            }
             if pending.as_ref().is_some_and(|t| !source.still_wanted(t)) {
                 pending = None; // target 減少で不要になった未送信チケットを破棄
             }
@@ -1338,6 +1409,10 @@ fn main() -> Result<()> {
                     recv(result_rx) -> result => {
                         if let Ok(result) = result {
                             agg.on_result(&result, tickets_sent, target_total)?;
+                            source.observe_result(&result);
+                            if result.worker_retired {
+                                live_workers = live_workers.saturating_sub(1);
+                            }
                         }
                     }
                 }
@@ -1355,14 +1430,22 @@ fn main() -> Result<()> {
                         &mut desired_workers,
                         agg.completed,
                     );
-                    if (!agg.stop_feeding && source.has_next()) || live_workers > desired_workers {
+                    if source.has_next() && (!agg.stop_feeding || !source.retry_queue.is_empty())
+                        || live_workers > desired_workers
+                    {
                         continue;
                     }
                     break;
                 }
                 // in-flight を drain。
                 match result_rx.recv() {
-                    Ok(result) => agg.on_result(&result, tickets_sent, target_total)?,
+                    Ok(result) => {
+                        agg.on_result(&result, tickets_sent, target_total)?;
+                        source.observe_result(&result);
+                        if result.worker_retired {
+                            live_workers = live_workers.saturating_sub(1);
+                        }
+                    }
                     Err(_) => break,
                 }
             }
@@ -1387,6 +1470,7 @@ fn main() -> Result<()> {
         pair_stats,
         sprt_state,
         completed,
+        valid_completed,
         ..
     } = agg;
 
@@ -1397,25 +1481,37 @@ fn main() -> Result<()> {
 
     // 完了直前の進捗を 1 行出す（report_interval で割り切れない端数対策）。
     // 直近のループで既に同じ行を出している場合（completed が interval の倍数）は重複を避ける。
-    if completed > 0 && !completed.is_multiple_of(cli.report_interval.max(1)) {
+    if valid_completed > 0 && !valid_completed.is_multiple_of(cli.report_interval.max(1)) {
         print_progress(
-            completed,
-            source.current_target_total().max(completed),
+            valid_completed,
+            source.current_target_total().max(valid_completed),
             &pair_stats,
             &engine_labels,
             start_time,
         );
     }
 
+    let retry_summary = source.retry_summary();
+    tournament_meta.retry = retry_summary;
+    let meta_file = File::create(cli.out_dir.join("meta.json"))?;
+    serde_json::to_writer_pretty(BufWriter::new(meta_file), &tournament_meta)?;
+
     println!();
     println!("=== Tournament Complete ===");
     println!("Total: {} games in {:.1}s", completed, start_time.elapsed().as_secs_f64());
     print_final_table(&pair_stats, &engine_labels);
+    println!(
+        "Error pairs: {}  Retried pairs: {}  Exhausted pairs: {}  Invalid: {}",
+        retry_summary.error_pairs,
+        retry_summary.retried_pairs,
+        retry_summary.exhausted_pairs,
+        retry_summary.invalid,
+    );
     println!("Output: {}", cli.out_dir.display());
     println!("===========================");
 
     if let Some(state) = sprt_state.as_ref() {
-        print_sprt_final(state);
+        print_sprt_final(state, retry_summary);
     }
 
     Ok(())
@@ -1569,9 +1665,9 @@ fn append_control_history(path: &Path, entry: &ControlHistoryEntry) -> Result<()
 /// 突き合わせて「まだ目標に達していない最初のペア」へ次のチケットを割り当てる。
 /// これにより実行中の `target_games` 増減に対局境界で追従できる。
 ///
-/// `pair_index` / `pair_slot` は通し `id` から導出（`pair_index = id / 2`, `pair_slot = id % 2`）。
-/// 各ペアの発行数は常に偶数境界で次ペアへ移るため、SPRT/pentanomial の 2 局ペアが
-/// ペア境界をまたぐことはない。
+/// 通常チケットの `pair_index` / `pair_slot` は再試行を除く発行数から導出する。
+/// 再試行チケットは新しい `id` を得る一方、元の `pair_index` / `pair_slot` を引き継ぐ。
+/// 各ペアの通常発行数は常に偶数境界で次ペアへ移るため、2 局ペアが境界をまたがない。
 struct TicketSource {
     pair_indices: Vec<(usize, usize)>,
     start_defs_len: usize,
@@ -1579,7 +1675,19 @@ struct TicketSource {
     seed: u64,
     /// ペアごとの発行済みゲーム数。
     emitted: Vec<u32>,
+    retry_queue: VecDeque<MatchTicket>,
+    retry_observations: HashMap<(u32, u32), RetryObservation>,
+    error_pairs: HashSet<u32>,
+    retried_pairs: HashSet<u32>,
+    exhausted_pairs: HashSet<u32>,
     next_id: u64,
+}
+
+#[derive(Default)]
+struct RetryObservation {
+    tickets: [Option<MatchTicket>; 2],
+    received: [bool; 2],
+    error: bool,
 }
 
 impl TicketSource {
@@ -1596,6 +1704,11 @@ impl TicketSource {
             target_per_dir,
             seed,
             emitted: vec![0; pair_count],
+            retry_queue: VecDeque::new(),
+            retry_observations: HashMap::new(),
+            error_pairs: HashSet::new(),
+            retried_pairs: HashSet::new(),
+            exhausted_pairs: HashSet::new(),
             next_id: 0,
         }
     }
@@ -1621,6 +1734,9 @@ impl TicketSource {
 
     /// 現在の目標値で、まだ発行すべきチケットが残っているか。
     fn has_next(&self) -> bool {
+        if !self.retry_queue.is_empty() {
+            return true;
+        }
         let target = self.target_per_pair();
         self.emitted.iter().any(|&e| Self::pair_needs_more(e, target))
     }
@@ -1631,6 +1747,11 @@ impl TicketSource {
     /// `target_games` が変化しても、`still_wanted` で現在値に対して再評価できる。
     /// 送信が確定したら `commit_sent` で状態を進める。
     fn peek_ticket(&self) -> Option<MatchTicket> {
+        if let Some(retry) = self.retry_queue.front() {
+            let mut ticket = retry.clone();
+            ticket.id = self.next_id;
+            return Some(ticket);
+        }
         let target = self.target_per_pair();
         let pair_pos = self.emitted.iter().position(|&e| Self::pair_needs_more(e, target))?;
         let (i, j) = self.pair_indices[pair_pos];
@@ -1643,7 +1764,9 @@ impl TicketSource {
             (j, i)
         };
         let id = self.next_id;
-        let pair_index = (id / 2) as u32;
+        // retry ticket の id は増えても、通常発行した論理ペアの index は変えない。
+        let normal_emitted: u32 = self.emitted.iter().copied().sum();
+        let pair_index = normal_emitted / 2;
         let local_pair_index = game_idx / 2;
         Some(MatchTicket {
             id,
@@ -1655,8 +1778,9 @@ impl TicketSource {
                 local_pair_index,
                 self.start_defs_len,
             ),
-            pair_slot: (id % 2) as u32,
+            pair_slot: game_idx % 2,
             pair_index,
+            attempt: 0,
         })
     }
 
@@ -1666,6 +1790,10 @@ impl TicketSource {
     /// `(min, max)` に正規化して該当ペアを引き、その発行数を 1 進める。
     fn commit_sent(&mut self, ticket: &MatchTicket) {
         self.next_id = ticket.id + 1;
+        if ticket.attempt > 0 {
+            self.retry_queue.pop_front();
+            return;
+        }
         let pair = (ticket.black_idx.min(ticket.white_idx), ticket.black_idx.max(ticket.white_idx));
         if let Some(pos) = self.pair_indices.iter().position(|&p| p == pair) {
             self.emitted[pos] += 1;
@@ -1678,6 +1806,9 @@ impl TicketSource {
     /// 2 局目（奇数 slot）はペアを完結させるため常に送る。1 局目（偶数 slot）は対象ペアが
     /// まだ target 未達のときだけ送る。
     fn still_wanted(&self, ticket: &MatchTicket) -> bool {
+        if ticket.attempt > 0 {
+            return true;
+        }
         if !ticket.pair_slot.is_multiple_of(2) {
             return true;
         }
@@ -1685,6 +1816,50 @@ impl TicketSource {
         match self.pair_indices.iter().position(|&p| p == pair) {
             Some(pos) => Self::pair_needs_more(self.emitted[pos], self.target_per_pair()),
             None => false,
+        }
+    }
+
+    fn observe_result(&mut self, result: &MatchResult) {
+        let key = (result.ticket.pair_index, result.ticket.attempt);
+        let slot = result.ticket.pair_slot.min(1) as usize;
+        let entry = self.retry_observations.entry(key).or_default();
+        entry.tickets[slot] = Some(result.ticket.clone());
+        entry.received[slot] = true;
+        entry.error |= result.error;
+        if result.error {
+            self.error_pairs.insert(result.ticket.pair_index);
+        }
+        if !entry.received.into_iter().all(|received| received) {
+            return;
+        }
+
+        let Some(completed) = self.retry_observations.remove(&key) else {
+            return;
+        };
+        if !completed.error {
+            return;
+        }
+        if result.ticket.attempt >= 2 {
+            self.exhausted_pairs.insert(result.ticket.pair_index);
+            return;
+        }
+
+        self.retried_pairs.insert(result.ticket.pair_index);
+        for ticket in completed.tickets.into_iter().flatten() {
+            self.retry_queue.push_back(MatchTicket {
+                id: 0,
+                attempt: ticket.attempt + 1,
+                ..ticket
+            });
+        }
+    }
+
+    fn retry_summary(&self) -> RetrySummary {
+        RetrySummary {
+            error_pairs: self.error_pairs.len() as u32,
+            retried_pairs: self.retried_pairs.len() as u32,
+            exhausted_pairs: self.exhausted_pairs.len() as u32,
+            invalid: !self.exhausted_pairs.is_empty(),
         }
     }
 }
@@ -1729,12 +1904,23 @@ struct Aggregator<'a> {
     pair_writers: HashMap<(usize, usize), PairWriter>,
     pair_stats: HashMap<(usize, usize), (u32, u32, u32)>,
     pair_game_count: HashMap<(usize, usize), u32>,
+    direct_buffer: HashMap<(u32, u32), [Option<DirectResult>; 2]>,
+    direct_completed_pairs: HashSet<(u32, u32)>,
     completed: u32,
+    valid_completed: u32,
     sprt_state: Option<SprtState>,
     /// SPRT 境界到達後は新規供給を止めて drain する。
     stop_feeding: bool,
     report_interval: u32,
     start_time: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct DirectResult {
+    black_idx: usize,
+    white_idx: usize,
+    outcome: GameOutcome,
+    error: bool,
 }
 
 impl Aggregator<'_> {
@@ -1749,9 +1935,11 @@ impl Aggregator<'_> {
             result,
             self.engine_labels,
             &mut self.pair_writers,
-            &mut self.pair_stats,
             &mut self.pair_game_count,
         )?;
+        if self.observe_direct_result(result) {
+            self.valid_completed += 2;
+        }
         self.completed += 1;
         handle_sprt_observation(
             &mut self.sprt_state,
@@ -1762,8 +1950,8 @@ impl Aggregator<'_> {
         );
         if self.completed.is_multiple_of(self.report_interval) {
             print_progress(
-                self.completed,
-                target_total.max(self.completed),
+                self.valid_completed,
+                target_total.max(self.valid_completed),
                 &self.pair_stats,
                 self.engine_labels,
                 self.start_time,
@@ -1771,13 +1959,70 @@ impl Aggregator<'_> {
         }
         Ok(())
     }
+
+    fn observe_direct_result(&mut self, result: &MatchResult) -> bool {
+        let key = (result.ticket.pair_index, result.ticket.attempt);
+        let slot = result.ticket.pair_slot.min(1) as usize;
+        if self.direct_completed_pairs.contains(&key) {
+            eprintln!(
+                "警告: 直接対決集計 — pair_index={}, attempt={}, slot={slot} は既に集計済みです。重複結果を除外します。",
+                key.0, key.1
+            );
+            return false;
+        }
+        let entry = self.direct_buffer.entry(key).or_insert([None, None]);
+        if entry[slot].is_some() {
+            eprintln!(
+                "警告: 直接対決集計 — pair_index={}, attempt={}, slot={slot} が重複しています。重複結果を除外します。",
+                key.0, key.1
+            );
+            return false;
+        }
+        entry[slot] = Some(DirectResult {
+            black_idx: result.ticket.black_idx,
+            white_idx: result.ticket.white_idx,
+            outcome: result.outcome,
+            error: result.error,
+        });
+        let [Some(a), Some(b)] = *entry else {
+            return false;
+        };
+        self.direct_buffer.remove(&key);
+        self.direct_completed_pairs.insert(key);
+        if a.error || b.error {
+            return false;
+        }
+        for game in [a, b] {
+            let pair_key = (game.black_idx.min(game.white_idx), game.black_idx.max(game.white_idx));
+            if let Some(stats) = self.pair_stats.get_mut(&pair_key) {
+                match game.outcome {
+                    GameOutcome::BlackWin => {
+                        if game.black_idx == pair_key.0 {
+                            stats.0 += 1;
+                        } else {
+                            stats.1 += 1;
+                        }
+                    }
+                    GameOutcome::WhiteWin => {
+                        if game.white_idx == pair_key.0 {
+                            stats.0 += 1;
+                        } else {
+                            stats.1 += 1;
+                        }
+                    }
+                    GameOutcome::Draw => stats.2 += 1,
+                    GameOutcome::InProgress => {}
+                }
+            }
+        }
+        true
+    }
 }
 
 fn process_result(
     result: &MatchResult,
     engine_labels: &[String],
     pair_writers: &mut HashMap<(usize, usize), PairWriter>,
-    pair_stats: &mut HashMap<(usize, usize), (u32, u32, u32)>,
     pair_game_count: &mut HashMap<(usize, usize), u32>,
 ) -> Result<()> {
     let bi = result.ticket.black_idx;
@@ -1824,34 +2069,12 @@ fn process_result(
             ticket_id: Some(result.ticket.id),
             pair_index: Some(result.ticket.pair_index),
             pair_slot: Some(result.ticket.pair_slot),
+            attempt: result.ticket.attempt,
             startpos_idx: Some(result.ticket.startpos_idx as u32),
             error: result.error,
         };
         pw.write_json(&result_entry)?;
         pw.flush()?;
-    }
-
-    // 統計更新
-    if let Some(stats) = pair_stats.get_mut(&pair_key) {
-        match result.outcome {
-            GameOutcome::BlackWin => {
-                if bi == pair_key.0 {
-                    stats.0 += 1; // i wins
-                } else {
-                    stats.1 += 1; // j wins
-                }
-            }
-            GameOutcome::WhiteWin => {
-                if wi == pair_key.0 {
-                    stats.0 += 1;
-                } else {
-                    stats.1 += 1;
-                }
-            }
-            GameOutcome::Draw | GameOutcome::InProgress => {
-                stats.2 += 1;
-            }
-        }
     }
 
     Ok(())
@@ -2029,8 +2252,8 @@ fn ensure_node_coverage(
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlFile, TicketSource, build_engine_usi_options, deterministic_startpos_index,
-        ensure_node_coverage, resolve_engine_nodes, splitmix64,
+        ControlFile, MatchResult, SprtState, TicketSource, build_engine_usi_options,
+        deterministic_startpos_index, ensure_node_coverage, resolve_engine_nodes, splitmix64,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2053,6 +2276,18 @@ mod tests {
             out.push(t);
         }
         out
+    }
+
+    fn result(ticket: super::MatchTicket, outcome: super::GameOutcome, error: bool) -> MatchResult {
+        MatchResult {
+            ticket,
+            outcome,
+            reason: String::new(),
+            plies: 0,
+            move_logs: Vec::new(),
+            error,
+            worker_retired: false,
+        }
     }
 
     /// pentanomial 整合: 各 pair_index がちょうど 2 回・slot 0/1 で現れ、
@@ -2342,6 +2577,147 @@ mod tests {
         assert_eq!(
             tickets[0].startpos_idx, tickets[1].startpos_idx,
             "先後入替の 2 局目は同一開始局面"
+        );
+    }
+
+    #[test]
+    fn error_pair_retries_twice_without_consuming_target() {
+        let target = Arc::new(AtomicU32::new(1));
+        let mut source = TicketSource::new(vec![(0, 1)], 8, target, 42);
+        let initial = drain_source(&mut source);
+        assert_eq!(initial.len(), 2);
+        let startpos_idx = initial[0].startpos_idx;
+
+        source.observe_result(&result(initial[0].clone(), super::GameOutcome::Draw, true));
+        source.observe_result(&result(initial[1].clone(), super::GameOutcome::Draw, false));
+        let attempt_1 = vec![pull(&mut source).unwrap(), pull(&mut source).unwrap()];
+        assert_eq!(attempt_1.iter().map(|t| t.attempt).collect::<Vec<_>>(), vec![1, 1]);
+        assert_eq!(attempt_1.iter().map(|t| t.pair_slot).collect::<Vec<_>>(), vec![0, 1]);
+        assert!(attempt_1.iter().all(|t| t.pair_index == initial[0].pair_index));
+        assert!(attempt_1.iter().all(|t| t.startpos_idx == startpos_idx));
+        assert_eq!(
+            attempt_1.iter().map(|t| (t.black_idx, t.white_idx)).collect::<Vec<_>>(),
+            initial.iter().map(|t| (t.black_idx, t.white_idx)).collect::<Vec<_>>()
+        );
+
+        for ticket in attempt_1 {
+            source.observe_result(&result(ticket, super::GameOutcome::Draw, true));
+        }
+        let attempt_2 = vec![pull(&mut source).unwrap(), pull(&mut source).unwrap()];
+        assert!(attempt_2.iter().all(|t| t.attempt == 2));
+        for ticket in attempt_2 {
+            source.observe_result(&result(ticket, super::GameOutcome::Draw, true));
+        }
+
+        assert!(!source.has_next());
+        assert_eq!(source.current_target_total(), 2);
+        let summary = source.retry_summary();
+        assert_eq!(summary.error_pairs, 1);
+        assert_eq!(summary.retried_pairs, 1);
+        assert_eq!(summary.exhausted_pairs, 1);
+        assert!(summary.invalid);
+    }
+
+    #[test]
+    fn live_sprt_pairs_only_within_attempt() {
+        let params = super::SprtParameters::new(0.0, 5.0, 0.05, 0.05).unwrap();
+        let mut state = SprtState::new(params, 0, 1, 10, "base".into(), "test".into());
+        let target = Arc::new(AtomicU32::new(1));
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target, 0);
+        let initial = drain_source(&mut source);
+        state.observe(&result(initial[0].clone(), super::GameOutcome::WhiteWin, false));
+        state.observe(&result(initial[1].clone(), super::GameOutcome::Draw, true));
+        source.observe_result(&result(initial[0].clone(), super::GameOutcome::WhiteWin, false));
+        source.observe_result(&result(initial[1].clone(), super::GameOutcome::Draw, true));
+        assert_eq!(state.penta, super::Penta::ZERO);
+
+        let retry = [pull(&mut source).unwrap(), pull(&mut source).unwrap()];
+        state.observe(&result(retry[0].clone(), super::GameOutcome::WhiteWin, false));
+        state.observe(&result(retry[1].clone(), super::GameOutcome::BlackWin, false));
+        assert_eq!(
+            state.penta,
+            super::Penta {
+                ww: 1,
+                ..super::Penta::ZERO
+            }
+        );
+    }
+
+    /// 同一結果列を live と JSONL post-hoc に流し、ペアリング規則の一致を直接検証する。
+    #[test]
+    fn live_and_posthoc_penta_match_for_retry_duplicate_and_incomplete_input() {
+        use std::io::Write as _;
+
+        fn ticket(pair_index: u32, pair_slot: u32, attempt: u32) -> super::MatchTicket {
+            let (black_idx, white_idx) = if pair_slot == 0 { (0, 1) } else { (1, 0) };
+            super::MatchTicket {
+                id: 0,
+                black_idx,
+                white_idx,
+                startpos_idx: pair_index as usize,
+                pair_index,
+                pair_slot,
+                attempt,
+            }
+        }
+
+        let cases = [
+            (0, 0, 0, super::GameOutcome::WhiteWin, false),
+            (0, 1, 0, super::GameOutcome::BlackWin, false),
+            (1, 0, 0, super::GameOutcome::WhiteWin, false),
+            (1, 1, 0, super::GameOutcome::Draw, true),
+            (1, 0, 1, super::GameOutcome::Draw, false),
+            (1, 1, 1, super::GameOutcome::Draw, false),
+            (2, 0, 0, super::GameOutcome::BlackWin, false),
+            // 同じ slot の 2 行目は、先の Loss を上書きせず除外する。
+            (2, 0, 0, super::GameOutcome::WhiteWin, false),
+            (2, 1, 0, super::GameOutcome::WhiteWin, false),
+            // 未完了ペア。
+            (3, 0, 0, super::GameOutcome::WhiteWin, false),
+        ];
+
+        let params = super::SprtParameters::new(0.0, 5.0, 0.05, 0.05).unwrap();
+        let mut live = SprtState::new(params, 0, 1, 10, "base".into(), "test".into());
+        for &(pair_index, pair_slot, attempt, outcome, error) in &cases {
+            live.observe(&result(ticket(pair_index, pair_slot, attempt), outcome, error));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"meta","engine_cmd":{{"path_black":"/base","path_white":"/test","label_black":"base","label_white":"test"}}}}"#
+        )
+        .unwrap();
+        let rows = [
+            r#"{"type":"result","outcome":"white_win","winner":"test","pair_index":0,"pair_slot":0}"#,
+            r#"{"type":"result","outcome":"black_win","winner":"test","pair_index":0,"pair_slot":1}"#,
+            r#"{"type":"result","outcome":"white_win","winner":"test","pair_index":1,"pair_slot":0}"#,
+            r#"{"type":"result","outcome":"draw","pair_index":1,"pair_slot":1,"error":true}"#,
+            r#"{"type":"result","outcome":"draw","pair_index":1,"pair_slot":0,"attempt":1}"#,
+            r#"{"type":"result","outcome":"draw","pair_index":1,"pair_slot":1,"attempt":1}"#,
+            r#"{"type":"result","outcome":"black_win","winner":"base","pair_index":2,"pair_slot":0}"#,
+            r#"{"type":"result","outcome":"white_win","winner":"test","pair_index":2,"pair_slot":0}"#,
+            r#"{"type":"result","outcome":"white_win","winner":"base","pair_index":2,"pair_slot":1}"#,
+            r#"{"type":"result","outcome":"white_win","winner":"test","pair_index":3,"pair_slot":0}"#,
+        ];
+        for row in rows {
+            writeln!(file, "{row}").unwrap();
+        }
+        drop(file);
+
+        let posthoc =
+            tools::sprt::collect_sprt_penta(path.to_str().unwrap(), "base", "test").unwrap();
+        assert_eq!(live.penta, posthoc);
+        assert_eq!(
+            posthoc,
+            super::Penta {
+                ll: 1,
+                dd: 1,
+                ww: 1,
+                ..super::Penta::ZERO
+            }
         );
     }
 

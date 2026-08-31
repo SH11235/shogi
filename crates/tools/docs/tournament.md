@@ -143,6 +143,19 @@ final:       pairs=1022, LLR=+2.889, decision=running
 確定済みのため、`final` の `decision` が `running` と表示されることがあるが、
 判定結果が覆ることはない。
 
+#### game error の再対局
+
+同一開始局面を先後入れ替えた 2 局のどちらかが engine 起動・通信・worker panic
+などの game error になった場合、その世代の 2 局は統計から除外される。同じ
+`pair_index`、開始局面、先後割当のまま最大 2 回再対局し、再対局は目標局数を消化しない。
+JSONL の result 行には初回 0 の `attempt` が記録される。
+通信・`usinewgame`・worker panic の error 後はその worker を退役させ、再対局は新しく
+起動した engine process で行う。
+
+最終サマリと `meta.json` の `error_pairs`、`retried_pairs`、`exhausted_pairs` で状況を
+確認できる。2 回の再試行後も error を含むペアがあれば `invalid: true` となり、SPRT
+サマリにも警告が出る。これは統計的敗北ではなくインフラ障害を示し、終了コードは変わらない。
+
 #### SPRT 用語
 
 | 用語 | 意味 |
@@ -188,7 +201,7 @@ tournament の出力 JSONL を読み込み、勝率・Elo 差・NPS 等を集計
   - nElo: pentanomial（ペア単位）ベース。開始局面・先後の交絡を除去した、より正確な推定
   - 通常はエンジンラベルの辞書順で左側の視点。`--sprt` 時は SPRT
     対象ペアを test vs base の順にし、Elo/nElo の符号も test 視点に揃える
-- **追加統計**（平均手数、先手勝率、NPS、depth、seldepth 等）
+- **追加統計**（平均手数、先手勝率、error 局・再試行関連件数、NPS、depth、seldepth 等）
 
 ### SPRT post-hoc 判定
 
