@@ -225,7 +225,12 @@ make_rshogi_wrapper() {
     return 1
   fi
   side_dir="$OUT/engine-stderr/$side"
-  mkdir -p "$side_dir" || return 1
+  mkdir -p "$OUT/engine-stderr" || return 1
+  if ! mkdir "$side_dir"; then
+    printf 'engine side already exists or cannot be created (%s); use a fresh OUT: %s\n' \
+      "$side" "$OUT" >&2
+    return 1
+  fi
   printf '%s\n' "$real_bin" > "$side_dir/real-bin" || return 1
   cat > "$side_dir/run" <<'SH' || return 1
 #!/bin/sh
