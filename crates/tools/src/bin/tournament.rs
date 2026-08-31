@@ -1644,11 +1644,17 @@ impl TicketSource {
         };
         let id = self.next_id;
         let pair_index = (id / 2) as u32;
+        let local_pair_index = game_idx / 2;
         Some(MatchTicket {
             id,
             black_idx,
             white_idx,
-            startpos_idx: deterministic_startpos_index(self.seed, pair_index, self.start_defs_len),
+            startpos_idx: deterministic_startpos_index(
+                self.seed,
+                (i, j),
+                local_pair_index,
+                self.start_defs_len,
+            ),
             pair_slot: (id % 2) as u32,
             pair_index,
         })
@@ -1683,13 +1689,26 @@ impl TicketSource {
     }
 }
 
-fn deterministic_startpos_index(seed: u64, pair_index: u32, startpos_count: usize) -> usize {
+fn deterministic_startpos_index(
+    seed: u64,
+    matchup: (usize, usize),
+    local_pair_index: u32,
+    startpos_count: usize,
+) -> usize {
     if startpos_count <= 1 {
         return 0;
     }
 
-    let stream_value =
-        seed.wrapping_add((u64::from(pair_index) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    // matchup ごとに独立したストリームを作り、その matchup 内のペア通番で進める。
+    // global ticket id を使わないため、control.json の target_games をいつ増やしても、
+    // 同じ matchup / local_pair_index には同じ開始局面が割り当てられる。
+    let first_engine_seed =
+        splitmix64(seed.wrapping_add((matchup.0 as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+    let matchup_seed = splitmix64(
+        first_engine_seed.wrapping_add((matchup.1 as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+    );
+    let stream_value = splitmix64(matchup_seed)
+        .wrapping_add((u64::from(local_pair_index) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     (splitmix64(stream_value) % startpos_count as u64) as usize
 }
 
@@ -2061,10 +2080,12 @@ mod tests {
     }
 
     #[test]
-    fn startpos_selection_is_deterministic_for_seed_and_pair_index() {
+    fn startpos_selection_is_deterministic_for_seed_matchup_and_local_pair() {
         let sequence = |seed| {
             (0..256)
-                .map(|pair_index| deterministic_startpos_index(seed, pair_index, 65_521))
+                .map(|local_pair_index| {
+                    deterministic_startpos_index(seed, (0, 1), local_pair_index, 65_521)
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -2175,6 +2196,40 @@ mod tests {
         for p in &pairs {
             assert_eq!(per_pair.get(p), Some(&4), "ペア {p:?} は 4 局");
         }
+    }
+
+    #[test]
+    fn target_increase_keeps_startpos_sequence_per_matchup() {
+        use std::collections::HashMap;
+
+        let pairs = vec![(0, 1), (0, 2), (1, 2)];
+        let collect_startpos = |tickets: Vec<super::MatchTicket>| {
+            let mut by_matchup: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+            for ticket in tickets {
+                if ticket.pair_slot == 0 {
+                    let matchup = (
+                        ticket.black_idx.min(ticket.white_idx),
+                        ticket.black_idx.max(ticket.white_idx),
+                    );
+                    by_matchup.entry(matchup).or_default().push(ticket.startpos_idx);
+                }
+            }
+            by_matchup
+        };
+
+        // まず各方向 1 局を発行し、その後 3 局へ増やす。
+        let dynamic_target = Arc::new(AtomicU32::new(1));
+        let mut dynamic = TicketSource::new(pairs.clone(), 65_521, dynamic_target.clone(), 42);
+        let mut dynamic_tickets = drain_source(&mut dynamic);
+        dynamic_target.store(3, Ordering::Relaxed);
+        dynamic_tickets.extend(drain_source(&mut dynamic));
+
+        // 最初から最終 target を指定した場合と、matchup ごとの局面列が一致する。
+        let fixed_target = Arc::new(AtomicU32::new(3));
+        let mut fixed = TicketSource::new(pairs, 65_521, fixed_target, 42);
+        let fixed_tickets = drain_source(&mut fixed);
+
+        assert_eq!(collect_startpos(dynamic_tickets), collect_startpos(fixed_tickets));
     }
 
     #[test]
