@@ -635,6 +635,39 @@ rshogi 式は `+` に統一しているため、YO 式の `-X *` は rshogi 側�
 - 実行時に `--scale` で摂動量を一律スケール、`--mobility` で移動量を一律スケールできる。
 - 個別調整が必要な場合は `.params` ファイルを直接編集する。
 
+### 7.1 step (c_end) / delta (r_end) 選定チェックリスト
+
+`step` 列は fishtest 用語の **c_end (最終摂動幅)** に対応する。schedule は
+`c_0 = c_end × N^γ` で初期摂動幅を逆算して減衰するため、`.params` に書く値は
+「run 終盤でもこの幅で摂動する」終端の目標値であって初期 c_k ではない
+(k 軸は total-pairs 到達の手前の batch で終わるため、実走の最終 batch の c_k は
+c_end よりわずかに大きい)。同様に `delta` 列は **r_end (最終学習率係数)** に
+対応し `a_0 = r_end × c_end² × (A+N)^α` で逆算される。
+
+run 投入前に確認する:
+
+- **摂動が意味のある差を生む大きさか**: θ+c と θ−c を固定した 2 エンジンの
+  短対局 (数百局) では数 nElo 級の差は統計的に検出できない。この確認の目的は
+  粗い sanity check — setoption が効いているか、c が明らかに過大 (勝率が壊れる)
+  でないか — に限る。摂動幅は run 終盤でも使われる `step` (c_end) で試す
+  (c_0 側はこれより大きいので、c_end で信号の見込みがあれば序盤は問題にならない)。
+  c の過小は短対局でも run 中の観測でも断定できない (§9.4)。疑いが立ったら
+  次回 run の `step` 設計を見直す材料にする。
+- **整数パラメータの `step`**: 本実装は θ±c_k を stochastic rounding
+  (`floor(v + U(0,1))`、期待値保存) で整数化するため、fishtest の「整数は c > 1
+  必須」則とは異なり **c_end ≈ 1 でも摂動は期待値として保たれる**。10 倍スケール
+  表現への変換が要るのは、整数刻みより細かい最適値の分解能が必要な場合に限る。
+- **min/max は clip (安全柵) であって探索範囲の設計変数ではない**:
+  `generate_spsa_params` が出力するエンジンの USI option 範囲内で広めに取り、
+  探索を狭めたいときは range を狭めるのではなく `delta` (または `--mobility`) を
+  下げる。clip で狭めると境界に張り付いた側の勾配感度が死ぬ。USI option の
+  min/max を越えて `.params` の range だけを広げてはならない。SPSA 内部の値と
+  エンジン側で clamp された実適用値が食い違うため、越える必要がある場合は先に
+  エンジン側の option 範囲を変更・再ビルドし、`.params` を再生成する。
+- **θ の境界張り付きを監視する**: `values.csv` で θ が min/max 境界に張り付き
+  続けていないかを確認する。張り付きが常態化したら、エンジンの USI option
+  範囲内で range を広げられるか確認するか、まず `delta` / `--mobility` を見直す。
+
 ## 8. よく使う調整項目
 - 開始局面ファイルを固定する: `--startpos-file /path/to/openings.txt`
 - 開始局面ファイルを必須化する: `--require-startpos-file`
@@ -677,7 +710,7 @@ avg_abs_shift,updated_params,avg_abs_update,max_abs_update,total_games
 | `raw_result` | + 側勝率ベースのスコア (`Σ plus_score`、各 game pair が +1 / 0 / -1) |
 | `active_params` | この batch で perturb 対象となった active パラメータ数 |
 | `avg_abs_shift` | active パラメータの摂動量の平均 (c_k に依存) |
-| `updated_params` | この batch で値が動いた parameter 数 |
+| `updated_params` | この batch で更新対象になった parameter 数 (active かつ c_end≠0)。clamp 等で更新量 0 でも数えるため「値が動いた数」ではない |
 | `avg_abs_update` / `max_abs_update` | 値更新量の平均と最大 |
 | `total_games` | これまでの累積対局数 |
 
@@ -700,6 +733,33 @@ avg_abs_shift,updated_params,avg_abs_update,max_abs_update,total_games
 (0..1 の正規化値、+1/-1 の game pair が完全に拮抗すると 0 に近づく) であり、
 `raw_result` の絶対値そのものではない点に注意。閾値値はチューニング対象の感度に
 応じて調整する (枝刈り系は感度高、history 初期値は低、等)。
+
+### 9.4 診断 checkpoint の運用
+
+`--early-stop-*` は閾値の運用実績が無いため自動停止の規約にはせず (§3 の注記参照)、
+代わりに **run 開始前に診断 checkpoint (500〜1000 pair 目安) を宣言し、そこで人手観測**
+する。checkpoint は原則**観測のみ**で、run は §3 のとおりフルで走らせる:
+
+- `values.csv` の θ 推移: 値が動いているか。min/max 境界への張り付き (§7.1) が
+  ないか。
+- `stats.csv` の `avg_abs_shift` / `avg_abs_update` / `max_abs_update`: 摂動と更新が
+  設計どおりの規模で起きているか。`updated_params` は active かつ c_end≠0 の
+  パラメータを更新量 0 (clamp 貼り付き等) でも数えるため、「値が動いている」証拠
+  には使えない — active 数の確認にだけ使う。
+- checkpoint で停止してよいのは、**機械的に確認できる異常に限る**: active
+  パラメータが 0 / 対象パラメータの c_end が 0 / setoption が engine に適用されて
+  いない (`usi` 応答の option 一覧と対象名・min/max を事前照合し、必要なら
+  setoption 受信値を出す engine ログで確認) / `values.csv` で全パラメータが
+  完全不動 (浮動小数の θ が 1 batch も変化していない = 更新経路が働いていない)、
+  等。**「勝率差に信号が無い」は停止理由にならない** — 符号付き `raw_result` は
+  ランダムな摂動方向で相殺されるため、無信号は正常な run でも観測され、c 過小
+  との区別が付かない。c 過小の疑いは停止理由ではなく、次回 run の `step` 設計を
+  見直す材料として記録する。感触や中間成績を理由にした打ち切りはしない。
+  startup summary は SPSA 内部の active 設定を表示するだけで、setoption の送信・
+  適用結果を保証しないため、この確認には使わない。
+- 更新量が小さいだけの状態を「収束した」と即断しない。checkpoint 時点の
+  値を選別採用する誘惑は winner's curse そのものであり、採否は正常終了した
+  endpoint の SPRT 検証 (§11.5) でのみ判断する。
 
 ## 10. YaneuraOu ⇔ rshogi `.params` 変換
 
@@ -1195,6 +1255,11 @@ ln -snf ../../rshogi-notes/spsa/<name>.rshogi.params <rshogi>/spsa_params/
 
 - **未検証の SPSA エンドポイントをそのまま大会投入しない**。本番採用前に
   selfplay / SPRT で base 比較し、Elo が有意に勝ち越すことを確認する。
+  SPSA は探索であり採用判定ではない。endpoint の採否基準 (独立 seed・SPSA で
+  未使用の局面系列・gainer bounds `<0, +10>` nElo の SPRT で `accept_h1` のみ採用)
+  は rshogi-notes の `rshogi/testing_policy.md` §5 に従う。独立 seed での再確認は
+  `tournament` が `--seed` を備えていることが前提 (無い版では開始局面選択を
+  再現・独立化できない)。
 - 過去に採用済みの値（例: Phase 1b の Futility/Razoring/NMP）は
   `tune_params.rs` の default に焼き込み済み（rebuild 経路）。ファイル投入経路で
   上書きすると二重適用ではなく **ファイル側が勝つ**（setoption は default を上書き）。
