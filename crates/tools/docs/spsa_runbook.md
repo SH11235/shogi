@@ -657,12 +657,16 @@ run 投入前に確認する:
   (`floor(v + U(0,1))`、期待値保存) で整数化するため、fishtest の「整数は c > 1
   必須」則とは異なり **c_end ≈ 1 でも摂動は期待値として保たれる**。10 倍スケール
   表現への変換が要るのは、整数刻みより細かい最適値の分解能が必要な場合に限る。
-- **min/max は clip (安全柵) であって探索範囲の設計変数ではない**: 広めに取り、
+- **min/max は clip (安全柵) であって探索範囲の設計変数ではない**:
+  `generate_spsa_params` が出力するエンジンの USI option 範囲内で広めに取り、
   探索を狭めたいときは range を狭めるのではなく `delta` (または `--mobility`) を
-  下げる。clip で狭めると境界に張り付いた側の勾配感度が死ぬ。
+  下げる。clip で狭めると境界に張り付いた側の勾配感度が死ぬ。USI option の
+  min/max を越えて `.params` の range だけを広げてはならない。SPSA 内部の値と
+  エンジン側で clamp された実適用値が食い違うため、越える必要がある場合は先に
+  エンジン側の option 範囲を変更・再ビルドし、`.params` を再生成する。
 - **θ の境界張り付きを監視する**: `values.csv` で θ が min/max 境界に張り付き
-  続けていないかを確認する。張り付きが常態化したら range を広げるか、まず
-  `delta` / `--mobility` を見直す。
+  続けていないかを確認する。張り付きが常態化したら、エンジンの USI option
+  範囲内で range を広げられるか確認するか、まず `delta` / `--mobility` を見直す。
 
 ## 8. よく使う調整項目
 - 開始局面ファイルを固定する: `--startpos-file /path/to/openings.txt`
@@ -744,12 +748,15 @@ avg_abs_shift,updated_params,avg_abs_update,max_abs_update,total_games
   には使えない — active 数の確認にだけ使う。
 - checkpoint で停止してよいのは、**機械的に確認できる異常に限る**: active
   パラメータが 0 / 対象パラメータの c_end が 0 / setoption が engine に適用されて
-  いない (startup summary や engine ログで確認) / `values.csv` で全パラメータが
+  いない (`usi` 応答の option 一覧と対象名・min/max を事前照合し、必要なら
+  setoption 受信値を出す engine ログで確認) / `values.csv` で全パラメータが
   完全不動 (浮動小数の θ が 1 batch も変化していない = 更新経路が働いていない)、
   等。**「勝率差に信号が無い」は停止理由にならない** — 符号付き `raw_result` は
   ランダムな摂動方向で相殺されるため、無信号は正常な run でも観測され、c 過小
   との区別が付かない。c 過小の疑いは停止理由ではなく、次回 run の `step` 設計を
   見直す材料として記録する。感触や中間成績を理由にした打ち切りはしない。
+  startup summary は SPSA 内部の active 設定を表示するだけで、setoption の送信・
+  適用結果を保証しないため、この確認には使わない。
 - 更新量が小さいだけの状態を「収束した」と即断しない。checkpoint 時点の
   値を選別採用する誘惑は winner's curse そのものであり、採否は正常終了した
   endpoint の SPRT 検証 (§11.5) でのみ判断する。
