@@ -223,22 +223,22 @@ impl fmt::Display for NetDeltaError {
 
 impl std::error::Error for NetDeltaError {}
 
-#[cfg(any(test, feature = "nnue-runtime-dimensions", feature = "layerstack-arch"))]
-pub(crate) fn add_i8_delta(value: i8, delta: i32) -> (i8, bool) {
+/// `i8` 係数へ整数 delta を saturating 加算する。
+pub fn add_i8_delta(value: i8, delta: i32) -> (i8, bool) {
     let sum = i64::from(value) + i64::from(delta);
     let clamped = sum.clamp(i64::from(i8::MIN), i64::from(i8::MAX));
     (clamped as i8, sum != clamped)
 }
 
-#[cfg(any(test, feature = "nnue-runtime-dimensions", feature = "layerstack-arch"))]
-pub(crate) fn add_i16_delta(value: i16, delta: i32) -> (i16, bool) {
+/// `i16` 係数へ整数 delta を saturating 加算する。
+pub fn add_i16_delta(value: i16, delta: i32) -> (i16, bool) {
     let sum = i64::from(value) + i64::from(delta);
     let clamped = sum.clamp(i64::from(i16::MIN), i64::from(i16::MAX));
     (clamped as i16, sum != clamped)
 }
 
-#[cfg(any(test, feature = "nnue-runtime-dimensions", feature = "layerstack-arch"))]
-pub(crate) fn add_i32_delta(value: i32, delta: i32) -> (i32, bool) {
+/// `i32` 係数へ整数 delta を saturating 加算する。
+pub fn add_i32_delta(value: i32, delta: i32) -> (i32, bool) {
     let sum = i64::from(value) + i64::from(delta);
     let clamped = sum.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
     (clamped as i32, sum != clamped)
@@ -280,6 +280,24 @@ pub mod test_utils {
         Leb128Split,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    /// 合成 FT 係数の値域。
+    pub enum SyntheticFtValues {
+        /// 1 byte signed LEB128 に収まる正値。
+        SingleBytePositive,
+        /// 負数、多 byte 値、`i16` 境界値を含む。
+        SignedBoundaries,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    /// 合成 FT の符号化方式と係数値域。
+    pub struct SyntheticFtConfig {
+        /// LEB128 ブロック構成。
+        pub encoding: SyntheticFtEncoding,
+        /// 係数の値域。
+        pub values: SyntheticFtValues,
+    }
+
     struct Lcg(u32);
 
     impl Lcg {
@@ -291,12 +309,6 @@ pub mod test_utils {
         fn range(&mut self, min: i32, max: i32) -> i32 {
             min + (self.next() % ((max - min + 1) as u32)) as i32
         }
-    }
-
-    /// 1 byte に収まる signed LEB128 を encode する。
-    pub(crate) fn encode_single_byte_signed_leb128(value: i32) -> u8 {
-        assert!((-64..=63).contains(&value));
-        (value as u8) & 0x7f
     }
 
     fn append_affine(
@@ -348,6 +360,30 @@ pub mod test_utils {
         num_buckets: usize,
         ft_encoding: SyntheticFtEncoding,
     ) -> SyntheticLayerStacksBin {
+        build_synthetic_layer_stacks_with_ft_values(
+            feature_name,
+            input_dimensions,
+            l1,
+            l2,
+            l3,
+            num_buckets,
+            SyntheticFtConfig {
+                encoding: ft_encoding,
+                values: SyntheticFtValues::SingleBytePositive,
+            },
+        )
+    }
+
+    /// 指定 FT 符号化と値域の合成 LayerStacks `.bin` を生成する。
+    pub fn build_synthetic_layer_stacks_with_ft_values(
+        feature_name: &str,
+        input_dimensions: usize,
+        l1: usize,
+        l2: usize,
+        l3: usize,
+        num_buckets: usize,
+        ft: SyntheticFtConfig,
+    ) -> SyntheticLayerStacksBin {
         let arch = format!(
             "Features={feature_name}[{input_dimensions}->{l1}x2],LayerStacks,l2={l2},l3={l3}"
         );
@@ -361,43 +397,53 @@ pub mod test_utils {
 
         let mut rng = Lcg(0x5eed_1234);
         let ft_element_count = l1 + input_dimensions * l1;
-        let mut ft_bias_values = Vec::with_capacity(l1);
-        for _ in 0..l1 {
-            ft_bias_values.push(rng.range(8, 15) as i16);
-        }
-        let mut ft_weight_values = Vec::with_capacity(ft_element_count - l1);
-        for _ in l1..ft_element_count {
-            ft_weight_values.push(rng.range(1, 2) as i16);
-        }
-        let ft_biases = match ft_encoding {
+        let signed_boundaries = [-1, 64, -65, -8192, 8191, i16::MIN, i16::MAX];
+        let mut ft_value = |index: usize, bias: bool| match ft.values {
+            SyntheticFtValues::SingleBytePositive if bias => rng.range(8, 15) as i16,
+            SyntheticFtValues::SingleBytePositive => rng.range(1, 2) as i16,
+            SyntheticFtValues::SignedBoundaries => {
+                signed_boundaries[index % signed_boundaries.len()]
+            }
+        };
+        let ft_bias_values: Vec<_> = (0..l1).map(|index| ft_value(index, true)).collect();
+        let ft_weight_values: Vec<_> =
+            (l1..ft_element_count).map(|index| ft_value(index, false)).collect();
+        let ft_biases = match ft.encoding {
             SyntheticFtEncoding::Leb128Combined => {
                 bytes.extend_from_slice(LEB128_MAGIC);
-                bytes.extend_from_slice(&(ft_element_count as u32).to_le_bytes());
+                let size_offset = bytes.len();
+                bytes.extend_from_slice(&0u32.to_le_bytes());
                 let offset = bytes.len();
-                bytes.extend(
-                    ft_bias_values
-                        .iter()
-                        .chain(&ft_weight_values)
-                        .map(|&value| encode_single_byte_signed_leb128(i32::from(value))),
-                );
+                for &value in ft_bias_values.iter().chain(&ft_weight_values) {
+                    super::super::leb128::encode_signed_leb128(i64::from(value), &mut bytes);
+                }
+                let size = u32::try_from(bytes.len() - offset).expect("synthetic FT size");
+                bytes[size_offset..size_offset + 4].copy_from_slice(&size.to_le_bytes());
                 offset
             }
             SyntheticFtEncoding::Leb128Split => {
                 bytes.extend_from_slice(LEB128_MAGIC);
-                bytes.extend_from_slice(&(l1 as u32).to_le_bytes());
+                let bias_size_offset = bytes.len();
+                bytes.extend_from_slice(&0u32.to_le_bytes());
                 let offset = bytes.len();
-                bytes.extend(
-                    ft_bias_values
-                        .iter()
-                        .map(|&value| encode_single_byte_signed_leb128(i32::from(value))),
-                );
+                for &value in &ft_bias_values {
+                    super::super::leb128::encode_signed_leb128(i64::from(value), &mut bytes);
+                }
+                let bias_size =
+                    u32::try_from(bytes.len() - offset).expect("synthetic FT bias size");
+                bytes[bias_size_offset..bias_size_offset + 4]
+                    .copy_from_slice(&bias_size.to_le_bytes());
                 bytes.extend_from_slice(LEB128_MAGIC);
-                bytes.extend_from_slice(&(ft_weight_values.len() as u32).to_le_bytes());
-                bytes.extend(
-                    ft_weight_values
-                        .iter()
-                        .map(|&value| encode_single_byte_signed_leb128(i32::from(value))),
-                );
+                let weight_size_offset = bytes.len();
+                bytes.extend_from_slice(&0u32.to_le_bytes());
+                let weight_offset = bytes.len();
+                for &value in &ft_weight_values {
+                    super::super::leb128::encode_signed_leb128(i64::from(value), &mut bytes);
+                }
+                let weight_size =
+                    u32::try_from(bytes.len() - weight_offset).expect("synthetic FT weight size");
+                bytes[weight_size_offset..weight_size_offset + 4]
+                    .copy_from_slice(&weight_size.to_le_bytes());
                 offset
             }
         };

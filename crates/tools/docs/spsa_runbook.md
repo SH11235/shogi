@@ -1295,8 +1295,26 @@ option 名は FC weight の padding を含む `.bin` 格納順 flat index を使
 | `l2_w` | 第 2 FC 層 weight (`i8`) | あり |
 
 `setoption` は delta を保存するだけで、続く `isready` で元の `EvalFile` を再ロードして
-全 delta を 1 回適用する。同じ値の再送では再ロードしない。確定 delta を net へ反映する
-finalize ツールは後続対応とする。
+全 delta を 1 回適用する。同じ値の再送では再ロードしない。
+
+SPSA 完了後は `final.params` を元 net へ焼き込み、独立 seed の SPRT で採否を判定する。
+`spsa` は `final.params` へコメント行を保存しないため、generator の初期 `.params` にある
+SHA-256 を控えて `--expected-net-sha256` で渡す。
+
+```bash
+expected_net_sha256="$(sed -n 's/^# .*sha256=\([[:xdigit:]]\{64\}\).*/\1/p' /path/to/net.params)"
+test "${#expected_net_sha256}" -eq 64
+cargo run --release -p tools --bin apply_net_spsa_params -- \
+  --nnue "$SHOGI_DATA/nnue/base.bin" \
+  --params runs/spsa/net-example/final.params \
+  --expected-net-sha256 "$expected_net_sha256" \
+  --output "$SHOGI_DATA/nnue/tuned.bin" \
+  --report runs/spsa/net-example/finalize.json
+```
+
+一連の流れは `generate_net_spsa_params` → SPSA → `apply_net_spsa_params` → SPSA と異なる
+独立 seed の SPRT とする。焼き込み時の SHA-256 照合、読み戻し検証、JSON report は
+[`apply_net_spsa_params` の詳細](apply_net_spsa_params.md)を参照する。
 
 ## 13. トラブルシューティング
 

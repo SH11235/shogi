@@ -1487,9 +1487,7 @@ mod tests {
 
     #[test]
     fn dynamic_layer_stacks_net_delta_matches_file_edits_and_validates_shape() {
-        use crate::nnue::net_delta::test_utils::{
-            build_synthetic_layer_stacks, encode_single_byte_signed_leb128,
-        };
+        use crate::nnue::net_delta::test_utils::build_synthetic_layer_stacks;
 
         crate::nnue::reset_layer_stack_progress_kpabs_weights();
 
@@ -1558,7 +1556,8 @@ mod tests {
                     NetTensorKind::OutputBias => edited[byte_offset..byte_offset + 4]
                         .copy_from_slice(&edited_value.to_le_bytes()),
                     NetTensorKind::FtBias => {
-                        edited[byte_offset] = encode_single_byte_signed_leb128(edited_value);
+                        edited[byte_offset] =
+                            u8::try_from(edited_value).expect("single-byte LEB128");
                     }
                     NetTensorKind::OutputWeight | NetTensorKind::L2Weight => {
                         edited[byte_offset] = edited_value as i8 as u8;
