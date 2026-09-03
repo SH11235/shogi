@@ -1267,6 +1267,9 @@ ln -snf ../../rshogi-notes/spsa/<name>.rshogi.params <rshogi>/spsa_params/
 ## 12. net 重み SPSA (post-training)
 
 LayerStacks 系 NNUE の一部係数は、`.bin` 自体を書き換えず整数 delta として調整できる。
+対象 `.bin` から `generate_net_spsa_params --nnue <net.bin> --output <net.params>` で
+初期 `.params` を作る。係数の絞り込みと範囲設定は
+[`generate_net_spsa_params` の詳細](generate_net_spsa_params.md)を参照する。
 調整対象の `.params` を engine 起動時の spec にも渡す。`--engine-args` は各 argv を
 個別指定するため、先頭が `-` の引数を含めて次の形で渡す。
 
@@ -1292,8 +1295,8 @@ option 名は FC weight の padding を含む `.bin` 格納順 flat index を使
 | `l2_w` | 第 2 FC 層 weight (`i8`) | あり |
 
 `setoption` は delta を保存するだけで、続く `isready` で元の `EvalFile` を再ロードして
-全 delta を 1 回適用する。同じ値の再送では再ロードしない。係数候補を生成するツールと、
-確定 delta を net へ反映する finalize ツールは後続対応とする。
+全 delta を 1 回適用する。同じ値の再送では再ロードしない。確定 delta を net へ反映する
+finalize ツールは後続対応とする。
 
 ## 13. トラブルシューティング
 

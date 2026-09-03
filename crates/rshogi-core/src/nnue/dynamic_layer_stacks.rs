@@ -18,7 +18,7 @@ use super::features::{
     HalfKaHmSplitFeatureSet, HalfKaMergedFeatureSet, HalfKaSplitFeatureSet,
 };
 use super::layers::padded_input;
-use super::leb128::read_compressed_tensor_i16_all;
+use super::leb128::read_layer_stacks_ft_i16;
 use super::ls_feature_spec::{
     HalfKaHmMergedSpec, HalfKaHmSplitSpec, HalfKaMergedSpec, HalfKaSplitSpec, HalfKpSpec,
     LsFeatureSpec,
@@ -280,21 +280,10 @@ impl DynamicLayerStacksNetwork {
         let input_dimensions = parse_ft_input_dimensions(arch, feature, threat_dimensions)?;
 
         reader.read_exact(&mut buf4)?;
-        let first = read_compressed_tensor_i16_all(reader)?;
         let weight_len = input_dimensions
             .checked_mul(l1)
             .ok_or_else(|| invalid("FT dimensions overflow"))?;
-        let (bias_vec, weight_vec) = if first.len() == l1 + weight_len {
-            (first[..l1].to_vec(), first[l1..].to_vec())
-        } else if first.len() == l1 {
-            let weights = read_compressed_tensor_i16_all(reader)?;
-            if weights.len() != weight_len {
-                return Err(invalid("FT weight block size mismatch"));
-            }
-            (first, weights)
-        } else {
-            return Err(invalid("FT LEB128 block size mismatch"));
-        };
+        let (bias_vec, weight_vec) = read_layer_stacks_ft_i16(reader, l1, weight_len)?;
         let mut ft_biases = AlignedBox::new_zeroed(l1);
         ft_biases.copy_from_slice(&bias_vec);
         let mut ft_weights = AlignedBox::new_zeroed(weight_len);

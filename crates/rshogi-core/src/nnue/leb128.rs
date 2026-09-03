@@ -7,6 +7,65 @@ use std::io::{self, Read};
 /// COMPRESSED_LEB128 マジック文字列
 pub const LEB128_MAGIC: &[u8] = b"COMPRESSED_LEB128";
 
+pub(crate) const MAX_COMPRESSED_SIZE: usize = 2 * 1024 * 1024 * 1024;
+
+/// LayerStacks FT の LEB128 ブロック構成。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayerStacksFtLeb128Format {
+    /// biases と weights が最初のブロックに連結されている。
+    Combined,
+    /// biases と weights が別々のブロックに格納されている。
+    Split,
+}
+
+/// 最初の LEB128 ブロックの要素数から LayerStacks FT のブロック構成を判定する。
+pub(crate) fn classify_layer_stacks_ft_leb128(
+    first_element_count: usize,
+    bias_count: usize,
+    weight_count: usize,
+) -> io::Result<LayerStacksFtLeb128Format> {
+    let total_count = bias_count
+        .checked_add(weight_count)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "FT element count overflow"))?;
+    if first_element_count == total_count {
+        Ok(LayerStacksFtLeb128Format::Combined)
+    } else if first_element_count == bias_count {
+        Ok(LayerStacksFtLeb128Format::Split)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Unexpected LEB128 tensor size: got {first_element_count}, expected {bias_count} or {}",
+                total_count
+            ),
+        ))
+    }
+}
+
+/// LayerStacks FT の biases / weights を LEB128 から読む。
+#[cfg(feature = "nnue-runtime-dimensions")]
+pub(crate) fn read_layer_stacks_ft_i16<R: Read>(
+    reader: &mut R,
+    bias_count: usize,
+    weight_count: usize,
+) -> io::Result<(Vec<i16>, Vec<i16>)> {
+    let first = read_compressed_tensor_i16_all(reader)?;
+    if first.len() == bias_count + weight_count {
+        Ok((first[..bias_count].to_vec(), first[bias_count..].to_vec()))
+    } else if first.len() == bias_count {
+        let weights = read_compressed_tensor_i16_all(reader)?;
+        if weights.len() != weight_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FT weight block size mismatch",
+            ));
+        }
+        Ok((first, weights))
+    } else {
+        Err(io::Error::new(io::ErrorKind::InvalidData, "FT LEB128 block size mismatch"))
+    }
+}
+
 /// 符号付きLEB128を読み込み
 ///
 /// 各バイトの下位7ビットがデータ、最上位ビットが継続フラグ。
@@ -48,7 +107,7 @@ pub fn read_signed_leb128<R: Read>(reader: &mut R) -> io::Result<i64> {
 /// バイトスライスからLEB128値を1つデコード
 ///
 /// 戻り値: (デコードされた値, 消費したバイト数)
-fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
+pub(crate) fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
     let mut result: i64 = 0;
     let mut shift = 0;
     let mut pos = 0;
@@ -105,7 +164,6 @@ pub fn read_compressed_tensor_i16_all<R: Read>(reader: &mut R) -> io::Result<Vec
     // 不正ファイルの巨大 alloc を防ぐ sanity 上限。HalfKaHmMerged + EffectBucket は base 特徴を NB 倍に
     // 拡張するため FT block が大きく (2x2×1024=600MB 生 / ~300MB 圧縮、3x3 系はさらに大)、
     // 旧 256MB では正当な effect bucket net を弾く。size field は u32 なので上限は 4GiB 未満。
-    const MAX_COMPRESSED_SIZE: usize = 2 * 1024 * 1024 * 1024;
     if compressed_size == 0 || compressed_size > MAX_COMPRESSED_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

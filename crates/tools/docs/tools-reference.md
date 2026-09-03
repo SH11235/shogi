@@ -89,6 +89,7 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 |--------|------|
 | `spsa` | SPSA チューナー。paired antithetic + stochastic rounding + 1 batch = 1 update のスケジュールで対局を回す。複数 seed の探索は `--seed` を変えた独立 run dir を別プロセスで並列実行する |
 | `generate_spsa_params` | SearchTuneParams から SPSA 用 .params ファイルを生成 |
+| `generate_net_spsa_params` | LayerStacks `.bin` を走査し、net 重み delta 用 SPSA `.params` を生成（[詳細](generate_net_spsa_params.md)） |
 | `spsa_param_diff` | SPSA .params の最終差分と履歴差分を集計 |
 | `spsa_stats_to_plot_csv` | SPSA 統計を可視化用 CSV に整形（移動平均計算） |
 | `params_to_shogitest_options` | SPSA .params を shogitest 互換オプション文字列に変換 |
