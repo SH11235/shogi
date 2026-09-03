@@ -55,6 +55,7 @@ mod leb128;
 mod ls_feature_spec;
 #[macro_use]
 pub mod macros;
+pub mod net_delta;
 mod network;
 pub(crate) mod network_halfka_hm_merged;
 pub(crate) mod network_halfka_hm_split;
@@ -111,6 +112,10 @@ pub use ls_feature_spec::{
     HalfKaHmMergedSpec, HalfKaHmSplitSpec, HalfKaMergedSpec, HalfKaSplitSpec, HalfKpSpec,
     LsFeatureSpec,
 };
+pub use net_delta::{
+    NET_DELTA_OPTION_PREFIX, NetCoefficientId, NetDelta, NetDeltaError, NetDeltaReport,
+    NetTensorKind, NetTensorShape,
+};
 #[cfg(feature = "layerstack-arch")]
 pub use network::evaluate_layer_stacks;
 pub(crate) use network::nnue_requires_board_effects;
@@ -122,8 +127,9 @@ pub use network::{
     configure_layer_stack_routing, detect_format, ensure_accumulator_computed, evaluate_dispatch,
     get_fv_scale_override, get_layer_stack_bucket_mode, get_layer_stack_progress_buckets,
     get_layer_stack_progress_kpabs_weights, get_network, init_nnue, init_nnue_from_bytes,
-    is_halfka_256_loaded, is_halfka_512_loaded, is_halfka_1024_loaded, is_halfka_hm_256_loaded,
-    is_halfka_hm_512_loaded, is_halfka_hm_1024_loaded, is_layer_stacks_loaded, is_nnue_initialized,
+    init_nnue_from_bytes_with_deltas, init_nnue_with_deltas, is_halfka_256_loaded,
+    is_halfka_512_loaded, is_halfka_1024_loaded, is_halfka_hm_256_loaded, is_halfka_hm_512_loaded,
+    is_halfka_hm_1024_loaded, is_layer_stacks_loaded, is_nnue_initialized,
     layer_stack_progress_coeff_required, load_progress_coeff_kpabs,
     load_progress_coeff_kpabs_from_bytes, parse_layer_stack_bucket_mode, parse_nnue_architecture,
     progress_sum_to_bucket, reset_layer_stack_progress_buckets,

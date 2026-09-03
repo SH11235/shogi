@@ -145,6 +145,30 @@ impl DynamicAffine {
         })
     }
 
+    pub(crate) fn weight_len(&self) -> usize {
+        self.weights.len()
+    }
+
+    pub(crate) fn file_weight(&self, index: usize) -> i8 {
+        self.weights[index]
+    }
+
+    pub(crate) fn apply_file_weight_delta(&mut self, index: usize, delta: i32) -> bool {
+        let (value, clamped) = super::net_delta::add_i8_delta(self.weights[index], delta);
+        self.weights[index] = value;
+        clamped
+    }
+
+    pub(crate) fn bias(&self, index: usize) -> i32 {
+        self.biases[index]
+    }
+
+    pub(crate) fn apply_bias_delta(&mut self, index: usize, delta: i32) -> bool {
+        let (value, clamped) = super::net_delta::add_i32_delta(self.biases[index], delta);
+        self.biases[index] = value;
+        clamped
+    }
+
     #[inline]
     pub(crate) fn propagate(&self, input: &[u8], output: &mut [i32]) {
         debug_assert!(input.len() >= self.padded_input);
@@ -638,6 +662,7 @@ mod tests {
     use super::*;
     use crate::nnue::accumulator_stack_variant::AccumulatorStackVariant;
     use crate::nnue::halfkp::{HalfKPNetwork, HalfKPStack};
+    use crate::nnue::net_delta::{NetCoefficientId, NetDelta, NetTensorKind};
     use crate::nnue::network::NNUENetwork;
     use crate::position::SFEN_HIRATE;
 
@@ -648,6 +673,36 @@ mod tests {
             output_dim,
             biases: AlignedBox::new_zeroed(output_dim),
             weights: AlignedBox::new_zeroed(output_dim * padded_input(input_dim)),
+        }
+    }
+
+    #[test]
+    fn dynamic_affine_file_edit_matches_delta() {
+        for (input_dim, output_dim) in [(30, 32), (32, 1)] {
+            let weight_len = output_dim * padded_input(input_dim);
+            let file_index = weight_len - 1;
+            let mut edited_bytes = vec![0; output_dim * std::mem::size_of::<i32>() + weight_len];
+            edited_bytes[output_dim * std::mem::size_of::<i32>() + file_index] = 19;
+            let edited =
+                DynamicAffine::read(&mut std::io::Cursor::new(edited_bytes), input_dim, output_dim)
+                    .expect("edited affine");
+
+            let mut delta = DynamicAffine::read(
+                &mut std::io::Cursor::new(vec![
+                    0;
+                    output_dim * std::mem::size_of::<i32>() + weight_len
+                ]),
+                input_dim,
+                output_dim,
+            )
+            .expect("base affine");
+            assert!(!delta.apply_file_weight_delta(file_index, 19));
+            assert_eq!(&*delta.biases, &*edited.biases);
+            assert_eq!(&*delta.weights, &*edited.weights);
+
+            delta.weights[file_index] = i8::MAX;
+            assert!(delta.apply_file_weight_delta(file_index, 1));
+            assert_eq!(delta.file_weight(file_index), i8::MAX);
         }
     }
 
@@ -667,6 +722,23 @@ mod tests {
             fv_scale: FV_SCALE,
             qa: 127,
         }
+    }
+
+    #[test]
+    fn net_delta_rejects_dynamic_halfkx() {
+        let spec = ArchitectureSpec::new(FeatureSet::HalfKP, 32, 4, 2, Activation::CReLU);
+        let mut network = NNUENetwork::DynamicHalfKx(Box::new(test_network(spec)));
+        let error = network
+            .apply_net_deltas(&[NetDelta {
+                id: NetCoefficientId {
+                    kind: NetTensorKind::FtBias,
+                    bucket: None,
+                    index: 0,
+                },
+                delta: 1,
+            }])
+            .expect_err("HalfKX must reject net deltas");
+        assert!(error.to_string().contains("unsupported architecture"));
     }
 
     #[test]

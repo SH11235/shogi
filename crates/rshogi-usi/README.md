@@ -39,6 +39,12 @@ The engine will start in USI mode, waiting for commands from stdin.
 | `USI_Hash` | Hash table size in MB | 256 |
 | `NetworkDelay` | Network delay compensation (ms) | 0 |
 | `NetworkDelay2` | Additional delay for uncertain situations | 0 |
+| `EvalFile` | NNUE model path | `eval/nn.bin` |
+| `SPSAParamsFile` | Search/net SPSA parameter file | `<auto>` |
+| `SPSA_NET_*` | LayerStacks net coefficient delta advertised by `--spsa-net-spec` | 0 |
+
+`SPSA_NET_*` options are loaded from the model again and applied at the next `isready`,
+`usinewgame`, or `go`; changing several options therefore causes one reload.
 
 ## License
 

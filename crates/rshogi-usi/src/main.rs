@@ -2,20 +2,23 @@
 //!
 //! 将棋GUIとの通信を行うUSIプロトコル実装。
 
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use rshogi_core::eval::{
     DEFAULT_PASS_RIGHT_VALUE_EARLY, DEFAULT_PASS_RIGHT_VALUE_LATE, MaterialLevel, disable_material,
     is_material_enabled, set_eval_hash_enabled, set_material_level, set_pass_move_bonus,
     set_pass_right_value_phased,
 };
 use rshogi_core::nnue::{
-    AccumulatorStackVariant, LayerStackBucketMode, MAX_LAYER_STACK_BUCKETS, clear_nnue,
-    configure_layer_stack_routing, evaluate_dispatch, get_network, init_nnue,
+    AccumulatorStackVariant, LayerStackBucketMode, MAX_LAYER_STACK_BUCKETS,
+    NET_DELTA_OPTION_PREFIX, NetCoefficientId, NetDelta, NetDeltaReport, clear_nnue,
+    configure_layer_stack_routing, evaluate_dispatch, get_network, init_nnue_with_deltas,
     layer_stack_progress_coeff_required, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
     parse_nnue_architecture, print_nnue_stats, reset_layer_stack_progress_buckets,
     reset_layer_stack_progress_kpabs_weights, set_fv_scale_override,
@@ -86,6 +89,12 @@ struct UsiEngine {
     spsa_params_file: Option<String>,
     /// SPSA params ファイルの読み込み済みフラグ
     spsa_params_loaded: bool,
+    /// 起動時 spec から広告する net delta option 名。
+    spsa_net_spec_names: Vec<String>,
+    /// 現在設定されている net delta。
+    net_deltas: BTreeMap<NetCoefficientId, i32>,
+    /// ロード済み net へ未反映の delta があるか。
+    net_deltas_dirty: bool,
     /// Large Pages使用メッセージの出力済みフラグ
     large_pages_reported: bool,
     // --- 有限パス権（Finite Pass Rights）関連 ---
@@ -116,7 +125,12 @@ struct UsiEngine {
 
 impl UsiEngine {
     /// 新しいUSIエンジンを作成
+    #[cfg(test)]
     fn new() -> Self {
+        Self::new_with_spsa_net_spec(Vec::new())
+    }
+
+    fn new_with_spsa_net_spec(spsa_net_spec_names: Vec<String>) -> Self {
         let tt_size_mb = 256;
         let eval_hash_size_mb = 256;
         let use_eval_hash = true;
@@ -151,6 +165,9 @@ impl UsiEngine {
             ls_progress_coeff_loaded: false,
             spsa_params_file: None,
             spsa_params_loaded: false,
+            spsa_net_spec_names,
+            net_deltas: BTreeMap::new(),
+            net_deltas_dirty: false,
             large_pages_reported: false,
             pass_rights_enabled: false,
             initial_pass_count: 2,
@@ -179,13 +196,13 @@ impl UsiEngine {
                 self.cmd_usi();
             }
             "isready" => {
-                self.cmd_isready();
+                self.cmd_isready()?;
             }
             "setoption" => {
                 self.cmd_setoption(&tokens);
             }
             "usinewgame" => {
-                self.cmd_usinewgame();
+                self.cmd_usinewgame()?;
             }
             "position" => {
                 self.last_position_cmd = Some(line.to_string());
@@ -193,13 +210,13 @@ impl UsiEngine {
             }
             "go" => {
                 self.last_go_cmd = Some(line.to_string());
-                self.cmd_go(&tokens);
+                self.cmd_go(&tokens)?;
             }
             "stop" => {
                 self.cmd_stop();
             }
             "ponderhit" => {
-                self.cmd_ponderhit();
+                self.cmd_ponderhit()?;
             }
             "quit" => {
                 self.cmd_stop();
@@ -305,15 +322,20 @@ impl UsiEngine {
                 spec.usi_name, spec.default, spec.min, spec.max
             );
         }
+        for name in &self.spsa_net_spec_names {
+            println!("option name {name} type spin default 0 min -32768 max 32767");
+        }
         println!("usiok");
     }
 
     /// isreadyコマンド: 準備完了を通知
     /// YaneuraOu準拠: isready 受信時にTTをクリアする
-    fn cmd_isready(&mut self) {
+    fn cmd_isready(&mut self) -> Result<()> {
+        self.wait_for_search();
         if let Some(search) = self.search.as_mut() {
             search.clear_tt();
         }
+        self.maybe_load_spsa_params();
         // EvalFile の状態を確認し、必要なら NNUE をロード
         match self.eval_file_explicit {
             Some(false) => {
@@ -331,8 +353,9 @@ impl UsiEngine {
                 // EvalFile 未指定 + Material 未指定 + NNUE 未ロード → eval/nn.bin を自動ロード
                 const DEFAULT_EVAL_FILE: &str = "eval/nn.bin";
                 if std::path::Path::new(DEFAULT_EVAL_FILE).exists() {
-                    match init_nnue(DEFAULT_EVAL_FILE) {
-                        Ok(()) => {
+                    match self.load_nnue_with_current_deltas(Path::new(DEFAULT_EVAL_FILE)) {
+                        Ok(_) => {
+                            self.eval_file_path = Some(DEFAULT_EVAL_FILE.to_string());
                             let payload = json!({
                                 "type": "info",
                                 "message": format!("NNUE auto-loaded: {DEFAULT_EVAL_FILE}"),
@@ -355,6 +378,7 @@ impl UsiEngine {
                 // EvalFile 未指定だが Material 有効 or NNUE 既ロード → 何もしない
             }
         }
+        self.reload_net_deltas_if_dirty()?;
         // version は binary layout の判別にだけ使う。LayerStacks の routing semantics は
         // USI オプションと、ロード済み net の格納 bucket 数を突き合わせて検証する。
         if let Some(stored_bucket_count) =
@@ -387,10 +411,10 @@ impl UsiEngine {
                 routing_bucket_count
             );
         }
-        self.maybe_load_spsa_params();
         self.maybe_report_large_pages();
         self.maybe_load_book();
         println!("readyok");
+        Ok(())
     }
 
     /// 定跡ファイルのロード（isready 時に実施）。
@@ -493,7 +517,11 @@ impl UsiEngine {
                 }
             };
 
-            if let Some(search) = self.search.as_mut()
+            if name.starts_with(NET_DELTA_OPTION_PREFIX) {
+                if self.set_net_delta_value(name, parsed) {
+                    applied += 1;
+                }
+            } else if let Some(search) = self.search.as_mut()
                 && let Some(result) = search.set_search_tune_option(name, parsed)
             {
                 applied += 1;
@@ -511,6 +539,63 @@ impl UsiEngine {
                 clamped
             );
         }
+    }
+
+    fn set_net_delta_value(&mut self, name: &str, value: i32) -> bool {
+        let Some(id) = NetCoefficientId::parse_usi_name(name) else {
+            eprintln!("info string Warning: invalid SPSA net option name '{name}'");
+            return false;
+        };
+        let previous = self.net_deltas.get(&id).copied().unwrap_or(0);
+        if previous != value {
+            self.net_deltas.insert(id, value);
+            self.net_deltas_dirty = true;
+        }
+        true
+    }
+
+    fn current_net_deltas(&self) -> Vec<NetDelta> {
+        self.net_deltas
+            .iter()
+            .filter(|(_, delta)| **delta != 0)
+            .map(|(id, delta)| NetDelta {
+                id: id.clone(),
+                delta: *delta,
+            })
+            .collect()
+    }
+
+    fn load_nnue_with_current_deltas(&mut self, path: &Path) -> io::Result<NetDeltaReport> {
+        let deltas = self.current_net_deltas();
+        let report = init_nnue_with_deltas(path, &deltas)?;
+        if !deltas.is_empty() || self.net_deltas_dirty {
+            eprintln!(
+                "info string net deltas applied: {} coefficients (clamped: {})",
+                report.applied, report.clamped
+            );
+        }
+        self.net_deltas_dirty = false;
+        Ok(report)
+    }
+
+    fn reload_net_deltas_if_dirty(&mut self) -> Result<()> {
+        if !self.net_deltas_dirty || get_network().is_none() {
+            return Ok(());
+        }
+        // 探索 worker は global Arc の生存を前提に raw pointer を持つため、差し替え前に join する。
+        self.wait_for_search();
+        let path = self
+            .eval_file_path
+            .as_ref()
+            .map(PathBuf::from)
+            .context("NNUE delta reload requested, but the loaded EvalFile path is unknown")?;
+        self.load_nnue_with_current_deltas(&path)
+            .with_context(|| format!("failed to reload NNUE file {}", path.display()))?;
+        if let Some(search) = self.search.as_mut() {
+            search.clear_tt();
+            search.resize_eval_hash(self.eval_hash_size_mb);
+        }
+        Ok(())
     }
 
     fn maybe_report_large_pages(&mut self) {
@@ -573,6 +658,18 @@ impl UsiEngine {
         }
 
         // オプションを適用
+        if name.starts_with(NET_DELTA_OPTION_PREFIX) {
+            let parsed = match value.parse::<i32>() {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("info string Warning: invalid SPSA net value '{}'", value);
+                    return;
+                }
+            };
+            self.set_net_delta_value(&name, parsed);
+            return;
+        }
+
         if name.starts_with("SPSA_") {
             let parsed = match value.parse::<i32>() {
                 Ok(v) => v,
@@ -777,8 +874,8 @@ impl UsiEngine {
                 } else {
                     // パス指定: ロード試行し、結果を記録
                     self.eval_file_path = Some(value.to_string());
-                    match init_nnue(&value) {
-                        Ok(()) => {
+                    match self.load_nnue_with_current_deltas(Path::new(&value)) {
+                        Ok(_) => {
                             // 前 net 向けの routing 数を新 net に引き継がない。次の isready で
                             // 再検証・再設定されるまで LayerStacks 評価は loud に失敗する。
                             reset_layer_stack_progress_buckets();
@@ -826,10 +923,13 @@ impl UsiEngine {
                     // arch_str 不整合が原因でロード失敗していた場合、architecture override
                     // 変更後の再試行で成功する可能性がある。再試行しても失敗した場合は
                     // Some(false) のまま維持され、isready の panic 安全策は保持される。
-                    if let Some(ref path) = self.eval_file_path {
+                    // auto-load した path を明示指定済みの状態へ昇格させないために限定する。
+                    if self.eval_file_explicit.is_some()
+                        && let Some(path) = self.eval_file_path.clone()
+                    {
                         let was_loaded = get_network().is_some();
-                        match init_nnue(path) {
-                            Ok(()) => {
+                        match self.load_nnue_with_current_deltas(Path::new(&path)) {
+                            Ok(_) => {
                                 reset_layer_stack_progress_buckets();
                                 self.eval_file_explicit = Some(true);
                                 let action = if was_loaded {
@@ -1041,14 +1141,16 @@ impl UsiEngine {
     }
 
     /// usinewgameコマンド: 新しい対局の開始
-    fn cmd_usinewgame(&mut self) {
+    fn cmd_usinewgame(&mut self) -> Result<()> {
         self.cmd_stop();
+        self.reload_net_deltas_if_dirty()?;
 
         if let Some(search) = self.search.as_mut() {
             search.clear_tt();
             search.clear_histories(); // YaneuraOu準拠：履歴統計もクリア
         }
         self.position = Position::new();
+        Ok(())
     }
 
     /// positionコマンド: 局面設定
@@ -1173,11 +1275,12 @@ impl UsiEngine {
     }
 
     /// goコマンド: 探索開始
-    fn cmd_go(&mut self, tokens: &[&str]) {
+    fn cmd_go(&mut self, tokens: &[&str]) -> Result<()> {
         // 既存の探索を停止（bestmove出力を抑制する）
         // GUIがstopを送らずにposition+goを送ってきた場合、前のponder探索の
         // bestmoveがstdoutに出力されるとGUIが混乱する（YaneuraOu準拠）
         self.stop_search_silently();
+        self.reload_net_deltas_if_dirty()?;
 
         // 制限を解析
         let limits = self.parse_go_options(tokens);
@@ -1186,7 +1289,7 @@ impl UsiEngine {
         // go infinite / go mate / go ponder では probe しない（Phase 1 の単純化、設計メモ §3）。
         // book hit 時は探索スレッドを起こさず bestmove を直接出力する。
         if !limits.infinite && limits.mate == 0 && !limits.ponder && self.try_book_probe() {
-            return;
+            return Ok(());
         }
 
         // Stochastic_Ponder では 1 手戻した局面から先読みする（YaneuraOu 準拠）
@@ -1253,6 +1356,7 @@ impl UsiEngine {
                 })
                 .expect("failed to spawn search thread"),
         );
+        Ok(())
     }
 
     /// 現在局面を定跡で probe し、hit したら bestmove を直接出力して true を返す。
@@ -1448,19 +1552,20 @@ impl UsiEngine {
     }
 
     /// ponderhitコマンド: 先読みヒットを通知
-    fn cmd_ponderhit(&mut self) {
+    fn cmd_ponderhit(&mut self) -> Result<()> {
         if self.stochastic_ponder {
-            self.restart_after_ponderhit();
-            return;
+            self.restart_after_ponderhit()?;
+            return Ok(());
         }
 
         if let Some(handle) = &self.ponderhit_handle {
             handle.signal();
         }
+        Ok(())
     }
 
     /// Stochastic_Ponder の ponderhit 後に通常探索へ切り替える
-    fn restart_after_ponderhit(&mut self) {
+    fn restart_after_ponderhit(&mut self) -> Result<()> {
         self.stop_search_silently();
 
         if let Some(line) = self.last_position_cmd.clone() {
@@ -1476,9 +1581,10 @@ impl UsiEngine {
                 .collect();
             let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
             if !tokens.is_empty() {
-                self.cmd_go(&tokens);
+                self.cmd_go(&tokens)?;
             }
         }
+        Ok(())
     }
 
     /// 探索スレッドの終了を待ち、Searchを取り戻す
@@ -1596,6 +1702,46 @@ fn validate_layer_stack_routing(
     }
 }
 
+fn parse_startup_args(args: impl IntoIterator<Item = String>) -> Result<Option<PathBuf>> {
+    let mut spec_path = None;
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--spsa-net-spec" => {
+                if spec_path.is_some() {
+                    bail!("--spsa-net-spec may only be specified once");
+                }
+                let path = args.next().context("--spsa-net-spec requires a path")?;
+                spec_path = Some(PathBuf::from(path));
+            }
+            _ => bail!("unknown argument: {argument}"),
+        }
+    }
+    Ok(spec_path)
+}
+
+fn parse_spsa_net_spec(content: &str) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for (line_index, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let without_comment = trimmed.split("//").next().unwrap_or(trimmed);
+        let usable = without_comment.replace("[[NOT USED]]", "");
+        let usable = usable.trim();
+        if usable.is_empty() {
+            continue;
+        }
+        let name = usable.split(',').next().unwrap_or("").trim();
+        if NetCoefficientId::parse_usi_name(name).is_none() {
+            bail!("invalid SPSA net spec at line {}: '{name}'", line_index + 1);
+        }
+        names.push(name.to_string());
+    }
+    Ok(names)
+}
+
 fn main() -> Result<()> {
     // ロガー初期化（標準エラー出力）
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -1605,7 +1751,17 @@ fn main() -> Result<()> {
     // ビットボードテーブルの初期化（ホットパスでの OnceLock atomic check 回避）
     rshogi_core::bitboard::init_bitboard_tables();
 
-    let mut engine = UsiEngine::new();
+    let spec_path = parse_startup_args(std::env::args().skip(1))?;
+    let spec_names = match spec_path {
+        Some(path) => {
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read SPSA net spec {}", path.display()))?;
+            parse_spsa_net_spec(&content)
+                .with_context(|| format!("failed to parse SPSA net spec {}", path.display()))?
+        }
+        None => Vec::new(),
+    };
+    let mut engine = UsiEngine::new_with_spsa_net_spec(spec_names);
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {
@@ -1628,6 +1784,64 @@ mod tests {
     // 履歴統計の初期化がスタックを大量に消費するため、別スレッドで実行
     // UsiEngine::new() が NNUE グローバル状態に依存するため、全テストを #[serial] で逐次実行
     const STACK_SIZE: usize = 64 * 1024 * 1024;
+
+    #[test]
+    fn spsa_net_spec_accepts_names_and_params_rows() {
+        let content = r#"
+# comment
+SPSA_NET_out_w_b3_17
+SPSA_NET_out_b_b0_0,int,0,-10,10,1,0.1 // output bias
+SPSA_NET_ft_b_1023,int,0,-10,10,1,0.1 [[NOT USED]]
+// ignored
+"#;
+        assert_eq!(
+            parse_spsa_net_spec(content).expect("spec"),
+            [
+                "SPSA_NET_out_w_b3_17",
+                "SPSA_NET_out_b_b0_0",
+                "SPSA_NET_ft_b_1023"
+            ]
+        );
+    }
+
+    #[test]
+    fn spsa_net_spec_reports_invalid_line_and_name() {
+        let error = parse_spsa_net_spec("# ok\nSPSA_NET_out_w_17,int,0").expect_err("invalid name");
+        let message = error.to_string();
+        assert!(message.contains("line 2"), "{message}");
+        assert!(message.contains("SPSA_NET_out_w_17"), "{message}");
+    }
+
+    #[test]
+    #[serial]
+    fn setoption_net_delta_saves_value_and_tracks_dirty_state() {
+        std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                let mut engine = UsiEngine::new();
+                let name = "SPSA_NET_l2_w_b2_45";
+                let id = NetCoefficientId::parse_usi_name(name).expect("id");
+
+                engine.cmd_setoption(&["setoption", "name", name, "value", "12"]);
+                assert_eq!(engine.net_deltas.get(&id), Some(&12));
+                assert!(engine.net_deltas_dirty);
+
+                engine.net_deltas_dirty = false;
+                engine.cmd_setoption(&["setoption", "name", name, "value", "12"]);
+                assert!(!engine.net_deltas_dirty);
+
+                engine.cmd_setoption(&["setoption", "name", name, "value", "0"]);
+                assert_eq!(engine.net_deltas.get(&id), Some(&0));
+                assert!(engine.net_deltas_dirty);
+
+                engine.net_deltas_dirty = false;
+                engine.cmd_setoption(&["setoption", "name", "SPSA_NET_out_w_3", "value", "1"]);
+                assert!(!engine.net_deltas_dirty);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[test]
     #[serial]
