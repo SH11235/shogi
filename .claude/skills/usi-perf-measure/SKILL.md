@@ -46,10 +46,24 @@ Precise と同じ帰属規則）。**Hyper-V / VBS 有効のままで動く**（
 非対応なので使わない）。
 
 - **要管理者権限**。非管理者だと `ERROR_ACCESS_DENIED` で明確にエラーになる
+- **非昇格セッションから自律実行するには昇格タスク経由**: タスクスケジューラに
+  RunLevel Highest のランナータスクを一度登録しておき（Linux 開発機の NOPASSWD
+  sudo 相当のローカルセットアップ）、非昇格プロセスからは job ファイルを書いて
+  `Start-ScheduledTask` でトリガーする方式が使える（UAC プロンプトなしで完結する）。
+  タスク名・パス等のマシン固有情報は repo には書かず各マシンの運用ノートで管理する。
+  この方式でランナーを組む場合の設計上の注意:
+  - job ファイル（JSON 等）は python 等で**機械生成**する（heredoc 手書きの
+    エスケープ破損で JSON が静かに壊れ、計測時間を丸ごと失った事故がある）
+  - 結果は log / exit code / error を別ファイルに分け、待機側は exit ファイルだけで
+    なく **error ファイルも監視**する（沈黙 ≠ 実行中）。ランナーが過去の result を
+    掃除しない設計なら、**トリガー前に前回の残骸を削除**してから起動する
+    （残骸を今回の失敗と誤判定しない）
+  - JSON レポートが必要なら `--json-out` を job の引数で明示指定する
 - CLI は Linux 版と同一互換。差分は以下のみ:
   - `--perf-events` の代わりに `--pmc-sources`（カンマ区切り、default
     `TotalCycles,InstructionRetired`）。source 名は `wpr -pmcsources` で列挙される
-    もの（`CacheMisses`, `DcacheMisses`, `BranchMispredictions` 等を追加可能、最大 8 個）
+    もの（`CacheMisses`, `DcacheMisses`, `BranchMispredictions` 等を追加可能、最大 8 個。
+    ただし cache 系は Zen 5 では 0 を返す — 後述の注意を参照）
   - `--cpus`（shard 並列）は未対応（指定するとエラー）。`--cpu N` は
     `SetProcessAffinityMask` で論理 CPU 1 個に pin + `HIGH_PRIORITY_CLASS`
 - 計測区間は `position`+`go` 送信直前〜`bestmove` 受信直後の QPC 区間で gating する。
@@ -96,6 +110,9 @@ Precise と同じ帰属規則）。**Hyper-V / VBS 有効のままで動く**（
 - ETW イベントロス（`EventsLost` / `RealTimeBuffersLost` の増分）を run ごとに検査し、
   検出したらその run はエラーで破棄する（静かに壊れた計測値を出さない）。頻発する
   場合はシステム負荷を下げる
+- **Zen 5 では cache 系 source（`DcacheMisses` / `CacheMisses`）が常に 0 を返す**
+  （legacy event が未マップの疑い）。`TotalCycles` / `InstructionRetired` は正常。
+  Zen 5 機では cache 指標に頼らず cycles/node と instructions/node で判定する
 
 ## 前提確認
 
@@ -220,6 +237,21 @@ nps_delta_pct=+12.3% cycles_per_node_delta_pct=-11.0% instructions_per_node_delt
 | `cache-misses` / `cache-references` | L2/L3 全体の miss 率 | cache pressure の目安 |
 | `L1-dcache-load-misses` / nodes | L1d miss/node | L2 以上へ落ちる量。Threat テーブル散在アクセスで増える |
 | `nps_delta_pct` | NPS 差 (%) | candidate が baseline より速ければ +、遅ければ − |
+
+### 有意性の目安（ノイズ床）
+
+Windows ETW backend の A/A 実測（Zen 5 / 9950X3D 機、movetime 3s × abba ×
+rounds 3、threads=1・単一 CPU pin、境界スライス線形按分実装後）で pooled の
+cycles/node 残差は **±0.13%** だった。この構成でのノイズ床として:
+
+- **pooled 差が ±0.2% 未満なら有意と主張しない**（ABBA + rounds ≥ 3 を揃えた上で）
+- ±0.2% はあくまで pooled A/A 残差由来のノイズ床であって A/B の最終判定基準では
+  ない。pooled 値には position-mix バイアスが乗る（ハマりどころ 8 参照）ので、
+  **ノイズ床を越えた場合の最終判定は per-position で行う**
+- 上記数値はこの構成（Windows ETW・3s・pin）での実測。movetime を伸ばせば締まり、
+  構成が違えばノイズ床も変わるので、疑わしければその構成で A/A を取り直す
+- 本文のレシピ例は `--rounds 2`（探索的な比較向け）。このノイズ床を適用して
+  有意性を主張する判定では `--rounds 3` 以上に上げる
 
 ### cycles/node vs instructions/node の差分
 
