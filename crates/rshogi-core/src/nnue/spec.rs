@@ -236,6 +236,47 @@ pub(crate) fn parse_layer_stacks_feature_set_keyword(
     Ok(Some(feature))
 }
 
+/// LayerStacks loader が共通で要求する header 条件を検証する。
+pub(crate) fn validate_layer_stacks_architecture_header(
+    arch_str: &str,
+) -> Result<Option<usize>, String> {
+    if arch_str.contains("Factorizer") {
+        return Err(format!(
+            "Unsupported model format: factorized (non-coalesced) model detected. \
+             This engine only supports coalesced models. \
+             To fix: re-export with nnue-pytorch serialize.py (python serialize.py model.ckpt output.nnue). \
+             Architecture string: {arch_str}"
+        ));
+    }
+
+    let Some(value) = arch_str.split(',').find_map(|part| part.strip_prefix("Threat=")) else {
+        return Ok(None);
+    };
+    let dimensions = value.parse::<usize>().map_err(|_| "malformed Threat token".to_owned())?;
+    if dimensions == 0 {
+        return Err("malformed Threat token".to_owned());
+    }
+    Ok(Some(dimensions))
+}
+
+pub(crate) fn validate_layer_stacks_dimensions(
+    l1: usize,
+    l2: usize,
+    l3: usize,
+) -> Result<(), String> {
+    const MAX_DIMENSION: usize = 16_384;
+
+    if l1 == 0 || !l1.is_multiple_of(2) || l2 < 2 || l3 == 0 {
+        return Err("invalid LayerStacks dimensions".to_owned());
+    }
+    for (name, value) in [("l1", l1), ("l2", l2), ("l3", l3)] {
+        if value > MAX_DIMENSION {
+            return Err(format!("invalid runtime LayerStacks {name} dimension: {value}"));
+        }
+    }
+    Ok(())
+}
+
 /// アーキテクチャ文字列から FeatureSet を判定
 pub fn parse_feature_set_from_arch(arch_str: &str) -> Result<FeatureSet, String> {
     // 明示的な "LayerStacks" キーワードがあれば確定
@@ -1498,6 +1539,21 @@ mod tests {
         // 何も取得できない場合
         assert_eq!(parse_arch_dimensions("unknown"), (0, 0, 0));
         assert_eq!(parse_arch_dimensions(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_validate_layer_stacks_dimensions() {
+        assert!(validate_layer_stacks_dimensions(16_384, 16_384, 16_384).is_ok());
+        for dimensions in [(0, 2, 1), (3, 2, 1), (2, 1, 1), (2, 2, 0)] {
+            assert!(
+                validate_layer_stacks_dimensions(dimensions.0, dimensions.1, dimensions.2).is_err()
+            );
+        }
+        for dimensions in [(16_386, 2, 1), (2, 16_385, 1), (2, 2, 16_385)] {
+            assert!(
+                validate_layer_stacks_dimensions(dimensions.0, dimensions.1, dimensions.2).is_err()
+            );
+        }
     }
 
     // =============================================================================

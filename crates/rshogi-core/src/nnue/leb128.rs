@@ -3,9 +3,104 @@
 //! nnue-pytorch の圧縮形式で使用される可変長整数エンコーディング。
 
 use std::io::{self, Read};
+use std::ops::DerefMut;
 
 /// COMPRESSED_LEB128 マジック文字列
 pub const LEB128_MAGIC: &[u8] = b"COMPRESSED_LEB128";
+
+pub(crate) const MAX_COMPRESSED_SIZE: usize = 2 * 1024 * 1024 * 1024;
+
+/// LayerStacks FT の biases / weights を LEB128 から読む。
+pub(crate) fn read_layer_stacks_ft_i16<R, W, F>(
+    reader: &mut R,
+    biases: &mut [i16],
+    weight_count: usize,
+    allocate_weights: F,
+) -> io::Result<W>
+where
+    R: Read,
+    W: DerefMut<Target = [i16]>,
+    F: FnOnce(usize) -> W,
+{
+    let combined_count = biases
+        .len()
+        .checked_add(weight_count)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "FT element count overflow"))?;
+    let mut first = read_compressed_i16_block(reader)?;
+    first.decode_into(biases, "FT biases")?;
+
+    if first.is_exhausted() {
+        drop(first);
+        let mut weights_block = read_compressed_i16_block(reader)?;
+        let mut weights = allocate_weights(weight_count);
+        weights_block.decode_into(&mut weights, "FT weights")?;
+        weights_block.require_exhausted("FT weights", weight_count)?;
+        Ok(weights)
+    } else {
+        let mut weights = allocate_weights(weight_count);
+        first.decode_into(&mut weights, "combined FT weights")?;
+        first.require_exhausted("combined FT", combined_count)?;
+        Ok(weights)
+    }
+}
+
+struct CompressedI16Block {
+    payload: Vec<u8>,
+    position: usize,
+}
+
+impl CompressedI16Block {
+    fn decode_into(&mut self, destination: &mut [i16], name: &str) -> io::Result<()> {
+        let expected = destination.len();
+        for (index, value) in destination.iter_mut().enumerate() {
+            if self.is_exhausted() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{name} block size mismatch: got {index} values, expected {expected}"),
+                ));
+            }
+            let (decoded, consumed) = decode_single_leb128(&self.payload[self.position..])?;
+            *value = decoded as i16;
+            self.position += consumed;
+        }
+        Ok(())
+    }
+
+    fn require_exhausted(&self, name: &str, expected: usize) -> io::Result<()> {
+        if self.is_exhausted() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name} block size mismatch: expected {expected} values"),
+            ))
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.position == self.payload.len()
+    }
+}
+
+fn read_compressed_i16_block<R: Read>(reader: &mut R) -> io::Result<CompressedI16Block> {
+    let mut magic_buf = [0u8; 17];
+    reader.read_exact(&mut magic_buf)?;
+    if magic_buf != LEB128_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Expected COMPRESSED_LEB128 magic"));
+    }
+
+    let mut size_buf = [0u8; 4];
+    reader.read_exact(&mut size_buf)?;
+    let compressed_size = u32::from_le_bytes(size_buf) as usize;
+    validate_compressed_size(compressed_size)?;
+
+    let mut payload = vec![0u8; compressed_size];
+    reader.read_exact(&mut payload)?;
+    Ok(CompressedI16Block {
+        payload,
+        position: 0,
+    })
+}
 
 /// 符号付きLEB128を読み込み
 ///
@@ -48,7 +143,7 @@ pub fn read_signed_leb128<R: Read>(reader: &mut R) -> io::Result<i64> {
 /// バイトスライスからLEB128値を1つデコード
 ///
 /// 戻り値: (デコードされた値, 消費したバイト数)
-fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
+pub(crate) fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
     let mut result: i64 = 0;
     let mut shift = 0;
     let mut pos = 0;
@@ -90,36 +185,28 @@ fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
 ///
 /// count を指定せず、圧縮データ内の全値をデコードする。
 /// ブロック内の要素数で形式（biases のみ / biases+weights 結合）を判別する用途に使う。
+#[cfg(test)]
 pub fn read_compressed_tensor_i16_all<R: Read>(reader: &mut R) -> io::Result<Vec<i16>> {
-    let mut magic_buf = [0u8; 17];
-    reader.read_exact(&mut magic_buf)?;
+    let block = read_compressed_i16_block(reader)?;
+    decode_leb128_all_i16(&block.payload)
+}
 
-    if magic_buf != LEB128_MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Expected COMPRESSED_LEB128 magic"));
-    }
-
-    let mut size_buf = [0u8; 4];
-    reader.read_exact(&mut size_buf)?;
-    let compressed_size = u32::from_le_bytes(size_buf) as usize;
-
+fn validate_compressed_size(compressed_size: usize) -> io::Result<()> {
     // 不正ファイルの巨大 alloc を防ぐ sanity 上限。HalfKaHmMerged + EffectBucket は base 特徴を NB 倍に
     // 拡張するため FT block が大きく (2x2×1024=600MB 生 / ~300MB 圧縮、3x3 系はさらに大)、
     // 旧 256MB では正当な effect bucket net を弾く。size field は u32 なので上限は 4GiB 未満。
-    const MAX_COMPRESSED_SIZE: usize = 2 * 1024 * 1024 * 1024;
     if compressed_size == 0 || compressed_size > MAX_COMPRESSED_SIZE {
-        return Err(io::Error::new(
+        Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Invalid compressed size: {compressed_size} (max: {MAX_COMPRESSED_SIZE})"),
-        ));
+        ))
+    } else {
+        Ok(())
     }
-
-    let mut compressed_data = vec![0u8; compressed_size];
-    reader.read_exact(&mut compressed_data)?;
-
-    decode_leb128_all_i16(&compressed_data)
 }
 
 /// LEB128エンコードされたバイト列から全 i16 値をデコード
+#[cfg(test)]
 fn decode_leb128_all_i16(data: &[u8]) -> io::Result<Vec<i16>> {
     let mut result = Vec::new();
     let mut pos = 0;
@@ -135,6 +222,32 @@ fn decode_leb128_all_i16(data: &[u8]) -> io::Result<Vec<i16>> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn compressed_block(values: &[i16]) -> Vec<u8> {
+        assert!(values.iter().all(|value| (-64..=63).contains(value)));
+        let mut block = Vec::new();
+        block.extend_from_slice(LEB128_MAGIC);
+        block.extend_from_slice(&(values.len() as u32).to_le_bytes());
+        block.extend(values.iter().map(|value| (*value as u8) & 0x7f));
+        block
+    }
+
+    fn decode_ft_with_old_loader(
+        bytes: &[u8],
+        bias_count: usize,
+        weight_count: usize,
+    ) -> (Vec<i16>, Vec<i16>) {
+        let mut reader = Cursor::new(bytes);
+        let first = read_compressed_tensor_i16_all(&mut reader).expect("first block");
+        if first.len() == bias_count + weight_count {
+            (first[..bias_count].to_vec(), first[bias_count..].to_vec())
+        } else {
+            assert_eq!(first.len(), bias_count);
+            let weights = read_compressed_tensor_i16_all(&mut reader).expect("weights block");
+            assert_eq!(weights.len(), weight_count);
+            (first, weights)
+        }
+    }
 
     #[test]
     fn test_decode_single_leb128_positive() {
@@ -201,6 +314,59 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_compressed_tensor_i16_all(&mut cursor).unwrap();
         assert_eq!(result, vec![1, -1, 127]);
+    }
+
+    #[test]
+    fn layer_stacks_ft_streaming_matches_old_loader() {
+        let biases = [1, -2, 3];
+        let weights = [4, -5, 6, -7];
+        let combined =
+            compressed_block(&biases.iter().chain(&weights).copied().collect::<Vec<_>>());
+        let mut split = compressed_block(&biases);
+        split.extend_from_slice(&compressed_block(&weights));
+
+        for bytes in [combined, split] {
+            let expected = decode_ft_with_old_loader(&bytes, biases.len(), weights.len());
+            let mut actual_biases = vec![0; biases.len()];
+            let actual_weights = read_layer_stacks_ft_i16(
+                &mut Cursor::new(bytes),
+                &mut actual_biases,
+                weights.len(),
+                |len| vec![0; len],
+            )
+            .expect("streaming FT");
+            assert_eq!((actual_biases, actual_weights), expected);
+        }
+    }
+
+    #[test]
+    fn layer_stacks_ft_streaming_rejects_size_mismatch() {
+        let combined_too_short = compressed_block(&[1, 2, 3]);
+        let mut split_too_long = compressed_block(&[1, 2]);
+        split_too_long.extend_from_slice(&compressed_block(&[3, 4, 5]));
+
+        for bytes in [combined_too_short, split_too_long] {
+            let result = read_layer_stacks_ft_i16(&mut Cursor::new(bytes), &mut [0; 2], 2, |len| {
+                vec![0; len]
+            });
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn layer_stacks_ft_validates_block_before_weight_allocation() {
+        let mut allocated = false;
+        let result = read_layer_stacks_ft_i16(
+            &mut Cursor::new(vec![0; LEB128_MAGIC.len() + 4]),
+            &mut [0; 2],
+            2,
+            |len| {
+                allocated = true;
+                vec![0; len]
+            },
+        );
+        assert!(result.is_err());
+        assert!(!allocated);
     }
 
     #[test]

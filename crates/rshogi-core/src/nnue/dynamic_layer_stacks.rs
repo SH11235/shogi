@@ -11,14 +11,14 @@ use super::constants::{
     DEFAULT_NUM_BUCKETS, FV_SCALE_HALFKA, MAX_ARCH_LEN, MAX_LAYER_STACK_BUCKETS,
     NNUE_VERSION_HALFKA, NNUE_VERSION_LAYERSTACK_NUM_BUCKETS,
 };
-use super::dynamic_halfkx::{DynamicAffine, validate_dimension};
+use super::dynamic_halfkx::DynamicAffine;
 use super::effect_bucket_features::append_active_effect_bucket;
 use super::features::{
     FeatureSet as FeatureSetTrait, HalfKPFeatureSet, HalfKaHmMergedFeatureSet,
     HalfKaHmSplitFeatureSet, HalfKaMergedFeatureSet, HalfKaSplitFeatureSet,
 };
 use super::layers::padded_input;
-use super::leb128::read_compressed_tensor_i16_all;
+use super::leb128::read_layer_stacks_ft_i16;
 use super::ls_feature_spec::{
     HalfKaHmMergedSpec, HalfKaHmSplitSpec, HalfKaMergedSpec, HalfKaSplitSpec, HalfKpSpec,
     LsFeatureSpec,
@@ -34,7 +34,8 @@ use super::piece_list::PieceNumber;
 use super::spec::{
     Activation, ArchitectureSpec, FeatureSet, parse_arch_dimensions,
     parse_feature_input_dimensions, parse_feature_set_from_arch,
-    parse_layer_stacks_feature_set_keyword,
+    parse_layer_stacks_feature_set_keyword, validate_layer_stacks_architecture_header,
+    validate_layer_stacks_dimensions,
 };
 use super::stats::{count_refresh, count_update};
 use crate::position::Position;
@@ -236,16 +237,9 @@ impl DynamicLayerStacksNetwork {
         }
 
         let (l1, l2, l3) = parse_arch_dimensions(arch);
-        if l1 == 0 || l1 % 2 != 0 || l2 < 2 || l3 == 0 {
-            return Err(invalid("invalid LayerStacks dimensions"));
-        }
-        validate_dimension("LayerStacks l1", l1)?;
-        validate_dimension("LayerStacks l2", l2)?;
-        validate_dimension("LayerStacks l3", l3)?;
-        let threat_dimensions = parse_token_usize(arch, "Threat=").unwrap_or(0);
-        if arch.contains("Threat=") && threat_dimensions == 0 {
-            return Err(invalid("malformed Threat token"));
-        }
+        validate_layer_stacks_dimensions(l1, l2, l3).map_err(invalid)?;
+        let threat_dimensions =
+            validate_layer_stacks_architecture_header(arch).map_err(invalid)?.unwrap_or(0);
         #[cfg(feature = "nnue-threat")]
         if threat_dimensions != 0 && threat_dimensions != super::threat_features::THREAT_DIMENSIONS
         {
@@ -280,25 +274,12 @@ impl DynamicLayerStacksNetwork {
         let input_dimensions = parse_ft_input_dimensions(arch, feature, threat_dimensions)?;
 
         reader.read_exact(&mut buf4)?;
-        let first = read_compressed_tensor_i16_all(reader)?;
         let weight_len = input_dimensions
             .checked_mul(l1)
             .ok_or_else(|| invalid("FT dimensions overflow"))?;
-        let (bias_vec, weight_vec) = if first.len() == l1 + weight_len {
-            (first[..l1].to_vec(), first[l1..].to_vec())
-        } else if first.len() == l1 {
-            let weights = read_compressed_tensor_i16_all(reader)?;
-            if weights.len() != weight_len {
-                return Err(invalid("FT weight block size mismatch"));
-            }
-            (first, weights)
-        } else {
-            return Err(invalid("FT LEB128 block size mismatch"));
-        };
         let mut ft_biases = AlignedBox::new_zeroed(l1);
-        ft_biases.copy_from_slice(&bias_vec);
-        let mut ft_weights = AlignedBox::new_zeroed(weight_len);
-        ft_weights.copy_from_slice(&weight_vec);
+        let ft_weights =
+            read_layer_stacks_ft_i16(reader, &mut ft_biases, weight_len, AlignedBox::new_zeroed)?;
 
         let has_psqt = psqt_override.unwrap_or_else(|| arch.contains("PSQT="));
         let mut psqt_biases = AlignedBox::new_zeroed(if has_psqt { num_buckets } else { 0 });
@@ -1122,9 +1103,6 @@ fn parse_effect_config(arch: &str) -> Option<EffectBucketConfig> {
         _ => None,
     }
 }
-fn parse_token_usize(arch: &str, token: &str) -> Option<usize> {
-    arch.split(',').find_map(|p| p.strip_prefix(token))?.parse().ok()
-}
 fn read_i32s<R: Read>(reader: &mut R, dst: &mut [i32]) -> io::Result<()> {
     let mut b = [0; 4];
     for v in dst {
@@ -1498,6 +1476,7 @@ mod tests {
 
     #[test]
     fn dynamic_layer_stacks_net_delta_matches_file_edits_and_validates_shape() {
+        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
         use crate::nnue::net_delta::test_utils::{
             build_synthetic_layer_stacks, encode_single_byte_signed_leb128,
         };
@@ -1630,6 +1609,8 @@ mod tests {
         }
         crate::nnue::reset_layer_stack_progress_buckets();
         crate::nnue::reset_layer_stack_progress_kpabs_weights();
+
+        drop(routing_guard);
     }
 
     #[test]
@@ -1850,6 +1831,7 @@ mod tests {
 
     #[test]
     fn public_evaluator_keeps_board_effects_for_runtime_effect_bucket() {
+        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
         let feature = RuntimeLsFeature::EffectBucket(EffectBucketConfig::KINGFIXED_2X2);
         let l1 = 2;
         let l2 = 2;
@@ -1886,6 +1868,8 @@ mod tests {
 
         // routing はプロセスグローバルのため、他テストへ持ち越さないよう未設定へ戻す。
         crate::nnue::reset_layer_stack_progress_buckets();
+
+        drop(routing_guard);
     }
 
     #[cfg(feature = "layerstack-arch")]

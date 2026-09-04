@@ -14,7 +14,7 @@ use super::bona_piece::BonaPiece;
 #[cfg(feature = "nnue-psqt")]
 use super::constants::MAX_LAYER_STACK_BUCKETS;
 use super::features::{Feature, FeatureSet};
-use super::leb128::read_compressed_tensor_i16_all;
+use super::leb128::read_layer_stacks_ft_i16;
 use super::ls_feature_spec::LsFeatureSpec;
 use super::piece_list::PieceNumber;
 #[cfg(feature = "nnue-threat")]
@@ -314,86 +314,26 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
     /// - 要素数 == biases + weights → 旧bullet-shogi形式（1ブロック）
     pub fn read_leb128<R: Read>(reader: &mut R) -> io::Result<Self> {
         let weight_size = FT::DIMENSIONS * L1;
-        let total_size = L1 + weight_size;
-
-        // 最初のブロックを全値デコードして要素数で判別
-        let first_block = read_compressed_tensor_i16_all(reader)?;
-
-        if first_block.len() == total_size {
-            // 旧bullet-shogi形式（1ブロック）: biases + weights が結合
-            let mut biases = [0i16; L1];
-            biases.copy_from_slice(&first_block[..L1]);
-
-            let mut weights = AlignedBox::new_zeroed(weight_size);
-            weights.copy_from_slice(&first_block[L1..]);
-
-            return Ok(Self {
-                biases: Aligned(biases),
-                weights,
-                #[cfg(feature = "nnue-psqt")]
-                psqt_biases: [0; MAX_LAYER_STACK_BUCKETS],
-                #[cfg(feature = "nnue-psqt")]
-                psqt_num_buckets: 0,
-                #[cfg(feature = "nnue-psqt")]
-                psqt_weights: AlignedBox::new_zeroed(0),
-                #[cfg(feature = "nnue-psqt")]
-                has_psqt: false,
-                #[cfg(feature = "nnue-threat")]
-                threat_weights: AlignedBox::new_zeroed(0),
-                #[cfg(feature = "nnue-threat")]
-                has_threat: false,
-                _ft: PhantomData,
-            });
-        }
-
-        if first_block.len() == L1 {
-            // YO形式（2ブロック）: 次に weights ブロックを読み込み
-            let weights_block = read_compressed_tensor_i16_all(reader)?;
-            if weights_block.len() != weight_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "FT weights block size mismatch: got {}, expected {}",
-                        weights_block.len(),
-                        weight_size
-                    ),
-                ));
-            }
-
-            let mut biases = [0i16; L1];
-            biases.copy_from_slice(&first_block);
-
-            let mut weights = AlignedBox::new_zeroed(weight_size);
-            weights.copy_from_slice(&weights_block);
-
-            return Ok(Self {
-                biases: Aligned(biases),
-                weights,
-                #[cfg(feature = "nnue-psqt")]
-                psqt_biases: [0; MAX_LAYER_STACK_BUCKETS],
-                #[cfg(feature = "nnue-psqt")]
-                psqt_num_buckets: 0,
-                #[cfg(feature = "nnue-psqt")]
-                psqt_weights: AlignedBox::new_zeroed(0),
-                #[cfg(feature = "nnue-psqt")]
-                has_psqt: false,
-                #[cfg(feature = "nnue-threat")]
-                threat_weights: AlignedBox::new_zeroed(0),
-                #[cfg(feature = "nnue-threat")]
-                has_threat: false,
-                _ft: PhantomData,
-            });
-        }
-
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Unexpected LEB128 tensor size: got {}, expected {} or {}",
-                first_block.len(),
-                L1,
-                total_size
-            ),
-        ))
+        let mut biases = [0i16; L1];
+        let weights =
+            read_layer_stacks_ft_i16(reader, &mut biases, weight_size, AlignedBox::new_zeroed)?;
+        Ok(Self {
+            biases: Aligned(biases),
+            weights,
+            #[cfg(feature = "nnue-psqt")]
+            psqt_biases: [0; MAX_LAYER_STACK_BUCKETS],
+            #[cfg(feature = "nnue-psqt")]
+            psqt_num_buckets: 0,
+            #[cfg(feature = "nnue-psqt")]
+            psqt_weights: AlignedBox::new_zeroed(0),
+            #[cfg(feature = "nnue-psqt")]
+            has_psqt: false,
+            #[cfg(feature = "nnue-threat")]
+            threat_weights: AlignedBox::new_zeroed(0),
+            #[cfg(feature = "nnue-threat")]
+            has_threat: false,
+            _ft: PhantomData,
+        })
     }
 
     /// PSQT 重み/バイアスをファイルから読み込み

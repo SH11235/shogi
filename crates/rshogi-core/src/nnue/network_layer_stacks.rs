@@ -358,19 +358,9 @@ impl<
         // FV_SCALE 検出
         let fv_scale = parse_fv_scale_from_arch(&arch_str).unwrap_or(FV_SCALE_HALFKA);
 
-        // Factorizedモデルの検出
-        if arch_str.contains("Factorizer") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Unsupported model format: factorized (non-coalesced) model detected.\n\
-                     This engine only supports coalesced models.\n\n\
-                     To fix: Re-export the model using nnue-pytorch serialize.py:\n\
-                       python serialize.py model.ckpt output.nnue\n\n\
-                     Architecture string: {arch_str}"
-                ),
-            ));
-        }
+        let threat_dimensions =
+            super::spec::validate_layer_stacks_architecture_header(&arch_str)
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
 
         // Feature transformer hash を読み飛ばす
         reader.read_exact(&mut buf4)?;
@@ -406,13 +396,7 @@ impl<
             // 照合。tatara export は profile の dims を必ず書くため、不一致は engine と
             // model の profile / feature set 不整合を意味する (旧 profile 0 net の
             // Threat=216720 は engine profile 0 のとき通る)。
-            if arch_str.contains("Threat=") {
-                let model_dims = parse_threat_dims_from_arch(&arch_str).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("malformed Threat= token in arch string: {arch_str}"),
-                    )
-                })?;
+            if let Some(model_dims) = threat_dimensions {
                 let engine_dims = super::threat_features::THREAT_DIMENSIONS;
                 if model_dims != engine_dims {
                     return Err(io::Error::new(
@@ -456,7 +440,7 @@ impl<
             }
         }
         #[cfg(not(feature = "nnue-threat"))]
-        if arch_str.contains("Threat=") {
+        if threat_dimensions.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Threat model requires nnue-threat feature",
@@ -2188,19 +2172,6 @@ fn parse_effect_bucket_config_from_arch(arch_str: &str) -> Option<(usize, bool)>
     }
 }
 
-/// arch_str の `Threat=<dims>` トークンから次元数を取り出す。
-/// `parse_fv_scale_from_arch` と同じトークン分割方針 (`,` split + `strip_prefix`)。
-///
-/// `strip_prefix("Threat=")` は `Threat=` で始まるトークンにのみ一致するため、
-/// 同居しうる `ThreatProfile=` トークン（7 文字目が `P` で `=` でない）には誤マッチしない。
-#[cfg(feature = "nnue-threat")]
-fn parse_threat_dims_from_arch(arch_str: &str) -> Option<usize> {
-    arch_str
-        .split(',')
-        .find_map(|part| part.strip_prefix("Threat="))
-        .and_then(|v| v.parse::<usize>().ok())
-}
-
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "layerstack-arch")]
@@ -2269,22 +2240,18 @@ mod tests {
         compute_layer_stack_kingrank9_bucket_index(&pos, Color::Black, 4);
     }
 
-    #[cfg(feature = "nnue-threat")]
     #[test]
-    fn test_parse_threat_dims_from_arch() {
-        use super::parse_threat_dims_from_arch as parse;
-        assert_eq!(parse("FV_SCALE=16,Threat=216720,"), Some(216720));
-        assert_eq!(parse("Threat=96320,ThreatProfile=10,"), Some(96320));
-        // ThreatProfile= が先行しても Threat= に誤マッチしない
-        assert_eq!(parse("ThreatProfile=10,Threat=96320,"), Some(96320));
-        // ThreatProfile= のみで Threat= が無い場合は None
-        assert_eq!(parse("ThreatProfile=10,"), None);
-        // 末尾カンマ無し (旧 profile 0 形式)
-        assert_eq!(parse("Threat=216720"), Some(216720));
-        // Threat トークン無し
-        assert_eq!(parse("PSQT=1,"), None);
-        // 数値でない
-        assert_eq!(parse("Threat=abc,"), None);
+    fn test_validate_layer_stacks_architecture_header() {
+        use crate::nnue::spec::validate_layer_stacks_architecture_header as validate;
+        assert_eq!(validate("FV_SCALE=16,Threat=216720,").unwrap(), Some(216720));
+        assert_eq!(validate("Threat=96320,ThreatProfile=10,").unwrap(), Some(96320));
+        assert_eq!(validate("ThreatProfile=10,Threat=96320,").unwrap(), Some(96320));
+        assert_eq!(validate("ThreatProfile=10,").unwrap(), None);
+        assert_eq!(validate("Threat=216720").unwrap(), Some(216720));
+        assert_eq!(validate("PSQT=1,").unwrap(), None);
+        assert!(validate("Threat=abc,").is_err());
+        assert!(validate("Threat=0,").is_err());
+        assert!(validate("Factorizer").is_err());
     }
 
     #[test]
@@ -2311,6 +2278,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_load_layer_stacks_file() {
+        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
         use crate::nnue::layer_stacks::{compute_bucket_index, sqr_clipped_relu_transform};
 
         // テスト用NNUEファイルのパスを設定してください
@@ -2487,6 +2455,8 @@ mod tests {
             let val = network.evaluate(&pos, &acc);
             eprintln!("{:15}: {:6} (raw: {:6})", name, val.raw(), raw);
         }
+
+        drop(routing_guard);
     }
 
     /// `detect_layer_stacks_feature_set` が underscore / PascalCase の arch_str を

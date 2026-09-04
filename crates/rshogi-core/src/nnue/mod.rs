@@ -53,6 +53,7 @@ mod layer_stacks;
 mod layers;
 mod leb128;
 mod ls_feature_spec;
+pub mod net_bin_layout;
 #[macro_use]
 pub mod macros;
 pub mod net_delta;

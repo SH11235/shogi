@@ -113,7 +113,6 @@ pub struct NetTensorShape {
 }
 
 impl NetTensorShape {
-    #[cfg(any(test, feature = "nnue-runtime-dimensions", feature = "layerstack-arch"))]
     pub(crate) fn validate(self, id: &NetCoefficientId) -> Result<(), NetDeltaError> {
         let name = id.usi_name();
         match (self.bucket_count, id.bucket) {
@@ -156,6 +155,11 @@ pub enum NetDeltaError {
         /// 読み込まれている architecture 名。
         architecture: String,
     },
+    /// `.bin` の内容が、解析済み layout と整合しない。
+    InvalidBinary {
+        /// 不整合の説明。
+        message: String,
+    },
     /// bucket 必須の kind に bucket が無い。
     MissingBucket {
         /// 問題の係数名。
@@ -192,6 +196,7 @@ impl fmt::Display for NetDeltaError {
             Self::UnsupportedArchitecture { architecture } => {
                 write!(formatter, "unsupported architecture \"{architecture}\"")
             }
+            Self::InvalidBinary { message } => write!(formatter, "invalid NNUE binary: {message}"),
             Self::MissingBucket { name } => write!(formatter, "{name}: bucket is required"),
             Self::UnexpectedBucket { name } => {
                 write!(formatter, "{name}: bucket is not allowed")
@@ -239,25 +244,40 @@ pub(crate) fn add_i32_delta(value: i32, delta: i32) -> (i32, bool) {
     (clamped as i32, sum != clamped)
 }
 
-#[cfg(all(
-    test,
-    any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch")
-))]
-pub(crate) mod test_utils {
+#[doc(hidden)]
+/// crate 間の `.bin` 整合性テストで共有する合成 LayerStacks builder。
+pub mod test_utils {
     use crate::nnue::constants::NNUE_VERSION_LAYERSTACK_NUM_BUCKETS;
     use crate::nnue::layers::padded_input;
     use crate::nnue::leb128::LEB128_MAGIC;
 
-    pub(crate) struct SyntheticBucketOffsets {
-        pub(crate) l2_weights: usize,
-        pub(crate) output_bias: usize,
-        pub(crate) output_weights: usize,
+    /// 合成 `.bin` 内の 1 bucket の編集対象 offset。
+    pub struct SyntheticBucketOffsets {
+        /// L2 weights の先頭 offset。
+        pub l2_weights: usize,
+        /// output bias の先頭 offset。
+        pub output_bias: usize,
+        /// output weights の先頭 offset。
+        pub output_weights: usize,
     }
 
-    pub(crate) struct SyntheticLayerStacksBin {
-        pub(crate) bytes: Vec<u8>,
-        pub(crate) ft_biases: usize,
-        pub(crate) buckets: Vec<SyntheticBucketOffsets>,
+    /// 決定的に生成した合成 LayerStacks `.bin` と主要 offset。
+    pub struct SyntheticLayerStacksBin {
+        /// `.bin` 全体。
+        pub bytes: Vec<u8>,
+        /// FT biases の先頭 offset。
+        pub ft_biases: usize,
+        /// bucket ごとの主要 offset。
+        pub buckets: Vec<SyntheticBucketOffsets>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    /// 合成 FT の符号化方式。
+    pub enum SyntheticFtEncoding {
+        /// biases と weights を連結した LEB128。
+        Leb128Combined,
+        /// biases と weights を分けた LEB128。
+        Leb128Split,
     }
 
     struct Lcg(u32);
@@ -273,6 +293,7 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// 1 byte に収まる signed LEB128 を encode する。
     pub(crate) fn encode_single_byte_signed_leb128(value: i32) -> u8 {
         assert!((-64..=63).contains(&value));
         (value as u8) & 0x7f
@@ -297,13 +318,35 @@ pub(crate) mod test_utils {
         weights
     }
 
-    pub(crate) fn build_synthetic_layer_stacks(
+    /// LEB128 1 ブロック形式の合成 LayerStacks `.bin` を生成する。
+    pub fn build_synthetic_layer_stacks(
         feature_name: &str,
         input_dimensions: usize,
         l1: usize,
         l2: usize,
         l3: usize,
         num_buckets: usize,
+    ) -> SyntheticLayerStacksBin {
+        build_synthetic_layer_stacks_with_ft_encoding(
+            feature_name,
+            input_dimensions,
+            l1,
+            l2,
+            l3,
+            num_buckets,
+            SyntheticFtEncoding::Leb128Combined,
+        )
+    }
+
+    /// 指定 FT 符号化の合成 LayerStacks `.bin` を生成する。
+    pub fn build_synthetic_layer_stacks_with_ft_encoding(
+        feature_name: &str,
+        input_dimensions: usize,
+        l1: usize,
+        l2: usize,
+        l3: usize,
+        num_buckets: usize,
+        ft_encoding: SyntheticFtEncoding,
     ) -> SyntheticLayerStacksBin {
         let arch = format!(
             "Features={feature_name}[{input_dimensions}->{l1}x2],LayerStacks,l2={l2},l3={l3}"
@@ -318,15 +361,46 @@ pub(crate) mod test_utils {
 
         let mut rng = Lcg(0x5eed_1234);
         let ft_element_count = l1 + input_dimensions * l1;
-        bytes.extend_from_slice(LEB128_MAGIC);
-        bytes.extend_from_slice(&(ft_element_count as u32).to_le_bytes());
-        let ft_biases = bytes.len();
+        let mut ft_bias_values = Vec::with_capacity(l1);
         for _ in 0..l1 {
-            bytes.push(encode_single_byte_signed_leb128(rng.range(8, 15)));
+            ft_bias_values.push(rng.range(8, 15) as i16);
         }
+        let mut ft_weight_values = Vec::with_capacity(ft_element_count - l1);
         for _ in l1..ft_element_count {
-            bytes.push(encode_single_byte_signed_leb128(rng.range(1, 2)));
+            ft_weight_values.push(rng.range(1, 2) as i16);
         }
+        let ft_biases = match ft_encoding {
+            SyntheticFtEncoding::Leb128Combined => {
+                bytes.extend_from_slice(LEB128_MAGIC);
+                bytes.extend_from_slice(&(ft_element_count as u32).to_le_bytes());
+                let offset = bytes.len();
+                bytes.extend(
+                    ft_bias_values
+                        .iter()
+                        .chain(&ft_weight_values)
+                        .map(|&value| encode_single_byte_signed_leb128(i32::from(value))),
+                );
+                offset
+            }
+            SyntheticFtEncoding::Leb128Split => {
+                bytes.extend_from_slice(LEB128_MAGIC);
+                bytes.extend_from_slice(&(l1 as u32).to_le_bytes());
+                let offset = bytes.len();
+                bytes.extend(
+                    ft_bias_values
+                        .iter()
+                        .map(|&value| encode_single_byte_signed_leb128(i32::from(value))),
+                );
+                bytes.extend_from_slice(LEB128_MAGIC);
+                bytes.extend_from_slice(&(ft_weight_values.len() as u32).to_le_bytes());
+                bytes.extend(
+                    ft_weight_values
+                        .iter()
+                        .map(|&value| encode_single_byte_signed_leb128(i32::from(value))),
+                );
+                offset
+            }
+        };
 
         let mut buckets = Vec::with_capacity(num_buckets);
         for _ in 0..num_buckets {
