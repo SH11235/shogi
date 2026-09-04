@@ -2251,6 +2251,7 @@ mod tests {
         feature = "layerstack-arch",
         feature = "ft-halfka_hm_merged",
         feature = "layerstacks-512x16x32",
+        not(feature = "nnue-runtime-dimensions"),
         not(feature = "nnue-psqt"),
         not(feature = "nnue-threat"),
         not(feature = "nnue-effect-bucket")
