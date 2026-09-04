@@ -2255,6 +2255,67 @@ mod tests {
     use crate::nnue::constants::DEFAULT_NUM_BUCKETS;
     use crate::position::SFEN_HIRATE;
 
+    #[cfg(any(
+        feature = "nnue-runtime-dimensions",
+        all(
+            feature = "layerstack-arch",
+            feature = "nnue-effect-bucket",
+            feature = "layerstacks-512x16x32"
+        )
+    ))]
+    #[test]
+    fn effect_bucket_e4_alias_matches_canonical_header_evaluation() {
+        use crate::nnue::evaluator::NNUEEvaluator;
+        use crate::nnue::net_delta::test_utils::build_synthetic_layer_stacks;
+
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        const L1: usize = 2;
+        #[cfg(not(feature = "nnue-runtime-dimensions"))]
+        const L1: usize = 512;
+
+        fn replace_architecture(bytes: &mut Vec<u8>, architecture: &str) {
+            let original_len =
+                u32::from_le_bytes(bytes[8..12].try_into().expect("architecture size"));
+            let original_end = 12 + usize::try_from(original_len).expect("architecture length");
+            let replacement_len = u32::try_from(architecture.len()).expect("replacement length");
+            bytes.splice(
+                8..original_end,
+                replacement_len.to_le_bytes().into_iter().chain(architecture.bytes()),
+            );
+        }
+
+        fn evaluate(bytes: &[u8], pos: &Position) -> Value {
+            let network = NNUENetwork::from_bytes(bytes).expect("effect bucket network");
+            assert!(network.is_layer_stacks());
+            let mut evaluator = NNUEEvaluator::new_with_position(Arc::new(network), pos);
+            evaluator.evaluate(pos)
+        }
+
+        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
+        let input_dimensions = crate::nnue::EffectBucketConfig::KINGFIXED_2X2.dimensions();
+        let synthetic =
+            build_synthetic_layer_stacks("HalfKaHmMerged", input_dimensions, L1, 16, 32, 1);
+        let mut bytes = synthetic.bytes;
+        configure_layer_stack_routing(LayerStackBucketMode::ProgressKPAbs, 1, Some(1))
+            .expect("routing");
+        let mut pos = Position::new();
+        pos.set_sfen(SFEN_HIRATE).expect("hirate");
+
+        let canonical_arch = format!(
+            "Features=HalfKaHmMerged[{input_dimensions}->{L1}x2],EffectBucket=2x2fixed,l2=16,l3=32"
+        );
+        replace_architecture(&mut bytes, &canonical_arch);
+        let canonical_value = evaluate(&bytes, &pos);
+
+        let alias_arch =
+            format!("Features=HalfKaHmMerged[{input_dimensions}->{L1}x2],E4=4xfixed,l2=16,l3=32");
+        replace_architecture(&mut bytes, &alias_arch);
+        assert_eq!(evaluate(&bytes, &pos), canonical_value);
+
+        reset_layer_stack_progress_buckets();
+        drop(routing_guard);
+    }
+
     #[cfg(all(
         feature = "layerstack-arch",
         feature = "ft-halfka_hm_merged",
