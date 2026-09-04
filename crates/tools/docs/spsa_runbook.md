@@ -382,10 +382,11 @@ cargo run --release -p tools --bin spsa_stats_to_plot_csv -- \
 ### 方法2: `.params` ファイルに `[[NOT USED]]` マーカー
 
 永続的に除外したいパラメータに `[[NOT USED]]` を付加する。
+マーカーは 7 番目の値カラムの後、インラインコメント (`//`) の前に置く。
 
 ```
 SPSA_CORR_PCV_WEIGHT,int,9536,0,32768,163,1638.4
-SPSA_LMR_TABLE_COEFF,int,2809,1024,8192,35,358.4 [[NOT USED]]
+SPSA_LMR_TABLE_COEFF,int,2809,1024,8192,35,358.4 [[NOT USED]] //base=2809
 ```
 
 ### 推奨チューニング順序
