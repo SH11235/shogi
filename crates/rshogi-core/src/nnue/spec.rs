@@ -283,6 +283,24 @@ pub(crate) fn parse_effect_bucket_config(
     }
 }
 
+/// LayerStacks loader が共通で要求する header 条件を検証する。
+pub(crate) fn validate_layer_stacks_architecture_header(
+    arch_str: &str,
+) -> Result<Option<usize>, String> {
+    if arch_str.contains("Factorizer") {
+        return Err("factorized training models must be coalesced before inference".to_owned());
+    }
+
+    let Some(value) = arch_str.split(',').find_map(|part| part.strip_prefix("Threat=")) else {
+        return Ok(None);
+    };
+    let dimensions = value.parse::<usize>().map_err(|_| "malformed Threat token".to_owned())?;
+    if dimensions == 0 {
+        return Err("malformed Threat token".to_owned());
+    }
+    Ok(Some(dimensions))
+}
+
 /// アーキテクチャ文字列から FeatureSet を判定
 pub fn parse_feature_set_from_arch(arch_str: &str) -> Result<FeatureSet, String> {
     // 明示的な "LayerStacks" キーワードがあれば確定

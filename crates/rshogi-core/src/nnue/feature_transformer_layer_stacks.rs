@@ -315,8 +315,8 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
     pub fn read_leb128<R: Read>(reader: &mut R) -> io::Result<Self> {
         let weight_size = FT::DIMENSIONS * L1;
         let mut biases = [0i16; L1];
-        let mut weights = AlignedBox::new_zeroed(weight_size);
-        read_layer_stacks_ft_i16(reader, &mut biases, &mut weights)?;
+        let weights =
+            read_layer_stacks_ft_i16(reader, &mut biases, weight_size, AlignedBox::new_zeroed)?;
         Ok(Self {
             biases: Aligned(biases),
             weights,

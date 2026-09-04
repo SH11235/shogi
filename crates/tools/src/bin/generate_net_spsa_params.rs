@@ -342,6 +342,8 @@ mod tests {
 
     #[test]
     fn generated_rows_round_trip_and_skip_padding() {
+        // WHY: tools の固定 1536x16x32 loader では小型合成 net を読めないため、ここでは layout の
+        // 往復を検証し、layout と dynamic network の一致は core の対応テストに委ねる。
         for (buckets, encoding) in [
             (2, SyntheticFtEncoding::Leb128Combined),
             (3, SyntheticFtEncoding::Leb128Split),

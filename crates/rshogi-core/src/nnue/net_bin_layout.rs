@@ -16,7 +16,7 @@ use super::net_delta::{
 };
 use super::spec::{
     FeatureSet, detect_layer_stacks_feature, parse_arch_dimensions, parse_effect_bucket_config,
-    parse_feature_input_dimensions,
+    parse_feature_input_dimensions, validate_layer_stacks_architecture_header,
 };
 
 /// tensor の biases / weights byte 範囲。
@@ -268,7 +268,9 @@ impl LayerStacksBinLayout {
         if l1 == 0 || !l1.is_multiple_of(2) || l2 < 2 || l3 == 0 {
             return Err(invalid("invalid LayerStacks dimensions"));
         }
-        let threat_dimensions = parse_token_usize(&architecture, "Threat=")?;
+        let threat_dimensions = validate_layer_stacks_architecture_header(&architecture)
+            .map_err(invalid)?
+            .unwrap_or(0);
         let ft_input_dimensions = parse_ft_input_dimensions(&architecture, threat_dimensions)?;
         let ft_hash = cursor.take(4, "FT hash")?;
         let (feature_transformer, ft_biases) = parse_leb128_ft(&mut cursor, ft_hash, l1)?;
@@ -489,13 +491,6 @@ fn parse_ft_input_dimensions(architecture: &str, threat: usize) -> io::Result<us
         Err(invalid(format!(
             "FT input dimension mismatch: header={reported}, runtime={dimensions}, threat={threat}"
         )))
-    }
-}
-
-fn parse_token_usize(architecture: &str, token: &str) -> io::Result<usize> {
-    match architecture.split(',').find_map(|part| part.strip_prefix(token)) {
-        Some(value) => value.parse().map_err(|_| invalid(format!("malformed {token} token"))),
-        None => Ok(0),
     }
 }
 
@@ -873,6 +868,30 @@ mod tests {
         Ok((output, report))
     }
 
+    fn with_psqt_and_threat(bytes: &[u8]) -> Vec<u8> {
+        let original = LayerStacksBinLayout::from_bytes(bytes).expect("original");
+        let architecture = format!(
+            "Features=HalfKP[{}->32x2],LayerStacks,l2=4,l3=3,PSQT=2,Threat=5,ThreatProfile=0",
+            <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS
+        );
+        let mut extended = Vec::new();
+        extended.extend_from_slice(&original.version.to_le_bytes());
+        extended.extend_from_slice(&original.network_hash.to_le_bytes());
+        extended.extend_from_slice(&(architecture.len() as u32).to_le_bytes());
+        extended.extend_from_slice(architecture.as_bytes());
+        extended.extend_from_slice(&(original.num_buckets as u32).to_le_bytes());
+        extended.extend_from_slice(
+            &bytes[original.feature_transformer.hash.start..original.buckets[0].fc_hash.start],
+        );
+        extended.resize(extended.len() + original.num_buckets * 4, 0);
+        extended
+            .resize(extended.len() + original.ft_input_dimensions * original.num_buckets * 4, 0);
+        extended.extend_from_slice(&0u32.to_le_bytes());
+        extended.resize(extended.len() + 5 * original.l1, 0);
+        extended.extend_from_slice(&bytes[original.buckets[0].fc_hash.start..]);
+        extended
+    }
+
     struct ReadAudit {
         cursor: Cursor<Vec<u8>>,
         reads: Vec<Range<usize>>,
@@ -1141,6 +1160,62 @@ mod tests {
     }
 
     #[test]
+    fn rejects_loader_invalid_architecture_headers() {
+        let synthetic = build_synthetic_layer_stacks_with_ft_encoding(
+            "HalfKP",
+            <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
+            32,
+            4,
+            3,
+            2,
+            SyntheticFtEncoding::Leb128Split,
+        );
+        for suffix in [",Threat=0", ",Factorizer"] {
+            let original = LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("original");
+            let architecture = format!("{}{suffix}", original.architecture);
+            let bytes = replace_architecture(&synthetic.bytes, &architecture);
+            assert!(LayerStacksBinLayout::from_bytes(&bytes).is_err(), "{suffix}");
+        }
+    }
+
+    #[test]
+    fn layout_skips_psqt_and_threat_payloads() {
+        let synthetic = build_synthetic_layer_stacks_with_ft_encoding(
+            "HalfKP",
+            <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
+            32,
+            4,
+            3,
+            2,
+            SyntheticFtEncoding::Leb128Split,
+        );
+        let bytes = with_psqt_and_threat(&synthetic.bytes);
+        let expected = LayerStacksBinLayout::from_bytes(&bytes).expect("expected layout");
+        let mut reader = ReadAudit {
+            cursor: Cursor::new(bytes),
+            reads: Vec::new(),
+        };
+        let actual = LayerStacksBinLayout::from_reader(&mut reader).expect("audited layout");
+        assert_eq!(actual, expected);
+
+        let psqt = actual.psqt.expect("PSQT");
+        let skipped = [
+            psqt.biases,
+            psqt.weights,
+            actual.threat_weights.expect("threat weights"),
+        ];
+        for payload in skipped {
+            assert!(
+                reader
+                    .reads
+                    .iter()
+                    .all(|read| read.end <= payload.start || read.start >= payload.end),
+                "payload was read: {payload:?}"
+            );
+        }
+    }
+
+    #[test]
     fn locates_optional_psqt_and_threat_blocks() {
         let synthetic = build_synthetic_layer_stacks_with_ft_encoding(
             "HalfKP",
@@ -1151,34 +1226,14 @@ mod tests {
             2,
             SyntheticFtEncoding::Leb128Split,
         );
-        let original = LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("original");
-        let architecture = format!(
-            "Features=HalfKP[{}->32x2],LayerStacks,l2=4,l3=3,PSQT=2,Threat=5,ThreatProfile=0",
-            <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS
-        );
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&original.version.to_le_bytes());
-        bytes.extend_from_slice(&original.network_hash.to_le_bytes());
-        bytes.extend_from_slice(&(architecture.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(architecture.as_bytes());
-        bytes.extend_from_slice(&(original.num_buckets as u32).to_le_bytes());
-        bytes.extend_from_slice(
-            &synthetic.bytes
-                [original.feature_transformer.hash.start..original.buckets[0].fc_hash.start],
-        );
-        let psqt_bias_size = original.num_buckets * 4;
-        let psqt_weight_size = original.ft_input_dimensions * original.num_buckets * 4;
-        bytes.resize(bytes.len() + psqt_bias_size + psqt_weight_size, 0);
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.resize(bytes.len() + 5 * original.l1, 0);
-        bytes.extend_from_slice(&synthetic.bytes[original.buckets[0].fc_hash.start..]);
+        let bytes = with_psqt_and_threat(&synthetic.bytes);
 
         let layout = LayerStacksBinLayout::from_bytes(&bytes).expect("extended layout");
         let psqt = layout.psqt.expect("PSQT");
-        assert_eq!(psqt.biases.len(), psqt_bias_size);
-        assert_eq!(psqt.weights.len(), psqt_weight_size);
+        assert_eq!(psqt.biases.len(), layout.num_buckets * 4);
+        assert_eq!(psqt.weights.len(), layout.ft_input_dimensions * layout.num_buckets * 4);
         assert_eq!(layout.threat_profile.expect("profile").len(), 4);
-        assert_eq!(layout.threat_weights.expect("threat").len(), 5 * original.l1);
+        assert_eq!(layout.threat_weights.expect("threat").len(), 5 * layout.l1);
     }
 
     #[test]
