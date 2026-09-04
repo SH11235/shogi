@@ -32,7 +32,8 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release -p rshogi-usi 2>/dev/null
 # プロファイル取得（コールグラフ付き）
 echo "プロファイル取得中 (depth $DEPTH)..."
 sudo perf record -g --call-graph dwarf -o "$PERF_DATA" \
-  ./target/release/rshogi-usi --eval "$NNUE_FILE" <<EOF
+  ./target/release/rshogi-usi <<EOF
+setoption name EvalFile value $NNUE_FILE
 isready
 position startpos
 go depth $DEPTH

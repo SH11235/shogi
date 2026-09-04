@@ -1500,6 +1500,7 @@ mod tests {
     #[cfg(feature = "nnue-runtime-dimensions")]
     #[test]
     fn patched_net_evaluation_matches_runtime_deltas_for_both_leb128_forms() {
+        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
         reset_layer_stack_progress_kpabs_weights();
         for (buckets, encoding) in [
             (4, SyntheticFtEncoding::Leb128Combined),
@@ -1544,5 +1545,7 @@ mod tests {
         }
         reset_layer_stack_progress_buckets();
         reset_layer_stack_progress_kpabs_weights();
+
+        drop(routing_guard);
     }
 }

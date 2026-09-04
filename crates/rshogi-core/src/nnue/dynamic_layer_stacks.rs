@@ -1434,6 +1434,7 @@ mod tests {
 
     #[test]
     fn dynamic_layer_stacks_net_delta_matches_file_edits_and_validates_shape() {
+        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
         use crate::nnue::net_delta::test_utils::build_synthetic_layer_stacks;
 
         crate::nnue::reset_layer_stack_progress_kpabs_weights();
@@ -1565,6 +1566,8 @@ mod tests {
         }
         crate::nnue::reset_layer_stack_progress_buckets();
         crate::nnue::reset_layer_stack_progress_kpabs_weights();
+
+        drop(routing_guard);
     }
 
     #[test]
@@ -1785,6 +1788,7 @@ mod tests {
 
     #[test]
     fn public_evaluator_keeps_board_effects_for_runtime_effect_bucket() {
+        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
         let feature = RuntimeLsFeature::EffectBucket(EffectBucketConfig::KINGFIXED_2X2);
         let l1 = 2;
         let l2 = 2;
@@ -1821,6 +1825,8 @@ mod tests {
 
         // routing はプロセスグローバルのため、他テストへ持ち越さないよう未設定へ戻す。
         crate::nnue::reset_layer_stack_progress_buckets();
+
+        drop(routing_guard);
     }
 
     #[cfg(feature = "layerstack-arch")]

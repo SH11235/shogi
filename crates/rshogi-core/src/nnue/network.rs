@@ -351,6 +351,14 @@ pub fn reset_layer_stack_progress_buckets() {
     LAYER_STACK_PROGRESS_BUCKETS.store(0, Ordering::Relaxed);
 }
 
+/// routing の global 状態を触るテストを直列化する guard。並列テストで一方の reset が
+/// 他方の評価中に入ると "routing is not configured" panic になるため。
+#[cfg(test)]
+pub(crate) fn layer_stack_routing_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// LayerStacks progresskpabs 重みを取得
 pub fn get_layer_stack_progress_kpabs_weights() -> &'static [f32] {
     let ptr = LAYER_STACK_PROGRESS_KP_ABS_PTR.load(Ordering::Relaxed);
@@ -2251,12 +2259,14 @@ mod tests {
         feature = "layerstack-arch",
         feature = "ft-halfka_hm_merged",
         feature = "layerstacks-512x16x32",
+        not(feature = "nnue-runtime-dimensions"),
         not(feature = "nnue-psqt"),
         not(feature = "nnue-threat"),
         not(feature = "nnue-effect-bucket")
     ))]
     #[test]
     fn const_generic_layer_stacks_applies_all_net_delta_kinds() {
+        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
         use crate::nnue::constants::HALFKA_HM_DIMENSIONS;
         use crate::nnue::evaluator::NNUEEvaluator;
         use crate::nnue::net_bin_layout::apply_deltas;
@@ -2359,6 +2369,8 @@ mod tests {
         assert_eq!(report.clamped, 0);
         reset_layer_stack_progress_buckets();
         reset_layer_stack_progress_kpabs_weights();
+
+        drop(routing_guard);
     }
 
     /// NNUENetwork のアーキテクチャ自動検出テスト
@@ -2373,6 +2385,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_nnue_network_auto_detect_layer_stacks() {
+        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
         let path = std::env::var("NNUE_TEST_FILE")
             .unwrap_or_else(|_| "/path/to/your/layer_stacks.nnue".to_string());
         let network = match NNUENetwork::load(path) {
@@ -2406,6 +2419,8 @@ mod tests {
 
         // 評価値が妥当な範囲内
         assert!(value.raw().abs() < 1000);
+
+        drop(routing_guard);
     }
 
     /// detect_format のファイルサイズベース検出テスト
