@@ -241,7 +241,12 @@ pub(crate) fn validate_layer_stacks_architecture_header(
     arch_str: &str,
 ) -> Result<Option<usize>, String> {
     if arch_str.contains("Factorizer") {
-        return Err("factorized training models must be coalesced before inference".to_owned());
+        return Err(format!(
+            "Unsupported model format: factorized (non-coalesced) model detected. \
+             This engine only supports coalesced models. \
+             To fix: re-export with nnue-pytorch serialize.py (python serialize.py model.ckpt output.nnue). \
+             Architecture string: {arch_str}"
+        ));
     }
 
     let Some(value) = arch_str.split(',').find_map(|part| part.strip_prefix("Threat=")) else {

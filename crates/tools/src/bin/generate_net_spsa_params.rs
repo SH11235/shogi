@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -106,8 +106,9 @@ fn main() -> Result<()> {
 fn run(cli: &Cli) -> Result<()> {
     let config = GenerateConfig::from_cli(cli)?;
     ensure_safe_output_path(&cli.output, &cli.nnue)?;
-    let mut input =
-        File::open(&cli.nnue).with_context(|| format!("failed to open {}", cli.nnue.display()))?;
+    let mut input = BufReader::new(
+        File::open(&cli.nnue).with_context(|| format!("failed to open {}", cli.nnue.display()))?,
+    );
     let net_name = cli
         .nnue
         .file_name()
