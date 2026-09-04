@@ -11,7 +11,7 @@ use super::constants::{
     DEFAULT_NUM_BUCKETS, FV_SCALE_HALFKA, MAX_ARCH_LEN, MAX_LAYER_STACK_BUCKETS,
     NNUE_VERSION_HALFKA, NNUE_VERSION_LAYERSTACK_NUM_BUCKETS,
 };
-use super::dynamic_halfkx::{DynamicAffine, validate_dimension};
+use super::dynamic_halfkx::DynamicAffine;
 use super::effect_bucket_features::append_active_effect_bucket;
 use super::features::{
     FeatureSet as FeatureSetTrait, HalfKPFeatureSet, HalfKaHmMergedFeatureSet,
@@ -34,7 +34,7 @@ use super::piece_list::PieceNumber;
 use super::spec::{
     Activation, ArchitectureSpec, FeatureSet, detect_layer_stacks_feature, parse_arch_dimensions,
     parse_effect_bucket_config, parse_feature_input_dimensions,
-    validate_layer_stacks_architecture_header,
+    validate_layer_stacks_architecture_header, validate_layer_stacks_dimensions,
 };
 use super::stats::{count_refresh, count_update};
 use crate::position::Position;
@@ -236,12 +236,7 @@ impl DynamicLayerStacksNetwork {
         }
 
         let (l1, l2, l3) = parse_arch_dimensions(arch);
-        if l1 == 0 || l1 % 2 != 0 || l2 < 2 || l3 == 0 {
-            return Err(invalid("invalid LayerStacks dimensions"));
-        }
-        validate_dimension("LayerStacks l1", l1)?;
-        validate_dimension("LayerStacks l2", l2)?;
-        validate_dimension("LayerStacks l3", l3)?;
+        validate_layer_stacks_dimensions(l1, l2, l3).map_err(invalid)?;
         let threat_dimensions =
             validate_layer_stacks_architecture_header(arch).map_err(invalid)?.unwrap_or(0);
         #[cfg(feature = "nnue-threat")]

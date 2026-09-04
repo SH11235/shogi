@@ -17,6 +17,7 @@ use super::net_delta::{
 use super::spec::{
     FeatureSet, detect_layer_stacks_feature, parse_arch_dimensions, parse_effect_bucket_config,
     parse_feature_input_dimensions, validate_layer_stacks_architecture_header,
+    validate_layer_stacks_dimensions,
 };
 
 /// tensor の biases / weights byte 範囲。
@@ -265,9 +266,7 @@ impl LayerStacksBinLayout {
         }
 
         let (l1, l2, l3) = parse_arch_dimensions(&architecture);
-        if l1 == 0 || !l1.is_multiple_of(2) || l2 < 2 || l3 == 0 {
-            return Err(invalid("invalid LayerStacks dimensions"));
-        }
+        validate_layer_stacks_dimensions(l1, l2, l3).map_err(invalid)?;
         let threat_dimensions = validate_layer_stacks_architecture_header(&architecture)
             .map_err(invalid)?
             .unwrap_or(0);
@@ -469,7 +468,7 @@ fn parse_ft_input_dimensions(architecture: &str, threat: usize) -> io::Result<us
     let reported = parse_feature_input_dimensions(architecture)
         .ok_or_else(|| invalid("missing FT input dimensions"))?;
     let feature = detect_layer_stacks_feature(architecture).map_err(invalid)?;
-    let dimensions = if architecture.contains("EffectBucket=") || architecture.contains("E4=") {
+    let dimensions = if feature == FeatureSet::HalfKaHmMergedEffectBucket {
         parse_effect_bucket_config(architecture)
             .ok_or_else(|| invalid("malformed EffectBucket token"))?
             .dimensions()
@@ -672,6 +671,11 @@ impl<'a, R: Read + Seek> StreamCursor<'a, R> {
         if data_end > self.file_size {
             return Err(invalid(format!("truncated {name}")));
         }
+        if prefix_count > size {
+            return Err(invalid(format!(
+                "{name} cannot contain {prefix_count} values in {size} bytes"
+            )));
+        }
         let mut values = Vec::with_capacity(prefix_count);
         for _ in 0..prefix_count {
             values.push(self.read_leb128_i16(data_end)?);
@@ -773,8 +777,9 @@ fn copy_range<R: Read + Seek, W: Write>(
 ) -> io::Result<()> {
     input.seek(SeekFrom::Start(u64_from_usize(range.start, "copy range")?))?;
     let mut remaining = range.len();
-    // FT weights は GiB 級になり得るため、net サイズに依存しない固定バッファで転送する。
-    let mut buffer = [0u8; 1024 * 1024];
+    // FT weights は GiB 級になり得るため、net サイズに依存しない固定長バッファで転送する
+    // (heap 確保: 小さいスタックのスレッドから呼ばれても溢れない)。
+    let mut buffer = vec![0u8; 1024 * 1024];
     while remaining != 0 {
         let chunk = remaining.min(buffer.len());
         input.read_exact(&mut buffer[..chunk])?;
@@ -866,6 +871,29 @@ mod tests {
         let mut output = Vec::new();
         let report = apply_deltas(&mut input, &mut output, deltas)?;
         Ok((output, report))
+    }
+
+    fn minimal_layer_stacks_with_ft_prefix(
+        l1: usize,
+        l2: usize,
+        l3: usize,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let architecture = format!(
+            "Features=HalfKP[{}->{l1}x2],LayerStacks,l2={l2},l3={l3}",
+            <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&NNUE_VERSION_LAYERSTACK_NUM_BUCKETS.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(architecture.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(architecture.as_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(LEB128_MAGIC);
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
     }
 
     fn with_psqt_and_threat(bytes: &[u8]) -> Vec<u8> {
@@ -1176,6 +1204,35 @@ mod tests {
             let bytes = replace_architecture(&synthetic.bytes, &architecture);
             assert!(LayerStacksBinLayout::from_bytes(&bytes).is_err(), "{suffix}");
         }
+    }
+
+    #[test]
+    fn rejects_gigantic_l1_without_panicking() {
+        let bytes = minimal_layer_stacks_with_ft_prefix(usize::MAX - 1, 2, 1, &[0]);
+        let result = std::panic::catch_unwind(move || {
+            let mut reader = Cursor::new(bytes);
+            LayerStacksBinLayout::from_reader(&mut reader)
+        })
+        .expect("invalid header must not panic");
+        let error = result.expect_err("gigantic l1");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_dimensions_above_runtime_loader_limit() {
+        for (l1, l2, l3) in [(16_386, 2, 1), (32, 16_385, 1), (32, 2, 16_385)] {
+            let bytes = minimal_layer_stacks_with_ft_prefix(l1, l2, l3, &[0]);
+            let error = LayerStacksBinLayout::from_bytes(&bytes).expect_err("oversized dimension");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{l1}x{l2}x{l3}");
+        }
+    }
+
+    #[test]
+    fn rejects_ft_bias_prefix_larger_than_compressed_payload() {
+        let bytes = minimal_layer_stacks_with_ft_prefix(32, 4, 3, &[0]);
+        let error = LayerStacksBinLayout::from_bytes(&bytes).expect_err("short FT bias payload");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("cannot contain 32 values in 1 bytes"));
     }
 
     #[test]
