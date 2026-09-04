@@ -6,8 +6,7 @@ user-invocable: true
 # 自己対局評価スキル
 
 以下の指示に従い、指定されたエンジン間の対局を実行し結果を集計する。
-統計規範 (SPRT bounds・試行規律・採否判定) の正典は rshogi-notes
-`rshogi/testing_policy.md`。本 SKILL はそれを実行手順に翻訳したもので、
+統計規範 (SPRT bounds・試行規律・採否判定) は本 SKILL の各節に記す。
 規範から逸脱する場合は実験 doc に理由を事前登録する。
 モードは主に 3 つ:
 
@@ -67,7 +66,7 @@ search / FS / arch / 速度が変わる対局を固定ノードでやると、�
 
 #### (c) SPRT 仮説と上限局数
 
-- 標準 bounds は testing_policy の用途別 2 種 (α=β=0.05):
+- 標準 bounds は用途別 2 種 (α=β=0.05):
   - **gainer (強くする変更)**: `--sprt-nelo0 0 --sprt-nelo1 10`
   - **simplification / non-regression**: `--sprt-nelo0 -10 --sprt-nelo1 0`
 - simplification の `<-10, 0>` は -5 nElo 級の退行を検出せず通し得る。簡略化 SPRT を
@@ -77,18 +76,23 @@ search / FS / arch / 速度が変わる対局を固定ノードでやると、�
   標準以外の bounds を使う場合は実験 doc に理由を事前登録した上で。
 - `--games`: 上限局数。**各方向の局数**であり、標準上限は `--games 5000` = 総 10,000 局。
   上限到達で境界未達なら inconclusive = **その patch は採用しない** (ただし accept_h0 と
-  異なりアイデア族の終了ではない。再挑戦の条件は testing_policy §2)。上限延長は事前宣言
+  異なりアイデア族の終了ではない。再挑戦はコード・パラメータ・仮説・条件のどれをなぜ
+  変えたかの事前記録が条件で、同一条件の引き直しや別 seed でのやり直しは不可)。上限延長は事前宣言
   した場合のみ、**到達前に** `control.json` の `target_games` で行う (到達後は延長不能)。
-- **走行中の SPRT を途中停止しない** (LLR の途中値は停止理由にならない。例外 3 種は
-  testing_policy §2 参照)。
-- **試行規律のチェック** (詳細は testing_policy §2): 正式 SPRT は同一アイデア族で
+- **走行中の SPRT を途中停止しない** (LLR の途中値は停止理由にならない。例外は
+  致命的実装不具合・設定誤り・game error の許容超過の 3 種のみ)。
+- **試行規律のチェック**: 正式 SPRT は同一アイデア族で
   最大 3 回 / 同一 patch・同一条件の引き直し禁止 / `accept_h0` でそのアイデア族は終了 /
   全試行を実験 doc に記録 (採用 run だけ残さない)。
+- **union patch (落ちたが正寄りだった変更の抱き合わせ再試験) の規律**: 最大 2 要素、
+  数値調整級・密接な相互作用が説明できるものだけ (独立した概念の追加/削除は単独で通す) /
+  `accept_h0` になった 2 案の結合救済は禁止 / union test も各要素のアイデア族の試行回数に
+  算入する / 通っても寄与の切り分けが不明である旨を記録する。
 
 #### (d) 開始局面選択の seed (`--seed`)
 
 棋力評価では `--seed` の明示指定を必須とし、値を実験 doc の事前登録節に記録する
-(再現性要件、testing_policy §4)。省略時に entropy 生成値が起動ログと `meta.json` に
+(再現性要件)。省略時に entropy 生成値が起動ログと `meta.json` に
 出るのは、デバッグ等の非採用 run 向けの挙動であり、採否判定に使う run では
 省略しない。独立 seed での再確認 (SPSA endpoint 等) では過去 run と異なる seed を
 明示的に選ぶ。
@@ -97,8 +101,7 @@ search / FS / arch / 速度が変わる対局を固定ノードでやると、�
 
 正式な棋力評価は、起動前に以下を実験 doc へ記録する: engine SHA、NNUE (ファイルと
 FV_SCALE)、USI options、startpos ファイルと hash、seed、TC (nodes / byoyomi)、threads、
-hash、SPRT bounds と上限局数。加えて rshogi-notes `rshogi/standing_rules.md` の実行機・
-backend・raw log 所在の記録要件を満たす。
+hash、SPRT bounds と上限局数。加えて実行機・backend・raw log の所在も記録する。
 
 #### (f) startpos / engine USI option
 
@@ -438,17 +441,19 @@ simplification / non-regression の検定は `--sprt-nelo0 -10 --sprt-nelo1 0` �
   `analyze_selfplay --sprt` で再判定できる。
 - 走らせている最中に並列度を変えたい / `--games` 上限を増減したいときは、再起動せず
   `<out-dir>/control.json` で調整できる（上記「実行中の動的制御」を参照）。SPRT の
-  途中有効化のみ未対応。上限延長は事前宣言した場合のみ (testing_policy §2)。
+  途中有効化のみ未対応。上限延長は事前宣言した場合のみ。
 - **run 終了時に error ペアの状況を確認する**: 最終サマリと `meta.json` の
-  `error_pairs` / `retried_pairs` / `exhausted_pairs` を見る。`exhausted_pairs > 0`
+  `error_pairs` / `retried_pairs` / `exhausted_pairs` を見る。規約は「error を含む
+  論理ペアは丸ごと破棄し、**同一 startpos・同一先後割当で最大 2 回再対局**」。
+  `exhausted_pairs > 0`
   (meta の `invalid: true`) の run は**統計を採用しない** (統計的敗北にも変換しない)。
   invalid は「再試行 2 回でも error が残った」という機械判定であり原因分類ではないので、
-  ログから error の帰属 (インフラ / candidate・base の crash / 原因不明) を調査して
-  testing_policy §3 の分類に従って扱う。**candidate の決定的 crash は品質 gate 失敗**
-  なので、run 中に気付いたら枯渇を待たず中断して調査する。
+  ログから error の帰属を調査して分類に応じて扱う (インフラ起因 → 再試行、枯渇なら
+  invalid のまま統計的敗北に変換しない / 原因不明 → invalid 寄りに倒し、成功局だけを
+  選んで集計し直さない)。**candidate (または base) 起因の crash は SPRT 以前の品質
+  gate 失敗**なので、run 中に気付いたら枯渇を待たず中断して調査する。
 - **二段検定は例外運用**: 標準は単段。release-critical な変更や SPSA endpoint 等の
   選抜結果のみ、**独立 seed** (過去 run と異なる `--seed`) で同 bounds を再確認する。
-  詳細は testing_policy §1。
 
 境界到達時の標準出力例:
 
