@@ -1314,7 +1314,8 @@ cargo run --release -p tools --bin apply_net_spsa_params -- \
 
 一連の流れは `generate_net_spsa_params` → SPSA → `apply_net_spsa_params` → SPSA と異なる
 独立 seed の SPRT とする。焼き込み時の SHA-256 照合、読み戻し検証、JSON report は
-[`apply_net_spsa_params` の詳細](apply_net_spsa_params.md)を参照する。
+[`apply_net_spsa_params` の詳細](apply_net_spsa_params.md)を参照する。焼き込み・SHA-256・
+staged file の読み戻し検証はいずれも net 全体をメモリへ載せずストリーミングで行う。
 
 ## 13. トラブルシューティング
 

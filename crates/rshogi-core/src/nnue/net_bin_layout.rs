@@ -1,25 +1,22 @@
 //! LayerStacks `.bin` の feature 非依存レイアウト走査。
 
 use std::fmt;
-use std::io;
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 
-use super::bona_piece_effect_bucket::EffectBucketConfig;
 use super::constants::{
     DEFAULT_NUM_BUCKETS, HALFKA_DIMENSIONS, HALFKA_HM_DIMENSIONS, HALFKA_HM_SPLIT_DIMENSIONS,
     HALFKA_MERGED_DIMENSIONS, HALFKP_DIMENSIONS, MAX_ARCH_LEN, MAX_LAYER_STACK_BUCKETS,
     NNUE_VERSION_HALFKA, NNUE_VERSION_LAYERSTACK_NUM_BUCKETS,
 };
-use super::leb128::{
-    LEB128_MAGIC, MAX_COMPRESSED_SIZE, decode_single_leb128, encode_signed_leb128,
-};
+use super::leb128::{LEB128_MAGIC, MAX_COMPRESSED_SIZE, encode_signed_leb128};
 use super::net_delta::{
     NetCoefficientId, NetDelta, NetDeltaError, NetDeltaReport, NetTensorKind, NetTensorShape,
     add_i8_delta, add_i16_delta, add_i32_delta,
 };
 use super::spec::{
-    FeatureSet, parse_arch_dimensions, parse_feature_input_dimensions,
-    parse_layer_stacks_feature_set_keyword,
+    FeatureSet, detect_layer_stacks_feature, parse_arch_dimensions, parse_effect_bucket_config,
+    parse_feature_input_dimensions,
 };
 
 /// tensor の biases / weights byte 範囲。
@@ -66,11 +63,10 @@ pub struct LayerStackBucketBinLayout {
     pub output: TensorBinLayout,
 }
 
-/// LEB128 FT bias の decode 結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodedFtBiases {
+struct StoredBinBlock {
     source: Range<usize>,
-    values: Vec<i16>,
+    bytes: Vec<u8>,
 }
 
 /// LayerStacks `.bin` 全体の byte レイアウト。
@@ -102,6 +98,10 @@ pub struct LayerStacksBinLayout {
     pub threat_weights: Option<Range<usize>>,
     /// bucket ごとの FC ブロック。
     pub buckets: Vec<LayerStackBucketBinLayout>,
+    // FT weights は EffectBucket で GiB 級になるため保持せず、係数列挙に必要な
+    // FT bias と小さい FC block だけを保持して常駐量を net の FT サイズから切り離す。
+    ft_biases: Vec<i16>,
+    fc_data: StoredBinBlock,
 }
 
 /// LayerStacks `.bin` の書換えエラー。
@@ -143,47 +143,38 @@ impl From<NetDeltaError> for NetBinPatchError {
     }
 }
 
-/// LayerStacks `.bin` の指定係数へ engine と同じ saturating delta を適用する。
+/// LayerStacks `.bin` の指定係数へ engine と同じ saturating delta をストリーミング適用する。
 ///
-/// 編集対象外の領域は入力からそのままコピーする。LEB128 FT は元の Combined / Split
-/// ブロック構成を維持し、変更を含むブロックだけを最短形で再エンコードする。
-pub fn apply_deltas_to_bytes(
-    bytes: &[u8],
+/// 編集対象外は固定サイズバッファで転送する。FT は bias prefix だけを再エンコードし、
+/// GiB 級になり得る weights payload は読み込まず入力 byte をそのまま転送する。
+pub fn apply_deltas<R: Read + Seek, W: Write>(
+    input: &mut R,
+    output: &mut W,
     deltas: &[NetDelta],
-) -> Result<(Vec<u8>, NetDeltaReport), NetBinPatchError> {
-    let layout = LayerStacksBinLayout::from_bytes(bytes)?;
+) -> Result<NetDeltaReport, NetBinPatchError> {
+    let mut layout = LayerStacksBinLayout::from_reader(input)?;
     for delta in deltas {
         layout.tensor_shape(delta.id.kind).validate(&delta.id)?;
     }
     let has_nonzero_ft_delta = deltas
         .iter()
         .any(|delta| delta.id.kind == NetTensorKind::FtBias && delta.delta != 0);
-    if layout.feature_transformer.encoding == FtBinEncoding::Leb128Combined && !has_nonzero_ft_delta
-    {
-        validate_combined_ft_payload(bytes, &layout)?;
+    if has_nonzero_ft_delta {
+        validate_canonical_ft_biases(input, &layout)?;
     }
 
     let mut report = NetDeltaReport {
         applied: deltas.len(),
         clamped: 0,
     };
-    if deltas.iter().all(|delta| delta.delta == 0) {
-        return Ok((bytes.to_vec(), report));
-    }
-
-    let mut patched = bytes.to_vec();
-    let mut ft_values =
-        has_nonzero_ft_delta.then(|| decode_ft_tensor(bytes, &layout)).transpose()?;
     for delta in deltas {
         if delta.delta == 0 {
             continue;
         }
         let clamped = match delta.id.kind {
             NetTensorKind::FtBias => {
-                let values = ft_values
-                    .as_mut()
-                    .ok_or_else(|| invalid_binary("FT values were not decoded"))?;
-                let current = values
+                let current = layout
+                    .ft_biases
                     .get_mut(delta.id.index)
                     .ok_or_else(|| invalid_binary("validated FT bias index is missing"))?;
                 let (value, clamped) = add_i16_delta(*current, delta.delta);
@@ -192,24 +183,30 @@ pub fn apply_deltas_to_bytes(
             }
             NetTensorKind::OutputWeight => {
                 let bucket = validated_bucket(&layout, &delta.id)?;
-                patch_i8(&mut patched, bucket.output.weights.start + delta.id.index, delta.delta)?
+                let offset = bucket.output.weights.start + delta.id.index;
+                layout.fc_data.patch_i8(offset, delta.delta)?
             }
             NetTensorKind::OutputBias => {
                 let bucket = validated_bucket(&layout, &delta.id)?;
-                patch_i32(&mut patched, bucket.output.biases.start, delta.delta)?
+                let offset = bucket.output.biases.start;
+                layout.fc_data.patch_i32(offset, delta.delta)?
             }
             NetTensorKind::L2Weight => {
                 let bucket = validated_bucket(&layout, &delta.id)?;
-                patch_i8(&mut patched, bucket.l2.weights.start + delta.id.index, delta.delta)?
+                let offset = bucket.l2.weights.start + delta.id.index;
+                layout.fc_data.patch_i8(offset, delta.delta)?
             }
         };
         report.clamped += usize::from(clamped);
     }
 
-    if let Some(values) = ft_values {
-        patched = replace_ft_block(&patched, &layout, &values)?;
+    let mut source_position = 0;
+    if has_nonzero_ft_delta {
+        source_position = write_reencoded_ft_biases(input, output, &layout)?;
     }
-    Ok((patched, report))
+    copy_range(input, output, source_position..layout.fc_data.source.start)?;
+    output.write_all(&layout.fc_data.bytes)?;
+    Ok(report)
 }
 
 fn validated_bucket<'a>(
@@ -226,9 +223,19 @@ fn validated_bucket<'a>(
 }
 
 impl LayerStacksBinLayout {
-    /// `.bin` 全体を走査し、LayerStacks の各 byte 範囲を返す。
+    /// byte slice を走査し、LayerStacks の各 byte 範囲を返す。
+    ///
+    /// 実装は [`Self::from_reader`] に委譲する。
     pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
-        let mut cursor = ByteCursor::new(bytes);
+        Self::from_reader(&mut Cursor::new(bytes))
+    }
+
+    /// seek 可能な `.bin` を走査し、LayerStacks の各 byte 範囲を返す。
+    ///
+    /// FT の圧縮 weights payload は読み込まず seek で飛ばす。常駐メモリは decode 済み
+    /// FT bias と全 bucket の FC block に限られ、FT weights のサイズには依存しない。
+    pub fn from_reader<R: Read + Seek>(reader: &mut R) -> io::Result<Self> {
+        let mut cursor = StreamCursor::new(reader)?;
         let version = cursor.read_u32("version")?;
         if version != NNUE_VERSION_HALFKA && version != NNUE_VERSION_LAYERSTACK_NUM_BUCKETS {
             return Err(invalid(format!("unsupported LayerStacks version {version:#x}")));
@@ -238,8 +245,8 @@ impl LayerStacksBinLayout {
         if arch_len == 0 || arch_len > MAX_ARCH_LEN {
             return Err(invalid(format!("invalid architecture string length: {arch_len}")));
         }
-        let architecture_range = cursor.take(arch_len, "architecture string")?;
-        let architecture = std::str::from_utf8(&bytes[architecture_range])
+        let architecture_bytes = cursor.read_bytes(arch_len, "architecture string")?;
+        let architecture = std::str::from_utf8(&architecture_bytes)
             .map_err(|_| invalid("architecture string is not UTF-8"))?
             .to_owned();
         if !is_layer_stacks_architecture(&architecture) {
@@ -264,10 +271,7 @@ impl LayerStacksBinLayout {
         let threat_dimensions = parse_token_usize(&architecture, "Threat=")?;
         let ft_input_dimensions = parse_ft_input_dimensions(&architecture, threat_dimensions)?;
         let ft_hash = cursor.take(4, "FT hash")?;
-        if !cursor.remaining().starts_with(LEB128_MAGIC) {
-            return Err(invalid("unsupported FT encoding: expected COMPRESSED_LEB128 magic"));
-        }
-        let feature_transformer = parse_leb128_ft(&mut cursor, ft_hash, l1)?;
+        let (feature_transformer, ft_biases) = parse_leb128_ft(&mut cursor, ft_hash, l1)?;
 
         let psqt = if architecture.contains("PSQT=") {
             Some(TensorBinLayout {
@@ -318,13 +322,22 @@ impl LayerStacksBinLayout {
                 output,
             });
         }
-        if cursor.position != bytes.len() {
+        let consumed = cursor.position;
+        if consumed != cursor.file_size {
             return Err(invalid(format!(
                 "unexpected trailing LayerStacks data: consumed={}, file_size={}",
-                cursor.position,
-                bytes.len()
+                consumed, cursor.file_size
             )));
         }
+        let fc_range = buckets
+            .first()
+            .zip(buckets.last())
+            .map(|(first, last)| first.fc_hash.start..last.output.weights.end)
+            .ok_or_else(|| invalid("LayerStacks has no FC buckets"))?;
+        let fc_data = StoredBinBlock {
+            bytes: cursor.read_range(fc_range.clone(), "FC blocks")?,
+            source: fc_range,
+        };
         Ok(Self {
             version,
             network_hash,
@@ -339,6 +352,8 @@ impl LayerStacksBinLayout {
             threat_profile,
             threat_weights,
             buckets,
+            ft_biases,
+            fc_data,
         })
     }
 
@@ -364,55 +379,77 @@ impl LayerStacksBinLayout {
         }
     }
 
-    /// FT bias を必要な部分だけ decode し、繰り返し参照用の cache を返す。
-    pub fn decode_ft_biases(&self, bytes: &[u8]) -> Result<DecodedFtBiases, NetDeltaError> {
-        let range = self.feature_transformer.biases.clone();
-        let encoded = bytes.get(range.clone()).ok_or_else(|| invalid_binary("FT bias range"))?;
-        let values = decode_i16_values(encoded, self.l1)
-            .map_err(|error| invalid_binary(error.to_string()))?;
-        Ok(DecodedFtBiases {
-            source: range,
-            values,
-        })
-    }
-
     /// ファイル格納順 ID で指定した係数の現在値を返す。
-    pub fn coefficient(&self, bytes: &[u8], id: &NetCoefficientId) -> Result<i32, NetDeltaError> {
-        self.coefficient_with_ft_biases(bytes, id, None)
-    }
-
-    /// decode 済み FT bias cache を再利用して係数の現在値を返す。
-    pub fn coefficient_with_ft_biases(
-        &self,
-        bytes: &[u8],
-        id: &NetCoefficientId,
-        ft_biases: Option<&DecodedFtBiases>,
-    ) -> Result<i32, NetDeltaError> {
+    pub fn coefficient(&self, id: &NetCoefficientId) -> Result<i32, NetDeltaError> {
         self.tensor_shape(id.kind).validate(id)?;
         match id.kind {
-            NetTensorKind::FtBias => {
-                if let Some(decoded) = ft_biases {
-                    if decoded.source != self.feature_transformer.biases {
-                        return Err(invalid_binary("FT bias cache does not match layout"));
-                    }
-                    return Ok(i32::from(decoded.values[id.index]));
-                }
-                let decoded = self.decode_ft_biases(bytes)?;
-                Ok(i32::from(decoded.values[id.index]))
-            }
+            NetTensorKind::FtBias => Ok(i32::from(self.ft_biases[id.index])),
             NetTensorKind::OutputWeight => {
                 let bucket = id.bucket.expect("validated bucket");
-                read_i8(bytes, self.buckets[bucket].output.weights.start + id.index)
+                self.fc_data.read_i8(self.buckets[bucket].output.weights.start + id.index)
             }
             NetTensorKind::OutputBias => {
                 let bucket = id.bucket.expect("validated bucket");
-                read_i32(bytes, self.buckets[bucket].output.biases.start)
+                self.fc_data.read_i32(self.buckets[bucket].output.biases.start)
             }
             NetTensorKind::L2Weight => {
                 let bucket = id.bucket.expect("validated bucket");
-                read_i8(bytes, self.buckets[bucket].l2.weights.start + id.index)
+                self.fc_data.read_i8(self.buckets[bucket].l2.weights.start + id.index)
             }
         }
+    }
+}
+
+impl StoredBinBlock {
+    fn get(&self, offset: usize, width: usize) -> Result<&[u8], NetDeltaError> {
+        let relative = offset
+            .checked_sub(self.source.start)
+            .ok_or_else(|| invalid_binary(format!("byte offset {offset}")))?;
+        let end = relative
+            .checked_add(width)
+            .ok_or_else(|| invalid_binary("byte range overflow"))?;
+        self.bytes
+            .get(relative..end)
+            .ok_or_else(|| invalid_binary(format!("byte offset {offset}")))
+    }
+
+    fn read_i8(&self, offset: usize) -> Result<i32, NetDeltaError> {
+        Ok(i32::from(self.get(offset, 1)?[0] as i8))
+    }
+
+    fn read_i32(&self, offset: usize) -> Result<i32, NetDeltaError> {
+        Ok(i32::from_le_bytes(
+            self.get(offset, 4)?.try_into().map_err(|_| invalid_binary("truncated i32"))?,
+        ))
+    }
+
+    fn patch_i8(&mut self, offset: usize, delta: i32) -> Result<bool, NetDeltaError> {
+        let relative = offset
+            .checked_sub(self.source.start)
+            .ok_or_else(|| invalid_binary(format!("byte offset {offset}")))?;
+        let current = self
+            .bytes
+            .get_mut(relative)
+            .ok_or_else(|| invalid_binary(format!("byte offset {offset}")))?;
+        let (value, clamped) = add_i8_delta(*current as i8, delta);
+        *current = value as u8;
+        Ok(clamped)
+    }
+
+    fn patch_i32(&mut self, offset: usize, delta: i32) -> Result<bool, NetDeltaError> {
+        let relative = offset
+            .checked_sub(self.source.start)
+            .ok_or_else(|| invalid_binary(format!("i32 offset {offset}")))?;
+        let end = relative.checked_add(4).ok_or_else(|| invalid_binary("i32 range overflow"))?;
+        let bytes = self
+            .bytes
+            .get_mut(relative..end)
+            .ok_or_else(|| invalid_binary(format!("i32 offset {offset}")))?;
+        let current =
+            i32::from_le_bytes(bytes.try_into().map_err(|_| invalid_binary("truncated i32"))?);
+        let (value, clamped) = add_i32_delta(current, delta);
+        bytes.copy_from_slice(&value.to_le_bytes());
+        Ok(clamped)
     }
 }
 
@@ -420,17 +457,18 @@ fn is_layer_stacks_architecture(architecture: &str) -> bool {
     matches!(
         super::spec::parse_feature_set_from_arch(architecture),
         Ok(FeatureSet::LayerStacks | FeatureSet::HalfKaHmMergedEffectBucket)
+    ) || matches!(
+        detect_layer_stacks_feature(architecture),
+        Ok(FeatureSet::HalfKaHmMergedEffectBucket)
     )
 }
 
 fn parse_ft_input_dimensions(architecture: &str, threat: usize) -> io::Result<usize> {
     let reported = parse_feature_input_dimensions(architecture)
         .ok_or_else(|| invalid("missing FT input dimensions"))?;
-    let feature = parse_layer_stacks_feature_set_keyword(architecture)
-        .map_err(invalid)?
-        .ok_or_else(|| invalid("LayerStacks header does not identify its FT feature set"))?;
+    let feature = detect_layer_stacks_feature(architecture).map_err(invalid)?;
     let dimensions = if architecture.contains("EffectBucket=") || architecture.contains("E4=") {
-        parse_effect_config(architecture)
+        parse_effect_bucket_config(architecture)
             .ok_or_else(|| invalid("malformed EffectBucket token"))?
             .dimensions()
     } else {
@@ -454,19 +492,6 @@ fn parse_ft_input_dimensions(architecture: &str, threat: usize) -> io::Result<us
     }
 }
 
-fn parse_effect_config(architecture: &str) -> Option<EffectBucketConfig> {
-    let token = architecture
-        .split(',')
-        .find_map(|part| part.strip_prefix("EffectBucket=").or_else(|| part.strip_prefix("E4=")))?;
-    match token {
-        "2x2fixed" | "4xfixed" => Some(EffectBucketConfig::KINGFIXED_2X2),
-        "2x2bucketed" | "4xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_2X2),
-        "3x3fixed" | "9xfixed" => Some(EffectBucketConfig::KINGFIXED_3X3),
-        "3x3bucketed" | "9xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_3X3),
-        _ => None,
-    }
-}
-
 fn parse_token_usize(architecture: &str, token: &str) -> io::Result<usize> {
     match architecture.split(',').find_map(|part| part.strip_prefix(token)) {
         Some(value) => value.parse().map_err(|_| invalid(format!("malformed {token} token"))),
@@ -474,32 +499,38 @@ fn parse_token_usize(architecture: &str, token: &str) -> io::Result<usize> {
     }
 }
 
-fn parse_leb128_ft(
-    cursor: &mut ByteCursor<'_>,
+fn parse_leb128_ft<R: Read + Seek>(
+    cursor: &mut StreamCursor<'_, R>,
     hash: Range<usize>,
     bias_count: usize,
-) -> io::Result<FeatureTransformerBinLayout> {
+) -> io::Result<(FeatureTransformerBinLayout, Vec<i16>)> {
     let first = cursor.take_leb128_prefix("FT first LEB128 block", bias_count)?;
     if first.prefix_end == first.data.end {
         let weights = cursor.take_leb128_payload("FT weights LEB128 block")?;
-        Ok(FeatureTransformerBinLayout {
-            hash,
-            encoding: FtBinEncoding::Leb128Split,
-            biases: first.data,
-            weights,
-        })
+        Ok((
+            FeatureTransformerBinLayout {
+                hash,
+                encoding: FtBinEncoding::Leb128Split,
+                biases: first.data,
+                weights,
+            },
+            first.values,
+        ))
     } else {
-        Ok(FeatureTransformerBinLayout {
-            hash,
-            encoding: FtBinEncoding::Leb128Combined,
-            biases: first.data.start..first.prefix_end,
-            weights: first.prefix_end..first.data.end,
-        })
+        Ok((
+            FeatureTransformerBinLayout {
+                hash,
+                encoding: FtBinEncoding::Leb128Combined,
+                biases: first.data.start..first.prefix_end,
+                weights: first.prefix_end..first.data.end,
+            },
+            first.values,
+        ))
     }
 }
 
-fn parse_affine(
-    cursor: &mut ByteCursor<'_>,
+fn parse_affine<R: Read + Seek>(
+    cursor: &mut StreamCursor<'_, R>,
     input: usize,
     output: usize,
     name: &str,
@@ -526,20 +557,30 @@ fn checked_padded_input(input: usize) -> io::Result<usize> {
 struct Leb128Block {
     data: Range<usize>,
     prefix_end: usize,
+    values: Vec<i16>,
 }
 
-struct ByteCursor<'a> {
-    bytes: &'a [u8],
+struct StreamCursor<'a, R> {
+    reader: &'a mut R,
     position: usize,
+    file_size: usize,
 }
 
-impl<'a> ByteCursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-
-    fn remaining(&self) -> &'a [u8] {
-        &self.bytes[self.position..]
+impl<'a, R: Read + Seek> StreamCursor<'a, R> {
+    fn new(reader: &'a mut R) -> io::Result<Self> {
+        let position = usize_from_u64(reader.stream_position()?, "stream position")?;
+        if position != 0 {
+            return Err(invalid(format!(
+                "LayerStacks reader must start at byte 0, got {position}"
+            )));
+        }
+        let file_size = usize_from_u64(reader.seek(SeekFrom::End(0))?, "file size")?;
+        reader.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            reader,
+            position: 0,
+            file_size,
+        })
     }
 
     fn take(&mut self, size: usize, name: &str) -> io::Result<Range<usize>> {
@@ -547,12 +588,50 @@ impl<'a> ByteCursor<'a> {
             .position
             .checked_add(size)
             .ok_or_else(|| invalid(format!("{name} range overflow")))?;
-        if end > self.bytes.len() {
+        if end > self.file_size {
             return Err(invalid(format!("truncated {name}")));
         }
         let range = self.position..end;
+        self.reader.seek(SeekFrom::Start(u64_from_usize(end, name)?))?;
         self.position = end;
         Ok(range)
+    }
+
+    fn read_bytes(&mut self, size: usize, name: &str) -> io::Result<Vec<u8>> {
+        let end = self
+            .position
+            .checked_add(size)
+            .ok_or_else(|| invalid(format!("{name} range overflow")))?;
+        if end > self.file_size {
+            return Err(invalid(format!("truncated {name}")));
+        }
+        let mut bytes = vec![0u8; size];
+        self.reader.read_exact(&mut bytes)?;
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn read_array<const N: usize>(&mut self, name: &str) -> io::Result<[u8; N]> {
+        let end = self
+            .position
+            .checked_add(N)
+            .ok_or_else(|| invalid(format!("{name} range overflow")))?;
+        if end > self.file_size {
+            return Err(invalid(format!("truncated {name}")));
+        }
+        let mut bytes = [0u8; N];
+        self.reader.read_exact(&mut bytes)?;
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn read_range(&mut self, range: Range<usize>, name: &str) -> io::Result<Vec<u8>> {
+        if range.start > range.end || range.end > self.file_size {
+            return Err(invalid(format!("invalid {name} range")));
+        }
+        self.reader.seek(SeekFrom::Start(u64_from_usize(range.start, name)?))?;
+        self.position = range.start;
+        self.read_bytes(range.len(), name)
     }
 
     fn take_count(&mut self, count: usize, width: usize, name: &str) -> io::Result<Range<usize>> {
@@ -563,15 +642,12 @@ impl<'a> ByteCursor<'a> {
     }
 
     fn read_u32(&mut self, name: &str) -> io::Result<u32> {
-        let range = self.take(4, name)?;
-        Ok(u32::from_le_bytes(
-            self.bytes[range].try_into().map_err(|_| invalid(format!("truncated {name}")))?,
-        ))
+        Ok(u32::from_le_bytes(self.read_array(name)?))
     }
 
     fn take_leb128_payload(&mut self, name: &str) -> io::Result<Range<usize>> {
-        let magic = self.take(LEB128_MAGIC.len(), name)?;
-        if &self.bytes[magic] != LEB128_MAGIC {
+        let magic: [u8; 17] = self.read_array(name)?;
+        if magic != LEB128_MAGIC {
             return Err(invalid(format!("{name} has invalid magic")));
         }
         let size = self.read_u32(name)? as usize;
@@ -584,199 +660,141 @@ impl<'a> ByteCursor<'a> {
     }
 
     fn take_leb128_prefix(&mut self, name: &str, prefix_count: usize) -> io::Result<Leb128Block> {
-        let data = self.take_leb128_payload(name)?;
-        let mut position = data.start;
-        for _ in 0..prefix_count {
-            let (_, consumed) = decode_single_leb128(&self.bytes[position..data.end])?;
-            position += consumed;
+        let magic: [u8; 17] = self.read_array(name)?;
+        if magic != LEB128_MAGIC {
+            return Err(invalid("unsupported FT encoding: expected COMPRESSED_LEB128 magic"));
         }
+        let size = self.read_u32(name)? as usize;
+        if size == 0 || size > MAX_COMPRESSED_SIZE {
+            return Err(invalid(format!(
+                "invalid {name} size: {size} (max: {MAX_COMPRESSED_SIZE})"
+            )));
+        }
+        let data_start = self.position;
+        let data_end = data_start
+            .checked_add(size)
+            .ok_or_else(|| invalid(format!("{name} range overflow")))?;
+        if data_end > self.file_size {
+            return Err(invalid(format!("truncated {name}")));
+        }
+        let mut values = Vec::with_capacity(prefix_count);
+        for _ in 0..prefix_count {
+            values.push(self.read_leb128_i16(data_end)?);
+        }
+        let prefix_end = self.position;
+        self.reader.seek(SeekFrom::Start(u64_from_usize(data_end, name)?))?;
+        self.position = data_end;
         Ok(Leb128Block {
-            data,
-            prefix_end: position,
+            data: data_start..data_end,
+            prefix_end,
+            values,
         })
     }
-}
 
-fn decode_i16_values(bytes: &[u8], expected: usize) -> io::Result<Vec<i16>> {
-    let mut values = Vec::with_capacity(expected);
-    let mut position = 0usize;
-    while position < bytes.len() {
-        let (value, consumed) = decode_single_leb128(&bytes[position..])?;
-        values.push(i16::try_from(value).map_err(|_| {
-            invalid(format!("LEB128 value is outside i16 range at byte {position}: {value}"))
-        })?);
-        position += consumed;
-    }
-    if values.len() != expected {
-        return Err(invalid(format!(
-            "FT bias count mismatch: got {}, expected {expected}",
-            values.len()
-        )));
-    }
-    Ok(values)
-}
-
-fn decode_ft_tensor(
-    bytes: &[u8],
-    layout: &LayerStacksBinLayout,
-) -> Result<Vec<i16>, NetDeltaError> {
-    let range = match layout.feature_transformer.encoding {
-        FtBinEncoding::Leb128Combined => {
-            layout.feature_transformer.biases.start..layout.feature_transformer.weights.end
+    fn read_leb128_i16(&mut self, block_end: usize) -> io::Result<i16> {
+        let mut result = 0i64;
+        let mut shift = 0u32;
+        loop {
+            if self.position >= block_end {
+                return Err(invalid("truncated FT bias LEB128 value"));
+            }
+            let byte = self.read_array::<1>("FT bias LEB128 value")?[0];
+            result |= i64::from(byte & 0x7f) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                if shift < 64 && byte & 0x40 != 0 {
+                    result |= !0i64 << shift;
+                }
+                return i16::try_from(result)
+                    .map_err(|_| invalid(format!("FT bias is outside i16 range: {result}")));
+            }
+            if shift >= 64 {
+                return Err(invalid("FT bias LEB128 value overflow"));
+            }
         }
-        FtBinEncoding::Leb128Split => layout.feature_transformer.biases.clone(),
-    };
-    let encoded = bytes.get(range).ok_or_else(|| invalid_binary("FT tensor range"))?;
-    let expected = match layout.feature_transformer.encoding {
-        FtBinEncoding::Leb128Combined => layout
-            .l1
-            .checked_add(
-                layout
-                    .ft_input_dimensions
-                    .checked_mul(layout.l1)
-                    .ok_or_else(|| invalid_binary("FT dimensions overflow"))?,
-            )
-            .ok_or_else(|| invalid_binary("FT dimensions overflow"))?,
-        FtBinEncoding::Leb128Split => layout.l1,
-    };
-    let values =
-        decode_i16_values(encoded, expected).map_err(|error| invalid_binary(error.to_string()))?;
-    if layout.feature_transformer.encoding == FtBinEncoding::Leb128Combined
-        && !is_canonical_i16_leb128(encoded, &values)
-    {
-        return Err(invalid_binary("Combined FT LEB128 payload is not canonical"));
     }
-    Ok(values)
 }
 
-fn validate_combined_ft_payload(
-    bytes: &[u8],
+fn validate_canonical_ft_biases<R: Read + Seek>(
+    input: &mut R,
     layout: &LayerStacksBinLayout,
-) -> Result<(), NetDeltaError> {
-    let range = layout.feature_transformer.biases.start..layout.feature_transformer.weights.end;
-    let encoded = bytes.get(range).ok_or_else(|| invalid_binary("FT tensor range"))?;
-    let expected = layout
-        .l1
-        .checked_add(
-            layout
-                .ft_input_dimensions
-                .checked_mul(layout.l1)
-                .ok_or_else(|| invalid_binary("FT dimensions overflow"))?,
-        )
-        .ok_or_else(|| invalid_binary("FT dimensions overflow"))?;
-    let mut position = 0usize;
-    let mut canonical = Vec::with_capacity(3);
-    for _ in 0..expected {
-        let (raw, consumed) = decode_single_leb128(&encoded[position..])
-            .map_err(|error| invalid_binary(error.to_string()))?;
-        let value = i16::try_from(raw).map_err(|_| {
-            invalid_binary(format!("LEB128 value is outside i16 range at byte {position}: {raw}"))
-        })?;
-        canonical.clear();
-        encode_signed_leb128(i64::from(value), &mut canonical);
-        if encoded.get(position..position + consumed) != Some(canonical.as_slice()) {
-            return Err(invalid_binary("Combined FT LEB128 payload is not canonical"));
-        }
-        position += consumed;
-    }
-    if position != encoded.len() {
-        return Err(invalid_binary(format!(
-            "FT element count mismatch: decoded {expected}, payload has trailing bytes"
-        )));
+) -> Result<(), NetBinPatchError> {
+    let mut original = vec![0; layout.feature_transformer.biases.len()];
+    input.seek(SeekFrom::Start(u64_from_usize(
+        layout.feature_transformer.biases.start,
+        "FT biases",
+    )?))?;
+    input.read_exact(&mut original)?;
+    if original != encode_ft_biases(&layout.ft_biases) {
+        return Err(invalid_binary("FT bias LEB128 payload is not canonical").into());
     }
     Ok(())
 }
 
-fn is_canonical_i16_leb128(encoded: &[u8], values: &[i16]) -> bool {
-    let mut position = 0usize;
-    let mut canonical = Vec::with_capacity(3);
-    for &value in values {
-        canonical.clear();
-        encode_signed_leb128(i64::from(value), &mut canonical);
-        let Some(end) = position.checked_add(canonical.len()) else {
-            return false;
-        };
-        if encoded.get(position..end) != Some(canonical.as_slice()) {
-            return false;
-        }
-        position = end;
+fn write_reencoded_ft_biases<R: Read + Seek, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    layout: &LayerStacksBinLayout,
+) -> Result<usize, NetBinPatchError> {
+    let encoded = encode_ft_biases(&layout.ft_biases);
+    let size = match layout.feature_transformer.encoding {
+        FtBinEncoding::Leb128Combined => encoded
+            .len()
+            .checked_add(layout.feature_transformer.weights.len())
+            .ok_or_else(|| invalid("encoded FT block size overflow"))?,
+        FtBinEncoding::Leb128Split => encoded.len(),
+    };
+    if size > MAX_COMPRESSED_SIZE {
+        return Err(invalid(format!("encoded FT block exceeds maximum size: {size}")).into());
     }
-    position == encoded.len()
+    let size = u32::try_from(size).map_err(|_| invalid("encoded FT block exceeds u32 size"))?;
+    let size_offset = layout
+        .feature_transformer
+        .biases
+        .start
+        .checked_sub(4)
+        .ok_or_else(|| invalid_binary("FT block size field range"))?;
+    copy_range(input, output, 0..size_offset)?;
+    output.write_all(&size.to_le_bytes())?;
+    output.write_all(&encoded)?;
+    Ok(match layout.feature_transformer.encoding {
+        FtBinEncoding::Leb128Combined => layout.feature_transformer.weights.start,
+        FtBinEncoding::Leb128Split => layout.feature_transformer.biases.end,
+    })
 }
 
-fn replace_ft_block(
-    bytes: &[u8],
-    layout: &LayerStacksBinLayout,
-    values: &[i16],
-) -> Result<Vec<u8>, NetBinPatchError> {
-    let payload = match layout.feature_transformer.encoding {
-        FtBinEncoding::Leb128Combined => {
-            layout.feature_transformer.biases.start..layout.feature_transformer.weights.end
-        }
-        FtBinEncoding::Leb128Split => layout.feature_transformer.biases.clone(),
-    };
-    let block_start = payload
-        .start
-        .checked_sub(LEB128_MAGIC.len() + 4)
-        .ok_or_else(|| invalid_binary("FT block header range"))?;
-    let mut encoded = Vec::new();
+fn encode_ft_biases(values: &[i16]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(values.len().saturating_mul(3));
     for &value in values {
         encode_signed_leb128(i64::from(value), &mut encoded);
     }
-    let encoded_size =
-        u32::try_from(encoded.len()).map_err(|_| invalid("encoded FT block exceeds u32 size"))?;
-    let capacity = bytes
-        .len()
-        .checked_sub(payload.end - block_start)
-        .and_then(|size| size.checked_add(LEB128_MAGIC.len() + 4))
-        .and_then(|size| size.checked_add(encoded.len()))
-        .ok_or_else(|| invalid("patched NNUE size overflow"))?;
-    let mut output = Vec::with_capacity(capacity);
-    output.extend_from_slice(&bytes[..block_start]);
-    output.extend_from_slice(LEB128_MAGIC);
-    output.extend_from_slice(&encoded_size.to_le_bytes());
-    output.extend_from_slice(&encoded);
-    output.extend_from_slice(&bytes[payload.end..]);
-    Ok(output)
+    encoded
 }
 
-fn patch_i8(bytes: &mut [u8], offset: usize, delta: i32) -> Result<bool, NetDeltaError> {
-    let current = bytes
-        .get(offset)
-        .copied()
-        .ok_or_else(|| invalid_binary(format!("byte offset {offset}")))? as i8;
-    let (value, clamped) = add_i8_delta(current, delta);
-    bytes[offset] = value as u8;
-    Ok(clamped)
+fn copy_range<R: Read + Seek, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    range: Range<usize>,
+) -> io::Result<()> {
+    input.seek(SeekFrom::Start(u64_from_usize(range.start, "copy range")?))?;
+    let mut remaining = range.len();
+    // FT weights は GiB 級になり得るため、net サイズに依存しない固定バッファで転送する。
+    let mut buffer = [0u8; 1024 * 1024];
+    while remaining != 0 {
+        let chunk = remaining.min(buffer.len());
+        input.read_exact(&mut buffer[..chunk])?;
+        output.write_all(&buffer[..chunk])?;
+        remaining -= chunk;
+    }
+    Ok(())
 }
 
-fn patch_i32(bytes: &mut [u8], offset: usize, delta: i32) -> Result<bool, NetDeltaError> {
-    let end = offset.checked_add(4).ok_or_else(|| invalid_binary("i32 range overflow"))?;
-    let current = bytes
-        .get(offset..end)
-        .ok_or_else(|| invalid_binary(format!("i32 offset {offset}")))?;
-    let current =
-        i32::from_le_bytes(current.try_into().map_err(|_| invalid_binary("truncated i32"))?);
-    let (value, clamped) = add_i32_delta(current, delta);
-    bytes[offset..end].copy_from_slice(&value.to_le_bytes());
-    Ok(clamped)
+fn usize_from_u64(value: u64, name: &str) -> io::Result<usize> {
+    usize::try_from(value).map_err(|_| invalid(format!("{name} exceeds usize")))
 }
 
-fn read_i8(bytes: &[u8], offset: usize) -> Result<i32, NetDeltaError> {
-    bytes
-        .get(offset)
-        .map(|value| i32::from(*value as i8))
-        .ok_or_else(|| invalid_binary(format!("byte offset {offset}")))
-}
-
-fn read_i32(bytes: &[u8], offset: usize) -> Result<i32, NetDeltaError> {
-    let end = offset.checked_add(4).ok_or_else(|| invalid_binary("i32 range overflow"))?;
-    let value = bytes
-        .get(offset..end)
-        .ok_or_else(|| invalid_binary(format!("i32 offset {offset}")))?;
-    Ok(i32::from_le_bytes(
-        value.try_into().map_err(|_| invalid_binary("truncated i32"))?,
-    ))
+fn u64_from_usize(value: usize, name: &str) -> io::Result<u64> {
+    u64::try_from(value).map_err(|_| invalid(format!("{name} offset exceeds u64")))
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -833,6 +851,50 @@ mod tests {
         replaced
     }
 
+    fn replace_architecture(bytes: &[u8], architecture: &str) -> Vec<u8> {
+        let original_len = u32::from_le_bytes(bytes[8..12].try_into().expect("architecture size"));
+        let original_end = 12 + usize::try_from(original_len).expect("architecture length");
+        let replacement_len = u32::try_from(architecture.len()).expect("replacement length");
+        let mut replaced = Vec::with_capacity(bytes.len() - original_end + 12 + architecture.len());
+        replaced.extend_from_slice(&bytes[..8]);
+        replaced.extend_from_slice(&replacement_len.to_le_bytes());
+        replaced.extend_from_slice(architecture.as_bytes());
+        replaced.extend_from_slice(&bytes[original_end..]);
+        replaced
+    }
+
+    fn apply_deltas_to_vec(
+        bytes: &[u8],
+        deltas: &[NetDelta],
+    ) -> Result<(Vec<u8>, NetDeltaReport), NetBinPatchError> {
+        let mut input = Cursor::new(bytes);
+        let mut output = Vec::new();
+        let report = apply_deltas(&mut input, &mut output, deltas)?;
+        Ok((output, report))
+    }
+
+    struct ReadAudit {
+        cursor: Cursor<Vec<u8>>,
+        reads: Vec<Range<usize>>,
+    }
+
+    impl Read for ReadAudit {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let start = usize_from_u64(self.cursor.position(), "audit position")?;
+            let read = self.cursor.read(buffer)?;
+            if read != 0 {
+                self.reads.push(start..start + read);
+            }
+            Ok(read)
+        }
+    }
+
+    impl Seek for ReadAudit {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.cursor.seek(position)
+        }
+    }
+
     #[test]
     #[cfg(feature = "nnue-runtime-dimensions")]
     fn layout_coefficients_match_dynamic_network_for_leb128() {
@@ -851,7 +913,6 @@ mod tests {
             );
             let layout = LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("layout");
             let network = NNUENetwork::from_bytes(&synthetic.bytes).expect("dynamic network");
-            let ft_biases = layout.decode_ft_biases(&synthetic.bytes).expect("FT biases");
             assert_eq!(layout.num_buckets, num_buckets);
             assert_eq!(layout.l1, 32);
             assert_eq!(layout.l2, 4);
@@ -873,13 +934,7 @@ mod tests {
             ];
             for coefficient in cases {
                 assert_eq!(
-                    layout
-                        .coefficient_with_ft_biases(
-                            &synthetic.bytes,
-                            &coefficient,
-                            Some(&ft_biases),
-                        )
-                        .expect("layout coefficient"),
+                    layout.coefficient(&coefficient).expect("layout coefficient"),
                     network.net_coefficient(&coefficient).expect("network coefficient"),
                     "{coefficient:?}, encoding={encoding:?}"
                 );
@@ -931,19 +986,133 @@ mod tests {
             );
             let original = LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("original");
             let original_bias = original
-                .coefficient(&synthetic.bytes, &id(NetTensorKind::FtBias, None, 0))
+                .coefficient(&id(NetTensorKind::FtBias, None, 0))
                 .expect("original FT bias");
             synthetic.bytes[original.feature_transformer.weights.clone()].fill(0x80);
 
-            let layout = LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("layout");
+            let mut reader = ReadAudit {
+                cursor: Cursor::new(synthetic.bytes),
+                reads: Vec::new(),
+            };
+            let layout = LayerStacksBinLayout::from_reader(&mut reader).expect("layout");
             assert_eq!(layout.feature_transformer.weights, original.feature_transformer.weights);
+            assert!(reader.reads.iter().all(|read| {
+                read.end <= layout.feature_transformer.weights.start
+                    || read.start >= layout.feature_transformer.weights.end
+            }));
             assert_eq!(
-                layout
-                    .coefficient(&synthetic.bytes, &id(NetTensorKind::FtBias, None, 0))
-                    .expect("FT bias"),
+                layout.coefficient(&id(NetTensorKind::FtBias, None, 0)).expect("FT bias"),
                 original_bias
             );
         }
+    }
+
+    #[test]
+    fn ft_delta_preserves_invalid_weight_payload_verbatim() {
+        for encoding in [
+            SyntheticFtEncoding::Leb128Combined,
+            SyntheticFtEncoding::Leb128Split,
+        ] {
+            let mut synthetic = build_synthetic_layer_stacks_with_ft_encoding(
+                "HalfKP",
+                <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
+                32,
+                4,
+                3,
+                2,
+                encoding,
+            );
+            let input_layout =
+                LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("input layout");
+            synthetic.bytes[input_layout.feature_transformer.weights.clone()].fill(0x80);
+            let (patched, report) = apply_deltas_to_vec(
+                &synthetic.bytes,
+                &[NetDelta {
+                    id: id(NetTensorKind::FtBias, None, 0),
+                    delta: 120,
+                }],
+            )
+            .expect("patch without decoding FT weights");
+            let output_layout = LayerStacksBinLayout::from_bytes(&patched).expect("output layout");
+            assert_ne!(
+                output_layout.feature_transformer.weights.start,
+                input_layout.feature_transformer.weights.start,
+                "{encoding:?}"
+            );
+            assert_eq!(
+                &patched[output_layout.feature_transformer.weights],
+                &synthetic.bytes[input_layout.feature_transformer.weights],
+                "{encoding:?}"
+            );
+            assert_eq!(report.applied, 1);
+        }
+    }
+
+    #[test]
+    fn e4_alias_layout_coefficient_and_apply_match_dynamic_reader() {
+        let input_dimensions =
+            crate::nnue::bona_piece_effect_bucket::EffectBucketConfig::KINGFIXED_2X2.dimensions();
+        let synthetic = build_synthetic_layer_stacks_with_ft_encoding(
+            "HalfKaHmMerged",
+            input_dimensions,
+            2,
+            2,
+            1,
+            2,
+            SyntheticFtEncoding::Leb128Split,
+        );
+        let architecture =
+            format!("Features=HalfKaHmMerged[{input_dimensions}->2x2],E4=2x2fixed,l2=2,l3=1");
+        let bytes = replace_architecture(&synthetic.bytes, &architecture);
+        let id = id(NetTensorKind::FtBias, None, 0);
+        let input_layout = LayerStacksBinLayout::from_bytes(&bytes).expect("E4 input layout");
+        let before = input_layout.coefficient(&id).expect("input coefficient");
+        let (patched, report) = apply_deltas_to_vec(
+            &bytes,
+            &[NetDelta {
+                id: id.clone(),
+                delta: 1,
+            }],
+        )
+        .expect("apply E4 delta");
+        let output_layout = LayerStacksBinLayout::from_bytes(&patched).expect("E4 output layout");
+        assert_eq!(output_layout.coefficient(&id).expect("output coefficient"), before + 1);
+        assert_eq!(report.applied, 1);
+
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        {
+            let network = NNUENetwork::from_bytes(&patched).expect("dynamic E4 network");
+            assert_eq!(network.net_coefficient(&id).expect("dynamic coefficient"), before + 1);
+        }
+    }
+
+    #[test]
+    fn retained_data_is_limited_to_ft_biases_and_fc_blocks() {
+        let synthetic = build_synthetic_layer_stacks_with_ft_encoding(
+            "HalfKP",
+            <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
+            32,
+            4,
+            3,
+            3,
+            SyntheticFtEncoding::Leb128Combined,
+        );
+        let mut reader = Cursor::new(&synthetic.bytes);
+        let from_reader = LayerStacksBinLayout::from_reader(&mut reader).expect("reader layout");
+        let from_bytes = LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("bytes layout");
+
+        assert_eq!(from_reader, from_bytes);
+        assert_eq!(from_reader.ft_biases.len(), from_reader.l1);
+        assert_eq!(
+            from_reader.fc_data.bytes.len(),
+            from_reader.buckets.last().expect("last bucket").output.weights.end
+                - from_reader.buckets[0].fc_hash.start
+        );
+        assert!(
+            from_reader.fc_data.bytes.len()
+                + from_reader.ft_biases.len() * std::mem::size_of::<i16>()
+                < from_reader.feature_transformer.weights.len()
+        );
     }
 
     #[test]
@@ -1013,33 +1182,11 @@ mod tests {
     }
 
     #[test]
-    fn leb128_blocks_decode_and_encode_to_identical_bytes() {
-        for encoding in [
-            SyntheticFtEncoding::Leb128Combined,
-            SyntheticFtEncoding::Leb128Split,
-        ] {
-            let synthetic = build_synthetic_layer_stacks_with_ft_encoding(
-                "HalfKP",
-                <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
-                32,
-                4,
-                3,
-                2,
-                encoding,
-            );
-            let layout = LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("layout");
-            let values = decode_ft_tensor(&synthetic.bytes, &layout).expect("decode FT tensor");
-            let encoded = replace_ft_block(&synthetic.bytes, &layout, &values).expect("encode");
-            assert_eq!(encoded, synthetic.bytes, "{encoding:?}");
-        }
-    }
-
-    #[test]
     fn combined_leb128_accepts_canonical_signed_i16_boundaries() {
         let synthetic = build_synthetic_layer_stacks_with_ft_values(
             "HalfKP",
             <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
-            2,
+            14,
             2,
             1,
             2,
@@ -1049,16 +1196,19 @@ mod tests {
             },
         );
         let layout = LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("layout");
-        let values = decode_ft_tensor(&synthetic.bytes, &layout).expect("decode FT tensor");
-        assert!(values.contains(&-1));
-        assert!(values.contains(&64));
-        assert!(values.contains(&-65));
-        assert!(values.contains(&-8192));
-        assert!(values.contains(&8191));
-        assert!(values.contains(&i16::MIN));
-        assert!(values.contains(&i16::MAX));
-        let encoded = replace_ft_block(&synthetic.bytes, &layout, &values).expect("encode");
-        assert_eq!(encoded, synthetic.bytes);
+        for value in [-1, 64, -65, -8192, 8191, i16::MIN, i16::MAX] {
+            assert!(layout.ft_biases.contains(&value));
+        }
+        let (patched, report) = apply_deltas_to_vec(
+            &synthetic.bytes,
+            &[NetDelta {
+                id: id(NetTensorKind::FtBias, None, 0),
+                delta: 1,
+            }],
+        )
+        .expect("apply canonical FT delta");
+        assert_ne!(patched, synthetic.bytes);
+        assert_eq!(report.applied, 1);
     }
 
     #[test]
@@ -1079,10 +1229,10 @@ mod tests {
         let mut non_canonical_payload = vec![0x88, 0x00];
         non_canonical_payload.extend_from_slice(&original[1..]);
         let non_canonical = replace_combined_ft_payload(&synthetic.bytes, &non_canonical_payload);
-        let error = apply_deltas_to_bytes(
+        let error = apply_deltas_to_vec(
             &non_canonical,
             &[NetDelta {
-                id: id(NetTensorKind::OutputBias, Some(0), 0),
+                id: id(NetTensorKind::FtBias, None, 0),
                 delta: 1,
             }],
         )
@@ -1094,10 +1244,10 @@ mod tests {
             encode_signed_leb128(invalid_value, &mut invalid_prefix);
             invalid_prefix.extend_from_slice(&original[1..]);
             let invalid = replace_combined_ft_payload(&synthetic.bytes, &invalid_prefix);
-            let error = apply_deltas_to_bytes(
+            let error = apply_deltas_to_vec(
                 &invalid,
                 &[NetDelta {
-                    id: id(NetTensorKind::OutputBias, Some(0), 0),
+                    id: id(NetTensorKind::FtBias, None, 0),
                     delta: 1,
                 }],
             )
@@ -1121,9 +1271,9 @@ mod tests {
             id: id(NetTensorKind::FtBias, None, 0),
             delta: 0,
         };
-        let (empty, empty_report) = apply_deltas_to_bytes(&synthetic.bytes, &[]).expect("empty");
+        let (empty, empty_report) = apply_deltas_to_vec(&synthetic.bytes, &[]).expect("empty");
         let (unchanged, zero_report) =
-            apply_deltas_to_bytes(&synthetic.bytes, &[zero]).expect("zero");
+            apply_deltas_to_vec(&synthetic.bytes, &[zero]).expect("zero");
         assert_eq!(empty, synthetic.bytes);
         assert_eq!(unchanged, synthetic.bytes);
         assert_eq!(empty_report.applied, 0);
@@ -1134,7 +1284,7 @@ mod tests {
             id: id(NetTensorKind::FtBias, None, 0),
             delta: 64,
         };
-        let (patched, _) = apply_deltas_to_bytes(&synthetic.bytes, &[delta]).expect("patch");
+        let (patched, _) = apply_deltas_to_vec(&synthetic.bytes, &[delta]).expect("patch");
         let patched_layout = LayerStacksBinLayout::from_bytes(&patched).expect("patched layout");
         assert_eq!(
             &patched[..layout.feature_transformer.hash.end],
@@ -1178,7 +1328,7 @@ mod tests {
                 delta: 1,
             },
         ];
-        let (patched, report) = apply_deltas_to_bytes(&synthetic.bytes, &deltas).expect("patch");
+        let (patched, report) = apply_deltas_to_vec(&synthetic.bytes, &deltas).expect("patch");
         let output_layout = LayerStacksBinLayout::from_bytes(&patched).expect("output layout");
         let input_ft =
             input_layout.feature_transformer.hash.end..input_layout.feature_transformer.weights.end;
@@ -1214,13 +1364,13 @@ mod tests {
                 delta: i32::MIN,
             },
         ];
-        let (patched, report) = apply_deltas_to_bytes(&synthetic.bytes, &deltas).expect("patch");
+        let (patched, report) = apply_deltas_to_vec(&synthetic.bytes, &deltas).expect("patch");
         let layout = LayerStacksBinLayout::from_bytes(&patched).expect("layout");
         assert_eq!(report.applied, 3);
         assert_eq!(report.clamped, 3);
-        assert_eq!(layout.coefficient(&patched, &deltas[0].id).expect("i8"), i8::MAX.into());
-        assert_eq!(layout.coefficient(&patched, &deltas[1].id).expect("i32"), i32::MAX);
-        assert_eq!(layout.coefficient(&patched, &deltas[2].id).expect("i16"), i16::MIN.into());
+        assert_eq!(layout.coefficient(&deltas[0].id).expect("i8"), i8::MAX.into());
+        assert_eq!(layout.coefficient(&deltas[1].id).expect("i32"), i32::MAX);
+        assert_eq!(layout.coefficient(&deltas[2].id).expect("i16"), i16::MIN.into());
     }
 
     #[cfg(feature = "nnue-runtime-dimensions")]
@@ -1273,8 +1423,7 @@ mod tests {
             ];
             let baseline = evaluate(&synthetic.bytes, &[], buckets);
             let runtime = evaluate(&synthetic.bytes, &deltas, buckets);
-            let (patched, report) =
-                apply_deltas_to_bytes(&synthetic.bytes, &deltas).expect("patch");
+            let (patched, report) = apply_deltas_to_vec(&synthetic.bytes, &deltas).expect("patch");
             let from_file = evaluate(&patched, &[], buckets);
             assert_ne!(runtime, baseline, "{encoding:?}");
             assert_eq!(from_file, runtime, "{encoding:?}");

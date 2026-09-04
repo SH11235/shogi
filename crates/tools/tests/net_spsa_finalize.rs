@@ -48,8 +48,7 @@ fn generator_apply_generator_round_trip_and_fail_closed_inputs() {
         bucket: Some(0),
         index: 0,
     };
-    let original_base =
-        base_layout.coefficient(&synthetic.bytes, &tuned_id).expect("base coefficient");
+    let original_base = base_layout.coefficient(&tuned_id).expect("base coefficient");
 
     let generated = run(
         env!("CARGO_BIN_EXE_generate_net_spsa_params"),
@@ -210,8 +209,8 @@ fn applies_spsa_final_params_without_comments_using_expected_sha256() {
         index: 0,
     };
     assert_eq!(
-        output_layout.coefficient(&output, &id).expect("output coefficient"),
-        input_layout.coefficient(&synthetic.bytes, &id).expect("input coefficient") + 2
+        output_layout.coefficient(&id).expect("output coefficient"),
+        input_layout.coefficient(&id).expect("input coefficient") + 2
     );
 }
 

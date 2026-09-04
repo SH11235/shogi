@@ -2259,7 +2259,7 @@ mod tests {
     fn const_generic_layer_stacks_applies_all_net_delta_kinds() {
         use crate::nnue::constants::HALFKA_HM_DIMENSIONS;
         use crate::nnue::evaluator::NNUEEvaluator;
-        use crate::nnue::net_bin_layout::apply_deltas_to_bytes;
+        use crate::nnue::net_bin_layout::apply_deltas;
         use crate::nnue::net_delta::test_utils::build_synthetic_layer_stacks;
         use crate::nnue::net_delta::{NetCoefficientId, NetDelta, NetTensorKind};
 
@@ -2348,8 +2348,9 @@ mod tests {
             all_deltas.push(net_delta);
         }
         let from_runtime_deltas = evaluate(&all_deltas);
-        let (patched, report) =
-            apply_deltas_to_bytes(&synthetic.bytes, &all_deltas).expect("patch net bytes");
+        let mut input = std::io::Cursor::new(&synthetic.bytes);
+        let mut patched = Vec::new();
+        let report = apply_deltas(&mut input, &mut patched, &all_deltas).expect("patch net bytes");
         let patched_network = NNUENetwork::from_bytes(&patched).expect("patched net");
         let mut patched_evaluator =
             NNUEEvaluator::new_with_position(Arc::new(patched_network), &pos);

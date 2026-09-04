@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use rshogi_core::nnue::net_bin_layout::{LayerStacksBinLayout, apply_deltas_to_bytes};
+use rshogi_core::nnue::net_bin_layout::{LayerStacksBinLayout, apply_deltas};
 use rshogi_core::nnue::net_delta::{add_i8_delta, add_i16_delta, add_i32_delta};
 use rshogi_core::nnue::{NetCoefficientId, NetDelta, NetTensorKind};
 use serde::Serialize;
@@ -62,11 +62,9 @@ fn main() -> Result<()> {
 
 fn run(cli: &Cli) -> Result<()> {
     reject_path_collisions(cli)?;
-    let input = std::fs::read(&cli.nnue)
-        .with_context(|| format!("failed to read {}", cli.nnue.display()))?;
     let params = std::fs::read_to_string(&cli.params)
         .with_context(|| format!("failed to read {}", cli.params.display()))?;
-    let input_sha256 = sha256_hex(&input);
+    let input_sha256 = sha256_file(&cli.nnue)?;
     validate_source_hash(
         &params,
         &input_sha256,
@@ -75,16 +73,27 @@ fn run(cli: &Cli) -> Result<()> {
     )?;
     let deltas = parse_deltas(&params)?;
 
-    let (output, patch_report) =
-        apply_deltas_to_bytes(&input, &deltas).context("failed to patch NNUE bytes")?;
+    let expected = {
+        let mut input = File::open(&cli.nnue)
+            .with_context(|| format!("failed to open {}", cli.nnue.display()))?;
+        let input_layout = LayerStacksBinLayout::from_reader(&mut input)
+            .context("failed to parse input NNUE layout")?;
+        expected_coefficients(&input_layout, &deltas)?
+    };
+
+    let mut input = File::open(&cli.nnue)
+        .with_context(|| format!("failed to reopen {}", cli.nnue.display()))?;
     let mut staged_output = create_staged_file(&cli.output)?;
     let staged_output_path = staged_output.path().to_owned();
-    write_bytes(staged_output.as_file_mut(), &staged_output_path, &output)?;
-    let persisted_output = std::fs::read(&staged_output_path)
-        .with_context(|| format!("failed to read back {}", staged_output_path.display()))?;
-    verify_output(&input, &persisted_output, &deltas)?;
+    let patch_report = apply_deltas(&mut input, staged_output.as_file_mut(), &deltas)
+        .context("failed to patch NNUE stream")?;
+    staged_output
+        .as_file_mut()
+        .flush()
+        .with_context(|| format!("failed to flush {}", staged_output_path.display()))?;
+    verify_output(&staged_output_path, &expected)?;
 
-    let output_sha256 = sha256_hex(&persisted_output);
+    let output_sha256 = sha256_file(&staged_output_path)?;
     let nonzero_delta_count = deltas.iter().filter(|delta| delta.delta != 0).count();
     let staged_report = if let Some(path) = &cli.report {
         let report = ApplyReport {
@@ -209,16 +218,15 @@ fn parse_deltas(contents: &str) -> Result<Vec<NetDelta>> {
     Ok(deltas)
 }
 
-fn verify_output(input: &[u8], output: &[u8], deltas: &[NetDelta]) -> Result<()> {
-    let input_layout =
-        LayerStacksBinLayout::from_bytes(input).context("failed to parse input NNUE layout")?;
-    let output_layout =
-        LayerStacksBinLayout::from_bytes(output).context("failed to parse patched NNUE layout")?;
+fn expected_coefficients(
+    input_layout: &LayerStacksBinLayout,
+    deltas: &[NetDelta],
+) -> Result<BTreeMap<NetCoefficientId, i32>> {
     let mut expected = BTreeMap::<NetCoefficientId, i32>::new();
     for delta in deltas {
         let current = match expected.get(&delta.id) {
             Some(value) => *value,
-            None => input_layout.coefficient(input, &delta.id)?,
+            None => input_layout.coefficient(&delta.id)?,
         };
         let value = match delta.id.kind {
             NetTensorKind::OutputWeight | NetTensorKind::L2Weight => {
@@ -235,9 +243,17 @@ fn verify_output(input: &[u8], output: &[u8], deltas: &[NetDelta]) -> Result<()>
         };
         expected.insert(delta.id.clone(), value);
     }
+    Ok(expected)
+}
+
+fn verify_output(path: &Path, expected: &BTreeMap<NetCoefficientId, i32>) -> Result<()> {
+    let mut output = File::open(path)
+        .with_context(|| format!("failed to reopen staged NNUE {}", path.display()))?;
+    let output_layout = LayerStacksBinLayout::from_reader(&mut output)
+        .context("failed to parse patched NNUE layout")?;
     for (id, expected_value) in expected {
-        let actual_value = output_layout.coefficient(output, &id)?;
-        if actual_value != expected_value {
+        let actual_value = output_layout.coefficient(id)?;
+        if actual_value != *expected_value {
             bail!(
                 "patched coefficient mismatch for {}: expected={expected_value}, actual={actual_value}",
                 id.usi_name()
@@ -258,8 +274,13 @@ fn reject_path_collisions(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut digest = Sha256::new();
+    io::copy(&mut file, &mut digest)
+        .with_context(|| format!("failed to hash {}", path.display()))?;
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn create_staged_file(destination: &Path) -> Result<tempfile::NamedTempFile> {
@@ -272,15 +293,6 @@ fn create_staged_file(destination: &Path) -> Result<tempfile::NamedTempFile> {
         .suffix(".tmp")
         .tempfile_in(parent)
         .with_context(|| format!("failed to create staged file under {}", parent.display()))
-}
-
-fn write_bytes(file: &mut File, path: &Path, contents: &[u8]) -> Result<()> {
-    let mut writer = BufWriter::new(file);
-    writer
-        .write_all(contents)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    writer.flush().with_context(|| format!("failed to flush {}", path.display()))?;
-    Ok(())
 }
 
 fn write_json(file: &mut File, path: &Path, report: &ApplyReport<'_>) -> Result<()> {

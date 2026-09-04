@@ -32,9 +32,8 @@ use super::network::{
 use super::network_layer_stacks::compute_layer_stack_kingrank9_bucket_index;
 use super::piece_list::PieceNumber;
 use super::spec::{
-    Activation, ArchitectureSpec, FeatureSet, parse_arch_dimensions,
-    parse_feature_input_dimensions, parse_feature_set_from_arch,
-    parse_layer_stacks_feature_set_keyword,
+    Activation, ArchitectureSpec, FeatureSet, detect_layer_stacks_feature, parse_arch_dimensions,
+    parse_effect_bucket_config, parse_feature_input_dimensions,
 };
 use super::stats::{count_refresh, count_update};
 use crate::position::Position;
@@ -261,7 +260,7 @@ impl DynamicLayerStacksNetwork {
                 "Threat model requires nnue-threat",
             ));
         }
-        let parsed_feature = detect_feature(arch)?;
+        let parsed_feature = detect_layer_stacks_feature(arch).map_err(invalid)?;
         let feature = match parsed_feature {
             FeatureSet::HalfKP => RuntimeLsFeature::HalfKP,
             FeatureSet::HalfKaHmMerged => RuntimeLsFeature::HalfKaHmMerged,
@@ -269,7 +268,7 @@ impl DynamicLayerStacksNetwork {
             FeatureSet::HalfKaMerged => RuntimeLsFeature::HalfKaMerged,
             FeatureSet::HalfKaHmSplit => RuntimeLsFeature::HalfKaHmSplit,
             FeatureSet::HalfKaHmMergedEffectBucket => {
-                let config = parse_effect_config(arch)
+                let config = parse_effect_bucket_config(arch)
                     .ok_or_else(|| invalid("malformed EffectBucket token"))?;
                 RuntimeLsFeature::EffectBucket(config)
             }
@@ -283,11 +282,9 @@ impl DynamicLayerStacksNetwork {
         let weight_len = input_dimensions
             .checked_mul(l1)
             .ok_or_else(|| invalid("FT dimensions overflow"))?;
-        let (bias_vec, weight_vec) = read_layer_stacks_ft_i16(reader, l1, weight_len)?;
         let mut ft_biases = AlignedBox::new_zeroed(l1);
-        ft_biases.copy_from_slice(&bias_vec);
         let mut ft_weights = AlignedBox::new_zeroed(weight_len);
-        ft_weights.copy_from_slice(&weight_vec);
+        read_layer_stacks_ft_i16(reader, &mut ft_biases, &mut ft_weights)?;
 
         let has_psqt = psqt_override.unwrap_or_else(|| arch.contains("PSQT="));
         let mut psqt_biases = AlignedBox::new_zeroed(if has_psqt { num_buckets } else { 0 });
@@ -1070,47 +1067,6 @@ impl DynamicLayerStacksStack {
     }
 }
 
-fn detect_feature(arch: &str) -> io::Result<FeatureSet> {
-    if arch.contains("EffectBucket=") || arch.contains("E4=") {
-        return Ok(FeatureSet::HalfKaHmMergedEffectBucket);
-    }
-    if let Some(feature) = parse_layer_stacks_feature_set_keyword(arch).map_err(invalid)? {
-        return Ok(feature);
-    }
-    if let Ok(feature) = parse_feature_set_from_arch(arch)
-        && feature != FeatureSet::LayerStacks
-    {
-        return Ok(feature);
-    }
-    for (token, feature) in [
-        ("HalfKP", FeatureSet::HalfKP),
-        ("HalfKaSplit", FeatureSet::HalfKaSplit),
-        ("HalfKaMerged", FeatureSet::HalfKaMerged),
-        ("HalfKaHmSplit", FeatureSet::HalfKaHmSplit),
-        ("HalfKaHmMerged", FeatureSet::HalfKaHmMerged),
-    ] {
-        if arch.contains(token) {
-            return Ok(feature);
-        }
-    }
-    Err(invalid("unknown LayerStacks FT"))
-}
-fn parse_effect_config(arch: &str) -> Option<EffectBucketConfig> {
-    let token = arch
-        .split(',')
-        .find_map(|p| p.strip_prefix("EffectBucket=").or_else(|| p.strip_prefix("E4=")))?;
-    match token {
-        "2x2fixed" => Some(EffectBucketConfig::KINGFIXED_2X2),
-        "2x2bucketed" => Some(EffectBucketConfig::KINGBUCKETED_2X2),
-        "3x3fixed" => Some(EffectBucketConfig::KINGFIXED_3X3),
-        "3x3bucketed" => Some(EffectBucketConfig::KINGBUCKETED_3X3),
-        "4xfixed" => Some(EffectBucketConfig::KINGFIXED_2X2),
-        "4xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_2X2),
-        "9xfixed" => Some(EffectBucketConfig::KINGFIXED_3X3),
-        "9xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_3X3),
-        _ => None,
-    }
-}
 fn parse_token_usize(arch: &str, token: &str) -> Option<usize> {
     arch.split(',').find_map(|p| p.strip_prefix(token))?.parse().ok()
 }
@@ -1432,14 +1388,14 @@ mod tests {
             let arch = format!(
                 "Features={keyword}(Friend)[{input_dim}->1536x2],Network=(ClippedReLU[32](SqrClippedReLU[30]))"
             );
-            assert_eq!(detect_feature(&arch).unwrap(), expected, "keyword={keyword}");
+            assert_eq!(detect_layer_stacks_feature(&arch).unwrap(), expected, "keyword={keyword}");
         }
     }
 
     #[test]
     fn layer_stacks_ft_detection_rejects_unknown_keyword_substrings() {
         let arch = "Features=UnknownHalfKaHmMerged(Friend)[73305->1536x2],Network=(ClippedReLU[32](SqrClippedReLU[30]))";
-        assert_eq!(detect_feature(arch).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(detect_layer_stacks_feature(arch).is_err());
     }
 
     fn zero_affine(input_dim: usize, output_dim: usize) -> DynamicAffine {

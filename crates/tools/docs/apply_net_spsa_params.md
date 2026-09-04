@@ -37,17 +37,22 @@ cargo run --release -p tools --bin apply_net_spsa_params -- \
 - output / L2 の `i8` weight と output の `i32` bias は対象 byte だけを書き換える。
 - Feature Transformer bias は signed LEB128 を decode し、engine と同じ saturating 加算後に
   最短形で再 encode する。
-- Split 形式は bias ブロックだけを再 encode する。Combined 形式は bias と weight の結合
-  ブロック全体を再 encode するが、weight の値は変更しない。Combined の payload は
-  全値が `i16` 範囲内かつ最短 LEB128 であることを再 encode 前に検証する。
+- Split / Combined とも bias 部分だけを decode・再 encode する。Combined の size field は
+  新しい bias 長と元の weight payload 長から更新する。weight payload は decode せず、元の
+  byte 列をそのまま転送する。再 encode 対象の bias は `i16` 範囲と最短 LEB128 を検証する。
 - header、architecture 文字列、FT weight、PSQT、Threat、対象外 bucket／tensor は入力から
   そのままコピーする。delta が空または全て 0 ならファイル全体が byte 一致する。
 
-最終パスと同じディレクトリの一時ファイルへ出力し、そのファイルを読み戻す。feature 非依存の
-`.bin` layout reader で末尾余りなく解析し、全対象係数が入力値へ engine と同じ saturating
-delta を適用した値に一致することを検証する。検証後に net を rename で確定し、その後で
-report を確定する (net の無い report を残さない)。検証・書き込み失敗時に部分ファイルを
-最終パスへ残さない。入力と出力に同じファイルは指定できない。
+入力 `File` から最終パスと同じディレクトリの一時ファイルへ、固定 1 MiB buffer で
+ストリーミング出力する。常駐するのは入力 layout が保持する FT bias と全 bucket の小さい
+FC block、再 encode 後の FT bias、転送 buffer だけで、FT weights や net 全体のサイズには
+依存しない。入出力 SHA-256 もファイルからストリーミング計算する。
+
+書き込み後は一時ファイルを開き直し、feature 非依存の `.bin` layout reader で末尾余りなく
+解析する。入力 layout から先に作った対象係数だけの期待値 map と、出力 layout が保持する
+値を比較し、engine と同じ saturating delta の適用を検証する。検証後に net を rename で
+確定し、その後で report を確定する (net の無い report を残さない)。検証・書き込み失敗時に
+部分ファイルを最終パスへ残さない。入力と出力に同じファイルは指定できない。
 
 入力と同じ version、architecture、LEB128 ブロック構成を維持し、末尾余りのない形式を
 layout reader と core 側の engine 等価性テストで確認している。このため tatara の
