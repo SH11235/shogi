@@ -2278,6 +2278,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_load_layer_stacks_file() {
+        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
         use crate::nnue::layer_stacks::{compute_bucket_index, sqr_clipped_relu_transform};
 
         // テスト用NNUEファイルのパスを設定してください
@@ -2454,6 +2455,8 @@ mod tests {
             let val = network.evaluate(&pos, &acc);
             eprintln!("{:15}: {:6} (raw: {:6})", name, val.raw(), raw);
         }
+
+        drop(routing_guard);
     }
 
     /// `detect_layer_stacks_feature_set` が underscore / PascalCase の arch_str を
