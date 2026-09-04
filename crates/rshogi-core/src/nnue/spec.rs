@@ -236,6 +236,53 @@ pub(crate) fn parse_layer_stacks_feature_set_keyword(
     Ok(Some(feature))
 }
 
+/// LayerStacks reader が使う実際の FT feature を判定する。
+///
+/// family 判定より EffectBucket の alias と `Features=` keyword を優先する。
+pub(crate) fn detect_layer_stacks_feature(arch_str: &str) -> Result<FeatureSet, String> {
+    if arch_str.contains("EffectBucket=") || arch_str.contains("E4=") {
+        return Ok(FeatureSet::HalfKaHmMergedEffectBucket);
+    }
+    if let Some(feature) = parse_layer_stacks_feature_set_keyword(arch_str)? {
+        return Ok(feature);
+    }
+    if let Ok(feature) = parse_feature_set_from_arch(arch_str)
+        && feature != FeatureSet::LayerStacks
+    {
+        return Ok(feature);
+    }
+    for (token, feature) in [
+        ("HalfKP", FeatureSet::HalfKP),
+        ("HalfKaSplit", FeatureSet::HalfKaSplit),
+        ("HalfKaMerged", FeatureSet::HalfKaMerged),
+        ("HalfKaHmSplit", FeatureSet::HalfKaHmSplit),
+        ("HalfKaHmMerged", FeatureSet::HalfKaHmMerged),
+    ] {
+        if arch_str.contains(token) {
+            return Ok(feature);
+        }
+    }
+    Err("unknown LayerStacks FT".to_string())
+}
+
+/// LayerStacks header の EffectBucket token と旧 alias を同じ設定へ解決する。
+pub(crate) fn parse_effect_bucket_config(
+    arch_str: &str,
+) -> Option<super::bona_piece_effect_bucket::EffectBucketConfig> {
+    use super::bona_piece_effect_bucket::EffectBucketConfig;
+
+    let token = arch_str
+        .split(',')
+        .find_map(|part| part.strip_prefix("EffectBucket=").or_else(|| part.strip_prefix("E4=")))?;
+    match token {
+        "2x2fixed" | "4xfixed" => Some(EffectBucketConfig::KINGFIXED_2X2),
+        "2x2bucketed" | "4xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_2X2),
+        "3x3fixed" | "9xfixed" => Some(EffectBucketConfig::KINGFIXED_3X3),
+        "3x3bucketed" | "9xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_3X3),
+        _ => None,
+    }
+}
+
 /// LayerStacks loader が共通で要求する header 条件を検証する。
 pub(crate) fn validate_layer_stacks_architecture_header(
     arch_str: &str,

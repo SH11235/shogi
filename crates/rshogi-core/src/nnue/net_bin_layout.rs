@@ -1,19 +1,22 @@
 //! LayerStacks `.bin` の feature 非依存レイアウト走査。
 
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::fmt;
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 
-use super::bona_piece_effect_bucket::EffectBucketConfig;
 use super::constants::{
     DEFAULT_NUM_BUCKETS, HALFKA_DIMENSIONS, HALFKA_HM_DIMENSIONS, HALFKA_HM_SPLIT_DIMENSIONS,
     HALFKA_MERGED_DIMENSIONS, HALFKP_DIMENSIONS, MAX_ARCH_LEN, MAX_LAYER_STACK_BUCKETS,
     NNUE_VERSION_HALFKA, NNUE_VERSION_LAYERSTACK_NUM_BUCKETS,
 };
-use super::leb128::{LEB128_MAGIC, MAX_COMPRESSED_SIZE};
-use super::net_delta::{NetCoefficientId, NetDeltaError, NetTensorKind, NetTensorShape};
+use super::leb128::{LEB128_MAGIC, MAX_COMPRESSED_SIZE, encode_signed_leb128};
+use super::net_delta::{
+    NetCoefficientId, NetDelta, NetDeltaError, NetDeltaReport, NetTensorKind, NetTensorShape,
+    add_i8_delta, add_i16_delta, add_i32_delta,
+};
 use super::spec::{
-    FeatureSet, parse_arch_dimensions, parse_feature_input_dimensions,
-    parse_layer_stacks_feature_set_keyword, validate_layer_stacks_architecture_header,
+    FeatureSet, detect_layer_stacks_feature, parse_arch_dimensions, parse_effect_bucket_config,
+    parse_feature_input_dimensions, validate_layer_stacks_architecture_header,
     validate_layer_stacks_dimensions,
 };
 
@@ -100,6 +103,124 @@ pub struct LayerStacksBinLayout {
     // FT bias と小さい FC block だけを保持して常駐量を net の FT サイズから切り離す。
     ft_biases: Vec<i16>,
     fc_data: StoredBinBlock,
+}
+
+/// LayerStacks `.bin` の書換えエラー。
+#[derive(Debug)]
+pub enum NetBinPatchError {
+    /// `.bin` レイアウトの読み取りに失敗した。
+    Io(io::Error),
+    /// delta の ID または対象バイト列が不正だった。
+    Delta(NetDeltaError),
+}
+
+impl fmt::Display for NetBinPatchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(formatter),
+            Self::Delta(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for NetBinPatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Delta(error) => Some(error),
+        }
+    }
+}
+
+impl From<io::Error> for NetBinPatchError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<NetDeltaError> for NetBinPatchError {
+    fn from(error: NetDeltaError) -> Self {
+        Self::Delta(error)
+    }
+}
+
+/// LayerStacks `.bin` の指定係数へ engine と同じ saturating delta をストリーミング適用する。
+///
+/// 編集対象外は固定サイズバッファで転送する。FT は bias prefix だけを再エンコードし、
+/// GiB 級になり得る weights payload は読み込まず入力 byte をそのまま転送する。
+pub fn apply_deltas<R: Read + Seek, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    deltas: &[NetDelta],
+) -> Result<NetDeltaReport, NetBinPatchError> {
+    let mut layout = LayerStacksBinLayout::from_reader(input)?;
+    for delta in deltas {
+        layout.tensor_shape(delta.id.kind).validate(&delta.id)?;
+    }
+    let has_nonzero_ft_delta = deltas
+        .iter()
+        .any(|delta| delta.id.kind == NetTensorKind::FtBias && delta.delta != 0);
+    if has_nonzero_ft_delta {
+        validate_canonical_ft_biases(input, &layout)?;
+    }
+
+    let mut report = NetDeltaReport {
+        applied: deltas.len(),
+        clamped: 0,
+    };
+    for delta in deltas {
+        if delta.delta == 0 {
+            continue;
+        }
+        let clamped = match delta.id.kind {
+            NetTensorKind::FtBias => {
+                let current = layout
+                    .ft_biases
+                    .get_mut(delta.id.index)
+                    .ok_or_else(|| invalid_binary("validated FT bias index is missing"))?;
+                let (value, clamped) = add_i16_delta(*current, delta.delta);
+                *current = value;
+                clamped
+            }
+            NetTensorKind::OutputWeight => {
+                let bucket = validated_bucket(&layout, &delta.id)?;
+                let offset = bucket.output.weights.start + delta.id.index;
+                layout.fc_data.patch_i8(offset, delta.delta)?
+            }
+            NetTensorKind::OutputBias => {
+                let bucket = validated_bucket(&layout, &delta.id)?;
+                let offset = bucket.output.biases.start;
+                layout.fc_data.patch_i32(offset, delta.delta)?
+            }
+            NetTensorKind::L2Weight => {
+                let bucket = validated_bucket(&layout, &delta.id)?;
+                let offset = bucket.l2.weights.start + delta.id.index;
+                layout.fc_data.patch_i8(offset, delta.delta)?
+            }
+        };
+        report.clamped += usize::from(clamped);
+    }
+
+    let mut source_position = 0;
+    if has_nonzero_ft_delta {
+        source_position = write_reencoded_ft_biases(input, output, &layout)?;
+    }
+    copy_range(input, output, source_position..layout.fc_data.source.start)?;
+    output.write_all(&layout.fc_data.bytes)?;
+    Ok(report)
+}
+
+fn validated_bucket<'a>(
+    layout: &'a LayerStacksBinLayout,
+    id: &NetCoefficientId,
+) -> Result<&'a LayerStackBucketBinLayout, NetDeltaError> {
+    let bucket = id.bucket.ok_or_else(|| NetDeltaError::MissingBucket {
+        name: id.usi_name(),
+    })?;
+    layout
+        .buckets
+        .get(bucket)
+        .ok_or_else(|| invalid_binary("validated bucket is missing from layout"))
 }
 
 impl LayerStacksBinLayout {
@@ -302,23 +423,53 @@ impl StoredBinBlock {
             self.get(offset, 4)?.try_into().map_err(|_| invalid_binary("truncated i32"))?,
         ))
     }
+
+    fn patch_i8(&mut self, offset: usize, delta: i32) -> Result<bool, NetDeltaError> {
+        let relative = offset
+            .checked_sub(self.source.start)
+            .ok_or_else(|| invalid_binary(format!("byte offset {offset}")))?;
+        let current = self
+            .bytes
+            .get_mut(relative)
+            .ok_or_else(|| invalid_binary(format!("byte offset {offset}")))?;
+        let (value, clamped) = add_i8_delta(*current as i8, delta);
+        *current = value as u8;
+        Ok(clamped)
+    }
+
+    fn patch_i32(&mut self, offset: usize, delta: i32) -> Result<bool, NetDeltaError> {
+        let relative = offset
+            .checked_sub(self.source.start)
+            .ok_or_else(|| invalid_binary(format!("i32 offset {offset}")))?;
+        let end = relative.checked_add(4).ok_or_else(|| invalid_binary("i32 range overflow"))?;
+        let bytes = self
+            .bytes
+            .get_mut(relative..end)
+            .ok_or_else(|| invalid_binary(format!("i32 offset {offset}")))?;
+        let current =
+            i32::from_le_bytes(bytes.try_into().map_err(|_| invalid_binary("truncated i32"))?);
+        let (value, clamped) = add_i32_delta(current, delta);
+        bytes.copy_from_slice(&value.to_le_bytes());
+        Ok(clamped)
+    }
 }
 
 fn is_layer_stacks_architecture(architecture: &str) -> bool {
     matches!(
         super::spec::parse_feature_set_from_arch(architecture),
         Ok(FeatureSet::LayerStacks | FeatureSet::HalfKaHmMergedEffectBucket)
+    ) || matches!(
+        detect_layer_stacks_feature(architecture),
+        Ok(FeatureSet::HalfKaHmMergedEffectBucket)
     )
 }
 
 fn parse_ft_input_dimensions(architecture: &str, threat: usize) -> io::Result<usize> {
     let reported = parse_feature_input_dimensions(architecture)
         .ok_or_else(|| invalid("missing FT input dimensions"))?;
-    let feature = parse_layer_stacks_feature_set_keyword(architecture)
-        .map_err(invalid)?
-        .ok_or_else(|| invalid("LayerStacks header does not identify its FT feature set"))?;
-    let dimensions = if architecture.contains("EffectBucket=") || architecture.contains("E4=") {
-        parse_effect_config(architecture)
+    let feature = detect_layer_stacks_feature(architecture).map_err(invalid)?;
+    let dimensions = if feature == FeatureSet::HalfKaHmMergedEffectBucket {
+        parse_effect_bucket_config(architecture)
             .ok_or_else(|| invalid("malformed EffectBucket token"))?
             .dimensions()
     } else {
@@ -339,19 +490,6 @@ fn parse_ft_input_dimensions(architecture: &str, threat: usize) -> io::Result<us
         Err(invalid(format!(
             "FT input dimension mismatch: header={reported}, runtime={dimensions}, threat={threat}"
         )))
-    }
-}
-
-fn parse_effect_config(architecture: &str) -> Option<EffectBucketConfig> {
-    let token = architecture
-        .split(',')
-        .find_map(|part| part.strip_prefix("EffectBucket=").or_else(|| part.strip_prefix("E4=")))?;
-    match token {
-        "2x2fixed" | "4xfixed" => Some(EffectBucketConfig::KINGFIXED_2X2),
-        "2x2bucketed" | "4xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_2X2),
-        "3x3fixed" | "9xfixed" => Some(EffectBucketConfig::KINGFIXED_3X3),
-        "3x3bucketed" | "9xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_3X3),
-        _ => None,
     }
 }
 
@@ -576,6 +714,81 @@ impl<'a, R: Read + Seek> StreamCursor<'a, R> {
     }
 }
 
+fn validate_canonical_ft_biases<R: Read + Seek>(
+    input: &mut R,
+    layout: &LayerStacksBinLayout,
+) -> Result<(), NetBinPatchError> {
+    let mut original = vec![0; layout.feature_transformer.biases.len()];
+    input.seek(SeekFrom::Start(u64_from_usize(
+        layout.feature_transformer.biases.start,
+        "FT biases",
+    )?))?;
+    input.read_exact(&mut original)?;
+    if original != encode_ft_biases(&layout.ft_biases) {
+        return Err(invalid_binary("FT bias LEB128 payload is not canonical").into());
+    }
+    Ok(())
+}
+
+fn write_reencoded_ft_biases<R: Read + Seek, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    layout: &LayerStacksBinLayout,
+) -> Result<usize, NetBinPatchError> {
+    let encoded = encode_ft_biases(&layout.ft_biases);
+    let size = match layout.feature_transformer.encoding {
+        FtBinEncoding::Leb128Combined => encoded
+            .len()
+            .checked_add(layout.feature_transformer.weights.len())
+            .ok_or_else(|| invalid("encoded FT block size overflow"))?,
+        FtBinEncoding::Leb128Split => encoded.len(),
+    };
+    if size > MAX_COMPRESSED_SIZE {
+        return Err(invalid(format!("encoded FT block exceeds maximum size: {size}")).into());
+    }
+    let size = u32::try_from(size).map_err(|_| invalid("encoded FT block exceeds u32 size"))?;
+    let size_offset = layout
+        .feature_transformer
+        .biases
+        .start
+        .checked_sub(4)
+        .ok_or_else(|| invalid_binary("FT block size field range"))?;
+    copy_range(input, output, 0..size_offset)?;
+    output.write_all(&size.to_le_bytes())?;
+    output.write_all(&encoded)?;
+    Ok(match layout.feature_transformer.encoding {
+        FtBinEncoding::Leb128Combined => layout.feature_transformer.weights.start,
+        FtBinEncoding::Leb128Split => layout.feature_transformer.biases.end,
+    })
+}
+
+fn encode_ft_biases(values: &[i16]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(values.len().saturating_mul(3));
+    for &value in values {
+        encode_signed_leb128(i64::from(value), &mut encoded);
+    }
+    encoded
+}
+
+fn copy_range<R: Read + Seek, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    range: Range<usize>,
+) -> io::Result<()> {
+    input.seek(SeekFrom::Start(u64_from_usize(range.start, "copy range")?))?;
+    let mut remaining = range.len();
+    // FT weights は GiB 級になり得るため、net サイズに依存しない固定長バッファで転送する
+    // (heap 確保: 小さいスタックのスレッドから呼ばれても溢れない)。
+    let mut buffer = vec![0u8; 1024 * 1024];
+    while remaining != 0 {
+        let chunk = remaining.min(buffer.len());
+        input.read_exact(&mut buffer[..chunk])?;
+        output.write_all(&buffer[..chunk])?;
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
 fn usize_from_u64(value: u64, name: &str) -> io::Result<usize> {
     usize::try_from(value).map_err(|_| invalid(format!("{name} exceeds usize")))
 }
@@ -596,13 +809,24 @@ fn invalid_binary(message: impl Into<String>) -> NetDeltaError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    use std::sync::Arc;
+
     use super::*;
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    use crate::nnue::evaluator::NNUEEvaluator;
     use crate::nnue::features::{FeatureSet as FeatureSetTrait, HalfKPFeatureSet};
     use crate::nnue::net_delta::test_utils::{
-        SyntheticFtEncoding, build_synthetic_layer_stacks_with_ft_encoding,
+        SyntheticFtConfig, SyntheticFtEncoding, SyntheticFtValues,
+        build_synthetic_layer_stacks_with_ft_encoding, build_synthetic_layer_stacks_with_ft_values,
     };
     #[cfg(feature = "nnue-runtime-dimensions")]
-    use crate::nnue::network::NNUENetwork;
+    use crate::nnue::network::{
+        LayerStackBucketMode, NNUENetwork, configure_layer_stack_routing,
+        reset_layer_stack_progress_buckets, reset_layer_stack_progress_kpabs_weights,
+    };
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    use crate::position::{Position, SFEN_HIRATE};
 
     fn id(kind: NetTensorKind, bucket: Option<usize>, index: usize) -> NetCoefficientId {
         NetCoefficientId {
@@ -612,15 +836,41 @@ mod tests {
         }
     }
 
-    fn replace_architecture(bytes: &[u8], architecture: &str) -> Vec<u8> {
-        let old_length = u32::from_le_bytes(bytes[8..12].try_into().expect("architecture length"));
-        let suffix_start = 12 + old_length as usize;
-        let mut replaced = Vec::new();
-        replaced.extend_from_slice(&bytes[..8]);
-        replaced.extend_from_slice(&(architecture.len() as u32).to_le_bytes());
-        replaced.extend_from_slice(architecture.as_bytes());
-        replaced.extend_from_slice(&bytes[suffix_start..]);
+    fn replace_combined_ft_payload(bytes: &[u8], payload: &[u8]) -> Vec<u8> {
+        let layout = LayerStacksBinLayout::from_bytes(bytes).expect("layout");
+        assert_eq!(layout.feature_transformer.encoding, FtBinEncoding::Leb128Combined);
+        let original =
+            layout.feature_transformer.biases.start..layout.feature_transformer.weights.end;
+        let size_offset = original.start - 4;
+        let size = u32::try_from(payload.len()).expect("payload size");
+        let mut replaced = Vec::with_capacity(bytes.len() - original.len() + payload.len());
+        replaced.extend_from_slice(&bytes[..size_offset]);
+        replaced.extend_from_slice(&size.to_le_bytes());
+        replaced.extend_from_slice(payload);
+        replaced.extend_from_slice(&bytes[original.end..]);
         replaced
+    }
+
+    fn replace_architecture(bytes: &[u8], architecture: &str) -> Vec<u8> {
+        let original_len = u32::from_le_bytes(bytes[8..12].try_into().expect("architecture size"));
+        let original_end = 12 + usize::try_from(original_len).expect("architecture length");
+        let replacement_len = u32::try_from(architecture.len()).expect("replacement length");
+        let mut replaced = Vec::with_capacity(bytes.len() - original_end + 12 + architecture.len());
+        replaced.extend_from_slice(&bytes[..8]);
+        replaced.extend_from_slice(&replacement_len.to_le_bytes());
+        replaced.extend_from_slice(architecture.as_bytes());
+        replaced.extend_from_slice(&bytes[original_end..]);
+        replaced
+    }
+
+    fn apply_deltas_to_vec(
+        bytes: &[u8],
+        deltas: &[NetDelta],
+    ) -> Result<(Vec<u8>, NetDeltaReport), NetBinPatchError> {
+        let mut input = Cursor::new(bytes);
+        let mut output = Vec::new();
+        let report = apply_deltas(&mut input, &mut output, deltas)?;
+        Ok((output, report))
     }
 
     fn minimal_layer_stacks_with_ft_prefix(
@@ -805,6 +1055,85 @@ mod tests {
     }
 
     #[test]
+    fn ft_delta_preserves_invalid_weight_payload_verbatim() {
+        for encoding in [
+            SyntheticFtEncoding::Leb128Combined,
+            SyntheticFtEncoding::Leb128Split,
+        ] {
+            let mut synthetic = build_synthetic_layer_stacks_with_ft_encoding(
+                "HalfKP",
+                <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
+                32,
+                4,
+                3,
+                2,
+                encoding,
+            );
+            let input_layout =
+                LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("input layout");
+            synthetic.bytes[input_layout.feature_transformer.weights.clone()].fill(0x80);
+            let (patched, report) = apply_deltas_to_vec(
+                &synthetic.bytes,
+                &[NetDelta {
+                    id: id(NetTensorKind::FtBias, None, 0),
+                    delta: 120,
+                }],
+            )
+            .expect("patch without decoding FT weights");
+            let output_layout = LayerStacksBinLayout::from_bytes(&patched).expect("output layout");
+            assert_ne!(
+                output_layout.feature_transformer.weights.start,
+                input_layout.feature_transformer.weights.start,
+                "{encoding:?}"
+            );
+            assert_eq!(
+                &patched[output_layout.feature_transformer.weights],
+                &synthetic.bytes[input_layout.feature_transformer.weights],
+                "{encoding:?}"
+            );
+            assert_eq!(report.applied, 1);
+        }
+    }
+
+    #[test]
+    fn e4_alias_layout_coefficient_and_apply_match_dynamic_reader() {
+        let input_dimensions =
+            crate::nnue::bona_piece_effect_bucket::EffectBucketConfig::KINGFIXED_2X2.dimensions();
+        let synthetic = build_synthetic_layer_stacks_with_ft_encoding(
+            "HalfKaHmMerged",
+            input_dimensions,
+            2,
+            2,
+            1,
+            2,
+            SyntheticFtEncoding::Leb128Split,
+        );
+        let architecture =
+            format!("Features=HalfKaHmMerged[{input_dimensions}->2x2],E4=2x2fixed,l2=2,l3=1");
+        let bytes = replace_architecture(&synthetic.bytes, &architecture);
+        let id = id(NetTensorKind::FtBias, None, 0);
+        let input_layout = LayerStacksBinLayout::from_bytes(&bytes).expect("E4 input layout");
+        let before = input_layout.coefficient(&id).expect("input coefficient");
+        let (patched, report) = apply_deltas_to_vec(
+            &bytes,
+            &[NetDelta {
+                id: id.clone(),
+                delta: 1,
+            }],
+        )
+        .expect("apply E4 delta");
+        let output_layout = LayerStacksBinLayout::from_bytes(&patched).expect("E4 output layout");
+        assert_eq!(output_layout.coefficient(&id).expect("output coefficient"), before + 1);
+        assert_eq!(report.applied, 1);
+
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        {
+            let network = NNUENetwork::from_bytes(&patched).expect("dynamic E4 network");
+            assert_eq!(network.net_coefficient(&id).expect("dynamic coefficient"), before + 1);
+        }
+    }
+
+    #[test]
     fn retained_data_is_limited_to_ft_biases_and_fc_blocks() {
         let synthetic = build_synthetic_layer_stacks_with_ft_encoding(
             "HalfKP",
@@ -962,5 +1291,261 @@ mod tests {
         assert_eq!(psqt.weights.len(), layout.ft_input_dimensions * layout.num_buckets * 4);
         assert_eq!(layout.threat_profile.expect("profile").len(), 4);
         assert_eq!(layout.threat_weights.expect("threat").len(), 5 * layout.l1);
+    }
+
+    #[test]
+    fn combined_leb128_accepts_canonical_signed_i16_boundaries() {
+        let synthetic = build_synthetic_layer_stacks_with_ft_values(
+            "HalfKP",
+            <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
+            14,
+            2,
+            1,
+            2,
+            SyntheticFtConfig {
+                encoding: SyntheticFtEncoding::Leb128Combined,
+                values: SyntheticFtValues::SignedBoundaries,
+            },
+        );
+        let layout = LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("layout");
+        for value in [-1, 64, -65, -8192, 8191, i16::MIN, i16::MAX] {
+            assert!(layout.ft_biases.contains(&value));
+        }
+        let (patched, report) = apply_deltas_to_vec(
+            &synthetic.bytes,
+            &[NetDelta {
+                id: id(NetTensorKind::FtBias, None, 0),
+                delta: 1,
+            }],
+        )
+        .expect("apply canonical FT delta");
+        assert_ne!(patched, synthetic.bytes);
+        assert_eq!(report.applied, 1);
+    }
+
+    #[test]
+    fn combined_leb128_rejects_non_canonical_and_out_of_i16_values() {
+        let synthetic = build_synthetic_layer_stacks_with_ft_encoding(
+            "HalfKP",
+            <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
+            2,
+            2,
+            1,
+            2,
+            SyntheticFtEncoding::Leb128Combined,
+        );
+        let layout = LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("layout");
+        let original = &synthetic.bytes
+            [layout.feature_transformer.biases.start..layout.feature_transformer.weights.end];
+
+        let mut non_canonical_payload = vec![0x88, 0x00];
+        non_canonical_payload.extend_from_slice(&original[1..]);
+        let non_canonical = replace_combined_ft_payload(&synthetic.bytes, &non_canonical_payload);
+        let error = apply_deltas_to_vec(
+            &non_canonical,
+            &[NetDelta {
+                id: id(NetTensorKind::FtBias, None, 0),
+                delta: 1,
+            }],
+        )
+        .expect_err("non-canonical payload");
+        assert!(error.to_string().contains("not canonical"));
+
+        for invalid_value in [i64::from(i16::MIN) - 1, i64::from(i16::MAX) + 1] {
+            let mut invalid_prefix = Vec::new();
+            encode_signed_leb128(invalid_value, &mut invalid_prefix);
+            invalid_prefix.extend_from_slice(&original[1..]);
+            let invalid = replace_combined_ft_payload(&synthetic.bytes, &invalid_prefix);
+            let error = apply_deltas_to_vec(
+                &invalid,
+                &[NetDelta {
+                    id: id(NetTensorKind::FtBias, None, 0),
+                    delta: 1,
+                }],
+            )
+            .expect_err("out-of-range payload");
+            assert!(error.to_string().contains("outside i16 range"));
+        }
+    }
+
+    #[test]
+    fn zero_deltas_preserve_every_byte_and_non_ft_regions_stay_verbatim() {
+        let synthetic = build_synthetic_layer_stacks_with_ft_encoding(
+            "HalfKP",
+            <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
+            32,
+            4,
+            3,
+            2,
+            SyntheticFtEncoding::Leb128Split,
+        );
+        let zero = NetDelta {
+            id: id(NetTensorKind::FtBias, None, 0),
+            delta: 0,
+        };
+        let (empty, empty_report) = apply_deltas_to_vec(&synthetic.bytes, &[]).expect("empty");
+        let (unchanged, zero_report) =
+            apply_deltas_to_vec(&synthetic.bytes, &[zero]).expect("zero");
+        assert_eq!(empty, synthetic.bytes);
+        assert_eq!(unchanged, synthetic.bytes);
+        assert_eq!(empty_report.applied, 0);
+        assert_eq!(zero_report.applied, 1);
+
+        let layout = LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("layout");
+        let delta = NetDelta {
+            id: id(NetTensorKind::FtBias, None, 0),
+            delta: 64,
+        };
+        let (patched, _) = apply_deltas_to_vec(&synthetic.bytes, &[delta]).expect("patch");
+        let patched_layout = LayerStacksBinLayout::from_bytes(&patched).expect("patched layout");
+        assert_eq!(
+            &patched[..layout.feature_transformer.hash.end],
+            &synthetic.bytes[..layout.feature_transformer.hash.end]
+        );
+        assert_eq!(patched_layout.version, layout.version);
+        assert_eq!(patched_layout.architecture, layout.architecture);
+        assert_eq!(
+            patched_layout.feature_transformer.encoding,
+            layout.feature_transformer.encoding
+        );
+        assert_eq!(
+            &patched[patched_layout.feature_transformer.weights.start..],
+            &synthetic.bytes[layout.feature_transformer.weights.start..]
+        );
+    }
+
+    #[test]
+    fn zero_ft_delta_mixed_with_output_delta_preserves_combined_ft_block() {
+        let synthetic = build_synthetic_layer_stacks_with_ft_values(
+            "HalfKP",
+            <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
+            2,
+            2,
+            1,
+            2,
+            SyntheticFtConfig {
+                encoding: SyntheticFtEncoding::Leb128Combined,
+                values: SyntheticFtValues::SignedBoundaries,
+            },
+        );
+        let input_layout =
+            LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("input layout");
+        let deltas = [
+            NetDelta {
+                id: id(NetTensorKind::FtBias, None, 0),
+                delta: 0,
+            },
+            NetDelta {
+                id: id(NetTensorKind::OutputBias, Some(0), 0),
+                delta: 1,
+            },
+        ];
+        let (patched, report) = apply_deltas_to_vec(&synthetic.bytes, &deltas).expect("patch");
+        let output_layout = LayerStacksBinLayout::from_bytes(&patched).expect("output layout");
+        let input_ft =
+            input_layout.feature_transformer.hash.end..input_layout.feature_transformer.weights.end;
+        let output_ft = output_layout.feature_transformer.hash.end
+            ..output_layout.feature_transformer.weights.end;
+        assert_eq!(&patched[output_ft], &synthetic.bytes[input_ft]);
+        assert_eq!(report.applied, 2);
+        assert_eq!(report.clamped, 0);
+    }
+
+    #[test]
+    fn byte_patching_uses_storage_type_saturation() {
+        let synthetic = build_synthetic_layer_stacks_with_ft_encoding(
+            "HalfKP",
+            <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
+            32,
+            4,
+            3,
+            2,
+            SyntheticFtEncoding::Leb128Combined,
+        );
+        let deltas = [
+            NetDelta {
+                id: id(NetTensorKind::OutputWeight, Some(0), 0),
+                delta: i32::MAX,
+            },
+            NetDelta {
+                id: id(NetTensorKind::OutputBias, Some(0), 0),
+                delta: i32::MAX,
+            },
+            NetDelta {
+                id: id(NetTensorKind::FtBias, None, 0),
+                delta: i32::MIN,
+            },
+        ];
+        let (patched, report) = apply_deltas_to_vec(&synthetic.bytes, &deltas).expect("patch");
+        let layout = LayerStacksBinLayout::from_bytes(&patched).expect("layout");
+        assert_eq!(report.applied, 3);
+        assert_eq!(report.clamped, 3);
+        assert_eq!(layout.coefficient(&deltas[0].id).expect("i8"), i8::MAX.into());
+        assert_eq!(layout.coefficient(&deltas[1].id).expect("i32"), i32::MAX);
+        assert_eq!(layout.coefficient(&deltas[2].id).expect("i16"), i16::MIN.into());
+    }
+
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    fn evaluate(bytes: &[u8], deltas: &[NetDelta], buckets: usize) -> i32 {
+        let mut network = NNUENetwork::from_bytes(bytes).expect("network");
+        network.apply_net_deltas(deltas).expect("deltas");
+        configure_layer_stack_routing(LayerStackBucketMode::ProgressKPAbs, buckets, Some(buckets))
+            .expect("routing");
+        let mut position = Position::new();
+        position.set_sfen(SFEN_HIRATE).expect("hirate");
+        let mut evaluator = NNUEEvaluator::new_with_position(Arc::new(network), &position);
+        evaluator.evaluate(&position).raw()
+    }
+
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    #[test]
+    fn patched_net_evaluation_matches_runtime_deltas_for_both_leb128_forms() {
+        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
+        reset_layer_stack_progress_kpabs_weights();
+        for (buckets, encoding) in [
+            (4, SyntheticFtEncoding::Leb128Combined),
+            (9, SyntheticFtEncoding::Leb128Split),
+        ] {
+            let synthetic = build_synthetic_layer_stacks_with_ft_encoding(
+                "HalfKP",
+                <HalfKPFeatureSet as FeatureSetTrait>::DIMENSIONS,
+                32,
+                4,
+                2,
+                buckets,
+                encoding,
+            );
+            let selected_bucket = buckets / 2;
+            let deltas = [
+                NetDelta {
+                    id: id(NetTensorKind::OutputWeight, Some(selected_bucket), 0),
+                    delta: 64,
+                },
+                NetDelta {
+                    id: id(NetTensorKind::OutputBias, Some(selected_bucket), 0),
+                    delta: 256,
+                },
+                NetDelta {
+                    id: id(NetTensorKind::FtBias, None, 0),
+                    delta: 48,
+                },
+                NetDelta {
+                    id: id(NetTensorKind::L2Weight, Some(selected_bucket), 3),
+                    delta: 64,
+                },
+            ];
+            let baseline = evaluate(&synthetic.bytes, &[], buckets);
+            let runtime = evaluate(&synthetic.bytes, &deltas, buckets);
+            let (patched, report) = apply_deltas_to_vec(&synthetic.bytes, &deltas).expect("patch");
+            let from_file = evaluate(&patched, &[], buckets);
+            assert_ne!(runtime, baseline, "{encoding:?}");
+            assert_eq!(from_file, runtime, "{encoding:?}");
+            assert_eq!(report.applied, deltas.len());
+            assert_eq!(report.clamped, 0);
+        }
+        reset_layer_stack_progress_buckets();
+        reset_layer_stack_progress_kpabs_weights();
+
+        drop(routing_guard);
     }
 }

@@ -181,6 +181,19 @@ pub(crate) fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
     Ok((result, pos))
 }
 
+/// 符号付き整数を最短形の LEB128 として追記する。
+pub(crate) fn encode_signed_leb128(mut value: i64, output: &mut Vec<u8>) {
+    loop {
+        let byte = (value as u8) & 0x7f;
+        value >>= 7;
+        let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
+        output.push(if done { byte } else { byte | 0x80 });
+        if done {
+            break;
+        }
+    }
+}
+
 /// LEB128圧縮ブロックを読み込み、全値をデコードして返す
 ///
 /// count を指定せず、圧縮データ内の全値をデコードする。
@@ -431,5 +444,40 @@ mod tests {
         let (val, _) = decode_single_leb128(&[0x80, 0x80, 0x7E]).unwrap();
         assert_eq!(val, -32768);
         assert_eq!(val as i16, i16::MIN);
+    }
+
+    #[test]
+    fn signed_leb128_encode_decode_round_trip_uses_shortest_form() {
+        for value in [
+            i16::MIN as i64,
+            -129,
+            -128,
+            -65,
+            -64,
+            -1,
+            0,
+            1,
+            63,
+            64,
+            127,
+            128,
+            i16::MAX as i64,
+        ] {
+            let mut encoded = Vec::new();
+            encode_signed_leb128(value, &mut encoded);
+            let (decoded, consumed) = decode_single_leb128(&encoded).expect("decode");
+            assert_eq!(decoded, value);
+            assert_eq!(consumed, encoded.len());
+        }
+        assert_eq!(encode(-64), [0x40]);
+        assert_eq!(encode(63), [0x3f]);
+        assert_eq!(encode(64), [0xc0, 0x00]);
+        assert_eq!(encode(-65), [0xbf, 0x7f]);
+
+        fn encode(value: i64) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            encode_signed_leb128(value, &mut bytes);
+            bytes
+        }
     }
 }

@@ -32,10 +32,9 @@ use super::network::{
 use super::network_layer_stacks::compute_layer_stack_kingrank9_bucket_index;
 use super::piece_list::PieceNumber;
 use super::spec::{
-    Activation, ArchitectureSpec, FeatureSet, parse_arch_dimensions,
-    parse_feature_input_dimensions, parse_feature_set_from_arch,
-    parse_layer_stacks_feature_set_keyword, validate_layer_stacks_architecture_header,
-    validate_layer_stacks_dimensions,
+    Activation, ArchitectureSpec, FeatureSet, detect_layer_stacks_feature, parse_arch_dimensions,
+    parse_effect_bucket_config, parse_feature_input_dimensions,
+    validate_layer_stacks_architecture_header, validate_layer_stacks_dimensions,
 };
 use super::stats::{count_refresh, count_update};
 use crate::position::Position;
@@ -255,7 +254,7 @@ impl DynamicLayerStacksNetwork {
                 "Threat model requires nnue-threat",
             ));
         }
-        let parsed_feature = detect_feature(arch)?;
+        let parsed_feature = detect_layer_stacks_feature(arch).map_err(invalid)?;
         let feature = match parsed_feature {
             FeatureSet::HalfKP => RuntimeLsFeature::HalfKP,
             FeatureSet::HalfKaHmMerged => RuntimeLsFeature::HalfKaHmMerged,
@@ -263,7 +262,7 @@ impl DynamicLayerStacksNetwork {
             FeatureSet::HalfKaMerged => RuntimeLsFeature::HalfKaMerged,
             FeatureSet::HalfKaHmSplit => RuntimeLsFeature::HalfKaHmSplit,
             FeatureSet::HalfKaHmMergedEffectBucket => {
-                let config = parse_effect_config(arch)
+                let config = parse_effect_bucket_config(arch)
                     .ok_or_else(|| invalid("malformed EffectBucket token"))?;
                 RuntimeLsFeature::EffectBucket(config)
             }
@@ -1062,47 +1061,6 @@ impl DynamicLayerStacksStack {
     }
 }
 
-fn detect_feature(arch: &str) -> io::Result<FeatureSet> {
-    if arch.contains("EffectBucket=") || arch.contains("E4=") {
-        return Ok(FeatureSet::HalfKaHmMergedEffectBucket);
-    }
-    if let Some(feature) = parse_layer_stacks_feature_set_keyword(arch).map_err(invalid)? {
-        return Ok(feature);
-    }
-    if let Ok(feature) = parse_feature_set_from_arch(arch)
-        && feature != FeatureSet::LayerStacks
-    {
-        return Ok(feature);
-    }
-    for (token, feature) in [
-        ("HalfKP", FeatureSet::HalfKP),
-        ("HalfKaSplit", FeatureSet::HalfKaSplit),
-        ("HalfKaMerged", FeatureSet::HalfKaMerged),
-        ("HalfKaHmSplit", FeatureSet::HalfKaHmSplit),
-        ("HalfKaHmMerged", FeatureSet::HalfKaHmMerged),
-    ] {
-        if arch.contains(token) {
-            return Ok(feature);
-        }
-    }
-    Err(invalid("unknown LayerStacks FT"))
-}
-fn parse_effect_config(arch: &str) -> Option<EffectBucketConfig> {
-    let token = arch
-        .split(',')
-        .find_map(|p| p.strip_prefix("EffectBucket=").or_else(|| p.strip_prefix("E4=")))?;
-    match token {
-        "2x2fixed" => Some(EffectBucketConfig::KINGFIXED_2X2),
-        "2x2bucketed" => Some(EffectBucketConfig::KINGBUCKETED_2X2),
-        "3x3fixed" => Some(EffectBucketConfig::KINGFIXED_3X3),
-        "3x3bucketed" => Some(EffectBucketConfig::KINGBUCKETED_3X3),
-        "4xfixed" => Some(EffectBucketConfig::KINGFIXED_2X2),
-        "4xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_2X2),
-        "9xfixed" => Some(EffectBucketConfig::KINGFIXED_3X3),
-        "9xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_3X3),
-        _ => None,
-    }
-}
 fn read_i32s<R: Read>(reader: &mut R, dst: &mut [i32]) -> io::Result<()> {
     let mut b = [0; 4];
     for v in dst {
@@ -1421,14 +1379,14 @@ mod tests {
             let arch = format!(
                 "Features={keyword}(Friend)[{input_dim}->1536x2],Network=(ClippedReLU[32](SqrClippedReLU[30]))"
             );
-            assert_eq!(detect_feature(&arch).unwrap(), expected, "keyword={keyword}");
+            assert_eq!(detect_layer_stacks_feature(&arch).unwrap(), expected, "keyword={keyword}");
         }
     }
 
     #[test]
     fn layer_stacks_ft_detection_rejects_unknown_keyword_substrings() {
         let arch = "Features=UnknownHalfKaHmMerged(Friend)[73305->1536x2],Network=(ClippedReLU[32](SqrClippedReLU[30]))";
-        assert_eq!(detect_feature(arch).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(detect_layer_stacks_feature(arch).is_err());
     }
 
     fn zero_affine(input_dim: usize, output_dim: usize) -> DynamicAffine {
@@ -1477,9 +1435,7 @@ mod tests {
     #[test]
     fn dynamic_layer_stacks_net_delta_matches_file_edits_and_validates_shape() {
         let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
-        use crate::nnue::net_delta::test_utils::{
-            build_synthetic_layer_stacks, encode_single_byte_signed_leb128,
-        };
+        use crate::nnue::net_delta::test_utils::build_synthetic_layer_stacks;
 
         crate::nnue::reset_layer_stack_progress_kpabs_weights();
 
@@ -1548,7 +1504,8 @@ mod tests {
                     NetTensorKind::OutputBias => edited[byte_offset..byte_offset + 4]
                         .copy_from_slice(&edited_value.to_le_bytes()),
                     NetTensorKind::FtBias => {
-                        edited[byte_offset] = encode_single_byte_signed_leb128(edited_value);
+                        edited[byte_offset] =
+                            u8::try_from(edited_value).expect("single-byte LEB128");
                     }
                     NetTensorKind::OutputWeight | NetTensorKind::L2Weight => {
                         edited[byte_offset] = edited_value as i8 as u8;

@@ -117,6 +117,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 - [nyugyoku_metrics](docs/nyugyoku_metrics.md) - 終局 CSA から宣言ルール距離ペアと探索読み切り詰み距離を抽出し、NNUE 静的評価の順序一致率 / concordance / 詰み手 top-1 率を採点
 - [nnue_saturation](docs/nnue_saturation.md) - LayerStacks NNUE の活性飽和率（u8 127 張り付き）を実局面で計測
 - [generate_net_spsa_params](docs/generate_net_spsa_params.md) - LayerStacks `.bin` から net 重み delta 用 SPSA `.params` を生成
+- [apply_net_spsa_params](docs/apply_net_spsa_params.md) - net 重み SPSA の確定 delta を LayerStacks `.bin` へ焼き込み、feature 非依存で読み戻し検証する
 - [rescore_psv](docs/rescore_psv.md) - PSV 評価値の再スコアリング（推奨: dlshogi ONNX + TensorRT FP16。qsearch-leaf ラベル / policy 展開 / レジューム対応）
 - [psv_gate_by_king_zone](docs/psv_gate_by_king_zone.md) - 入玉ドメインの base/override score 合成と行対応 mask bitmap
 - [psv_dual_label](docs/psv_dual_label.md) - 通常 PSV の score 退避、dual-label PSV の生成・sidecar 抽出・fail-closed 検証

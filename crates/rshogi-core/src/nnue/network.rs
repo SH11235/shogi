@@ -2269,6 +2269,7 @@ mod tests {
         let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
         use crate::nnue::constants::HALFKA_HM_DIMENSIONS;
         use crate::nnue::evaluator::NNUEEvaluator;
+        use crate::nnue::net_bin_layout::apply_deltas;
         use crate::nnue::net_delta::test_utils::build_synthetic_layer_stacks;
         use crate::nnue::net_delta::{NetCoefficientId, NetDelta, NetTensorKind};
 
@@ -2332,6 +2333,7 @@ mod tests {
                 64,
             ),
         ];
+        let mut all_deltas = Vec::new();
         for (id, delta) in cases {
             let base_network = NNUENetwork::from_bytes(&synthetic.bytes).expect("synthetic net");
             let base = base_network.net_coefficient(&id).expect("coefficient");
@@ -2346,14 +2348,25 @@ mod tests {
             assert_eq!(report.clamped, 0);
             assert_eq!(network.net_coefficient(&id).expect("coefficient"), base + delta);
 
-            let from_delta = evaluate(&[net_delta]);
+            let from_delta = evaluate(std::slice::from_ref(&net_delta));
             assert_ne!(
                 from_delta,
                 baseline,
                 "{}: baseline={baseline:?}, from_delta={from_delta:?}",
                 id.usi_name()
             );
+            all_deltas.push(net_delta);
         }
+        let from_runtime_deltas = evaluate(&all_deltas);
+        let mut input = std::io::Cursor::new(&synthetic.bytes);
+        let mut patched = Vec::new();
+        let report = apply_deltas(&mut input, &mut patched, &all_deltas).expect("patch net bytes");
+        let patched_network = NNUENetwork::from_bytes(&patched).expect("patched net");
+        let mut patched_evaluator =
+            NNUEEvaluator::new_with_position(Arc::new(patched_network), &pos);
+        assert_eq!(patched_evaluator.evaluate(&pos), from_runtime_deltas);
+        assert_eq!(report.applied, all_deltas.len());
+        assert_eq!(report.clamped, 0);
         reset_layer_stack_progress_buckets();
         reset_layer_stack_progress_kpabs_weights();
 
