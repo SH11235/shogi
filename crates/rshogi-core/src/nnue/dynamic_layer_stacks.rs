@@ -34,7 +34,7 @@ use super::piece_list::PieceNumber;
 use super::spec::{
     Activation, ArchitectureSpec, FeatureSet, parse_arch_dimensions,
     parse_feature_input_dimensions, parse_feature_set_from_arch,
-    parse_layer_stacks_feature_set_keyword,
+    parse_layer_stacks_feature_set_keyword, validate_layer_stacks_architecture_header,
 };
 use super::stats::{count_refresh, count_update};
 use crate::position::Position;
@@ -242,10 +242,8 @@ impl DynamicLayerStacksNetwork {
         validate_dimension("LayerStacks l1", l1)?;
         validate_dimension("LayerStacks l2", l2)?;
         validate_dimension("LayerStacks l3", l3)?;
-        let threat_dimensions = parse_token_usize(arch, "Threat=").unwrap_or(0);
-        if arch.contains("Threat=") && threat_dimensions == 0 {
-            return Err(invalid("malformed Threat token"));
-        }
+        let threat_dimensions =
+            validate_layer_stacks_architecture_header(arch).map_err(invalid)?.unwrap_or(0);
         #[cfg(feature = "nnue-threat")]
         if threat_dimensions != 0 && threat_dimensions != super::threat_features::THREAT_DIMENSIONS
         {
@@ -284,8 +282,8 @@ impl DynamicLayerStacksNetwork {
             .checked_mul(l1)
             .ok_or_else(|| invalid("FT dimensions overflow"))?;
         let mut ft_biases = AlignedBox::new_zeroed(l1);
-        let mut ft_weights = AlignedBox::new_zeroed(weight_len);
-        read_layer_stacks_ft_i16(reader, &mut ft_biases, &mut ft_weights)?;
+        let ft_weights =
+            read_layer_stacks_ft_i16(reader, &mut ft_biases, weight_len, AlignedBox::new_zeroed)?;
 
         let has_psqt = psqt_override.unwrap_or_else(|| arch.contains("PSQT="));
         let mut psqt_biases = AlignedBox::new_zeroed(if has_psqt { num_buckets } else { 0 });
@@ -1108,9 +1106,6 @@ fn parse_effect_config(arch: &str) -> Option<EffectBucketConfig> {
         "9xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_3X3),
         _ => None,
     }
-}
-fn parse_token_usize(arch: &str, token: &str) -> Option<usize> {
-    arch.split(',').find_map(|p| p.strip_prefix(token))?.parse().ok()
 }
 fn read_i32s<R: Read>(reader: &mut R, dst: &mut [i32]) -> io::Result<()> {
     let mut b = [0; 4];
