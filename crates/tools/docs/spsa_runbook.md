@@ -1246,21 +1246,23 @@ CLI `--options "K=V,..."` は同名キーを上書きする。
 `git pull` に一本化できる）。
 
 ```bash
-# 前提: rshogi/ と rshogi-notes/ が同一親ディレクトリ下にあること（相対 symlink のため）
+# 前提: rshogi/ と params 管理 repo が同一親ディレクトリ下にあること（相対 symlink のため）
 # 初回のみ: mkdir -p <rshogi>/spsa_params/
-git -C <…>/rshogi-notes pull
-ln -snf ../../rshogi-notes/spsa/<name>.rshogi.params <rshogi>/spsa_params/
+git -C <…>/<params-repo> pull
+ln -snf ../../<params-repo>/spsa/<name>.rshogi.params <rshogi>/spsa_params/
 ```
 
 ### 11.5 注意
 
 - **未検証の SPSA エンドポイントをそのまま大会投入しない**。本番採用前に
   selfplay / SPRT で base 比較し、Elo が有意に勝ち越すことを確認する。
-  SPSA は探索であり採用判定ではない。endpoint の採否基準 (独立 seed・SPSA で
-  未使用の局面系列・gainer bounds `<0, +10>` nElo の SPRT で `accept_h1` のみ採用)
-  は rshogi-notes の `rshogi/testing_policy.md` §5 に従う。独立 seed での再確認は
-  `tournament` が `--seed` を備えていることが前提 (無い版では開始局面選択を
-  再現・独立化できない)。
+  SPSA は探索であり採用判定ではない (θ の動き・中間成績を根拠に採用しない)。
+  endpoint の採否基準: **正常終了した endpoint** を **独立 seed・SPSA で未使用の
+  局面系列**で標準 gainer bounds `<0, +10>` nElo の SPRT にかけ、`accept_h1` 以外
+  (accept_h0 / inconclusive) は不採用。中間 checkpoint の選別採用は禁止
+  (winner's curse)。複数 SPSA run から最良 endpoint を選んだ場合はその選択も
+  試行記録に残す (選択自体が multiple testing)。独立 seed での再確認は `tournament` が `--seed` を備えていることが
+  前提 (無い版では開始局面選択を再現・独立化できない)。
 - 過去に採用済みの値（例: Phase 1b の Futility/Razoring/NMP）は
   `tune_params.rs` の default に焼き込み済み（rebuild 経路）。ファイル投入経路で
   上書きすると二重適用ではなく **ファイル側が勝つ**（setoption は default を上書き）。

@@ -5,8 +5,8 @@ CSA 棋譜群(floodgate など)から YANEURAOU-DB2016 テキスト `.db` 定跡
 生成した `.db` は `rshogi-book` のリーダ(`Book::from_path`)でそのまま読め、エンジンの
 定跡 probe に使える。
 
-設計・判断根拠の正本は
-`rshogi-notes/rshogi/plans/20260704_opening_book_design.md`(Phase 1.5「ルート (b)」)。
+設計の要点 (常に新規スタンドアロン `.db` 出力・消費時間による定跡手判定・
+決定性の担保) は `book_from_csa.rs` 冒頭の doc comment を参照。
 
 ## 使い方
 

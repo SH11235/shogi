@@ -302,7 +302,7 @@ impl UsiEngine {
         );
         println!("option name SPSAParamsFile type string default <auto>");
         // 定跡（opening book）オプション。既定は BookFile=no_book(オフ)、
-        // BookDepthLimit=0(無効)（設計メモ 20260704_opening_book_design.md §3）。
+        // BookDepthLimit=0(無効)。
         println!("option name USI_OwnBook type check default true");
         println!("option name BookFile type string default no_book");
         println!("option name BookDir type string default book");

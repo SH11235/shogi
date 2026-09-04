@@ -1,6 +1,6 @@
 //! 定跡 probe(root 局面 1 回、探索の外で実行)。
 //!
-//! 選択パイプラインは設計メモ(20260704_opening_book_design.md §3)の順序に従う:
+//! 選択パイプラインは次の順序で実行する:
 //!
 //! 1. `USI_OwnBook=false` なら不使用
 //! 2. `game_ply > BookMoves` なら不使用
@@ -75,7 +75,7 @@ impl BookRng for DefaultBookRng {
 
 /// 定跡 probe のオプション群(USI オプションのミラー)。
 ///
-/// 既定値は設計メモ(20260704_opening_book_design.md §3)の規定に従う。
+/// 既定値はモジュール doc の選択パイプラインが前提とする値に揃えている。
 #[derive(Debug, Clone)]
 pub struct BookOptions {
     /// `USI_OwnBook`: 定跡使用の総合スイッチ。

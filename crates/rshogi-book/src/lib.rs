@@ -4,8 +4,6 @@
 //! リーダと、root 局面 1 回の probe(指し手選択)を提供する。ファイルフォーマットのみ
 //! 外部互換とし、probe 機構・実装は rshogi 内で完結する。
 //!
-//! 設計は `rshogi-notes/rshogi/plans/20260704_opening_book_design.md` を正本とする。
-//!
 //! # 概要
 //!
 //! - [`Book`]: `.db` を丸読みした定跡本体。path 版([`Book::from_path`])と
