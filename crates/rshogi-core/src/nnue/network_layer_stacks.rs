@@ -306,20 +306,28 @@ impl<
 
         #[cfg(feature = "nnue-effect-bucket")]
         {
-            let model_config = parse_effect_bucket_config_from_arch(&arch_str).ok_or_else(|| {
+            let model_config = super::spec::parse_effect_bucket_config(&arch_str).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("effect bucket build requires EffectBucket= token in arch string: {arch_str}"),
+                    format!(
+                        "effect bucket build requires EffectBucket= or E4= token in arch string: {arch_str}"
+                    ),
                 )
             })?;
-            if model_config != (EFFECT_BUCKET_NB, EFFECT_BUCKET_KING_BUCKETED) {
+            if (model_config.nb, model_config.king_bucketed)
+                != (EFFECT_BUCKET_NB, EFFECT_BUCKET_KING_BUCKETED)
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "effect bucket config mismatch: model=({}x{}), engine=({}x{}). \
                          Use a model trained with the matching effect bucket config.",
-                        model_config.0,
-                        if model_config.1 { "bucketed" } else { "fixed" },
+                        model_config.nb,
+                        if model_config.king_bucketed {
+                            "bucketed"
+                        } else {
+                            "fixed"
+                        },
                         EFFECT_BUCKET_NB,
                         if EFFECT_BUCKET_KING_BUCKETED {
                             "bucketed"
@@ -348,7 +356,10 @@ impl<
             }
         }
         #[cfg(not(feature = "nnue-effect-bucket"))]
-        if arch_str.contains("EffectBucket=") {
+        if matches!(
+            super::spec::detect_layer_stacks_feature(&arch_str),
+            Ok(super::spec::FeatureSet::HalfKaHmMergedEffectBucket)
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "effect bucket model requires nnue-effect-bucket feature",
@@ -2111,11 +2122,10 @@ impl LayerStacksNetwork {
 /// reader の現在位置から LayerStacks ヘッダの arch_str を peek し、FT を判別する。
 ///
 /// tatara emit 形式の arch_str は `Features=<FT>(Friend)[<dim>->1536x2],...` で、
-/// `Features=` 直後のキーワードを最優先で読み取る。PascalCase 形式と underscore
-/// 形式を同じ 5 FT に解決し、キーワードが無ければ汎用 `parse_feature_set_from_arch`
-/// (LayerStacks fallback 含む) に委譲する。FT が明示されていないモデルは
-/// `FeatureSet::LayerStacks` を返し、上位の `read_with_feature_set` で
-/// HalfKaHmMerged 互換扱いになる。明示された未知キーワードはエラーにする。
+/// 共有 helper が EffectBucket alias、`Features=` keyword、旧 header の substring を
+/// dynamic reader と同じ規則で判定する。明示された未知 keyword はエラーとし、
+/// keyword が無く FT を特定できない旧 header だけ `FeatureSet::LayerStacks` へ fallback
+/// して、上位の `read_with_feature_set` で HalfKaHmMerged 互換扱いにする。
 ///
 /// 読み取り後は `Seek::seek(SeekFrom::Start(original))` で reader 位置を巻き戻す。
 /// `BufReader<File>` 等の seekable reader では seek 時に内部 buffer が破棄・再同期される
@@ -2151,24 +2161,13 @@ fn peek_layer_stacks_feature_set<R: Read + Seek>(
 #[cfg(feature = "layerstack-arch")]
 fn detect_layer_stacks_feature_set(arch_str: &str) -> Result<super::spec::FeatureSet, String> {
     use super::spec::FeatureSet as Fs;
-    if arch_str.contains("EffectBucket=") {
-        return Ok(Fs::HalfKaHmMergedEffectBucket);
-    }
-    if let Some(feature) = super::spec::parse_layer_stacks_feature_set_keyword(arch_str)? {
-        return Ok(feature);
-    }
-    Ok(super::spec::parse_feature_set_from_arch(arch_str).unwrap_or(Fs::LayerStacks))
-}
-
-#[cfg(feature = "nnue-effect-bucket")]
-fn parse_effect_bucket_config_from_arch(arch_str: &str) -> Option<(usize, bool)> {
-    let token = arch_str.split(',').find_map(|part| part.strip_prefix("EffectBucket="))?;
-    match token {
-        "2x2fixed" => Some((4, false)),
-        "2x2bucketed" => Some((4, true)),
-        "3x3fixed" => Some((9, false)),
-        "3x3bucketed" => Some((9, true)),
-        _ => None,
+    match super::spec::detect_layer_stacks_feature(arch_str) {
+        Ok(feature) => Ok(feature),
+        Err(_) => {
+            // 明示 keyword の解析エラーを伝播し、keyword が無い旧 header だけ互換扱いする。
+            super::spec::parse_layer_stacks_feature_set_keyword(arch_str)?;
+            Ok(Fs::LayerStacks)
+        }
     }
 }
 
@@ -2520,6 +2519,14 @@ mod tests {
                 "Features=HalfKaHmMerged(Friend)[73305->1536x2],EffectBucket=2x2fixed,Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
                 Fs::HalfKaHmMergedEffectBucket,
             ),
+            (
+                "Features=HalfKaHmMerged(Friend)[293220->1536x2],E4=2x2fixed,Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
+                Fs::HalfKaHmMergedEffectBucket,
+            ),
+            (
+                "Features=HalfKaHmMerged(Friend)[293220->1536x2],E4=4xfixed,Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
+                Fs::HalfKaHmMergedEffectBucket,
+            ),
         ];
 
         for (arch_str, expected) in cases {
@@ -2531,22 +2538,66 @@ mod tests {
         }
     }
 
-    /// `Features=` keyword が無い場合のみ `LayerStacks` fallback に落ち、明示された
-    /// 未知 keyword は拒否することを確認する。
+    /// FT を特定できない旧 header との互換性のため `LayerStacks` fallback を維持する。
     #[cfg(feature = "layerstack-arch")]
     #[test]
     fn test_detect_feature_set_fallback() {
         use crate::nnue::spec::FeatureSet as Fs;
-        // Features= が無く LayerStacks キーワードがあるケース → fallback で LayerStacks
+        // FT 未指定の旧 header を HalfKaHmMerged 互換で読むため fallback を維持する。
         let got = detect_layer_stacks_feature_set("LayerStacks(...)").unwrap();
         assert_eq!(got, Fs::LayerStacks);
-        // 完全に未知 → fallback の unwrap_or で LayerStacks
+        // FT を特定できない旧 header も同じ互換経路で読む。
         let got = detect_layer_stacks_feature_set("unknown-arch-string").unwrap();
         assert_eq!(got, Fs::LayerStacks);
+        // dynamic reader と同じ substring 判定にし、旧 header でも dispatch を一致させる。
+        let got = detect_layer_stacks_feature_set("legacy-HalfKP").unwrap();
+        assert_eq!(got, Fs::HalfKP);
         let err = detect_layer_stacks_feature_set(
             "Features=UnknownHalfKaHmMerged(Friend)[73305->1536x2]",
         )
         .unwrap_err();
         assert!(err.contains("Unknown feature set keyword"));
+    }
+
+    #[cfg(all(
+        feature = "layerstack-arch",
+        feature = "layerstacks-512x16x32",
+        feature = "ft-halfka_hm_merged",
+        not(feature = "nnue-effect-bucket")
+    ))]
+    #[test]
+    fn read_with_feature_set_rejects_effect_bucket_alias_without_feature() {
+        use crate::nnue::spec::FeatureSet;
+
+        fn read_error(effect_bucket_token: &str) -> io::Error {
+            let arch = format!(
+                "Features=HalfKaHmMerged(Friend)[293220->512x2],{effect_bucket_token},l2=16,l3=32"
+            );
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&NNUE_VERSION_HALFKA.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&(arch.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(arch.as_bytes());
+            let mut reader = Cursor::new(bytes);
+
+            // 強制された FT dispatch でも effect-bucket の互換性検査を素通りさせない。
+            match LayerStacksNetwork::read_with_feature_set(
+                &mut reader,
+                FeatureSet::HalfKaHmMerged,
+                512,
+                16,
+                32,
+                None,
+            ) {
+                Ok(_) => panic!("effect bucket model must be rejected"),
+                Err(err) => err,
+            }
+        }
+
+        let canonical = read_error("EffectBucket=2x2fixed");
+        let alias = read_error("E4=4xfixed");
+        assert_eq!(canonical.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(alias.kind(), canonical.kind());
+        assert_eq!(alias.to_string(), canonical.to_string());
     }
 }
