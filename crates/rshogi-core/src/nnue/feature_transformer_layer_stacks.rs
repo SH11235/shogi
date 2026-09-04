@@ -14,9 +14,7 @@ use super::bona_piece::BonaPiece;
 #[cfg(feature = "nnue-psqt")]
 use super::constants::MAX_LAYER_STACK_BUCKETS;
 use super::features::{Feature, FeatureSet};
-use super::leb128::{
-    LayerStacksFtLeb128Format, classify_layer_stacks_ft_leb128, read_compressed_tensor_i16_all,
-};
+use super::leb128::read_layer_stacks_ft_i16;
 use super::ls_feature_spec::LsFeatureSpec;
 use super::piece_list::PieceNumber;
 #[cfg(feature = "nnue-threat")]
@@ -316,31 +314,9 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
     /// - 要素数 == biases + weights → 旧bullet-shogi形式（1ブロック）
     pub fn read_leb128<R: Read>(reader: &mut R) -> io::Result<Self> {
         let weight_size = FT::DIMENSIONS * L1;
-        // 最初のブロックを全値デコードして要素数で判別
-        let first_block = read_compressed_tensor_i16_all(reader)?;
-        let (bias_values, weight_values) =
-            match classify_layer_stacks_ft_leb128(first_block.len(), L1, weight_size)? {
-                LayerStacksFtLeb128Format::Combined => {
-                    (first_block[..L1].to_vec(), first_block[L1..].to_vec())
-                }
-                LayerStacksFtLeb128Format::Split => {
-                    let weights = read_compressed_tensor_i16_all(reader)?;
-                    if weights.len() != weight_size {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "FT weights block size mismatch: got {}, expected {weight_size}",
-                                weights.len()
-                            ),
-                        ));
-                    }
-                    (first_block, weights)
-                }
-            };
         let mut biases = [0i16; L1];
-        biases.copy_from_slice(&bias_values);
         let mut weights = AlignedBox::new_zeroed(weight_size);
-        weights.copy_from_slice(&weight_values);
+        read_layer_stacks_ft_i16(reader, &mut biases, &mut weights)?;
         Ok(Self {
             biases: Aligned(biases),
             weights,

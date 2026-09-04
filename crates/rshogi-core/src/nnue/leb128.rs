@@ -43,27 +43,35 @@ pub(crate) fn classify_layer_stacks_ft_leb128(
 }
 
 /// LayerStacks FT の biases / weights を LEB128 から読む。
-#[cfg(feature = "nnue-runtime-dimensions")]
 pub(crate) fn read_layer_stacks_ft_i16<R: Read>(
     reader: &mut R,
-    bias_count: usize,
-    weight_count: usize,
-) -> io::Result<(Vec<i16>, Vec<i16>)> {
+    biases: &mut [i16],
+    weights: &mut [i16],
+) -> io::Result<()> {
     let first = read_compressed_tensor_i16_all(reader)?;
-    if first.len() == bias_count + weight_count {
-        Ok((first[..bias_count].to_vec(), first[bias_count..].to_vec()))
-    } else if first.len() == bias_count {
-        let weights = read_compressed_tensor_i16_all(reader)?;
-        if weights.len() != weight_count {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "FT weight block size mismatch",
-            ));
+    match classify_layer_stacks_ft_leb128(first.len(), biases.len(), weights.len())? {
+        LayerStacksFtLeb128Format::Combined => {
+            biases.copy_from_slice(&first[..biases.len()]);
+            weights.copy_from_slice(&first[biases.len()..]);
         }
-        Ok((first, weights))
-    } else {
-        Err(io::Error::new(io::ErrorKind::InvalidData, "FT LEB128 block size mismatch"))
+        LayerStacksFtLeb128Format::Split => {
+            biases.copy_from_slice(&first);
+            drop(first);
+            let weight_values = read_compressed_tensor_i16_all(reader)?;
+            if weight_values.len() != weights.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "FT weights block size mismatch: got {}, expected {}",
+                        weight_values.len(),
+                        weights.len()
+                    ),
+                ));
+            }
+            weights.copy_from_slice(&weight_values);
+        }
     }
+    Ok(())
 }
 
 /// 符号付きLEB128を読み込み

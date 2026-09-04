@@ -283,11 +283,9 @@ impl DynamicLayerStacksNetwork {
         let weight_len = input_dimensions
             .checked_mul(l1)
             .ok_or_else(|| invalid("FT dimensions overflow"))?;
-        let (bias_vec, weight_vec) = read_layer_stacks_ft_i16(reader, l1, weight_len)?;
         let mut ft_biases = AlignedBox::new_zeroed(l1);
-        ft_biases.copy_from_slice(&bias_vec);
         let mut ft_weights = AlignedBox::new_zeroed(weight_len);
-        ft_weights.copy_from_slice(&weight_vec);
+        read_layer_stacks_ft_i16(reader, &mut ft_biases, &mut ft_weights)?;
 
         let has_psqt = psqt_override.unwrap_or_else(|| arch.contains("PSQT="));
         let mut psqt_biases = AlignedBox::new_zeroed(if has_psqt { num_buckets } else { 0 });

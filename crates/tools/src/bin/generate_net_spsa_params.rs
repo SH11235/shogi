@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use rshogi_core::nnue::net_bin_layout::{DecodedFtBiases, LayerStacksBinLayout};
+use rshogi_core::nnue::net_bin_layout::LayerStacksBinLayout;
 use rshogi_core::nnue::{NetCoefficientId, NetTensorKind};
 use sha2::{Digest, Sha256};
+use tools::output_path::ensure_safe_output_path;
 
 const DEFAULT_MAX_PARAMS: usize = 4096;
 const R_END: &str = "0.002";
@@ -99,30 +100,37 @@ impl GenerateConfig {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = GenerateConfig::from_cli(&cli)?;
-    let bytes = std::fs::read(&cli.nnue)
-        .with_context(|| format!("failed to read {}", cli.nnue.display()))?;
+    run(&cli)
+}
+
+fn run(cli: &Cli) -> Result<()> {
+    let config = GenerateConfig::from_cli(cli)?;
+    ensure_safe_output_path(&cli.output, &cli.nnue)?;
+    let mut input =
+        File::open(&cli.nnue).with_context(|| format!("failed to open {}", cli.nnue.display()))?;
     let net_name = cli
         .nnue
         .file_name()
         .and_then(|name| name.to_str())
         .context("--nnue must have a UTF-8 basename")?;
-    let output = generate_params(&bytes, net_name, &config)?;
+    let output = generate_params(&mut input, net_name, &config)?;
     write_output(&cli.output, output.as_bytes())
 }
 
-fn generate_params(bytes: &[u8], net_name: &str, config: &GenerateConfig) -> Result<String> {
-    let layout = LayerStacksBinLayout::from_bytes(bytes).context("invalid LayerStacks NNUE")?;
-    let sha256 = format!("{:x}", Sha256::digest(bytes));
+fn generate_params<R: Read + Seek>(
+    reader: &mut R,
+    net_name: &str,
+    config: &GenerateConfig,
+) -> Result<String> {
+    let layout = LayerStacksBinLayout::from_reader(reader).context("invalid LayerStacks NNUE")?;
+    reader.rewind().context("failed to rewind NNUE for SHA-256")?;
+    let mut hasher = Sha256::new();
+    std::io::copy(reader, &mut hasher).context("failed to hash NNUE")?;
+    let sha256 = format!("{:x}", hasher.finalize());
     let mut output = format!(
         "# net={net_name} sha256={sha256} arch={} buckets={}\n",
         layout.architecture, layout.num_buckets
     );
-    let ft_biases = config
-        .targets
-        .contains(&NetTensorKind::FtBias)
-        .then(|| layout.decode_ft_biases(bytes))
-        .transpose()?;
     let mut count = 0usize;
     for kind in KIND_ORDER {
         if !config.targets.contains(&kind) {
@@ -134,9 +142,7 @@ fn generate_params(bytes: &[u8], net_name: &str, config: &GenerateConfig) -> Res
                     emit_parameter(
                         &mut output,
                         &mut count,
-                        bytes,
                         &layout,
-                        ft_biases.as_ref(),
                         NetCoefficientId {
                             kind,
                             bucket: None,
@@ -151,9 +157,7 @@ fn generate_params(bytes: &[u8], net_name: &str, config: &GenerateConfig) -> Res
                     emit_parameter(
                         &mut output,
                         &mut count,
-                        bytes,
                         &layout,
-                        ft_biases.as_ref(),
                         NetCoefficientId {
                             kind,
                             bucket: Some(bucket),
@@ -179,9 +183,7 @@ fn generate_params(bytes: &[u8], net_name: &str, config: &GenerateConfig) -> Res
                         emit_parameter(
                             &mut output,
                             &mut count,
-                            bytes,
                             &layout,
-                            ft_biases.as_ref(),
                             NetCoefficientId {
                                 kind,
                                 bucket: Some(bucket),
@@ -200,13 +202,11 @@ fn generate_params(bytes: &[u8], net_name: &str, config: &GenerateConfig) -> Res
 fn emit_parameter(
     output: &mut String,
     count: &mut usize,
-    bytes: &[u8],
     layout: &LayerStacksBinLayout,
-    ft_biases: Option<&DecodedFtBiases>,
     id: NetCoefficientId,
     config: &GenerateConfig,
 ) -> Result<()> {
-    let base = layout.coefficient_with_ft_biases(bytes, &id, ft_biases)?;
+    let base = layout.coefficient(&id)?;
     if !config.selection.includes(base) {
         return Ok(());
     }
@@ -311,6 +311,7 @@ mod tests {
     use rshogi_core::nnue::net_delta::test_utils::{
         SyntheticFtEncoding, build_synthetic_layer_stacks_with_ft_encoding,
     };
+    use std::io::Cursor;
     use tools::spsa_param_mapping::parse_param_line;
 
     fn config(selection: Selection) -> GenerateConfig {
@@ -355,8 +356,12 @@ mod tests {
                 encoding,
             );
             let layout = LayerStacksBinLayout::from_bytes(&synthetic.bytes).expect("layout");
-            let contents = generate_params(&synthetic.bytes, "test.bin", &config(Selection::All))
-                .expect("params");
+            let contents = generate_params(
+                &mut Cursor::new(&synthetic.bytes),
+                "test.bin",
+                &config(Selection::All),
+            )
+            .expect("params");
             let parsed = rows(&contents);
             assert!(!parsed.is_empty());
             for row in parsed {
@@ -367,10 +372,7 @@ mod tests {
                 assert_eq!(row.min_text, (-range).to_string());
                 assert_eq!(row.max_text, range.to_string());
                 assert_eq!(row.col5_text, c_end.to_string());
-                assert_eq!(
-                    layout.coefficient(&synthetic.bytes, &id).expect("coefficient"),
-                    base(&row)
-                );
+                assert_eq!(layout.coefficient(&id).expect("coefficient"), base(&row));
                 match id.kind {
                     NetTensorKind::OutputWeight => assert!(id.index % 32 < 3),
                     NetTensorKind::L2Weight => assert!(id.index % 32 < 6),
@@ -399,14 +401,22 @@ mod tests {
             .copy_from_slice(&0i32.to_le_bytes());
         synthetic.bytes[layout.buckets[0].output.weights.start] = 0;
 
-        let zero = generate_params(&synthetic.bytes, "test.bin", &config(Selection::Zero))
-            .expect("zero params");
+        let zero = generate_params(
+            &mut Cursor::new(&synthetic.bytes),
+            "test.bin",
+            &config(Selection::Zero),
+        )
+        .expect("zero params");
         let zero_rows = rows(&zero);
         assert_eq!(zero_rows.len(), 4);
         assert!(zero_rows.iter().all(|row| base(row) == 0));
 
-        let below = generate_params(&synthetic.bytes, "test.bin", &config(Selection::AbsBelow(3)))
-            .expect("abs-below params");
+        let below = generate_params(
+            &mut Cursor::new(&synthetic.bytes),
+            "test.bin",
+            &config(Selection::AbsBelow(3)),
+        )
+        .expect("abs-below params");
         let below_rows = rows(&below);
         assert!(below_rows.len() > zero_rows.len());
         assert!(below_rows.iter().all(|row| i64::from(base(row)).abs() < 3));
@@ -423,15 +433,23 @@ mod tests {
             2,
             SyntheticFtEncoding::Leb128Combined,
         );
-        let first =
-            generate_params(&synthetic.bytes, "same.bin", &config(Selection::All)).expect("first");
-        let second =
-            generate_params(&synthetic.bytes, "same.bin", &config(Selection::All)).expect("second");
+        let first = generate_params(
+            &mut Cursor::new(&synthetic.bytes),
+            "same.bin",
+            &config(Selection::All),
+        )
+        .expect("first");
+        let second = generate_params(
+            &mut Cursor::new(&synthetic.bytes),
+            "same.bin",
+            &config(Selection::All),
+        )
+        .expect("second");
         assert_eq!(first.as_bytes(), second.as_bytes());
 
         let mut limited = config(Selection::All);
         limited.max_params = 1;
-        assert!(generate_params(&synthetic.bytes, "same.bin", &limited).is_err());
+        assert!(generate_params(&mut Cursor::new(&synthetic.bytes), "same.bin", &limited).is_err());
     }
 
     #[test]
@@ -441,5 +459,87 @@ mod tests {
         let c_ends = parse_kind_values(&["out_w=3".to_owned()], "--c-end").expect("c-end");
         assert_eq!(ranges[&NetTensorKind::OutputWeight], 7);
         assert_eq!(c_ends[&NetTensorKind::OutputWeight], 3);
+    }
+
+    fn cli(nnue: PathBuf, output: PathBuf) -> Cli {
+        Cli {
+            nnue,
+            output,
+            targets: "out_b".to_owned(),
+            select: "all".to_owned(),
+            ranges: Vec::new(),
+            c_ends: Vec::new(),
+            max_params: DEFAULT_MAX_PARAMS,
+        }
+    }
+
+    #[test]
+    fn same_input_and_output_is_rejected_without_truncation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("net.bin");
+        let original = build_synthetic_layer_stacks_with_ft_encoding(
+            "HalfKP",
+            HalfKPFeatureSet::DIMENSIONS,
+            32,
+            4,
+            3,
+            2,
+            SyntheticFtEncoding::Leb128Combined,
+        )
+        .bytes;
+        std::fs::write(&path, &original)?;
+
+        assert!(run(&cli(path.clone(), path.clone())).is_err());
+        assert_eq!(std::fs::read(path)?, original);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_output_is_rejected_without_truncating_input() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir()?;
+        let input = dir.path().join("net.bin");
+        let output = dir.path().join("output.params");
+        let original = build_synthetic_layer_stacks_with_ft_encoding(
+            "HalfKP",
+            HalfKPFeatureSet::DIMENSIONS,
+            32,
+            4,
+            3,
+            2,
+            SyntheticFtEncoding::Leb128Split,
+        )
+        .bytes;
+        std::fs::write(&input, &original)?;
+        symlink(&input, &output)?;
+
+        assert!(run(&cli(input.clone(), output)).is_err());
+        assert_eq!(std::fs::read(input)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn hardlink_output_is_rejected_without_truncating_input() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let input = dir.path().join("net.bin");
+        let output = dir.path().join("output.params");
+        let original = build_synthetic_layer_stacks_with_ft_encoding(
+            "HalfKP",
+            HalfKPFeatureSet::DIMENSIONS,
+            32,
+            4,
+            3,
+            2,
+            SyntheticFtEncoding::Leb128Combined,
+        )
+        .bytes;
+        std::fs::write(&input, &original)?;
+        std::fs::hard_link(&input, &output)?;
+
+        assert!(run(&cli(input.clone(), output)).is_err());
+        assert_eq!(std::fs::read(input)?, original);
+        Ok(())
     }
 }

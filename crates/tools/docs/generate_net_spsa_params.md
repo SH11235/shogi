@@ -5,6 +5,11 @@
 `.bin` layout を走査するため、bucket 数・層次元・FT 種別・PSQT／Threat の有無が異なる
 LayerStacks net にも使用できる。
 
+入力はストリーミング走査し、巨大になり得る圧縮 FT weights payload は seek で読み飛ばす。
+常駐するのは decode 済み FT bias と全 bucket の FC block だけで、SHA-256 も入力全体を
+保持せず計算する。`--output` が `--nnue` と同じ実体を指すパス、hardlink、symlink は
+入力を truncate する前に拒否する。
+
 ## 基本形
 
 ```bash
