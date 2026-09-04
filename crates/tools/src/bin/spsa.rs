@@ -1876,12 +1876,13 @@ fn write_params(path: &Path, params: &[SpsaParam]) -> Result<()> {
                 "{},{},{},{},{},{},{}",
                 p.name, p.type_name, v_str, p.min, p.max, p.c_end, p.r_end
             );
+            if p.not_used {
+                line.push(' ');
+                line.push_str(PARAM_NOT_USED_MARKER);
+            }
             if !p.comment.is_empty() {
                 line.push_str(" //");
                 line.push_str(&p.comment);
-            }
-            if p.not_used {
-                line.push_str(PARAM_NOT_USED_MARKER);
             }
             writeln!(w, "{line}")?;
         }
@@ -3678,6 +3679,71 @@ mod tests {
             let s = name.to_string_lossy();
             assert!(!s.starts_with(".spsa_state_"), "tempfile leaked: {s}");
         }
+    }
+
+    #[test]
+    fn write_params_round_trips_not_used_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.params");
+        let params = vec![
+            SpsaParam {
+                name: "CommentNotUsed".into(),
+                type_name: "int".into(),
+                is_int: true,
+                value: 1.0,
+                min: 0.0,
+                max: 10.0,
+                c_end: 1.0,
+                r_end: 0.002,
+                comment: "base=1".into(),
+                not_used: true,
+            },
+            SpsaParam {
+                name: "NoCommentNotUsed".into(),
+                type_name: "int".into(),
+                is_int: true,
+                value: 2.0,
+                min: 0.0,
+                max: 10.0,
+                c_end: 1.0,
+                r_end: 0.002,
+                comment: String::new(),
+                not_used: true,
+            },
+            SpsaParam {
+                name: "CommentUsed".into(),
+                type_name: "int".into(),
+                is_int: true,
+                value: 3.0,
+                min: 0.0,
+                max: 10.0,
+                c_end: 1.0,
+                r_end: 0.002,
+                comment: "base=3".into(),
+                not_used: false,
+            },
+        ];
+
+        write_params(&path, &params).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body,
+            "CommentNotUsed,int,1.000000,0,10,1,0.002 [[NOT USED]] //base=1\n\
+             NoCommentNotUsed,int,2.000000,0,10,1,0.002 [[NOT USED]]\n\
+             CommentUsed,int,3.000000,0,10,1,0.002 //base=3\n"
+        );
+
+        let reloaded = read_params(&path).unwrap();
+        assert_eq!(reloaded.len(), 3);
+        assert_eq!(reloaded[0].name, "CommentNotUsed");
+        assert!(reloaded[0].not_used);
+        assert_eq!(reloaded[0].comment, "base=1");
+        assert_eq!(reloaded[1].name, "NoCommentNotUsed");
+        assert!(reloaded[1].not_used);
+        assert!(reloaded[1].comment.is_empty());
+        assert_eq!(reloaded[2].name, "CommentUsed");
+        assert!(!reloaded[2].not_used);
+        assert_eq!(reloaded[2].comment, "base=3");
     }
 
     #[test]
