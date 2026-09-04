@@ -23,6 +23,7 @@ use super::ls_feature_spec::{
     HalfKaHmMergedSpec, HalfKaHmSplitSpec, HalfKaMergedSpec, HalfKaSplitSpec, HalfKpSpec,
     LsFeatureSpec,
 };
+use super::net_delta::{NetCoefficientId, NetTensorKind, NetTensorShape, add_i16_delta};
 use super::network::{
     LayerStackBucketMode, compute_layer_stack_progresskpabs_bucket_index, get_fv_scale_override,
     get_layer_stack_bucket_mode, get_layer_stack_progress_buckets,
@@ -375,6 +376,62 @@ impl DynamicLayerStacksNetwork {
     pub(crate) fn num_buckets(&self) -> usize {
         self.num_buckets
     }
+
+    pub(crate) fn net_tensor_shape(&self, kind: NetTensorKind) -> NetTensorShape {
+        match kind {
+            NetTensorKind::OutputWeight => NetTensorShape {
+                bucket_count: Some(self.num_buckets),
+                element_count: self.buckets[0].output.weight_len(),
+            },
+            NetTensorKind::OutputBias => NetTensorShape {
+                bucket_count: Some(self.num_buckets),
+                element_count: 1,
+            },
+            NetTensorKind::FtBias => NetTensorShape {
+                bucket_count: None,
+                element_count: self.ft_biases.len(),
+            },
+            NetTensorKind::L2Weight => NetTensorShape {
+                bucket_count: Some(self.num_buckets),
+                element_count: self.buckets[0].l2.weight_len(),
+            },
+        }
+    }
+
+    pub(crate) fn net_coefficient(&self, id: &NetCoefficientId) -> i32 {
+        match id.kind {
+            NetTensorKind::OutputWeight => i32::from(
+                self.buckets[id.bucket.expect("validated bucket")].output.file_weight(id.index),
+            ),
+            NetTensorKind::OutputBias => {
+                self.buckets[id.bucket.expect("validated bucket")].output.bias(0)
+            }
+            NetTensorKind::FtBias => i32::from(self.ft_biases[id.index]),
+            NetTensorKind::L2Weight => i32::from(
+                self.buckets[id.bucket.expect("validated bucket")].l2.file_weight(id.index),
+            ),
+        }
+    }
+
+    pub(crate) fn apply_net_delta(&mut self, id: &NetCoefficientId, delta: i32) -> bool {
+        match id.kind {
+            NetTensorKind::OutputWeight => self.buckets[id.bucket.expect("validated bucket")]
+                .output
+                .apply_file_weight_delta(id.index, delta),
+            NetTensorKind::OutputBias => self.buckets[id.bucket.expect("validated bucket")]
+                .output
+                .apply_bias_delta(0, delta),
+            NetTensorKind::FtBias => {
+                let (value, clamped) = add_i16_delta(self.ft_biases[id.index], delta);
+                self.ft_biases[id.index] = value;
+                clamped
+            }
+            NetTensorKind::L2Weight => self.buckets[id.bucket.expect("validated bucket")]
+                .l2
+                .apply_file_weight_delta(id.index, delta),
+        }
+    }
+
     pub(crate) fn requires_board_effects(&self) -> bool {
         matches!(self.feature, RuntimeLsFeature::EffectBucket(_))
     }
@@ -1364,6 +1421,7 @@ mod tests {
     use super::*;
     use crate::nnue::accumulator_stack_variant::AccumulatorStackVariant;
     use crate::nnue::evaluator::NNUEEvaluator;
+    use crate::nnue::net_delta::{NetCoefficientId, NetDelta, NetTensorKind};
     use crate::nnue::network::NNUENetwork;
     #[cfg(feature = "layerstack-arch")]
     use crate::nnue::network::set_layer_stack_bucket_mode;
@@ -1398,6 +1456,180 @@ mod tests {
     fn zero_affine(input_dim: usize, output_dim: usize) -> DynamicAffine {
         let bytes = vec![0; output_dim * 4 + output_dim * padded_input(input_dim)];
         DynamicAffine::read(&mut Cursor::new(bytes), input_dim, output_dim).unwrap()
+    }
+
+    fn coefficient(kind: NetTensorKind, bucket: Option<usize>, index: usize) -> NetCoefficientId {
+        NetCoefficientId {
+            kind,
+            bucket,
+            index,
+        }
+    }
+
+    fn evaluated_values(
+        bytes: &[u8],
+        deltas: Option<&[NetDelta]>,
+        num_buckets: usize,
+    ) -> Vec<Value> {
+        let mut network = NNUENetwork::from_bytes(bytes).expect("synthetic LayerStacks");
+        if let Some(deltas) = deltas {
+            network.apply_net_deltas(deltas).expect("valid deltas");
+        }
+        crate::nnue::configure_layer_stack_routing(
+            LayerStackBucketMode::ProgressKPAbs,
+            num_buckets,
+            Some(num_buckets),
+        )
+        .expect("routing");
+
+        let mut pos = Position::new();
+        pos.set_sfen(SFEN_HIRATE).expect("hirate");
+        let mut evaluator = NNUEEvaluator::new_with_position(Arc::new(network), &pos);
+        let mut values = vec![evaluator.evaluate(&pos)];
+        for move_text in ["7g7f", "3c3d", "2g2f"] {
+            let mv = Move::from_usi(move_text).expect("move");
+            let gives_check = pos.gives_check(mv);
+            let dirty = pos.do_move(mv, gives_check);
+            evaluator.push(dirty);
+            values.push(evaluator.evaluate(&pos));
+        }
+        values
+    }
+
+    #[test]
+    fn dynamic_layer_stacks_net_delta_matches_file_edits_and_validates_shape() {
+        use crate::nnue::net_delta::test_utils::{
+            build_synthetic_layer_stacks, encode_single_byte_signed_leb128,
+        };
+
+        crate::nnue::reset_layer_stack_progress_kpabs_weights();
+
+        for num_buckets in [4, 9] {
+            let synthetic = build_synthetic_layer_stacks(
+                "HalfKP",
+                HalfKPFeatureSet::DIMENSIONS,
+                32,
+                4,
+                2,
+                num_buckets,
+            );
+            crate::nnue::configure_layer_stack_routing(
+                LayerStackBucketMode::ProgressKPAbs,
+                num_buckets,
+                Some(num_buckets),
+            )
+            .expect("routing");
+            let mut pos = Position::new();
+            pos.set_sfen(SFEN_HIRATE).expect("hirate");
+            let selected_bucket = compute_layer_stack_progresskpabs_bucket_index(
+                &pos,
+                pos.side_to_move(),
+                get_layer_stack_progress_kpabs_weights(),
+                num_buckets,
+            );
+            assert_eq!(selected_bucket, num_buckets / 2);
+
+            let baseline = evaluated_values(&synthetic.bytes, None, num_buckets);
+            let empty = evaluated_values(&synthetic.bytes, Some(&[]), num_buckets);
+            let zero = evaluated_values(
+                &synthetic.bytes,
+                Some(&[NetDelta {
+                    id: coefficient(NetTensorKind::FtBias, None, 0),
+                    delta: 0,
+                }]),
+                num_buckets,
+            );
+            assert_eq!(baseline, empty);
+            assert_eq!(baseline, zero);
+
+            let cases = [
+                (
+                    coefficient(NetTensorKind::OutputWeight, Some(selected_bucket), 0),
+                    synthetic.buckets[selected_bucket].output_weights,
+                    64,
+                ),
+                (
+                    coefficient(NetTensorKind::OutputBias, Some(selected_bucket), 0),
+                    synthetic.buckets[selected_bucket].output_bias,
+                    256,
+                ),
+                (coefficient(NetTensorKind::FtBias, None, 0), synthetic.ft_biases, 48),
+                (
+                    coefficient(NetTensorKind::L2Weight, Some(selected_bucket), 3),
+                    synthetic.buckets[selected_bucket].l2_weights + 3,
+                    64,
+                ),
+            ];
+            for (id, byte_offset, delta) in cases {
+                let network = NNUENetwork::from_bytes(&synthetic.bytes).expect("network");
+                let base = network.net_coefficient(&id).expect("coefficient");
+                let edited_value = base + delta;
+                let mut edited = synthetic.bytes.clone();
+                match id.kind {
+                    NetTensorKind::OutputBias => edited[byte_offset..byte_offset + 4]
+                        .copy_from_slice(&edited_value.to_le_bytes()),
+                    NetTensorKind::FtBias => {
+                        edited[byte_offset] = encode_single_byte_signed_leb128(edited_value);
+                    }
+                    NetTensorKind::OutputWeight | NetTensorKind::L2Weight => {
+                        edited[byte_offset] = edited_value as i8 as u8;
+                    }
+                }
+                let from_file = evaluated_values(&edited, None, num_buckets);
+                let from_delta = evaluated_values(
+                    &synthetic.bytes,
+                    Some(&[NetDelta {
+                        id: id.clone(),
+                        delta,
+                    }]),
+                    num_buckets,
+                );
+                assert_ne!(
+                    from_delta,
+                    baseline,
+                    "{}: baseline={baseline:?}, from_delta={from_delta:?}",
+                    id.usi_name()
+                );
+                assert_eq!(from_file, from_delta, "{}", id.usi_name());
+
+                let mut network = NNUENetwork::from_bytes(&synthetic.bytes).expect("network");
+                network
+                    .apply_net_deltas(&[NetDelta {
+                        id: id.clone(),
+                        delta,
+                    }])
+                    .expect("apply");
+                assert_eq!(network.net_coefficient(&id).expect("coefficient"), edited_value);
+            }
+
+            let mut network = NNUENetwork::from_bytes(&synthetic.bytes).expect("network");
+            let bad_bucket = NetDelta {
+                id: coefficient(NetTensorKind::OutputWeight, Some(num_buckets), 0),
+                delta: 1,
+            };
+            assert!(network.apply_net_deltas(&[bad_bucket]).is_err());
+            let out_w_len = network
+                .net_tensor_shape(NetTensorKind::OutputWeight)
+                .expect("shape")
+                .element_count;
+            let bad_index = NetDelta {
+                id: coefficient(NetTensorKind::OutputWeight, Some(0), out_w_len),
+                delta: 1,
+            };
+            assert!(network.apply_net_deltas(&[bad_index]).is_err());
+
+            let saturating_id = coefficient(NetTensorKind::OutputWeight, Some(0), 0);
+            let report = network
+                .apply_net_deltas(&[NetDelta {
+                    id: saturating_id.clone(),
+                    delta: 1_000,
+                }])
+                .expect("saturating delta");
+            assert_eq!(report.clamped, 1);
+            assert_eq!(network.net_coefficient(&saturating_id).expect("coefficient"), 127);
+        }
+        crate::nnue::reset_layer_stack_progress_buckets();
+        crate::nnue::reset_layer_stack_progress_kpabs_weights();
     }
 
     #[test]

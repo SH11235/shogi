@@ -38,6 +38,9 @@ use super::halfka_hm_split::{HalfKaHmSplitNetwork, HalfKaHmSplitStack};
 use super::halfka_merged::{HalfKaMergedNetwork, HalfKaMergedStack};
 use super::halfka_split::{HalfKaSplitNetwork, HalfKaSplitStack};
 use super::halfkp::{HalfKPNetwork, HalfKPStack};
+use super::net_delta::{
+    NetCoefficientId, NetDelta, NetDeltaError, NetDeltaReport, NetTensorKind, NetTensorShape,
+};
 #[cfg(feature = "layerstack-arch")]
 use super::network_layer_stacks::LayerStacksNetwork;
 use super::spec::{Activation, FeatureSet};
@@ -436,6 +439,110 @@ impl NNUENetwork {
             return net.requires_board_effects();
         }
         cfg!(feature = "nnue-effect-bucket")
+    }
+
+    /// 読み込まれた net から対象テンソルの実行時形状を返す。
+    #[cfg(any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch"))]
+    pub fn net_tensor_shape(&self, kind: NetTensorKind) -> Result<NetTensorShape, NetDeltaError> {
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        if let Self::DynamicLayerStacks(net) = self {
+            return Ok(net.net_tensor_shape(kind));
+        }
+        #[cfg(feature = "layerstack-arch")]
+        if let Self::LayerStacks(net) = self {
+            return Ok(net.net_tensor_shape(kind));
+        }
+        Err(NetDeltaError::UnsupportedArchitecture {
+            architecture: self.architecture_name(),
+        })
+    }
+
+    /// 読み込まれた net から対象テンソルの実行時形状を返す。
+    #[cfg(not(any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch")))]
+    pub fn net_tensor_shape(&self, kind: NetTensorKind) -> Result<NetTensorShape, NetDeltaError> {
+        match kind {
+            NetTensorKind::OutputWeight
+            | NetTensorKind::OutputBias
+            | NetTensorKind::FtBias
+            | NetTensorKind::L2Weight => Err(NetDeltaError::UnsupportedArchitecture {
+                architecture: self.architecture_name(),
+            }),
+        }
+    }
+
+    /// ファイル格納順 ID で指定した係数の現在値を返す。
+    #[cfg(any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch"))]
+    pub fn net_coefficient(&self, id: &NetCoefficientId) -> Result<i32, NetDeltaError> {
+        self.net_tensor_shape(id.kind)?.validate(id)?;
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        if let Self::DynamicLayerStacks(net) = self {
+            return Ok(net.net_coefficient(id));
+        }
+        #[cfg(feature = "layerstack-arch")]
+        if let Self::LayerStacks(net) = self {
+            return Ok(net.net_coefficient(id));
+        }
+        unreachable!("net_tensor_shape rejected non-LayerStacks architecture")
+    }
+
+    /// ファイル格納順 ID で指定した係数の現在値を返す。
+    #[cfg(not(any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch")))]
+    pub fn net_coefficient(&self, id: &NetCoefficientId) -> Result<i32, NetDeltaError> {
+        match id.kind {
+            NetTensorKind::OutputWeight
+            | NetTensorKind::OutputBias
+            | NetTensorKind::FtBias
+            | NetTensorKind::L2Weight => Err(NetDeltaError::UnsupportedArchitecture {
+                architecture: self.architecture_name(),
+            }),
+        }
+    }
+
+    /// LayerStacks net の係数へ整数 delta を 1 回適用する。
+    ///
+    /// すべての ID を先に検証するため、エラー時は net を変更しない。
+    #[cfg(any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch"))]
+    pub fn apply_net_deltas(
+        &mut self,
+        deltas: &[NetDelta],
+    ) -> Result<NetDeltaReport, NetDeltaError> {
+        if deltas.is_empty() {
+            return Ok(NetDeltaReport::default());
+        }
+        for delta in deltas {
+            self.net_coefficient(&delta.id)?;
+        }
+
+        let mut report = NetDeltaReport {
+            applied: deltas.len(),
+            clamped: 0,
+        };
+        for delta in deltas {
+            let clamped = match self {
+                #[cfg(feature = "nnue-runtime-dimensions")]
+                Self::DynamicLayerStacks(net) => net.apply_net_delta(&delta.id, delta.delta),
+                #[cfg(feature = "layerstack-arch")]
+                Self::LayerStacks(net) => net.apply_net_delta(&delta.id, delta.delta),
+                _ => unreachable!("all deltas were validated against a LayerStacks network"),
+            };
+            report.clamped += usize::from(clamped);
+        }
+        Ok(report)
+    }
+
+    /// LayerStacks net の係数へ整数 delta を 1 回適用する。
+    #[cfg(not(any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch")))]
+    pub fn apply_net_deltas(
+        &mut self,
+        deltas: &[NetDelta],
+    ) -> Result<NetDeltaReport, NetDeltaError> {
+        if deltas.is_empty() {
+            Ok(NetDeltaReport::default())
+        } else {
+            Err(NetDeltaError::UnsupportedArchitecture {
+                architecture: self.architecture_name(),
+            })
+        }
     }
 
     /// HalfKP でサポートされているアーキテクチャ一覧
@@ -1254,20 +1361,44 @@ pub fn progress_sum_to_bucket(sum: f32, num_buckets: usize) -> usize {
 
 /// NNUEを初期化（バージョン自動判別）
 pub fn init_nnue<P: AsRef<Path>>(path: P) -> io::Result<()> {
-    let network = Arc::new(NNUENetwork::load(path)?);
+    init_nnue_with_deltas(path, &[]).map(|_| ())
+}
+
+/// NNUE をロードし、`Arc` で公開する前に整数 delta を適用する。
+pub fn init_nnue_with_deltas<P: AsRef<Path>>(
+    path: P,
+    deltas: &[NetDelta],
+) -> io::Result<NetDeltaReport> {
+    let mut network = NNUENetwork::load(path)?;
+    let report = network.apply_net_deltas(deltas).map_err(net_delta_io_error)?;
+    let network = Arc::new(network);
     NNUE_REQUIRES_BOARD_EFFECTS.store(network.requires_board_effects(), Ordering::Release);
     *NETWORK.write().expect("NNUE lock poisoned") = Some(network);
     NNUE_INITIALIZED.store(true, Ordering::Release);
-    Ok(())
+    Ok(report)
 }
 
 /// バイト列からNNUEを初期化（バージョン自動判別）
 pub fn init_nnue_from_bytes(bytes: &[u8]) -> io::Result<()> {
-    let network = Arc::new(NNUENetwork::from_bytes(bytes)?);
+    init_nnue_from_bytes_with_deltas(bytes, &[]).map(|_| ())
+}
+
+/// バイト列から NNUE をロードし、`Arc` で公開する前に整数 delta を適用する。
+pub fn init_nnue_from_bytes_with_deltas(
+    bytes: &[u8],
+    deltas: &[NetDelta],
+) -> io::Result<NetDeltaReport> {
+    let mut network = NNUENetwork::from_bytes(bytes)?;
+    let report = network.apply_net_deltas(deltas).map_err(net_delta_io_error)?;
+    let network = Arc::new(network);
     NNUE_REQUIRES_BOARD_EFFECTS.store(network.requires_board_effects(), Ordering::Release);
     *NETWORK.write().expect("NNUE lock poisoned") = Some(network);
     NNUE_INITIALIZED.store(true, Ordering::Release);
-    Ok(())
+    Ok(report)
+}
+
+fn net_delta_io_error(error: NetDeltaError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error)
 }
 
 /// グローバル NNUE をクリアする
@@ -2115,6 +2246,108 @@ mod tests {
     use super::*;
     use crate::nnue::constants::DEFAULT_NUM_BUCKETS;
     use crate::position::SFEN_HIRATE;
+
+    #[cfg(all(
+        feature = "layerstack-arch",
+        feature = "ft-halfka_hm_merged",
+        feature = "layerstacks-512x16x32",
+        not(feature = "nnue-runtime-dimensions"),
+        not(feature = "nnue-psqt"),
+        not(feature = "nnue-threat"),
+        not(feature = "nnue-effect-bucket")
+    ))]
+    #[test]
+    fn const_generic_layer_stacks_applies_all_net_delta_kinds() {
+        use crate::nnue::constants::HALFKA_HM_DIMENSIONS;
+        use crate::nnue::evaluator::NNUEEvaluator;
+        use crate::nnue::net_delta::test_utils::build_synthetic_layer_stacks;
+        use crate::nnue::net_delta::{NetCoefficientId, NetDelta, NetTensorKind};
+
+        reset_layer_stack_progress_kpabs_weights();
+        configure_layer_stack_routing(LayerStackBucketMode::ProgressKPAbs, 4, Some(4))
+            .expect("routing");
+        let synthetic =
+            build_synthetic_layer_stacks("HalfKaHmMerged", HALFKA_HM_DIMENSIONS, 512, 16, 32, 4);
+        assert_eq!(synthetic.buckets.len(), 4);
+        assert!(synthetic.ft_biases < synthetic.buckets[0].l2_weights);
+        assert!(synthetic.buckets[0].l2_weights < synthetic.buckets[0].output_bias);
+        assert!(synthetic.buckets[0].output_bias < synthetic.buckets[0].output_weights);
+        let mut pos = Position::new();
+        pos.set_sfen(SFEN_HIRATE).expect("hirate");
+        let selected_bucket = compute_layer_stack_progresskpabs_bucket_index(
+            &pos,
+            pos.side_to_move(),
+            get_layer_stack_progress_kpabs_weights(),
+            4,
+        );
+        assert_eq!(selected_bucket, 2);
+
+        let evaluate = |deltas: &[NetDelta]| {
+            let mut network = NNUENetwork::from_bytes(&synthetic.bytes).expect("synthetic net");
+            network.apply_net_deltas(deltas).expect("apply deltas");
+            let mut evaluator = NNUEEvaluator::new_with_position(Arc::new(network), &pos);
+            evaluator.evaluate(&pos)
+        };
+        let baseline = evaluate(&[]);
+        let cases = [
+            (
+                NetCoefficientId {
+                    kind: NetTensorKind::OutputWeight,
+                    bucket: Some(selected_bucket),
+                    index: 0,
+                },
+                64,
+            ),
+            (
+                NetCoefficientId {
+                    kind: NetTensorKind::OutputBias,
+                    bucket: Some(selected_bucket),
+                    index: 0,
+                },
+                256,
+            ),
+            (
+                NetCoefficientId {
+                    kind: NetTensorKind::FtBias,
+                    bucket: None,
+                    index: 0,
+                },
+                48,
+            ),
+            (
+                NetCoefficientId {
+                    kind: NetTensorKind::L2Weight,
+                    bucket: Some(selected_bucket),
+                    index: 15,
+                },
+                64,
+            ),
+        ];
+        for (id, delta) in cases {
+            let base_network = NNUENetwork::from_bytes(&synthetic.bytes).expect("synthetic net");
+            let base = base_network.net_coefficient(&id).expect("coefficient");
+            let net_delta = NetDelta {
+                id: id.clone(),
+                delta,
+            };
+            let mut network = NNUENetwork::from_bytes(&synthetic.bytes).expect("synthetic net");
+            let report =
+                network.apply_net_deltas(std::slice::from_ref(&net_delta)).expect("apply delta");
+            assert_eq!(report.applied, 1);
+            assert_eq!(report.clamped, 0);
+            assert_eq!(network.net_coefficient(&id).expect("coefficient"), base + delta);
+
+            let from_delta = evaluate(&[net_delta]);
+            assert_ne!(
+                from_delta,
+                baseline,
+                "{}: baseline={baseline:?}, from_delta={from_delta:?}",
+                id.usi_name()
+            );
+        }
+        reset_layer_stack_progress_buckets();
+        reset_layer_stack_progress_kpabs_weights();
+    }
 
     /// NNUENetwork のアーキテクチャ自動検出テスト
     ///

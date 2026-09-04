@@ -301,6 +301,34 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
             + i % Self::CHUNK_SIZE
     }
 
+    /// `.bin` の row-major flat index を実行時の格納 index に変換する。
+    #[inline]
+    pub(crate) const fn file_weight_index(i: usize) -> usize {
+        if Self::should_use_scrambled_weights() {
+            Self::get_weight_index_scrambled(i)
+        } else {
+            i
+        }
+    }
+
+    /// padding を含むファイル格納上の weight 要素数。
+    pub(crate) const fn weight_len() -> usize {
+        OUTPUT_DIM * Self::PADDED_INPUT
+    }
+
+    #[cfg(any(test, feature = "layerstack-arch"))]
+    pub(crate) fn file_weight(&self, index: usize) -> i8 {
+        self.weights[Self::file_weight_index(index)]
+    }
+
+    #[cfg(any(test, feature = "layerstack-arch"))]
+    pub(crate) fn apply_file_weight_delta(&mut self, index: usize, delta: i32) -> bool {
+        let memory_index = Self::file_weight_index(index);
+        let (value, clamped) = super::net_delta::add_i8_delta(self.weights[memory_index], delta);
+        self.weights[memory_index] = value;
+        clamped
+    }
+
     /// ゼロ初期化で新規作成
     pub fn new() -> Self {
         Self {
@@ -321,17 +349,13 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
 
         // 重みを読み込み（64バイトアラインで確保）
         // 格納レイアウトは should_use_scrambled_weights() の単一判定に従う。
-        let weight_size = OUTPUT_DIM * Self::PADDED_INPUT;
+        let weight_size = Self::weight_len();
         let mut weights = AlignedBox::new_zeroed(weight_size);
         let mut buf1 = [0u8; 1];
 
         for i in 0..weight_size {
             reader.read_exact(&mut buf1)?;
-            let idx = if Self::should_use_scrambled_weights() {
-                Self::get_weight_index_scrambled(i)
-            } else {
-                i
-            };
+            let idx = Self::file_weight_index(i);
             weights[idx] = buf1[0] as i8;
         }
 
@@ -351,16 +375,12 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
 
         // 重みを読み込み（64バイトアラインで確保）
         // 格納レイアウトは should_use_scrambled_weights() の単一判定に従う。
-        let weight_size = OUTPUT_DIM * Self::PADDED_INPUT;
+        let weight_size = Self::weight_len();
         let mut weights = AlignedBox::new_zeroed(weight_size);
 
         for i in 0..weight_size {
             let val = read_signed_leb128(reader)?;
-            let idx = if Self::should_use_scrambled_weights() {
-                Self::get_weight_index_scrambled(i)
-            } else {
-                i
-            };
+            let idx = Self::file_weight_index(i);
             weights[idx] = val as i8;
         }
 
@@ -1053,6 +1073,55 @@ impl<const DIM: usize> ClippedReLU<DIM> {
 mod tests {
     use super::*;
     use crate::nnue::accumulator::Aligned;
+
+    fn affine_file_bytes<const INPUT: usize, const OUTPUT: usize>(weight: i8) -> Vec<u8> {
+        let mut bytes = vec![0; OUTPUT * std::mem::size_of::<i32>()];
+        bytes.extend(std::iter::repeat_n(
+            weight as u8,
+            AffineTransform::<INPUT, OUTPUT>::weight_len(),
+        ));
+        bytes
+    }
+
+    fn assert_file_edit_matches_delta<const INPUT: usize, const OUTPUT: usize>() {
+        let weight_len = AffineTransform::<INPUT, OUTPUT>::weight_len();
+        for (case, file_index) in [4, weight_len / 2 + 4, weight_len - 5].into_iter().enumerate() {
+            let value = 21 + case as u8;
+            let mut edited = affine_file_bytes::<INPUT, OUTPUT>(0);
+            edited[OUTPUT * std::mem::size_of::<i32>() + file_index] = value;
+            let edited = AffineTransform::<INPUT, OUTPUT>::read(&mut std::io::Cursor::new(edited))
+                .expect("edited affine");
+
+            let mut delta = AffineTransform::<INPUT, OUTPUT>::read(&mut std::io::Cursor::new(
+                affine_file_bytes::<INPUT, OUTPUT>(0),
+            ))
+            .expect("base affine");
+            assert!(!delta.apply_file_weight_delta(file_index, i32::from(value)));
+
+            assert_eq!(delta.biases, edited.biases);
+            assert_eq!(&*delta.weights, &*edited.weights);
+        }
+
+        if AffineTransform::<INPUT, OUTPUT>::should_use_scrambled_weights() {
+            assert_ne!(AffineTransform::<INPUT, OUTPUT>::file_weight_index(4), 4);
+        }
+    }
+
+    #[test]
+    fn file_order_delta_matches_affine_read_layouts() {
+        assert_file_edit_matches_delta::<30, 32>();
+        assert_file_edit_matches_delta::<32, 1>();
+    }
+
+    #[test]
+    fn affine_weight_delta_saturates() {
+        let mut affine = AffineTransform::<30, 32>::read(&mut std::io::Cursor::new(
+            affine_file_bytes::<30, 32>(127),
+        ))
+        .expect("affine");
+        assert!(affine.apply_file_weight_delta(17, 1));
+        assert_eq!(affine.file_weight(17), i8::MAX);
+    }
 
     #[test]
     fn test_affine_transform_propagate() {

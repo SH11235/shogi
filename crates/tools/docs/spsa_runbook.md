@@ -1264,7 +1264,38 @@ ln -snf ../../rshogi-notes/spsa/<name>.rshogi.params <rshogi>/spsa_params/
   `tune_params.rs` の default に焼き込み済み（rebuild 経路）。ファイル投入経路で
   上書きすると二重適用ではなく **ファイル側が勝つ**（setoption は default を上書き）。
 
-## 12. トラブルシューティング
+## 12. net 重み SPSA (post-training)
+
+LayerStacks 系 NNUE の一部係数は、`.bin` 自体を書き換えず整数 delta として調整できる。
+調整対象の `.params` を engine 起動時の spec にも渡す。`--engine-args` は各 argv を
+個別指定するため、先頭が `-` の引数を含めて次の形で渡す。
+
+```bash
+cargo run --release -p tools --bin spsa -- \
+  --run-dir runs/spsa/net-example \
+  --init-from /path/to/net.params \
+  --total-pairs 6400 \
+  --engine-args=--spsa-net-spec \
+  --engine-args=/path/to/net.params \
+  --usi-option EvalFile=/path/to/layerstacks.bin
+```
+
+option 名は FC weight の padding を含む `.bin` 格納順 flat index を使う。bucket ありは
+`SPSA_NET_<kind>_b<bucket>_<index>`、bucket なしは
+`SPSA_NET_ft_b_<index>` とする。
+
+| kind | 対象 | bucket |
+|---|---|---|
+| `out_w` | output 層 weight (`i8`) | あり |
+| `out_b` | output 層 bias (`i32`, index は `0`) | あり |
+| `ft_b` | Feature Transformer bias (`i16`) | なし |
+| `l2_w` | 第 2 FC 層 weight (`i8`) | あり |
+
+`setoption` は delta を保存するだけで、続く `isready` で元の `EvalFile` を再ロードして
+全 delta を 1 回適用する。同じ値の再送では再ロードしない。係数候補を生成するツールと、
+確定 delta を net へ反映する finalize ツールは後続対応とする。
+
+## 13. トラブルシューティング
 
 実機での typical な詰まりどころと対処（症状ベース）。
 

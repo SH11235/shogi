@@ -25,6 +25,8 @@ use super::accumulator::Aligned;
 use super::accumulator_layer_stacks::{AccumulatorLayerStacks, AccumulatorStackLayerStacks};
 #[cfg(feature = "nnue-effect-bucket")]
 use super::constants::HALFKA_EFFECT_BUCKET_DIMENSIONS;
+#[cfg(feature = "layerstack-arch")]
+use super::constants::NNUE_PYTORCH_L3;
 use super::constants::{
     DEFAULT_NUM_BUCKETS, FV_SCALE_HALFKA, MAX_ARCH_LEN, MAX_LAYER_STACK_BUCKETS,
     NNUE_VERSION_HALFKA, NNUE_VERSION_LAYERSTACK_NUM_BUCKETS,
@@ -43,6 +45,8 @@ use super::constants::{LAYER_STACK_16X32_L1_OUT, LAYER_STACK_16X32_L2_IN};
 use super::constants::{LAYER_STACK_32X32_L1_OUT, LAYER_STACK_32X32_L2_IN};
 use super::feature_transformer_layer_stacks::FeatureTransformerLayerStacks;
 use super::layer_stacks::{LayerStacks, sqr_clipped_relu_transform};
+#[cfg(feature = "layerstack-arch")]
+use super::layers::AffineTransform;
 #[cfg(feature = "ft-halfka_hm_merged")]
 use super::ls_feature_spec::HalfKaHmMergedSpec;
 #[cfg(feature = "ft-halfka_hm_split")]
@@ -54,6 +58,10 @@ use super::ls_feature_spec::HalfKaSplitSpec;
 #[cfg(feature = "ft-halfkp")]
 use super::ls_feature_spec::HalfKpSpec;
 use super::ls_feature_spec::LsFeatureSpec;
+#[cfg(feature = "layerstack-arch")]
+use super::net_delta::{
+    NetCoefficientId, NetTensorKind, NetTensorShape, add_i16_delta, add_i32_delta,
+};
 use super::network::{
     LayerStackBucketMode, compute_layer_stack_progresskpabs_bucket_index, get_fv_scale_override,
     get_layer_stack_bucket_mode, get_layer_stack_progress_buckets,
@@ -535,6 +543,76 @@ impl<
     pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         Self::read(&mut cursor)
+    }
+
+    #[cfg(feature = "layerstack-arch")]
+    pub(crate) fn net_tensor_shape(&self, kind: NetTensorKind) -> NetTensorShape {
+        match kind {
+            NetTensorKind::OutputWeight => NetTensorShape {
+                bucket_count: Some(self.num_buckets),
+                element_count: AffineTransform::<NNUE_PYTORCH_L3, 1>::weight_len(),
+            },
+            NetTensorKind::OutputBias => NetTensorShape {
+                bucket_count: Some(self.num_buckets),
+                element_count: 1,
+            },
+            NetTensorKind::FtBias => NetTensorShape {
+                bucket_count: None,
+                element_count: L1,
+            },
+            NetTensorKind::L2Weight => NetTensorShape {
+                bucket_count: Some(self.num_buckets),
+                element_count: AffineTransform::<LS_L2_IN, NNUE_PYTORCH_L3>::weight_len(),
+            },
+        }
+    }
+
+    #[cfg(feature = "layerstack-arch")]
+    pub(crate) fn net_coefficient(&self, id: &NetCoefficientId) -> i32 {
+        match id.kind {
+            NetTensorKind::OutputWeight => i32::from(
+                self.layer_stacks.buckets[id.bucket.expect("validated bucket")]
+                    .output
+                    .file_weight(id.index),
+            ),
+            NetTensorKind::OutputBias => {
+                self.layer_stacks.buckets[id.bucket.expect("validated bucket")].output.biases[0]
+            }
+            NetTensorKind::FtBias => i32::from(self.feature_transformer.biases.0[id.index]),
+            NetTensorKind::L2Weight => i32::from(
+                self.layer_stacks.buckets[id.bucket.expect("validated bucket")]
+                    .l2
+                    .file_weight(id.index),
+            ),
+        }
+    }
+
+    #[cfg(feature = "layerstack-arch")]
+    pub(crate) fn apply_net_delta(&mut self, id: &NetCoefficientId, delta: i32) -> bool {
+        match id.kind {
+            NetTensorKind::OutputWeight => self.layer_stacks.buckets
+                [id.bucket.expect("validated bucket")]
+            .output
+            .apply_file_weight_delta(id.index, delta),
+            NetTensorKind::OutputBias => {
+                let bias = &mut self.layer_stacks.buckets[id.bucket.expect("validated bucket")]
+                    .output
+                    .biases[0];
+                let (value, clamped) = add_i32_delta(*bias, delta);
+                *bias = value;
+                clamped
+            }
+            NetTensorKind::FtBias => {
+                let bias = &mut self.feature_transformer.biases.0[id.index];
+                let (value, clamped) = add_i16_delta(*bias, delta);
+                *bias = value;
+                clamped
+            }
+            NetTensorKind::L2Weight => self.layer_stacks.buckets
+                [id.bucket.expect("validated bucket")]
+            .l2
+            .apply_file_weight_delta(id.index, delta),
+        }
     }
 
     /// 評価値を計算
@@ -1027,6 +1105,21 @@ impl<FT: LsFeatureSpec + 'static> LsNetByFt<FT> {
     /// 現在 load されている net の bucket 数 (= `.bin` header の `num_buckets`)
     pub fn num_buckets(&self) -> usize {
         ls_match_size!(self, net => net.num_buckets)
+    }
+
+    #[cfg(feature = "layerstack-arch")]
+    pub(crate) fn net_tensor_shape(&self, kind: NetTensorKind) -> NetTensorShape {
+        ls_match_size!(self, net => net.net_tensor_shape(kind))
+    }
+
+    #[cfg(feature = "layerstack-arch")]
+    pub(crate) fn net_coefficient(&self, id: &NetCoefficientId) -> i32 {
+        ls_match_size!(self, net => net.net_coefficient(id))
+    }
+
+    #[cfg(feature = "layerstack-arch")]
+    pub(crate) fn apply_net_delta(&mut self, id: &NetCoefficientId, delta: i32) -> bool {
+        ls_match_size!(self, net => net.apply_net_delta(id, delta))
     }
 
     /// (L1, L2, L3) と PSQT override から読み込み (FT は型レベルで固定)。
@@ -1866,6 +1959,21 @@ impl LayerStacksNetwork {
     /// 現在 load されている net の bucket 数 (= `.bin` header の `num_buckets`)
     pub fn num_buckets(&self) -> usize {
         ls_match_ft!(self, by_ft => by_ft.num_buckets())
+    }
+
+    #[cfg(feature = "layerstack-arch")]
+    pub(crate) fn net_tensor_shape(&self, kind: NetTensorKind) -> NetTensorShape {
+        ls_match_ft!(self, by_ft => by_ft.net_tensor_shape(kind))
+    }
+
+    #[cfg(feature = "layerstack-arch")]
+    pub(crate) fn net_coefficient(&self, id: &NetCoefficientId) -> i32 {
+        ls_match_ft!(self, by_ft => by_ft.net_coefficient(id))
+    }
+
+    #[cfg(feature = "layerstack-arch")]
+    pub(crate) fn apply_net_delta(&mut self, id: &NetCoefficientId, delta: i32) -> bool {
+        ls_match_ft!(self, by_ft => by_ft.apply_net_delta(id, delta))
     }
 
     /// アーキテクチャ仕様を取得
