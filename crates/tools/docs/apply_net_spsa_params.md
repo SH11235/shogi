@@ -43,7 +43,8 @@ cargo run --release -p tools --bin apply_net_spsa_params -- \
 - header、architecture 文字列、FT weight、PSQT、Threat、対象外 bucket／tensor は入力から
   そのままコピーする。delta が空または全て 0 ならファイル全体が byte 一致する。
 
-入力 `File` から最終パスと同じディレクトリの一時ファイルへ、固定 1 MiB buffer で
+入力は一度だけ `File` として open し、同じ descriptor を rewind しながら SHA-256、layout、
+delta 適用に使う。最終パスと同じディレクトリの一時ファイルへ、固定 1 MiB buffer で
 ストリーミング出力する。常駐するのは入力 layout が保持する FT bias と全 bucket の小さい
 FC block、再 encode 後の FT bias、転送 buffer だけで、FT weights や net 全体のサイズには
 依存しない。入出力 SHA-256 もファイルからストリーミング計算する。
@@ -51,8 +52,10 @@ FC block、再 encode 後の FT bias、転送 buffer だけで、FT weights や 
 書き込み後は一時ファイルを開き直し、feature 非依存の `.bin` layout reader で末尾余りなく
 解析する。入力 layout から先に作った対象係数だけの期待値 map と、出力 layout が保持する
 値を比較し、engine と同じ saturating delta の適用を検証する。検証後に net を rename で
-確定し、その後で report を確定する (net の無い report を残さない)。検証・書き込み失敗時に
-部分ファイルを最終パスへ残さない。入力と出力に同じファイルは指定できない。
+確定し、output と report の実体が異なることを再確認してから report を確定する (net の無い
+report を残さない)。この事後確認で alias を検出した場合は report を書かずエラーにし、正しく
+確定済みの net は残す。検証・書き込み失敗時に部分ファイルを最終パスへ残さない。入力と出力に
+同じファイルは指定できない。
 
 入力と同じ version、architecture、LEB128 ブロック構成を維持し、末尾余りのない形式を
 layout reader と core 側の engine 等価性テストで確認している。このため tatara の

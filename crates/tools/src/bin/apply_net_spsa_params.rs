@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -10,7 +10,9 @@ use rshogi_core::nnue::net_delta::{add_i8_delta, add_i16_delta, add_i32_delta};
 use rshogi_core::nnue::{NetCoefficientId, NetDelta, NetTensorKind};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tools::output_path::{ensure_distinct_output_paths, ensure_safe_output_path};
+use tools::output_path::{
+    ensure_created_paths_distinct, ensure_distinct_output_paths, ensure_safe_output_path,
+};
 use tools::spsa_param_mapping::parse_param_line;
 
 #[derive(Parser, Debug)]
@@ -64,7 +66,9 @@ fn run(cli: &Cli) -> Result<()> {
     reject_path_collisions(cli)?;
     let params = std::fs::read_to_string(&cli.params)
         .with_context(|| format!("failed to read {}", cli.params.display()))?;
-    let input_sha256 = sha256_file(&cli.nnue)?;
+    let mut input =
+        File::open(&cli.nnue).with_context(|| format!("failed to open {}", cli.nnue.display()))?;
+    let input_sha256 = sha256_reader(&mut input, &cli.nnue)?;
     validate_source_hash(
         &params,
         &input_sha256,
@@ -73,16 +77,12 @@ fn run(cli: &Cli) -> Result<()> {
     )?;
     let deltas = parse_deltas(&params)?;
 
-    let expected = {
-        let mut input = File::open(&cli.nnue)
-            .with_context(|| format!("failed to open {}", cli.nnue.display()))?;
-        let input_layout = LayerStacksBinLayout::from_reader(&mut input)
-            .context("failed to parse input NNUE layout")?;
-        expected_coefficients(&input_layout, &deltas)?
-    };
-
-    let mut input = File::open(&cli.nnue)
-        .with_context(|| format!("failed to reopen {}", cli.nnue.display()))?;
+    // 入力パスが途中で差し替わっても hash・期待値・patch の由来を同じ inode に固定する。
+    input.rewind().context("failed to rewind input NNUE after hashing")?;
+    let input_layout = LayerStacksBinLayout::from_reader(&mut input)
+        .context("failed to parse input NNUE layout")?;
+    let expected = expected_coefficients(&input_layout, &deltas)?;
+    input.rewind().context("failed to rewind input NNUE before patching")?;
     let mut staged_output = create_staged_file(&cli.output)?;
     let staged_output_path = staged_output.path().to_owned();
     let patch_report = apply_deltas(&mut input, staged_output.as_file_mut(), &deltas)
@@ -119,6 +119,7 @@ fn run(cli: &Cli) -> Result<()> {
         .persist(&cli.output)
         .with_context(|| format!("failed to rename staged NNUE to {}", cli.output.display()))?;
     if let Some((staged, path)) = staged_report {
+        ensure_report_destination_distinct(&cli.output, path)?;
         staged
             .persist(path)
             .with_context(|| format!("failed to rename staged report to {}", path.display()))?;
@@ -128,6 +129,11 @@ fn run(cli: &Cli) -> Result<()> {
         patch_report.applied, nonzero_delta_count, patch_report.clamped
     );
     Ok(())
+}
+
+fn ensure_report_destination_distinct(output: &Path, report: &Path) -> Result<()> {
+    ensure_created_paths_distinct(&[output, report])
+        .context("output and report destinations alias after finalizing the NNUE")
 }
 
 fn validate_source_hash(
@@ -277,9 +283,12 @@ fn reject_path_collisions(cli: &Cli) -> Result<()> {
 fn sha256_file(path: &Path) -> Result<String> {
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    sha256_reader(&mut file, path)
+}
+
+fn sha256_reader(file: &mut File, path: &Path) -> Result<String> {
     let mut digest = Sha256::new();
-    io::copy(&mut file, &mut digest)
-        .with_context(|| format!("failed to hash {}", path.display()))?;
+    io::copy(file, &mut digest).with_context(|| format!("failed to hash {}", path.display()))?;
     Ok(format!("{:x}", digest.finalize()))
 }
 
@@ -345,5 +354,19 @@ SPSA_NET_ft_b_2,int,-1.500000,-3,3,1,0.002 [[NOT USED]]\n";
         let message = error.to_string();
         assert!(message.contains("--expected-net-sha256"));
         assert!(message.contains("--allow-net-mismatch"));
+    }
+
+    #[test]
+    fn rejects_report_alias_created_after_preflight() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let output = dir.path().join("tuned.bin");
+        let report = dir.path().join("report.json");
+        ensure_distinct_output_paths(&output, &report)?;
+
+        std::fs::write(&output, [0u8])?;
+        std::fs::hard_link(&output, &report)?;
+
+        assert!(ensure_report_destination_distinct(&output, &report).is_err());
+        Ok(())
     }
 }
