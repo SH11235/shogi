@@ -14,6 +14,17 @@ core 変更を公開する PR では `crates/rshogi-core/Cargo.toml` のバー�
 
 ## Unreleased
 
+### rescore_psv: routing bucket 数の防御と NNUE score sidecar
+
+- `--ls-progress-buckets` が NNUE ファイルの格納 bucket 数と不一致の場合はエラーに
+  なる（合法設定として素通りし全行を無警告で誤評価にしていた）。格納数より少ない
+  routing で学習された旧世代 net の評価は新フラグ
+  `--allow-routing-buckets-mismatch` で警告付きに許可する。
+- `--out-scores`（i16 score sidecar）を NNUE 静的評価モードに開放した。dlshogi
+  ONNX 経路と同じ `.in-progress` / `.done` marker による中断再開・fail-closed
+  （エラーを含むチャンクは 1 byte も書かない）で、fingerprint は NNUE の
+  path/size/mtime と routing 設定（progress 係数は sha256）・FV_SCALE 変換を追跡する。
+
 ### 破壊的変更: LayerStacks routing の明示化
 
 - bucket mode 名 `progress8kpabs` を `progresskpabs` へ変更した。旧名の alias はなく、指定するとエラーになる。

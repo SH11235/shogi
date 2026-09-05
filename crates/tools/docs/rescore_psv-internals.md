@@ -70,7 +70,8 @@ TensorRT FP32 は計測の結果 CUDA EP より遅い（カーネル最適化の
 
 ## 完了マーカー（`<rescore_output>.done`）の仕様
 
-ONNX モードで各入力ファイルの処理完了時に `key=value` 形式の sidecar テキストを
+ONNX モードと NNUE 静的評価 + `--out-scores` モードで、各入力ファイルの処理完了時に
+`key=value` 形式の sidecar テキストを
 atomic rename + `sync_all()` で書く。プロセス kill / panic に耐えるが、電源断・
 カーネルパニックは非目標。
 
@@ -98,11 +99,17 @@ fingerprint に含まれる項目:
   `--expand-output-dir` の canonicalize 済みパス
 - replacement 有効時: `--qsearch-leaf-replacement-output` の canonicalize 済みパス
   とその出力サイズ
+- NNUE 静的評価 + `--out-scores`（`mode=nnue-static`）時のみ: `--ls-bucket-mode` /
+  `--ls-progress-buckets` / `--ls-progress-coeff`（canonicalize 済みパス + sha256）、
+  `--source-fv-scale` / `--target-fv-scale`。このモードでは model キーが NNUE ファイル
+  を指し、ONNX 専用キー（`eval_scale_bits` / `onnx_draw_ply`）は固定値 0 を書く
 
 後方互換: 旧 marker の `use_tensorrt` キー欠落は unknown として読み、現在値の
 `true` / `false` のどちらとも fingerprint を一致させない。このためキー無し旧 marker は
 更新後の初回実行で出力を truncate して一度だけ再生成され、再生成後の marker には同キーが入る。
 `out_scores` キー欠落は従来どおり `false` 扱い（旧 sidecar 出力は存在しないため安全）。
+`nnue_*` キー欠落は `None` 扱いで、NNUE 静的評価の現設定とは fingerprint 不一致になり
+再生成される。
 旧 marker の `--qsearch-leaf-label` / `replacement` キー欠落も `false` 扱い。
 `--qsearch-leaf-label=true` だが
 葉探索 NNUE キーを持たない旧 marker は NNUE メタを `None` として読み、現設定と

@@ -51,14 +51,12 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 // mpsc/Arc/Mutex/Instant は ONNX 直推論パイプライン専用（バッチ供給の Receiver 共有・
 // フェーズ計時）。ONNX 無効ビルドでの unused import を避けるため cfg で囲う。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 use sha2::{Digest, Sha256};
 #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 use std::sync::mpsc;
@@ -124,6 +122,12 @@ struct Cli {
     /// progresskpabs 用の進行度係数ファイル。
     #[arg(long)]
     ls_progress_coeff: Option<PathBuf>,
+
+    /// --ls-progress-buckets が NNUE ファイルの格納 bucket 数と異なる指定を警告付きで
+    /// 許可する。格納 9 bucket を floor(p*8) routing で学習した旧世代 net の再評価
+    /// 専用。通常の net は格納数 = routing 数なので、不一致は指定ミスとして拒否される。
+    #[arg(long)]
+    allow_routing_buckets_mismatch: bool,
 
     /// qsearch評価を使用（デフォルトは静的評価）
     #[arg(long)]
@@ -365,7 +369,6 @@ fn is_same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// 既存出力パスが symlink でないこと、未作成・既存どちらでも入力パスと衝突
 /// しないことを検証する。既存ファイルが入力の hardlink である場合も検出する
 /// （Unix のみ、`MetadataExt::dev/ino` で同一 inode を判定）。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn ensure_safe_output_path(
     predicted: &std::path::Path,
     canonical_input: &std::path::Path,
@@ -673,6 +676,10 @@ fn main() -> Result<()> {
     let use_onnx = cli.onnx_model.is_some();
     let use_dlshogi_onnx = cli.dlshogi_onnx_model.is_some();
 
+    // --out-scores の NNUE 静的評価モード: NNUE を直接ロードし、qsearch も探索も
+    // 使わない構成のみ。行対応を崩す/出力内容を混ぜる他モードとの併用は下で reject。
+    let nnue_static_scores =
+        cli.out_scores && !use_engine && !use_onnx && !use_dlshogi_onnx && cli.nnue.is_some();
     if cli.out_scores {
         if cli.limit > 0 {
             anyhow::bail!(
@@ -684,21 +691,23 @@ fn main() -> Result<()> {
                 "--out-scores cannot be combined with --delete-input because the base PSV is required to interpret the score sidecar"
             );
         }
-        if !use_dlshogi_onnx {
-            anyhow::bail!("--out-scores requires --dlshogi-onnx-model");
+        if !use_dlshogi_onnx && !nnue_static_scores {
+            anyhow::bail!(
+                "--out-scores requires --dlshogi-onnx-model or --nnue (static evaluation)"
+            );
         }
         if use_onnx
             || use_engine
-            || cli.nnue.is_some()
             || cli.use_qsearch
             || cli.search_depth.is_some()
             || cli.qsearch_leaf_label
             || cli.apply_qsearch_leaf
             || cli.expand_output_dir.is_some()
             || cli.qsearch_leaf_replacement_output.is_some()
+            || (use_dlshogi_onnx && cli.nnue.is_some())
         {
             anyhow::bail!(
-                "--out-scores supports only direct --dlshogi-onnx-model inference and cannot be combined with other evaluation, qsearch, search, expand, or replacement modes"
+                "--out-scores supports only direct --dlshogi-onnx-model inference or NNUE static evaluation and cannot be combined with other evaluation, qsearch, search, expand, or replacement modes"
             );
         }
         if cli.skip_in_check {
@@ -911,6 +920,13 @@ fn main() -> Result<()> {
                     (LayerStackBucketMode::KingRank9, None) => {}
                     _ => unreachable!(),
                 }
+                if matches!(mode, LayerStackBucketMode::ProgressKPAbs) {
+                    validate_progress_routing_buckets(
+                        cli.ls_progress_buckets,
+                        stored,
+                        cli.allow_routing_buckets_mismatch,
+                    )?;
+                }
                 configure_layer_stack_routing(mode, stored, cli.ls_progress_buckets)
                     .map_err(anyhow::Error::msg)?;
             }
@@ -1086,9 +1102,9 @@ fn main() -> Result<()> {
 
         // ONNX モードでは marker ベースで skip / truncate 判定
         #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-        let mut use_legacy_resume_check = !(use_onnx || use_dlshogi_onnx);
+        let mut use_legacy_resume_check = !(use_onnx || use_dlshogi_onnx || nnue_static_scores);
         #[cfg(not(any(feature = "aobazero-onnx", feature = "dlshogi-onnx")))]
-        let use_legacy_resume_check = !(use_onnx || use_dlshogi_onnx);
+        let use_legacy_resume_check = !(use_onnx || use_dlshogi_onnx || nnue_static_scores);
         #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
         if use_onnx || use_dlshogi_onnx {
             let (model_kind, onnx_path): (&str, &std::path::Path) = if use_onnx {
@@ -1137,6 +1153,21 @@ fn main() -> Result<()> {
                     use_legacy_resume_check = true;
                 }
             }
+        }
+
+        // NNUE 静的評価 sidecar は完了 marker で skip / 作り直しを判定する
+        // (途中再開の判定は process_file_nnue_scores 内の in-progress marker が担う)。
+        if nnue_static_scores
+            && nnue_scores_marker_decide(&cli, input_path, &output_path, process_count)?
+        {
+            eprintln!(
+                "=== [{}/{}] Skipping (marker matches): {} ===",
+                file_idx + 1,
+                total_files,
+                output_path.display()
+            );
+            rprog.skip_file(process_count);
+            continue;
         }
 
         // legacy resume / skip 判定（NNUE/USI 全モード、または ONNX 無 marker + expand 無効）
@@ -1237,6 +1268,8 @@ fn main() -> Result<()> {
                 )?;
             } else if cli.search_depth.is_some() {
                 process_file_with_search(&cli, input_path, &output_path, process_count, &fprog)?;
+            } else if nnue_static_scores {
+                process_file_nnue_scores(&cli, input_path, &output_path, process_count, &fprog)?;
             } else {
                 process_file(&cli, input_path, &output_path, process_count, &fprog)?;
             }
@@ -1284,6 +1317,320 @@ fn main() -> Result<()> {
 }
 
 /// ファイルを処理
+/// progresskpabs の routing bucket 数指定と NNUE 格納 bucket 数の整合を検証する。
+///
+/// 現行世代の net は格納数 = 学習時 routing 数なので、不一致は bucket 数の指定ミス
+/// (誤った routing は全行を無警告で誤評価にする) として拒否する。格納 bucket 数より
+/// 少ない routing で学習した旧世代 net だけが正当な不一致で、
+/// `--allow-routing-buckets-mismatch` で明示的に通す。未指定 (None) の explicit 必須
+/// 検査は `configure_layer_stack_routing` 側が担う。
+fn validate_progress_routing_buckets(
+    requested: Option<usize>,
+    stored: usize,
+    allow_mismatch: bool,
+) -> Result<()> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    if requested == stored {
+        return Ok(());
+    }
+    if allow_mismatch {
+        eprintln!(
+            "Warning: --ls-progress-buckets {requested} != stored bucket count {stored}; \
+             proceeding because --allow-routing-buckets-mismatch is set"
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "--ls-progress-buckets {requested} does not match the stored bucket count {stored} of \
+         the NNUE file. A mismatched routing count silently mis-routes every position. Pass \
+         the stored count, or pass --allow-routing-buckets-mismatch if this net was really \
+         trained with {requested}-bucket routing on a {stored}-bucket layout."
+    );
+}
+
+/// NNUE 静的評価 score sidecar の同一性 fingerprint を構築する。
+///
+/// model_* は NNUE ファイル (path / size / mtime)、nnue_* は出力スコアを変える
+/// routing (`--ls-bucket-mode` / `--ls-progress-buckets` / `--ls-progress-coeff`
+/// の path + sha256) とスケール変換 (`--source-fv-scale` / `--target-fv-scale`)。
+/// `eval_scale_bits` / `onnx_draw_ply` は ONNX 専用キーだが marker format 上
+/// 必須のため固定値 (0) を書く。
+fn build_nnue_scores_fingerprint(
+    cli: &Cli,
+    input_path: &std::path::Path,
+    process_count: u64,
+) -> Result<RunFingerprint> {
+    let nnue = cli
+        .nnue
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("NNUE score sidecar mode requires --nnue"))?;
+    let model_path = nnue
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize --nnue {}", nnue.display()))?;
+    ensure_marker_safe_path("--nnue", &model_path)?;
+    let (model_size, model_mtime_ns) = file_size_mtime_ns(&model_path)?;
+    let input_path = input_path
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize {}", input_path.display()))?;
+    ensure_marker_safe_path("input", &input_path)?;
+    let (input_size, input_mtime_ns) = file_size_mtime_ns(&input_path)?;
+    let (nnue_ls_progress_coeff_path, nnue_ls_progress_coeff_sha256) =
+        match cli.ls_progress_coeff.as_deref() {
+            Some(path) => {
+                let canonical = path.canonicalize().with_context(|| {
+                    format!("Failed to canonicalize --ls-progress-coeff {}", path.display())
+                })?;
+                ensure_marker_safe_path("--ls-progress-coeff", &canonical)?;
+                let bytes = fs::read(&canonical).with_context(|| {
+                    format!("Failed to read --ls-progress-coeff {}", canonical.display())
+                })?;
+                let sha256 = format!("{:x}", Sha256::digest(bytes));
+                (Some(canonical), Some(sha256))
+            }
+            None => (None, None),
+        };
+    Ok(RunFingerprint {
+        version: MARKER_VERSION,
+        mode: "nnue-static".to_string(),
+        model_kind: "nnue".to_string(),
+        model_path,
+        model_size,
+        model_mtime_ns,
+        input_path,
+        input_size,
+        input_mtime_ns,
+        process_count,
+        out_scores: true,
+        skip_in_check: false,
+        score_clip: cli.score_clip,
+        eval_scale_bits: 0,
+        use_tensorrt: None,
+        onnx_draw_ply: 0,
+        qsearch_leaf_label: false,
+        qsearch_max_ply: None,
+        qsearch_nnue_path: None,
+        qsearch_nnue_size: None,
+        qsearch_nnue_mtime_ns: None,
+        qsearch_ls_bucket_mode: None,
+        qsearch_ls_progress_buckets: None,
+        qsearch_ls_progress_coeff_path: None,
+        qsearch_ls_progress_coeff_sha256: None,
+        nnue_ls_bucket_mode: cli.ls_bucket_mode.clone(),
+        nnue_ls_progress_buckets: cli.ls_progress_buckets,
+        nnue_ls_progress_coeff_path,
+        nnue_ls_progress_coeff_sha256,
+        nnue_source_fv_scale: Some(cli.source_fv_scale),
+        nnue_target_fv_scale: Some(cli.target_fv_scale),
+        expand: false,
+        expand_threshold_bits: None,
+        expand_skip_parent_in_check: None,
+        expand_skip_child_in_check: None,
+        expand_output_path: None,
+        replacement: false,
+        replacement_output_path: None,
+    })
+}
+
+/// NNUE 静的評価 sidecar の完了 marker を判定する。`true` = 完了済み (skip)。
+///
+/// marker 不一致 (net / 入力 / routing / スケールの差し替え) は sidecar を空にして
+/// から `.done` を削除する。逆順だと truncate 失敗時に「古い marker + 別設定の
+/// sidecar」が残って誤 skip し得る。途中再開の判定は
+/// [`process_file_nnue_scores`] 内の in-progress marker が担う。
+fn nnue_scores_marker_decide(
+    cli: &Cli,
+    input_path: &std::path::Path,
+    output_path: &std::path::Path,
+    process_count: u64,
+) -> Result<bool> {
+    let current = build_nnue_scores_fingerprint(cli, input_path, process_count)?;
+    ensure_safe_output_path(output_path, &current.input_path)?;
+    let marker_path = marker_path_for(output_path);
+    if marker_path.exists() {
+        let marker = parse_marker(&marker_path)?;
+        let body_matches = output_path.exists()
+            && fs::metadata(output_path)?.len() == marker.output_sizes.rescore_output_size;
+        if marker.fingerprint == current && body_matches {
+            remove_in_progress_marker(output_path)?;
+            return Ok(true);
+        }
+        if output_path.exists() {
+            File::options().write(true).open(output_path)?.set_len(0)?;
+        }
+        fs::remove_file(&marker_path)
+            .with_context(|| format!("Failed to remove stale marker {}", marker_path.display()))?;
+    }
+    Ok(false)
+}
+
+/// NNUE 静的評価で little-endian i16 score sidecar を出力する。
+///
+/// 不変条件は「sidecar 行 i = 入力 record i」の行対応で、エラーを含むチャンクは
+/// 1 byte も書かない ([`write_rescore_batch`])。in-progress marker の fingerprint が
+/// 一致すれば件数ベースで追記再開し、完了時に行数 == 入力 record 数を検証して
+/// `.done` へ昇格する。Ctrl-C はチャンク境界で停止し、marker を残して次回の
+/// 再開に備える。
+fn process_file_nnue_scores(
+    cli: &Cli,
+    input_path: &PathBuf,
+    output_path: &PathBuf,
+    process_count: u64,
+    progress: &FileProgress,
+) -> Result<()> {
+    const CHUNK_SIZE: usize = 1_000_000;
+    const SCORE_RECORD_SIZE: u64 = 2;
+
+    let start_fingerprint = build_nnue_scores_fingerprint(cli, input_path, process_count)?;
+    prepare_in_progress_marker(output_path, &start_fingerprint, false)?
+        .context("out_scores=true did not create an in-progress marker")?;
+    let resume_count = prepare_resume_count(output_path, SCORE_RECORD_SIZE, true)?;
+    if resume_count > process_count {
+        anyhow::bail!(
+            "Existing sidecar has {resume_count} records but the input has only {process_count}. \
+             Delete the sidecar {} and its .in-progress marker to regenerate.",
+            output_path.display()
+        );
+    }
+
+    let in_file = File::open(input_path)
+        .with_context(|| format!("Failed to open {}", input_path.display()))?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, in_file);
+    seek_to_record(&mut reader, resume_count)?;
+    let out_file = File::options()
+        .create(true)
+        .append(true)
+        .open(output_path)
+        .with_context(|| format!("Failed to open {}", output_path.display()))?;
+    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
+
+    let max_ply = cli.max_ply;
+    let score_clip = cli.score_clip;
+    let source_fv_scale = cli.source_fv_scale;
+    let target_fv_scale = cli.target_fv_scale;
+    let verbose = cli.verbose;
+
+    progress.set_message("Processing...");
+    if resume_count > 0 {
+        eprintln!("Resuming sidecar at record {resume_count}/{process_count}");
+        progress.inc(resume_count);
+    }
+    let mut total_written = resume_count;
+    let mut interrupted = false;
+
+    while total_written < process_count {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            interrupted = true;
+            break;
+        }
+
+        let want = (CHUNK_SIZE as u64).min(process_count - total_written) as usize;
+        let mut chunk: Vec<[u8; PackedSfenValue::SIZE]> = Vec::with_capacity(want);
+        let mut buffer = [0u8; PackedSfenValue::SIZE];
+        for _ in 0..want {
+            match reader.read_exact(&mut buffer) {
+                Ok(()) => chunk.push(buffer),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if chunk.is_empty() {
+            break;
+        }
+
+        // 行対応維持のためチャンク全件を評価してから一括書き出しする。process_file と
+        // 違い INTERRUPTED での record 単位 early-out はしない (None 化した行が
+        // fail-closed でエラー扱いになり、正常な中断がエラー終了に化けるため)。
+        let results: Vec<ProcessResult> = chunk
+            .par_iter()
+            .map(|record| {
+                thread_local! {
+                    static NNUE_STACKS: RefCell<NnueStacks> = RefCell::new(NnueStacks::new());
+                }
+                NNUE_STACKS.with(|stacks| {
+                    let mut stacks = stacks.borrow_mut();
+                    stacks.reset();
+                    process_record(
+                        record,
+                        &mut stacks,
+                        max_ply,
+                        false,
+                        false,
+                        score_clip,
+                        false,
+                        source_fv_scale,
+                        target_fv_scale,
+                    )
+                })
+            })
+            .collect();
+
+        let mut bytes: Vec<u8> = Vec::with_capacity(results.len() * SCORE_RECORD_SIZE as usize);
+        let mut errors = 0u64;
+        for result in &results {
+            match result {
+                ProcessResult::Ok(record, _clipped) => match PackedSfenValue::from_bytes(record) {
+                    Some(psv) => append_rescore_bytes(&mut bytes, &psv, true),
+                    None => errors += 1,
+                },
+                // skip_in_check=false 固定なので Skip は返らない想定。防御として
+                // 行落ちさせず fail-closed のエラー扱いにする。
+                ProcessResult::Skip => errors += 1,
+                ProcessResult::Error(e) => {
+                    errors += 1;
+                    if verbose {
+                        eprintln!("Error processing record: {e}");
+                    }
+                }
+            }
+        }
+        write_rescore_batch(&mut writer, &bytes, true, errors)?;
+        total_written += chunk.len() as u64;
+        progress.inc(chunk.len() as u64);
+    }
+
+    writer.flush()?;
+
+    if interrupted {
+        progress.abandon_with_message("Interrupted");
+        eprintln!(
+            "Interrupted at {total_written}/{process_count} records; the in-progress marker is \
+             kept so the next run resumes by record count"
+        );
+        return Ok(());
+    }
+    if total_written != process_count {
+        anyhow::bail!(
+            "Input ended early: wrote {total_written} of {process_count} score records for {}",
+            input_path.display()
+        );
+    }
+
+    let final_fingerprint = build_nnue_scores_fingerprint(cli, input_path, process_count)?;
+    reject_changed_sidecar_fingerprint(
+        output_path,
+        &start_fingerprint,
+        &final_fingerprint,
+        "during the run",
+    )?;
+    let rescore_output_size = fs::metadata(output_path)?.len();
+    promote_score_sidecar_marker(
+        output_path,
+        &DoneMarker {
+            fingerprint: final_fingerprint,
+            output_sizes: OutputSizes {
+                rescore_output_size,
+                expand_output_size: None,
+                replacement_output_size: None,
+            },
+        },
+    )?;
+    progress.finish_with_message("Done");
+    eprintln!("Wrote {total_written} score records");
+    Ok(())
+}
+
 fn process_file(
     cli: &Cli,
     input_path: &PathBuf,
@@ -2236,7 +2583,6 @@ fn onnx_ort_err(e: ort::Error) -> anyhow::Error {
 }
 
 /// score 決定後のレコードを通常 PSV または score sidecar として直列化する。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn append_rescore_bytes(output: &mut Vec<u8>, psv: &PackedSfenValue, out_scores: bool) {
     if out_scores {
         output.extend_from_slice(&psv.score.to_le_bytes());
@@ -2249,7 +2595,6 @@ fn append_rescore_bytes(output: &mut Vec<u8>, psv: &PackedSfenValue, out_scores:
 ///
 /// reader の decode 失敗と producer の局面構築失敗を同じ errors に集約し、
 /// seq 順 writer が書き出し直前に拒否することで、既存 prefix の行対応を保つ。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn write_rescore_batch<W: Write>(
     writer: &mut W,
     bytes: &[u8],
@@ -2267,7 +2612,6 @@ fn write_rescore_batch<W: Write>(
 
 /// 既存出力のレコード数を返す。通常 PSV の末尾 partial record は従来どおり
 /// 切り捨てて自己修復するが、事後検出不能な score sidecar は fail-closed にする。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn prepare_resume_count(
     output_path: &std::path::Path,
     output_record_size: u64,
@@ -2301,7 +2645,6 @@ fn prepare_resume_count(
 
 /// 入力を既処理レコードの直後へ移動する。巨大 sidecar の resume で入力 prefix を
 /// 空読みせず、checked offset に直接 seek する。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn seek_to_record<R: Seek>(reader: &mut R, record_count: u64) -> Result<u64> {
     let offset = record_count
         .checked_mul(PackedSfenValue::SIZE as u64)
@@ -2378,11 +2721,9 @@ struct ExpandConfig<'a> {
 }
 
 /// 完了マーカーのフォーマットバージョン
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 const MARKER_VERSION: u32 = 1;
 
 /// 完了マーカーの fingerprint 部（出力内容を一意に決める実行設定）
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunFingerprint {
     version: u32,
@@ -2417,6 +2758,15 @@ struct RunFingerprint {
     qsearch_ls_progress_buckets: Option<usize>,
     qsearch_ls_progress_coeff_path: Option<PathBuf>,
     qsearch_ls_progress_coeff_sha256: Option<String>,
+    // NNUE 静的評価 sidecar (mode="nnue-static") のみ Some。model_* が NNUE 本体を
+    // 指すのに対し、こちらは出力スコアを変える routing / スケール設定を固定する。
+    // LayerStacks でない NNUE では routing 3 兄弟は None のまま。
+    nnue_ls_bucket_mode: Option<String>,
+    nnue_ls_progress_buckets: Option<usize>,
+    nnue_ls_progress_coeff_path: Option<PathBuf>,
+    nnue_ls_progress_coeff_sha256: Option<String>,
+    nnue_source_fv_scale: Option<i32>,
+    nnue_target_fv_scale: Option<i32>,
     expand: bool,
     expand_threshold_bits: Option<u32>,
     expand_skip_parent_in_check: Option<bool>,
@@ -2429,7 +2779,6 @@ struct RunFingerprint {
 }
 
 /// 完了マーカーの出力サイズ情報（fingerprint とは分離）
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OutputSizes {
     rescore_output_size: u64,
@@ -2438,7 +2787,6 @@ struct OutputSizes {
 }
 
 /// 完了マーカー全体（fingerprint + output sizes）
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DoneMarker {
     fingerprint: RunFingerprint,
@@ -2446,7 +2794,6 @@ struct DoneMarker {
 }
 
 /// `<rescore_output>.done` を返す
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn marker_path_for(rescore_output: &std::path::Path) -> PathBuf {
     let mut s = rescore_output.as_os_str().to_owned();
     s.push(".done");
@@ -2454,7 +2801,6 @@ fn marker_path_for(rescore_output: &std::path::Path) -> PathBuf {
 }
 
 /// `<rescore_output>.in-progress` を返す
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn in_progress_marker_path_for(rescore_output: &std::path::Path) -> PathBuf {
     let mut s = rescore_output.as_os_str().to_owned();
     s.push(".in-progress");
@@ -2462,7 +2808,6 @@ fn in_progress_marker_path_for(rescore_output: &std::path::Path) -> PathBuf {
 }
 
 /// ファイルの `(len, modified_unix_ns)` を取得
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn file_size_mtime_ns(path: &std::path::Path) -> Result<(u64, u128)> {
     let m = fs::metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?;
     let mtime = m
@@ -2475,7 +2820,6 @@ fn file_size_mtime_ns(path: &std::path::Path) -> Result<(u64, u128)> {
 }
 
 /// `DoneMarker` をテキスト key=value 形式にシリアライズ
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn serialize_marker(marker: &DoneMarker) -> String {
     let f = &marker.fingerprint;
     let mut out = String::new();
@@ -2536,6 +2880,24 @@ fn serialize_marker(marker: &DoneMarker) -> String {
             let _ = writeln!(out, "qsearch_ls_progress_coeff_sha256={sha256}");
         }
     }
+    if let Some(mode) = &f.nnue_ls_bucket_mode {
+        let _ = writeln!(out, "nnue_ls_bucket_mode={mode}");
+    }
+    if let Some(buckets) = f.nnue_ls_progress_buckets {
+        let _ = writeln!(out, "nnue_ls_progress_buckets={buckets}");
+    }
+    if let Some(path) = &f.nnue_ls_progress_coeff_path {
+        let _ = writeln!(out, "nnue_ls_progress_coeff_path={}", path.display());
+    }
+    if let Some(sha256) = &f.nnue_ls_progress_coeff_sha256 {
+        let _ = writeln!(out, "nnue_ls_progress_coeff_sha256={sha256}");
+    }
+    if let Some(v) = f.nnue_source_fv_scale {
+        let _ = writeln!(out, "nnue_source_fv_scale={v}");
+    }
+    if let Some(v) = f.nnue_target_fv_scale {
+        let _ = writeln!(out, "nnue_target_fv_scale={v}");
+    }
     let _ = writeln!(out, "expand={}", f.expand);
     if f.expand {
         let _ = writeln!(
@@ -2595,7 +2957,6 @@ fn serialize_marker(marker: &DoneMarker) -> String {
 }
 
 /// マーカーファイルをパース（key=value テキスト形式、行頭空白・コメントは未対応）
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("Failed to read marker {}", path.display()))?;
@@ -2692,6 +3053,21 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
             .get("qsearch_ls_progress_coeff_path")
             .map(PathBuf::from),
         qsearch_ls_progress_coeff_sha256: map.get("qsearch_ls_progress_coeff_sha256").cloned(),
+        nnue_ls_bucket_mode: map.get("nnue_ls_bucket_mode").cloned(),
+        nnue_ls_progress_buckets: map
+            .get("nnue_ls_progress_buckets")
+            .map(|value| value.parse().context("invalid nnue_ls_progress_buckets"))
+            .transpose()?,
+        nnue_ls_progress_coeff_path: map.get("nnue_ls_progress_coeff_path").map(PathBuf::from),
+        nnue_ls_progress_coeff_sha256: map.get("nnue_ls_progress_coeff_sha256").cloned(),
+        nnue_source_fv_scale: map
+            .get("nnue_source_fv_scale")
+            .map(|value| value.parse().context("invalid nnue_source_fv_scale"))
+            .transpose()?,
+        nnue_target_fv_scale: map
+            .get("nnue_target_fv_scale")
+            .map(|value| value.parse().context("invalid nnue_target_fv_scale"))
+            .transpose()?,
         expand,
         expand_threshold_bits: if expand {
             Some(parse_hex_u32(get("expand_threshold_bits")?)?)
@@ -2748,14 +3124,12 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
 /// マーカーを atomic に書き出す（tmp に書く → sync_all → rename）。
 /// 他の出力パスと同様、tmp / final が symlink の場合は拒否する
 /// （symlink を follow して任意ファイルを上書きするのを防ぐ）。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn write_marker_atomic(rescore_output: &std::path::Path, marker: &DoneMarker) -> Result<()> {
     let final_path = marker_path_for(rescore_output);
     write_marker_atomic_at(&final_path, marker)
 }
 
 /// 指定したパスへマーカーを atomic に書き出す。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn write_marker_atomic_at(final_path: &std::path::Path, marker: &DoneMarker) -> Result<()> {
     let mut tmp_os = final_path.as_os_str().to_owned();
     tmp_os.push(".tmp");
@@ -2798,7 +3172,6 @@ fn write_marker_atomic_at(final_path: &std::path::Path, marker: &DoneMarker) -> 
 }
 
 /// score sidecar の run 開始時に選ぶ処理方法。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidecarStartDecision {
     Resume,
@@ -2806,7 +3179,6 @@ enum SidecarStartDecision {
 }
 
 /// in-progress marker が通常ファイルなら削除する。symlink は追跡せず拒否する。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn remove_in_progress_marker(rescore_output: &std::path::Path) -> Result<()> {
     let path = in_progress_marker_path_for(rescore_output);
     let metadata = match fs::symlink_metadata(&path) {
@@ -2831,7 +3203,6 @@ fn remove_in_progress_marker(rescore_output: &std::path::Path) -> Result<()> {
 ///
 /// 完了 marker と同じ key=value 形式を再利用し、output size は未完了を表す 0 とする。
 /// fingerprint だけを resume の根拠にし、変化する sidecar 自身の mtime は記録しない。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn write_in_progress_marker(
     rescore_output: &std::path::Path,
     fingerprint: &RunFingerprint,
@@ -2852,7 +3223,6 @@ fn write_in_progress_marker(
 /// full PSV では何もせず、従来の marker / record-count 判定へ委ねる。sidecar では
 /// 出力と in-progress marker の両方が存在し fingerprint が一致するときだけ追記を許可する。
 /// それ以外は出力を truncate して現在 fingerprint の marker を書き直す。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn prepare_in_progress_marker(
     rescore_output: &std::path::Path,
     current: &RunFingerprint,
@@ -2906,7 +3276,6 @@ fn prepare_in_progress_marker(
 
 /// sidecar の正常完了を `.done` へ昇格し、その後 in-progress marker を削除する。
 /// この順序なら両操作の間で停止しても、次回は `.done` を正として回収できる。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn promote_score_sidecar_marker(
     rescore_output: &std::path::Path,
     marker: &DoneMarker,
@@ -2916,7 +3285,6 @@ fn promote_score_sidecar_marker(
 }
 
 /// sidecar run の開始時 fingerprint が現在も有効か確認する。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn ensure_sidecar_fingerprint_unchanged(
     start: &RunFingerprint,
     current: &RunFingerprint,
@@ -2931,7 +3299,6 @@ fn ensure_sidecar_fingerprint_unchanged(
 }
 
 /// run 中の fingerprint 変更を検出した sidecar を、次回 resume 不能な状態へ戻す。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn reject_changed_sidecar_fingerprint(
     rescore_output: &std::path::Path,
     start: &RunFingerprint,
@@ -2962,7 +3329,6 @@ fn reject_changed_sidecar_fingerprint(
 /// 現実的には `=` を含むパスだけが稀に発生する（例:
 /// `v1.0=alpha/model.onnx`）。非 UTF-8 と改行はほぼ起こらないが、同じ
 /// 検証枠で拾っておく。遭遇時はパスをリネームすることで回避可能。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn ensure_marker_safe_path(kind: &str, path: &std::path::Path) -> Result<()> {
     let s = path.to_str().ok_or_else(|| {
         anyhow::anyhow!(
@@ -3087,6 +3453,12 @@ fn build_run_fingerprint(config: &OnnxPipelineConfig<'_>) -> Result<RunFingerpri
             .flatten(),
         qsearch_ls_progress_coeff_path,
         qsearch_ls_progress_coeff_sha256,
+        nnue_ls_bucket_mode: None,
+        nnue_ls_progress_buckets: None,
+        nnue_ls_progress_coeff_path: None,
+        nnue_ls_progress_coeff_sha256: None,
+        nnue_source_fv_scale: None,
+        nnue_target_fv_scale: None,
         expand: config.expand.is_some(),
         expand_threshold_bits: config.expand.map(|e| e.threshold.to_bits()),
         expand_skip_parent_in_check: config.expand.map(|e| e.skip_parent_in_check),
@@ -3099,7 +3471,6 @@ fn build_run_fingerprint(config: &OnnxPipelineConfig<'_>) -> Result<RunFingerpri
 
 /// 未作成出力ファイルの予定 canonical パスを構築する。
 /// parent dir を canonicalize して file_name と join する。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn canonicalize_predicted_path(path: &std::path::Path) -> Result<PathBuf> {
     let parent = path
         .parent()
@@ -4637,7 +5008,7 @@ fn process_file_with_dlshogi_onnx(
     )
 }
 
-#[cfg(all(test, any(feature = "aobazero-onnx", feature = "dlshogi-onnx")))]
+#[cfg(test)]
 mod marker_tests {
     use super::*;
     use std::io::{Read, Write};
@@ -5030,6 +5401,59 @@ mod marker_tests {
         let error = prepare_resume_count(&sidecar, 2, true).unwrap_err();
         assert!(error.to_string().contains("Delete the .in-progress marker"));
         assert_eq!(std::fs::metadata(sidecar).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn nnue_static_marker_keys_roundtrip() {
+        const NNUE_KEYS: &str = concat!(
+            "nnue_ls_bucket_mode=progresskpabs\n",
+            "nnue_ls_progress_buckets=9\n",
+            "nnue_ls_progress_coeff_path=/tmp/progress.bin\n",
+            "nnue_ls_progress_coeff_sha256=deadbeef\n",
+            "nnue_source_fv_scale=14\n",
+            "nnue_target_fv_scale=14\n",
+        );
+        let m = parse_text(&base_marker(NNUE_KEYS));
+        assert_eq!(m.fingerprint.nnue_ls_bucket_mode.as_deref(), Some("progresskpabs"));
+        assert_eq!(m.fingerprint.nnue_ls_progress_buckets, Some(9));
+        assert_eq!(
+            m.fingerprint.nnue_ls_progress_coeff_path,
+            Some(PathBuf::from("/tmp/progress.bin"))
+        );
+        assert_eq!(m.fingerprint.nnue_ls_progress_coeff_sha256.as_deref(), Some("deadbeef"));
+        assert_eq!(m.fingerprint.nnue_source_fv_scale, Some(14));
+        assert_eq!(m.fingerprint.nnue_target_fv_scale, Some(14));
+        assert_eq!(m, parse_text(&serialize_marker(&m)));
+    }
+
+    #[test]
+    fn old_marker_without_nnue_keys_defaults_to_none_and_mismatches_new_marker() {
+        let old = parse_text(&base_marker(""));
+        assert_eq!(old.fingerprint.nnue_ls_bucket_mode, None);
+        assert_eq!(old.fingerprint.nnue_ls_progress_buckets, None);
+        assert_eq!(old.fingerprint.nnue_ls_progress_coeff_path, None);
+        assert_eq!(old.fingerprint.nnue_ls_progress_coeff_sha256, None);
+        assert_eq!(old.fingerprint.nnue_source_fv_scale, None);
+        assert_eq!(old.fingerprint.nnue_target_fv_scale, None);
+
+        // routing 設定の差は fingerprint 不一致 → 再生成側に倒れる。
+        let with_keys = parse_text(&base_marker("nnue_ls_progress_buckets=8\n"));
+        assert_ne!(old.fingerprint, with_keys.fingerprint);
+    }
+
+    #[test]
+    fn progress_routing_bucket_mismatch_is_rejected_without_override() {
+        // 未指定は configure_layer_stack_routing 側の explicit 必須検査に委ねる。
+        assert!(validate_progress_routing_buckets(None, 9, false).is_ok());
+        assert!(validate_progress_routing_buckets(Some(9), 9, false).is_ok());
+
+        // 9-bucket net への 8 指定 (無警告の誤 routing を生んでいた組合せ) は拒否。
+        let err = validate_progress_routing_buckets(Some(8), 9, false).unwrap_err().to_string();
+        assert!(err.contains("stored bucket count 9"), "{err}");
+        assert!(err.contains("--allow-routing-buckets-mismatch"), "{err}");
+
+        // 旧世代 (格納 9 / routing 8) net は override flag で警告付きに通す。
+        assert!(validate_progress_routing_buckets(Some(8), 9, true).is_ok());
     }
 
     #[test]
