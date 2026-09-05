@@ -68,8 +68,8 @@ use std::time::Instant;
 
 use rshogi_core::nnue::{
     LayerStackBucketMode, configure_layer_stack_routing, get_network, init_nnue,
-    layer_stack_progress_coeff_required, load_progress_coeff_kpabs, parse_layer_stack_bucket_mode,
-    set_layer_stack_progress_kpabs_weights,
+    layer_stack_progress_coeff_required, load_progress_coeff_kpabs_from_bytes,
+    parse_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
 };
 use rshogi_core::position::Position;
 use rshogi_core::search::{LimitsType, Search};
@@ -886,6 +886,7 @@ fn main() -> Result<()> {
 
     // NNUEモデルのロード（NNUE内部評価モード、または ONNX ラベラー併用の
     // --qsearch-leaf-label で葉探索に NNUE を使う場合）
+    let mut nnue_scores_identity: Option<NnueScoresIdentity> = None;
     if (!use_engine && !use_onnx && !use_dlshogi_onnx) || cli.qsearch_leaf_label {
         let nnue = cli.nnue.as_ref().unwrap();
         if !nnue.exists() {
@@ -894,6 +895,7 @@ fn main() -> Result<()> {
         init_nnue(nnue).context("Failed to load NNUE model")?;
         eprintln!("NNUE model loaded: {}", nnue.display());
         let network = get_network().context("NNUE was not initialized")?;
+        let mut loaded_coeff_sha: Option<String> = None;
         match network.layer_stack_num_buckets() {
             Some(stored) => {
                 let mode_str = cli
@@ -904,8 +906,17 @@ fn main() -> Result<()> {
                     .context("--ls-bucket-mode must be progresskpabs or kingrank9")?;
                 match (mode, cli.ls_progress_coeff.as_deref()) {
                     (LayerStackBucketMode::ProgressKPAbs, Some(path)) => {
-                        let weights =
-                            load_progress_coeff_kpabs(path).map_err(anyhow::Error::msg)?;
+                        // fingerprint に書く sha256 を実際にロードした byte 列そのもの
+                        // から計算するため、ファイルは 1 回だけ読む (読み直すと
+                        // 差し替え時にロード内容と sha が乖離する)。
+                        let bytes = fs::read(path).with_context(|| {
+                            format!("Failed to read --ls-progress-coeff {}", path.display())
+                        })?;
+                        if nnue_static_scores {
+                            loaded_coeff_sha = Some(format!("{:x}", Sha256::digest(&bytes)));
+                        }
+                        let weights = load_progress_coeff_kpabs_from_bytes(&bytes)
+                            .map_err(anyhow::Error::msg)?;
                         set_layer_stack_progress_kpabs_weights(weights)
                             .map_err(anyhow::Error::msg)?;
                     }
@@ -937,6 +948,13 @@ fn main() -> Result<()> {
                 anyhow::bail!("LayerStacks routing options require a LayerStacks NNUE")
             }
             None => {}
+        }
+        // sidecar fingerprint の識別情報はロード直後のこの時点で固定する。
+        if nnue_static_scores {
+            nnue_scores_identity = Some(NnueScoresIdentity::capture(
+                nnue,
+                cli.ls_progress_coeff.as_deref().zip(loaded_coeff_sha),
+            )?);
         }
     }
 
@@ -1157,17 +1175,20 @@ fn main() -> Result<()> {
 
         // NNUE 静的評価 sidecar は完了 marker で skip / 作り直しを判定する
         // (途中再開の判定は process_file_nnue_scores 内の in-progress marker が担う)。
-        if nnue_static_scores
-            && nnue_scores_marker_decide(&cli, input_path, &output_path, process_count)?
-        {
-            eprintln!(
-                "=== [{}/{}] Skipping (marker matches): {} ===",
-                file_idx + 1,
-                total_files,
-                output_path.display()
-            );
-            rprog.skip_file(process_count);
-            continue;
+        if nnue_static_scores {
+            let identity = nnue_scores_identity
+                .as_ref()
+                .context("NNUE score sidecar identity must be captured at model load time")?;
+            if nnue_scores_marker_decide(&cli, identity, input_path, &output_path, process_count)? {
+                eprintln!(
+                    "=== [{}/{}] Skipping (marker matches): {} ===",
+                    file_idx + 1,
+                    total_files,
+                    output_path.display()
+                );
+                rprog.skip_file(process_count);
+                continue;
+            }
         }
 
         // legacy resume / skip 判定（NNUE/USI 全モード、または ONNX 無 marker + expand 無効）
@@ -1269,7 +1290,17 @@ fn main() -> Result<()> {
             } else if cli.search_depth.is_some() {
                 process_file_with_search(&cli, input_path, &output_path, process_count, &fprog)?;
             } else if nnue_static_scores {
-                process_file_nnue_scores(&cli, input_path, &output_path, process_count, &fprog)?;
+                let identity = nnue_scores_identity
+                    .as_ref()
+                    .context("NNUE score sidecar identity must be captured at model load time")?;
+                process_file_nnue_scores(
+                    &cli,
+                    identity,
+                    input_path,
+                    &output_path,
+                    process_count,
+                    &fprog,
+                )?;
             } else {
                 process_file(&cli, input_path, &output_path, process_count, &fprog)?;
             }
@@ -1350,54 +1381,111 @@ fn validate_progress_routing_buckets(
     );
 }
 
+/// NNUE score sidecar 用のモデル識別情報。
+///
+/// プロセスは NNUE と progress 係数を起動時に 1 回だけロードする。fingerprint に
+/// 書く識別情報 (path / size / mtime、係数はロードした byte 列の sha256) も
+/// ロード直後に 1 回だけ取得して固定し、以後の全 fingerprint はこの値を使う。
+/// 入力ファイルごとに stat し直すと、複数入力の長時間実行中にファイルが
+/// 差し替わった場合に「旧モデルで生成した sidecar へ新モデルの識別情報で
+/// `.done` が付き、次回誤って skip される」取り違えが起きる。
+struct NnueScoresIdentity {
+    model_path: PathBuf,
+    model_size: u64,
+    model_mtime_ns: u128,
+    coeff_path: Option<PathBuf>,
+    coeff_size: Option<u64>,
+    coeff_mtime_ns: Option<u128>,
+    coeff_sha256: Option<String>,
+}
+
+impl NnueScoresIdentity {
+    /// NNUE ロード直後に識別情報を取得する。`coeff` の sha256 はロードに使った
+    /// byte 列から計算済みの値を受け取る (ここでファイルを読み直すと、差し替え時
+    /// にロード内容と sha が乖離するため)。
+    fn capture(nnue: &std::path::Path, coeff: Option<(&std::path::Path, String)>) -> Result<Self> {
+        let model_path = nnue
+            .canonicalize()
+            .with_context(|| format!("Failed to canonicalize --nnue {}", nnue.display()))?;
+        ensure_marker_safe_path("--nnue", &model_path)?;
+        let (model_size, model_mtime_ns) = file_size_mtime_ns(&model_path)?;
+        let (coeff_path, coeff_size, coeff_mtime_ns, coeff_sha256) = match coeff {
+            Some((path, sha256)) => {
+                let canonical = path.canonicalize().with_context(|| {
+                    format!("Failed to canonicalize --ls-progress-coeff {}", path.display())
+                })?;
+                ensure_marker_safe_path("--ls-progress-coeff", &canonical)?;
+                let (size, mtime_ns) = file_size_mtime_ns(&canonical)?;
+                (Some(canonical), Some(size), Some(mtime_ns), Some(sha256))
+            }
+            None => (None, None, None, None),
+        };
+        Ok(Self {
+            model_path,
+            model_size,
+            model_mtime_ns,
+            coeff_path,
+            coeff_size,
+            coeff_mtime_ns,
+            coeff_sha256,
+        })
+    }
+
+    /// 現物がロード時の識別情報から差し替わっていないかを stat で検証する
+    /// (係数は再ハッシュしない — sha はロード時の byte 列に固定済み)。差し替えを
+    /// 検出したら硬いエラーにする: ロード済み weight で評価を続けても、marker が
+    /// 指すファイルと実体が一致しなくなるため。
+    fn verify_unchanged(&self) -> Result<()> {
+        let (size, mtime_ns) = file_size_mtime_ns(&self.model_path)?;
+        if (size, mtime_ns) != (self.model_size, self.model_mtime_ns) {
+            anyhow::bail!(
+                "NNUE model {} changed while rescoring (loaded size {} / current size {size}); \
+                 the loaded weights no longer match the file on disk. Restart the run.",
+                self.model_path.display(),
+                self.model_size,
+            );
+        }
+        if let (Some(path), Some(c_size), Some(c_mtime)) =
+            (&self.coeff_path, self.coeff_size, self.coeff_mtime_ns)
+        {
+            let (size, mtime_ns) = file_size_mtime_ns(path)?;
+            if (size, mtime_ns) != (c_size, c_mtime) {
+                anyhow::bail!(
+                    "--ls-progress-coeff {} changed while rescoring; the loaded coefficients \
+                     no longer match the file on disk. Restart the run.",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// NNUE 静的評価 score sidecar の同一性 fingerprint を構築する。
 ///
-/// model_* は NNUE ファイル (path / size / mtime)、nnue_* は出力スコアを変える
-/// routing (`--ls-bucket-mode` / `--ls-progress-buckets` / `--ls-progress-coeff`
-/// の path + sha256) とスケール変換 (`--source-fv-scale` / `--target-fv-scale`)。
-/// `eval_scale_bits` / `onnx_draw_ply` は ONNX 専用キーだが marker format 上
-/// 必須のため固定値 (0) を書く。
+/// model_* / nnue_ls_progress_coeff_* はロード時に固定した [`NnueScoresIdentity`]
+/// から取り、入力 (path / size / mtime) だけを都度 stat する。nnue_* の残りは
+/// 出力スコアを変える routing (`--ls-bucket-mode` / `--ls-progress-buckets`) と
+/// スケール変換 (`--source-fv-scale` / `--target-fv-scale`)。`eval_scale_bits` /
+/// `onnx_draw_ply` は ONNX 専用キーだが marker format 上必須のため固定値 (0) を書く。
 fn build_nnue_scores_fingerprint(
     cli: &Cli,
+    identity: &NnueScoresIdentity,
     input_path: &std::path::Path,
     process_count: u64,
 ) -> Result<RunFingerprint> {
-    let nnue = cli
-        .nnue
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("NNUE score sidecar mode requires --nnue"))?;
-    let model_path = nnue
-        .canonicalize()
-        .with_context(|| format!("Failed to canonicalize --nnue {}", nnue.display()))?;
-    ensure_marker_safe_path("--nnue", &model_path)?;
-    let (model_size, model_mtime_ns) = file_size_mtime_ns(&model_path)?;
     let input_path = input_path
         .canonicalize()
         .with_context(|| format!("Failed to canonicalize {}", input_path.display()))?;
     ensure_marker_safe_path("input", &input_path)?;
     let (input_size, input_mtime_ns) = file_size_mtime_ns(&input_path)?;
-    let (nnue_ls_progress_coeff_path, nnue_ls_progress_coeff_sha256) =
-        match cli.ls_progress_coeff.as_deref() {
-            Some(path) => {
-                let canonical = path.canonicalize().with_context(|| {
-                    format!("Failed to canonicalize --ls-progress-coeff {}", path.display())
-                })?;
-                ensure_marker_safe_path("--ls-progress-coeff", &canonical)?;
-                let bytes = fs::read(&canonical).with_context(|| {
-                    format!("Failed to read --ls-progress-coeff {}", canonical.display())
-                })?;
-                let sha256 = format!("{:x}", Sha256::digest(bytes));
-                (Some(canonical), Some(sha256))
-            }
-            None => (None, None),
-        };
     Ok(RunFingerprint {
         version: MARKER_VERSION,
         mode: "nnue-static".to_string(),
         model_kind: "nnue".to_string(),
-        model_path,
-        model_size,
-        model_mtime_ns,
+        model_path: identity.model_path.clone(),
+        model_size: identity.model_size,
+        model_mtime_ns: identity.model_mtime_ns,
         input_path,
         input_size,
         input_mtime_ns,
@@ -1419,8 +1507,8 @@ fn build_nnue_scores_fingerprint(
         qsearch_ls_progress_coeff_sha256: None,
         nnue_ls_bucket_mode: cli.ls_bucket_mode.clone(),
         nnue_ls_progress_buckets: cli.ls_progress_buckets,
-        nnue_ls_progress_coeff_path,
-        nnue_ls_progress_coeff_sha256,
+        nnue_ls_progress_coeff_path: identity.coeff_path.clone(),
+        nnue_ls_progress_coeff_sha256: identity.coeff_sha256.clone(),
         nnue_source_fv_scale: Some(cli.source_fv_scale),
         nnue_target_fv_scale: Some(cli.target_fv_scale),
         expand: false,
@@ -1441,11 +1529,12 @@ fn build_nnue_scores_fingerprint(
 /// [`process_file_nnue_scores`] 内の in-progress marker が担う。
 fn nnue_scores_marker_decide(
     cli: &Cli,
+    identity: &NnueScoresIdentity,
     input_path: &std::path::Path,
     output_path: &std::path::Path,
     process_count: u64,
 ) -> Result<bool> {
-    let current = build_nnue_scores_fingerprint(cli, input_path, process_count)?;
+    let current = build_nnue_scores_fingerprint(cli, identity, input_path, process_count)?;
     ensure_safe_output_path(output_path, &current.input_path)?;
     let marker_path = marker_path_for(output_path);
     if marker_path.exists() {
@@ -1474,6 +1563,7 @@ fn nnue_scores_marker_decide(
 /// 再開に備える。
 fn process_file_nnue_scores(
     cli: &Cli,
+    identity: &NnueScoresIdentity,
     input_path: &PathBuf,
     output_path: &PathBuf,
     process_count: u64,
@@ -1486,6 +1576,7 @@ fn process_file_nnue_scores(
     let target_fv_scale = cli.target_fv_scale;
     run_nnue_scores_pipeline(
         cli,
+        identity,
         input_path,
         output_path,
         process_count,
@@ -1518,8 +1609,10 @@ fn process_file_nnue_scores(
 /// して、NNUE ロードなし・小 chunk での統合テスト (順序保存 / chunk 境界 /
 /// fail-closed / resume) を成立させる。marker / resume / 件数検証のセマンティクスは
 /// この関数が単一の実装である。
+#[allow(clippy::too_many_arguments)]
 fn run_nnue_scores_pipeline(
     cli: &Cli,
+    identity: &NnueScoresIdentity,
     input_path: &PathBuf,
     output_path: &PathBuf,
     process_count: u64,
@@ -1530,7 +1623,10 @@ fn run_nnue_scores_pipeline(
     const SCORE_RECORD_SIZE: u64 = 2;
     assert!(chunk_size >= 1, "chunk_size must be >= 1");
 
-    let start_fingerprint = build_nnue_scores_fingerprint(cli, input_path, process_count)?;
+    // ロード済みモデルと disk 上の実体が処理開始時点で一致していることを確認する。
+    identity.verify_unchanged()?;
+    let start_fingerprint =
+        build_nnue_scores_fingerprint(cli, identity, input_path, process_count)?;
     prepare_in_progress_marker(output_path, &start_fingerprint, false)?
         .context("out_scores=true did not create an in-progress marker")?;
     let resume_count = prepare_resume_count(output_path, SCORE_RECORD_SIZE, true)?;
@@ -1629,7 +1725,11 @@ fn run_nnue_scores_pipeline(
         );
     }
 
-    let final_fingerprint = build_nnue_scores_fingerprint(cli, input_path, process_count)?;
+    // model / coeff の差し替えは identity の stat 検証で、入力の変化は fingerprint
+    // 再構築 (入力 stat のみ都度取得) の比較で、それぞれ `.done` 昇格前に検出する。
+    identity.verify_unchanged()?;
+    let final_fingerprint =
+        build_nnue_scores_fingerprint(cli, identity, input_path, process_count)?;
     reject_changed_sidecar_fingerprint(
         output_path,
         &start_fingerprint,
@@ -5493,6 +5593,55 @@ mod marker_tests {
         ProcessResult::Ok(doubled.to_bytes(), false)
     }
 
+    /// fingerprint のモデル識別情報はロード時に固定した [`NnueScoresIdentity`] から
+    /// 来る: 実ファイルを後から差し替えても fingerprint は変わらず、差し替え自体は
+    /// `verify_unchanged` が検出する。
+    #[test]
+    fn nnue_identity_is_fixed_at_capture_and_swap_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let nnue = dir.path().join("nn.bin");
+        std::fs::write(&nnue, b"model v1").unwrap();
+        let coeff = dir.path().join("progress.bin");
+        let coeff_bytes = b"coeff v1 bytes".to_vec();
+        std::fs::write(&coeff, &coeff_bytes).unwrap();
+        let loaded_sha = format!("{:x}", Sha256::digest(&coeff_bytes));
+
+        let input = dir.path().join("in.psv");
+        std::fs::write(&input, test_psv(1).to_bytes()).unwrap();
+        let out_dir = dir.path().join("scores");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let cli = Cli::try_parse_from([
+            "rescore_psv",
+            "--input",
+            input.to_str().unwrap(),
+            "--output-dir",
+            out_dir.to_str().unwrap(),
+            "--nnue",
+            nnue.to_str().unwrap(),
+            "--ls-progress-coeff",
+            coeff.to_str().unwrap(),
+            "--out-scores",
+        ])
+        .unwrap();
+
+        let identity =
+            NnueScoresIdentity::capture(&nnue, Some((&coeff, loaded_sha.clone()))).unwrap();
+        identity.verify_unchanged().expect("unchanged files must verify");
+        let fp1 = build_nnue_scores_fingerprint(&cli, &identity, &input, 1).unwrap();
+        assert_eq!(fp1.model_size, 8, "size of the loaded model v1");
+        assert_eq!(fp1.nnue_ls_progress_coeff_sha256.as_deref(), Some(loaded_sha.as_str()));
+
+        // モデルと係数を別内容 (別サイズ) に差し替えても fingerprint は固定値のまま。
+        std::fs::write(&nnue, b"model v2 with a different size").unwrap();
+        std::fs::write(&coeff, b"swapped coefficients v2").unwrap();
+        let fp2 = build_nnue_scores_fingerprint(&cli, &identity, &input, 1).unwrap();
+        assert_eq!(fp1, fp2, "identity fields must not re-stat the files");
+
+        // 差し替えは stat 検証が硬いエラーで検出する。
+        let err = identity.verify_unchanged().expect_err("swapped model must be detected");
+        assert!(err.to_string().contains("changed while rescoring"), "{err}");
+    }
+
     /// [`run_nnue_scores_pipeline`] の統合テスト: 小 chunk で順序保存・chunk 境界・
     /// 最終端数・エラー chunk の fail-closed prefix・件数 resume を一気に固定する。
     #[test]
@@ -5523,6 +5672,7 @@ mod marker_tests {
             "--out-scores",
         ])
         .unwrap();
+        let identity = NnueScoresIdentity::capture(&nnue, None).unwrap();
         let mut expected = Vec::new();
         for i in 0..n {
             expected.extend_from_slice(&pipeline_input_score(i).wrapping_mul(2).to_le_bytes());
@@ -5534,6 +5684,7 @@ mod marker_tests {
         let input_pathbuf = input.clone();
         run_nnue_scores_pipeline(
             &cli,
+            &identity,
             &input_pathbuf,
             &output,
             n,
@@ -5561,6 +5712,7 @@ mod marker_tests {
         };
         let err = run_nnue_scores_pipeline(
             &cli,
+            &identity,
             &input_pathbuf,
             &output,
             n,
@@ -5579,6 +5731,7 @@ mod marker_tests {
         // から追記され、最終 sidecar は一気通貫実行と bit 一致して `.done` へ昇格する。
         run_nnue_scores_pipeline(
             &cli,
+            &identity,
             &input_pathbuf,
             &output,
             n,
