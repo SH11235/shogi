@@ -142,7 +142,7 @@ ort は load-dynamic のためビルド時に libonnxruntime は不要（実行�
 |---|---|---|
 | `--input` | （必須） | 入力 PSV。glob / 複数指定可 |
 | `--output-dir` | （必須） | 出力ディレクトリ（入力ファイル名で出力） |
-| `--out-scores` | false | dlshogi ONNX の score のみを `<入力名>.scores.i16` に出力（後述） |
+| `--out-scores` | false | dlshogi ONNX または NNUE 静的評価の score のみを `<入力名>.scores.i16` に出力（後述） |
 | `--threads` | 0（論理コア数） | 並列処理スレッド数 |
 | `--limit` | 0（無制限） | 各入力ファイルで処理するレコード数上限（`--out-scores` と併用不可） |
 | `--score-clip` | 10000 | スコアを ± この値にクリップ |
@@ -184,6 +184,7 @@ ort は load-dynamic のためビルド時に libonnxruntime は不要（実行�
 | `--max-ply` | 16 | qsearch の最大深さ |
 | `--apply-qsearch-leaf` | false | 局面を qsearch 葉に置換して出力 |
 | `--source-fv-scale` / `--target-fv-scale` | 24 / 24 | FV_SCALE 変換（通常は変換不要） |
+| `--allow-routing-buckets-mismatch` | false | `--ls-progress-buckets` と格納 bucket 数の不一致を警告付きで許可（旧世代 net 専用、本文参照） |
 | `--engine` | — | 外部 USI エンジンパス。内部 NNUE の代わりに評価 |
 | `--engine-nodes` | 1 | エンジンの `go nodes` 値（0 で `go depth 1`） |
 | `--engine-threads` | 1 | 並列エンジンプロセス数（DL 系は VRAM に応じ 2〜4） |
@@ -231,18 +232,29 @@ rescore_psv --input "data/*.psv" --output-dir scores/ \
   --dlshogi-onnx-model model.onnx --out-scores
 ```
 
+```bash
+# NNUE 静的評価でも同じ sidecar を出力できる（LayerStacks は routing 3 オプション併用）
+rescore_psv --input "data/*.psv" --output-dir scores/ \
+  --nnue ls.bin --ls-bucket-mode progresskpabs --ls-progress-buckets 9 \
+  --ls-progress-coeff progress.bin --out-scores
+```
+
 フル PSV の代わりに `<入力ファイル名>.scores.i16` を生成する。record `i` の score は
 offset `i * 2` にある little-endian i16 で、ファイルサイズは厳密に
 `base PSV の全 records × 2` byte となる。通常のフル PSV
 出力と同じ推論・符号変換・clip を通り、
 通常出力の offset 32..34 を行順に抽出したものと bit 一致する。
 
-このモードは `--dlshogi-onnx-model` の直接推論専用で、NNUE、qsearch、search、外部
+このモードは `--dlshogi-onnx-model` の直接推論、または `--nnue` の静的評価
+（qsearch なし）で使える。qsearch、search、外部
 engine、AobaZero ONNX、leaf label/replacement、expand、入力を削除する `--delete-input`、
 処理件数を制限する `--limit`（0 より大きい値）、および行を減らす `--skip-in-check` とは
 併用できない。入力は 40 byte の倍数でなければ
 即時エラーになる。run 開始時に `<入力名>.scores.i16.in-progress` を作り、
-入力・ONNX モデル・ラベル条件の fingerprint を記録する。中断後はこの marker が現在の
+入力・モデル・ラベル条件の fingerprint を記録する（NNUE 静的評価では ONNX モデルの
+代わりに NNUE の path/size/mtime と routing 設定 `--ls-bucket-mode` /
+`--ls-progress-buckets` / `--ls-progress-coeff`（path + sha256）、
+`--source-fv-scale` / `--target-fv-scale` を追跡する）。中断後はこの marker が現在の
 設定と一致し、既存 sidecar が 2 byte の倍数であるときだけ、サイズを 2 で割った record
 位置から追記再開する。一致時に奇数 byte なら即時エラーになる。marker が無い、壊れている、
 または fingerprint が異なる場合は、既存サイズにかかわらず sidecar を truncate して最初から生成する。
@@ -315,9 +327,11 @@ rescore_psv --input "data/*.bin" --output-dir rescored_leaflabel/ \
 # 静的 NNUE 評価（CPU のみ、最軽量）
 rescore_psv --input data.bin --output-dir rescored/ --nnue nn.bin
 
-# LayerStacks progresskpabs（routing は必ず学習時と同じ値を明示）
+# LayerStacks progresskpabs（routing は必ず学習時と同じ値を明示。
+# 格納 bucket 数と不一致の指定はエラー。旧世代の格納 9 / routing 8 net だけ
+# --allow-routing-buckets-mismatch で通す）
 rescore_psv --input data.bin --output-dir rescored/ --nnue ls.bin \
-  --ls-bucket-mode progresskpabs --ls-progress-buckets 8 \
+  --ls-bucket-mode progresskpabs --ls-progress-buckets 9 \
   --ls-progress-coeff progress.bin
 
 # qsearch 評価
@@ -342,6 +356,11 @@ LayerStacks NNUE では `--ls-bucket-mode` が必須です。`progresskpabs` は
 `--ls-progress-buckets` と `--ls-progress-coeff` が必須で、格納 bucket 数を routing 数へ
 暗黙採用しません。`kingrank9` は progress 用の2オプションを指定せず、格納9 bucket のモデルだけを受理します。
 
+`--ls-progress-buckets` が NNUE ファイルの格納 bucket 数と異なる場合はエラーになります
+（誤った routing 数は全行を無警告で誤評価にするため）。格納 bucket 数より少ない routing で
+学習された旧世代 net（例: 格納 9 / routing 8）を意図的に評価する場合のみ
+`--allow-routing-buckets-mismatch` を付けると警告付きで通過します。
+
 ## 再開（resume）の仕組み
 
 - **ONNX モード**: 入力ファイルごとに完了マーカー `<出力名>.done` を書く。
@@ -357,6 +376,11 @@ LayerStacks NNUE では `--ls-bucket-mode` が必須です。`progresskpabs` は
   自身の mtime は fingerprint に含めないため、追記による mtime 更新は resume を妨げない。
   `Ctrl-C` 中断時は in-progress marker を残し、正常完了時だけ `.done` へ昇格する。
   同じ出力 sidecar への複数プロセスからの同時書き込みは非対応。
+- **NNUE 静的評価 + `--out-scores`**: ONNX の `--out-scores` と同じ
+  `.in-progress` / `.done` marker 方式で中断再開・skip 判定を行う。fingerprint は
+  入力 path/size/mtime、NNUE path/size/mtime、全入力件数、`--score-clip`、
+  routing（`--ls-bucket-mode` / `--ls-progress-buckets` / `--ls-progress-coeff` の
+  path + sha256）、`--source-fv-scale` / `--target-fv-scale` を追跡する。
 - **NNUE / 探索 / 外部エンジンモード**: マーカーは使わず、出力レコード数が入力
   レコード数以上のファイルを skip する（ファイル粒度。中途半端なファイルは最初
   から再処理）。

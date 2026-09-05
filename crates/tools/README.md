@@ -34,7 +34,7 @@
 | `split_psv` | PSV ファイルを局面数または容量で分割 |
 | `merge_psv` | 複数の PSV ファイルを順序どおり結合 |
 | `relabel_psv` | PSV の score を game_result 由来値へ置換し、宣言勝ち override / diversion 整合性 deblunder / dry-run / verdict sidecar に対応（[詳細](docs/relabel_psv.md)） |
-| `rescore_psv` | 局面の再評価（探索スコア付与） |
+| `rescore_psv` | 局面の再評価（NNUE / 外部エンジン / ONNX。`--out-scores` で i16 score sidecar 出力） |
 | `psv_gate_by_king_zone` | 入玉ドメインの score 合成 / mask bitmap 生成 |
 | `psv_dual_label` | 通常 PSV の score 退避、dual-label PSV の生成・sidecar 抽出・fail-closed 検証（[詳細](docs/psv_dual_label.md)） |
 | `psv_select_by_mask` | LSB-first bitmap mask の bit 1 に対応する PSV 行を入力順に抽出（[詳細](docs/psv_select_by_mask.md)） |
@@ -118,7 +118,7 @@ cargo run -p tools --release --bin benchmark -- --internal
 - [nnue_saturation](docs/nnue_saturation.md) - LayerStacks NNUE の活性飽和率（u8 127 張り付き）を実局面で計測
 - [generate_net_spsa_params](docs/generate_net_spsa_params.md) - LayerStacks `.bin` から net 重み delta 用 SPSA `.params` を生成
 - [apply_net_spsa_params](docs/apply_net_spsa_params.md) - net 重み SPSA の確定 delta を LayerStacks `.bin` へ焼き込み、feature 非依存で読み戻し検証する
-- [rescore_psv](docs/rescore_psv.md) - PSV 評価値の再スコアリング（推奨: dlshogi ONNX + TensorRT FP16。qsearch-leaf ラベル / policy 展開 / レジューム対応）
+- [rescore_psv](docs/rescore_psv.md) - PSV 評価値の再スコアリング（推奨: dlshogi ONNX + TensorRT FP16。qsearch-leaf ラベル / policy 展開 / レジューム / score sidecar（`--out-scores`、dlshogi ONNX と NNUE 静的評価）対応。LayerStacks routing は格納 bucket 数との不一致を拒否し、旧世代 net のみ `--allow-routing-buckets-mismatch` で明示許可）
 - [psv_gate_by_king_zone](docs/psv_gate_by_king_zone.md) - 入玉ドメインの base/override score 合成と行対応 mask bitmap
 - [psv_dual_label](docs/psv_dual_label.md) - 通常 PSV の score 退避、dual-label PSV の生成・sidecar 抽出・fail-closed 検証
 - [psv_select_by_mask](docs/psv_select_by_mask.md) - bitmap mask の bit 1 に対応する PSV 行の順序保持抽出
