@@ -1480,7 +1480,55 @@ fn process_file_nnue_scores(
     progress: &FileProgress,
 ) -> Result<()> {
     const CHUNK_SIZE: usize = 1_000_000;
+    let max_ply = cli.max_ply;
+    let score_clip = cli.score_clip;
+    let source_fv_scale = cli.source_fv_scale;
+    let target_fv_scale = cli.target_fv_scale;
+    run_nnue_scores_pipeline(
+        cli,
+        input_path,
+        output_path,
+        process_count,
+        progress,
+        CHUNK_SIZE,
+        &|record| {
+            thread_local! {
+                static NNUE_STACKS: RefCell<NnueStacks> = RefCell::new(NnueStacks::new());
+            }
+            NNUE_STACKS.with(|stacks| {
+                let mut stacks = stacks.borrow_mut();
+                stacks.reset();
+                process_record(
+                    record,
+                    &mut stacks,
+                    max_ply,
+                    false,
+                    false,
+                    score_clip,
+                    false,
+                    source_fv_scale,
+                    target_fv_scale,
+                )
+            })
+        },
+    )
+}
+
+/// [`process_file_nnue_scores`] の本体。record 評価関数と chunk サイズを注入可能に
+/// して、NNUE ロードなし・小 chunk での統合テスト (順序保存 / chunk 境界 /
+/// fail-closed / resume) を成立させる。marker / resume / 件数検証のセマンティクスは
+/// この関数が単一の実装である。
+fn run_nnue_scores_pipeline(
+    cli: &Cli,
+    input_path: &PathBuf,
+    output_path: &PathBuf,
+    process_count: u64,
+    progress: &FileProgress,
+    chunk_size: usize,
+    eval_record: &(dyn Fn(&[u8; PackedSfenValue::SIZE]) -> ProcessResult + Sync),
+) -> Result<()> {
     const SCORE_RECORD_SIZE: u64 = 2;
+    assert!(chunk_size >= 1, "chunk_size must be >= 1");
 
     let start_fingerprint = build_nnue_scores_fingerprint(cli, input_path, process_count)?;
     prepare_in_progress_marker(output_path, &start_fingerprint, false)?
@@ -1505,10 +1553,6 @@ fn process_file_nnue_scores(
         .with_context(|| format!("Failed to open {}", output_path.display()))?;
     let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
 
-    let max_ply = cli.max_ply;
-    let score_clip = cli.score_clip;
-    let source_fv_scale = cli.source_fv_scale;
-    let target_fv_scale = cli.target_fv_scale;
     let verbose = cli.verbose;
 
     progress.set_message("Processing...");
@@ -1525,7 +1569,7 @@ fn process_file_nnue_scores(
             break;
         }
 
-        let want = (CHUNK_SIZE as u64).min(process_count - total_written) as usize;
+        let want = (chunk_size as u64).min(process_count - total_written) as usize;
         let mut chunk: Vec<[u8; PackedSfenValue::SIZE]> = Vec::with_capacity(want);
         let mut buffer = [0u8; PackedSfenValue::SIZE];
         for _ in 0..want {
@@ -1542,29 +1586,7 @@ fn process_file_nnue_scores(
         // 行対応維持のためチャンク全件を評価してから一括書き出しする。process_file と
         // 違い INTERRUPTED での record 単位 early-out はしない (None 化した行が
         // fail-closed でエラー扱いになり、正常な中断がエラー終了に化けるため)。
-        let results: Vec<ProcessResult> = chunk
-            .par_iter()
-            .map(|record| {
-                thread_local! {
-                    static NNUE_STACKS: RefCell<NnueStacks> = RefCell::new(NnueStacks::new());
-                }
-                NNUE_STACKS.with(|stacks| {
-                    let mut stacks = stacks.borrow_mut();
-                    stacks.reset();
-                    process_record(
-                        record,
-                        &mut stacks,
-                        max_ply,
-                        false,
-                        false,
-                        score_clip,
-                        false,
-                        source_fv_scale,
-                        target_fv_scale,
-                    )
-                })
-            })
-            .collect();
+        let results: Vec<ProcessResult> = chunk.par_iter().map(eval_record).collect();
 
         let mut bytes: Vec<u8> = Vec::with_capacity(results.len() * SCORE_RECORD_SIZE as usize);
         let mut errors = 0u64;
@@ -5454,6 +5476,120 @@ mod marker_tests {
 
         // 旧世代 (格納 9 / routing 8) net は override flag で警告付きに通す。
         assert!(validate_progress_routing_buckets(Some(8), 9, true).is_ok());
+    }
+
+    /// record 番号から一意な入力 score を作る (順序検証用。線形なので重複しない)。
+    fn pipeline_input_score(i: u64) -> i16 {
+        (i as i16) * 3 - 11
+    }
+
+    /// 統合テスト用の record 評価: score を 2 倍にした PSV を返す (NNUE 非依存)。
+    fn pipeline_double_score(record: &[u8; PackedSfenValue::SIZE]) -> ProcessResult {
+        let psv = PackedSfenValue::from_bytes(record).expect("test record must parse");
+        let doubled = PackedSfenValue {
+            score: psv.score.wrapping_mul(2),
+            ..psv
+        };
+        ProcessResult::Ok(doubled.to_bytes(), false)
+    }
+
+    /// [`run_nnue_scores_pipeline`] の統合テスト: 小 chunk で順序保存・chunk 境界・
+    /// 最終端数・エラー chunk の fail-closed prefix・件数 resume を一気に固定する。
+    #[test]
+    fn nnue_scores_pipeline_preserves_order_and_resumes_after_error_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let n: u64 = 25;
+        let input = dir.path().join("in.psv");
+        let mut input_bytes = Vec::new();
+        for i in 0..n {
+            input_bytes.extend_from_slice(&test_psv(pipeline_input_score(i)).to_bytes());
+        }
+        std::fs::write(&input, &input_bytes).unwrap();
+        // fingerprint は NNUE の path/size/mtime しか見ないため中身は任意でよい。
+        let nnue = dir.path().join("nn.bin");
+        std::fs::write(&nnue, b"not a real net").unwrap();
+        let out_dir = dir.path().join("scores");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let output = out_dir.join("in.psv.scores.i16");
+
+        let cli = Cli::try_parse_from([
+            "rescore_psv",
+            "--input",
+            input.to_str().unwrap(),
+            "--output-dir",
+            out_dir.to_str().unwrap(),
+            "--nnue",
+            nnue.to_str().unwrap(),
+            "--out-scores",
+        ])
+        .unwrap();
+        let mut expected = Vec::new();
+        for i in 0..n {
+            expected.extend_from_slice(&pipeline_input_score(i).wrapping_mul(2).to_le_bytes());
+        }
+        let mprog = MultiFileProgress::new(3 * n, 3, "test");
+
+        // chunk_size 4 / 25 records = 満杯 6 chunk + 端数 1 record。sidecar は入力順の
+        // 期待値と bit 一致し、`.done` へ昇格して in-progress marker は消える。
+        let input_pathbuf = input.clone();
+        run_nnue_scores_pipeline(
+            &cli,
+            &input_pathbuf,
+            &output,
+            n,
+            &mprog.start_file("full", 1, n),
+            4,
+            &pipeline_double_score,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), expected);
+        assert!(marker_path_for(&output).exists());
+        assert!(!in_progress_marker_path_for(&output).exists());
+
+        // 作り直し: record 10 (chunk 2 = record 8..12 に含まれる) がエラーになる評価で
+        // 流すと、chunk 0..=1 の 8 records だけが書かれた時点で fail-closed に停止し、
+        // 既存 prefix は行対応を保つ。in-progress marker は残り `.done` は無い。
+        std::fs::remove_file(marker_path_for(&output)).unwrap();
+        std::fs::remove_file(&output).unwrap();
+        let error_score = pipeline_input_score(10);
+        let inject_error = move |record: &[u8; PackedSfenValue::SIZE]| -> ProcessResult {
+            let psv = PackedSfenValue::from_bytes(record).expect("test record must parse");
+            if psv.score == error_score {
+                return ProcessResult::Error(anyhow::anyhow!("injected failure"));
+            }
+            pipeline_double_score(record)
+        };
+        let err = run_nnue_scores_pipeline(
+            &cli,
+            &input_pathbuf,
+            &output,
+            n,
+            &mprog.start_file("error", 2, n),
+            4,
+            &inject_error,
+        )
+        .expect_err("a chunk containing an error must abort before writing");
+        assert!(err.to_string().contains("score sidecar aborted"), "{err}");
+        let partial = std::fs::read(&output).unwrap();
+        assert_eq!(partial, expected[..8 * 2], "prefix must stay row-aligned");
+        assert!(!marker_path_for(&output).exists());
+        assert!(in_progress_marker_path_for(&output).exists());
+
+        // 件数 resume: fingerprint 一致の in-progress marker が残っているので record 8
+        // から追記され、最終 sidecar は一気通貫実行と bit 一致して `.done` へ昇格する。
+        run_nnue_scores_pipeline(
+            &cli,
+            &input_pathbuf,
+            &output,
+            n,
+            &mprog.start_file("resume", 3, n),
+            4,
+            &pipeline_double_score,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), expected);
+        assert!(marker_path_for(&output).exists());
+        assert!(!in_progress_marker_path_for(&output).exists());
     }
 
     #[test]
